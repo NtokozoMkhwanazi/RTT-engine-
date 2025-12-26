@@ -1,7 +1,6 @@
 #pragma once
 
 #include "RigidBody.h"
-#include "Manifolds.h"
 #include "TOI.h"
 
 #include <vector>

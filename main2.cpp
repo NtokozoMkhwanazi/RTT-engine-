@@ -143,7 +143,7 @@ std::cout << "Matched animation channels: " << matched << "\n";
 // =====================================================
 Animator animator(&skeleton);
 
-// 🔥 THIS IS THE CRITICAL LINE 🔥
+ 
 animator.Play(&idleAnim);
 
 // Force evaluation BEFORE render loop (kills T-pose)

@@ -9,5 +9,5 @@ This is a game engine project i am currently developing just for learning more a
 - Custom Phyics System .
 - Custom Animation system 
 # what it fails to do for now 
-- Mixamorig charcter bone mismatch when animating, cuases weird deformation at animation and correct T-pose character at rest.
+- Mixamorig character bone mismatch when animating, cuases weird deformation at animation and correct T-pose character at rest.
 

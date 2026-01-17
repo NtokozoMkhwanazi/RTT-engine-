@@ -13,13 +13,11 @@ struct Vertex {
     glm::vec3 Position;
     glm::vec3 Normal;
     glm::vec2 TexCoords;
-    int BoneIDs[MAX_BONES_PER_VERTEX];
-    float Weights[MAX_BONES_PER_VERTEX];
 
-    Vertex() {
-        for (int i=0;i<MAX_BONES_PER_VERTEX;i++){ BoneIDs[i]=0; Weights[i]=0.0f; }
-    }
+    glm::ivec4 BoneIDs;   // ❗ MUST BE INT
+    glm::vec4  Weights;
 };
+
 
 struct Texture {
     unsigned int id;

@@ -1,12 +1,7 @@
 #include "DebugSkeleton.h"
+#include "BoneName.h"
 #include <iostream>
 
-
-static std::string NormalizeName(const std::string& name){
-    size_t pos = name.find('|');
-    return(pos == std::string::npos) ? name : name.substr(pos + 1);    
-
-}
 // REMOVED 'inline' here so it links correctly from main.cpp
 void BuildSkeletonLines(
     const AssimpNodeData& node,
@@ -23,7 +18,7 @@ glm::mat4 global = parentTransform * node.transform;
     // FIX 1: Default to -1 (no bone) instead of 1
    
     int currentBoneIndex = node.boneIndex; 
-    std::string cleanName = NormalizeName(node.name);
+    std::string cleanName = NormalizeBoneName(node.name);
     std::cout<<"Visiting node normalized: "<<cleanName<<std::endl;
     auto it = skeleton.boneMapping.find(cleanName);
 

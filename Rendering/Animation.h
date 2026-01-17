@@ -28,6 +28,7 @@ public:
 
     void AddBoneAnimation(const BoneAnimation& boneAnim);
     const BoneAnimation* GetBoneAnimation(const std::string& boneName) const;
+    void DebugPrintBoneNames() const;
 
     float GetDuration() const;
     float GetTicksPerSecond() const;

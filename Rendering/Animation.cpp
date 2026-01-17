@@ -1,6 +1,8 @@
 #include "Animation.h"
 #include <algorithm>
 #include <cmath>
+#include <iostream>
+
 
 // ---------------- Animation ----------------
 
@@ -9,6 +11,12 @@ Animation::Animation(const std::string& name, float duration, float tps)
 
 void Animation::AddBoneAnimation(const BoneAnimation& boneAnim) {
     boneAnimations[boneAnim.boneName] = boneAnim;
+}
+void Animation::DebugPrintBoneNames() const
+{
+    std::cout << "==== Animation Bone Channels ====\n";
+    for (const auto& [name, _] : boneAnimations)
+        std::cout << name << "\n";
 }
 
 const BoneAnimation* Animation::GetBoneAnimation(const std::string& boneName) const {

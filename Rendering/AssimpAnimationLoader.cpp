@@ -3,6 +3,9 @@
 #include <glm/gtc/quaternion.hpp>
 #include <string>
 
+
+#include "BoneName.h"
+
 static glm::vec3 ToVec3(const aiVector3D& v) {
     return glm::vec3(v.x, v.y, v.z);
 }
@@ -33,7 +36,10 @@ Animation AssimpAnimationLoader::LoadAnimation(
         aiNodeAnim* channel = aiAnim->mChannels[i];
 
         BoneAnimation boneAnim;
-        boneAnim.boneName = channel->mNodeName.C_Str();
+
+
+boneAnim.boneName = NormalizeBoneName(channel->mNodeName.C_Str());
+
 
         unsigned int keyCount =
             std::max({

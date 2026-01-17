@@ -35,6 +35,7 @@ private:
     glm::vec3 rootMotionDelta{0.0f};
     std::vector<glm::mat4> finalBoneMatrices;
 
+
     // ---- Internal ----
     void EvaluatePose();
     void EvaluatePose(Animation* blendAnim, float blendFactor);

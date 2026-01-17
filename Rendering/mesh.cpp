@@ -19,14 +19,11 @@ void Mesh::AddBoneDataToVertex(unsigned int vertexID, int boneID, float weight)
         {
             v.BoneIDs[i] = boneID;
             v.Weights[i] = weight;
-            std::cout <<"BoneId : "<< v.BoneIDs[i]<< std::endl;
-            std::cout << " Weights : "<< v.Weights[i]<<std::endl;
             return;
         }
     }
-
-    // extra influences are ignored (acceptable)
 }
+
 
 
 void Mesh::setupMesh() {
@@ -42,21 +39,33 @@ void Mesh::setupMesh() {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
 
-    // pos (layout 0)
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Position));
-    // normal (layout 1)
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Normal));
-    // texcoords (layout 2)
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, TexCoords));
-    // bone IDs (layout 3) - integer attribute
-    glEnableVertexAttribArray(3);
-    glVertexAttribIPointer(3, 4, GL_INT, sizeof(Vertex), (void*)offsetof(Vertex, BoneIDs));
-    // bone weights (layout 4)
-    glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Weights));
+    // Position
+glEnableVertexAttribArray(0);
+glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
+
+// Normal
+glEnableVertexAttribArray(1);
+glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Normal));
+
+// TexCoords
+glEnableVertexAttribArray(2);
+glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, TexCoords));
+
+// Bone IDs — MUST USE INTEGER POINTER
+glEnableVertexAttribArray(3);
+glVertexAttribIPointer(3,4,GL_INT,sizeof(Vertex),(void*)offsetof(Vertex, BoneIDs));
+
+// Weights
+glEnableVertexAttribArray(4);
+glVertexAttribPointer(
+    4,
+    4,
+    GL_FLOAT,
+    GL_FALSE,
+    sizeof(Vertex),
+    (void*)offsetof(Vertex, Weights)
+);
+
 
     glBindVertexArray(0);
 }

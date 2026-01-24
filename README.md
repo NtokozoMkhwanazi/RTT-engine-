@@ -87,15 +87,6 @@ g++ -std=c++17 src/glad.c link/*.cpp test.cpp \
     -o run \
     -lassimp -lopenal -lz -ldl -lglfw -lGL -lX11 -pthread -g
 ```
-
-Then run:
-
-```bash
-./run
-```
-
----
-
 ## 🚧 Current Status
 
 * ✅ Rendering pipeline working
@@ -122,27 +113,6 @@ This engine is built to:
   * Custom interactive experiences
 
 The long-term vision is to ship **real commercial games** powered by this engine.
-
----
-
-## 📜 Philosophy
-
-* Learn by building
-* Understand every system
-* Prefer clarity over magic
-* Performance over convenience
-
----
-
-## 🧠 What This Engine Is NOT
-
-* ❌ A Unity or Unreal competitor
-* ❌ A general-purpose engine for everyone
-* ❌ A finished product
-
-This is a **serious engineering project**, not a toy.
-
----
 
 ## 📌 Roadmap (High Level)
 

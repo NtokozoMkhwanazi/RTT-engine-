@@ -3,7 +3,7 @@
 A lightweight, low-level **C++ game engine** built from scratch with a focus on **full control**, **performance**, and **deep understanding of real-time systems**.
 This engine is designed as a **foundation for building real 3D games**, simulations, and interactive applications..
 
-> ⚠️ This is an **active work-in-progress engine**, developed primarily for learning, experimentation, and future projects.
+> ⚠️ This is an **active work-in-progress engine**, developed primarily for learning and experimentation.
 
 ---
 
@@ -57,12 +57,10 @@ This engine is designed as a **foundation for building real 3D games**, simulati
 
 ```text
 src/            Core engine source
-link/           Engine subsystems (animation, physics, rendering)
+link/           Engine subsystems (animation, physics, rendering), shaers,
 assets/         Models, animations, shaders
-shaders/        GLSL shaders
 third_party/    External libraries
 ```
-i.e please move all the header and their .cpp files to a link folder then compile as shown below. 
 ---
 
 ## 🛠️ Dependencies
@@ -96,7 +94,7 @@ g++ -std=c++17 src/glad.c link/*.cpp test.cpp \
 * ⚠️ Physics/animation synchronization ongoing
 * 🚧 Collision system still basic
 
-This engine is **not production-ready yet**, but core systems are functional and evolving.
+This engine is **is not ready to build games yet**, but core systems are functional and evolving.
 
 ---
 
@@ -112,7 +110,7 @@ This engine is built to:
   * Simulation & training software
   * Custom interactive experiences
 
-The long-term vision is to build to do **gaming projects** powered by this engine.
+The long-term vision is to build to do **gaming and simulation projects** powered by this engine.
 
 ## 📌 Roadmap (High Level)
 
@@ -124,20 +122,3 @@ The long-term vision is to build to do **gaming projects** powered by this engin
 * [ ] First complete game built on the engine
 
 ---
-
-## 📄 License
-
-Currently private / unspecified.
-License will be defined once the engine reaches a stable milestone.
-
----
-
-## 🙌 Acknowledgements
-
-* OpenGL community
-* Assimp contributors
-* GLM, GLFW, OpenAL developers
-
----
-
-> Built with curiosity, persistence, and a lot of debugging.

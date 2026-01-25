@@ -110,7 +110,7 @@ This engine is built to:
   * Simulation & training software
   * Custom interactive experiences
 
-The long-term vision is to build to do **gaming and simulation projects** powered by this engine.
+The long-term vision is to build **gaming and simulation projects** powered by this engine.
 
 ## 📌 Roadmap (High Level)
 

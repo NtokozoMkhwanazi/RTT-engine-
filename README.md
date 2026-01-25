@@ -1,9 +1,9 @@
 # 🎮 Custom C++ Game Engine
 
 A lightweight, low-level **C++ game engine** built from scratch with a focus on **full control**, **performance**, and **deep understanding of real-time systems**.
-This engine is designed as a **foundation for shipping real games**, simulations, and interactive applications — not as a Unity/Unreal replacement.
+This engine is designed as a **foundation for building real 3D games**, simulations, and interactive applications..
 
-> ⚠️ This is an **active work-in-progress engine**, developed primarily for learning, experimentation, and future commercial projects.
+> ⚠️ This is an **active work-in-progress engine**, developed primarily for learning, experimentation, and future projects.
 
 ---
 
@@ -49,7 +49,7 @@ This engine is designed as a **foundation for shipping real games**, simulations
 
 ### 🔊 Audio
 
-* Audio playback via **OpenAL**
+* Audio playback via **OpenAL** Disabled for now not needed as yet 
 
 ---
 
@@ -62,7 +62,7 @@ assets/         Models, animations, shaders
 shaders/        GLSL shaders
 third_party/    External libraries
 ```
-
+i.e please move all the header and their .cpp files to a link folder then compile as shown below. 
 ---
 
 ## 🛠️ Dependencies

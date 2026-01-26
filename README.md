@@ -107,7 +107,7 @@ This engine is **is not ready to build games yet**, but core systems are functio
 
 This engine is built to:
 
-* Provide **full low-level control** over game systems
+* Provide **full low-level control** over game and simulation systems
 * Avoid bloated, black-box engines
 * Serve as the foundation for:
 

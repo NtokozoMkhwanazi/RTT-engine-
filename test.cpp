@@ -253,37 +253,53 @@ int main()
         if(!final.empty()){}
             //std::cout<<"Root bone matrix: "<<glm::to_string(final[0])<<"\n";
 
-        // ----- FOOT IK -----
-        auto processFoot = [&](int bone, FootLock& lock){
-            glm::vec3 footWorld = animator.GetBoneWorldPosition(bone, modelMat);
-            bool planted = animator.IsFootPlanted(bone);
+        auto processFoot = [&](int bone, FootLock& lock)
+{
+    if (bone < 0 || bone >= (int)final.size())
+        return;
 
-            if (planted) {
-                if (!lock.locked) {
-                    glm::vec3 hit, normal;
-                    if (physicsWorld.raycastDown(footWorld, 1.0f, hit, normal)) {
-                        lock.locked = true;
-                        lock.worldPos = hit;
-                    }
-                }
-                    lock.weight = std::min(lock.weight + dt * 8.0f, 1.0f);
-                } else {
-                    lock.weight = std::max(lock.weight - dt * 8.0f, 0.0f);
-                    if (lock.weight == 0.0f) lock.locked = false;
-                }
-        
-                if (lock.locked) {
-                    glm::vec3 correction = lock.worldPos - footWorld;
-                    glm::mat4 boneGlobal = final[bone];
-                    glm::vec3 boneOffset =
-                        glm::vec3(glm::inverse(boneGlobal) * glm::vec4(correction, 0.0f));
-            
-                    animator.AddIKOffset(bone, boneOffset, lock.weight);
-                }
-            };      
+    glm::vec3 footWorld = animator.GetBoneWorldPosition(bone, modelMat);
+    bool planted = animator.IsFootPlanted(bone);
 
-        processFoot(leftFootBone,leftFootLock);
-        processFoot(rightFootBone,rightFootLock);
+    if (planted)
+    {
+        if (!lock.locked)
+        {
+            glm::vec3 hit, normal;
+            if (physicsWorld.raycastDown(footWorld, 1.0f, hit, normal))
+            {
+                lock.locked = true;
+                lock.worldPos = hit;
+            }
+        }
+        lock.weight = std::min(lock.weight + dt * 8.0f, 1.0f);
+    }
+    else
+    {
+        lock.weight = std::max(lock.weight - dt * 8.0f, 0.0f);
+        if (lock.weight == 0.0f)
+            lock.locked = false;
+    }
+
+    if (lock.locked)
+    {
+        glm::vec3 correction = lock.worldPos - footWorld;
+        glm::mat4 boneGlobal = final[bone];
+
+        glm::vec3 boneOffset =
+            glm::vec3(glm::inverse(boneGlobal) * glm::vec4(correction, 0.0f));
+
+        animator.AddIKOffset(bone, boneOffset, lock.weight);
+    }
+};
+
+
+        if (leftFootBone != -1)
+    processFoot(leftFootBone, leftFootLock);
+
+if (rightFootBone != -1)
+    processFoot(rightFootBone, rightFootLock);
+
 
         glm::vec3 rootMotion = animator.ConsumeRootMotion();
         rootMotion.y = 0.0f;

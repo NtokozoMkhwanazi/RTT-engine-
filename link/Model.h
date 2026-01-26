@@ -21,16 +21,12 @@
 class Model
 {
 public:
-    // ---- Construction ----
     explicit Model(const std::string& path);
 
-    // ---- Rendering ----
     void Draw(Shader& shader);
 
-    // ---- Animations ----
     Animation* GetAnimation(size_t index);
 
-    // ---- Accessors ----
     const Skeleton& GetSkeleton() const { return m_Skeleton; }
     const aiScene* GetScene() const { return scene; }
     int GetRootBoneIndex() const { return rootBoneIndex; }
@@ -58,11 +54,10 @@ private:
     std::vector<std::unique_ptr<Animation>> m_Animations;
 
     // --------------------------------------------------------
-    // Texture cache
+    // Bone bookkeeping
     // --------------------------------------------------------
-    std::vector<Texture> loaded_textures;
+    int m_BoneCounter = 0;
 
-private:
     // --------------------------------------------------------
     // Loading
     // --------------------------------------------------------
@@ -77,8 +72,6 @@ private:
         AssimpNodeData& node,
         const std::unordered_map<std::string, int>& normBoneMap
     );
-
-    void CountBoneNodes(const AssimpNodeData& node, int& count);
 
     // --------------------------------------------------------
     // Scene traversal

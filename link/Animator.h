@@ -36,6 +36,8 @@ private:
     Animation* current = nullptr;
     Animation* next = nullptr;
 
+    std::vector<glm::vec3> m_BoneWorldPositions;
+
     float time = 0.0f;
     float blendTime = 0.0f;
     float blendDuration = 0.0f;

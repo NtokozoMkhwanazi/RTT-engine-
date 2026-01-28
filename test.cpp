@@ -26,75 +26,148 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include <map>
 
 // ================= CONSTANTS =================
 constexpr int MAX_INSTANCES = 1;
 GLuint boneTexID = 0;
 
 // ================= CAMERA =================
-flyCamera camera(glm::vec3(0.0f,3.0f,8.0f), glm::vec3(0,1,0), -90.0f, 15.0f, 8.0f);
+flyCamera camera(
+    glm::vec3(0.0f, 3.0f, 8.0f),
+    glm::vec3(0, 1, 0),
+    -90.0f,
+    15.0f,
+    8.0f
+);
 
 // ================= CALLBACKS =================
-void framebuffer_size_callback(GLFWwindow*, int w, int h) { glViewport(0,0,w,h); }
-void mouse_callback(GLFWwindow*, double x, double y) { camera.ProcessMouseMovement((float)x,(float)y); }
-void scroll_callback(GLFWwindow*, double, double y) { camera.ProcessMouseScroll((float)y); }
+void framebuffer_size_callback(GLFWwindow*, int w, int h)
+{
+    glViewport(0, 0, w, h);
+}
+void mouse_callback(GLFWwindow*, double x, double y)
+{
+    camera.ProcessMouseMovement((float)x, (float)y);
+}
+void scroll_callback(GLFWwindow*, double, double y)
+{
+    camera.ProcessMouseScroll((float)y);
+}
 
-struct SimpleMesh {
+// =============================================================
+// SMART BONE LOOKUP (FINAL, GLOBAL)
+// =============================================================
+int GetBoneIndexSmart(const Skeleton& skel, const std::string& rawName)
+{
+    std::string key = NormalizeBone(rawName);
+
+    // 1. Direct match
+    auto it = skel.boneMapping.find(key);
+    if (it != skel.boneMapping.end())
+        return it->second;
+
+    // 2. Mixamo aliases
+    static const std::map<std::string, std::vector<std::string>> aliases = {
+        { "lefttoe",  { "lefttoebase", "lefttoe_end" } },
+        { "righttoe", { "righttoebase", "righttoe_end" } },
+        { "leftfoot", { "leftfoot" } },
+        { "rightfoot",{ "rightfoot" } }
+    };
+
+    auto a = aliases.find(key);
+    if (a != aliases.end())
+    {
+        for (const auto& alt : a->second)
+        {
+            auto it2 = skel.boneMapping.find(alt);
+            if (it2 != skel.boneMapping.end())
+                return it2->second;
+        }
+    }
+
+    return -1;
+}
+
+// ================= SIMPLE DEBUG MESH =================
+struct SimpleMesh
+{
     std::vector<glm::vec3> vertices;
     std::vector<unsigned int> indices;
-    GLuint VAO,VBO,EBO;
+    GLuint VAO, VBO, EBO;
 
-    void createCube(float sx,float sy,float sz){
-        float hx = sx*0.5f, hy=sy*0.5f, hz=sz*0.5f;
+    void createCube(float sx, float sy, float sz)
+    {
+        float hx = sx * 0.5f, hy = sy * 0.5f, hz = sz * 0.5f;
+
         vertices = {
             {-hx,-hy,-hz},{hx,-hy,-hz},{hx,hy,-hz},{-hx,hy,-hz},
             {-hx,-hy,hz},{hx,-hy,hz},{hx,hy,hz},{-hx,hy,hz}
         };
+
         indices = {
             0,1,2,2,3,0, 4,5,6,6,7,4,
             4,5,1,1,0,4, 7,6,2,2,3,7,
             4,0,3,3,7,4, 5,1,2,2,6,5
         };
 
-        glGenVertexArrays(1,&VAO);
-        glGenBuffers(1,&VBO);
-        glGenBuffers(1,&EBO);
+        glGenVertexArrays(1, &VAO);
+        glGenBuffers(1, &VBO);
+        glGenBuffers(1, &EBO);
 
         glBindVertexArray(VAO);
-        glBindBuffer(GL_ARRAY_BUFFER,VBO);
-        glBufferData(GL_ARRAY_BUFFER,vertices.size()*sizeof(glm::vec3),vertices.data(),GL_STATIC_DRAW);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,EBO);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER,indices.size()*sizeof(unsigned int),indices.data(),GL_STATIC_DRAW);
 
-        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
+        glBindBuffer(GL_ARRAY_BUFFER, VBO);
+        glBufferData(GL_ARRAY_BUFFER,
+                     vertices.size() * sizeof(glm::vec3),
+                     vertices.data(),
+                     GL_STATIC_DRAW);
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     indices.size() * sizeof(unsigned int),
+                     indices.data(),
+                     GL_STATIC_DRAW);
+
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
+                              sizeof(glm::vec3), (void*)0);
         glEnableVertexAttribArray(0);
+
         glBindVertexArray(0);
     }
 
-    void Draw(){
+    void Draw()
+    {
         glBindVertexArray(VAO);
-        glDrawElements(GL_TRIANGLES,(GLsizei)indices.size(),GL_UNSIGNED_INT,0);
+        glDrawElements(GL_TRIANGLES,
+                       (GLsizei)indices.size(),
+                       GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
     }
 };
 
+// =============================================================
+// MAIN
+// =============================================================
 int main()
 {
     // ---------- GLFW ----------
     glfwInit();
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(1280,720,"Animation Stable",nullptr,nullptr);
+    GLFWwindow* window =
+        glfwCreateWindow(1280, 720, "Animation Stable", nullptr, nullptr);
     glfwMakeContextCurrent(window);
 
-    glfwSetFramebufferSizeCallback(window,framebuffer_size_callback);
-    glfwSetCursorPosCallback(window,mouse_callback);
-    glfwSetScrollCallback(window,scroll_callback);
-    glfwSetInputMode(window,GLFW_CURSOR,GLFW_CURSOR_DISABLED);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+    glfwSetCursorPosCallback(window, mouse_callback);
+    glfwSetScrollCallback(window, scroll_callback);
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
-    if(!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)){
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+    {
         std::cerr << "Failed to initialize GLAD\n";
         return -1;
     }
@@ -102,81 +175,75 @@ int main()
     glEnable(GL_DEPTH_TEST);
 
     // ================= SHADERS =================
-    Shader skinnedShader("link/VS.glsl","link/FS.glsl");
-    Shader flatShader("link/flatVS.glsl","link/flatFS.glsl");
+    Shader skinnedShader("link/VS.glsl", "link/FS.glsl");
+    Shader flatShader("link/flatVS.glsl", "link/flatFS.glsl");
 
     // ================= BONE TEXTURE =================
-    glGenTextures(1,&boneTexID);
-    glBindTexture(GL_TEXTURE_2D,boneTexID);
-    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,MAX_BONES*4,MAX_INSTANCES,0,GL_RGBA,GL_FLOAT,nullptr);
-    glBindTexture(GL_TEXTURE_2D,0);
+    glGenTextures(1, &boneTexID);
+    glBindTexture(GL_TEXTURE_2D, boneTexID);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F,
+                 MAX_BONES * 4, MAX_INSTANCES,
+                 0, GL_RGBA, GL_FLOAT, nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     // ================= MODEL =================
     Model character("assets/bot.fbx");
     const Skeleton& skeleton = character.GetSkeleton();
 
-    auto GetBoneIndexByName = [&](const Skeleton& skel, const std::string& name) -> int
-{
-    std::string key = NormalizeBone(name);
-    auto it = skel.boneMapping.find(key);
-    return (it != skel.boneMapping.end()) ? it->second : -1;
-};
+    // ================= BONE LOOKUP =================
+    int leftFootBone  = GetBoneIndexSmart(skeleton, "LeftFoot");
+    int rightFootBone = GetBoneIndexSmart(skeleton, "RightFoot");
+    int leftToeBone   = GetBoneIndexSmart(skeleton, "LeftToe");
+    int rightToeBone  = GetBoneIndexSmart(skeleton, "RightToe");
 
-    
-    int leftFootBone = GetBoneIndexByName(skeleton,"LeftFoot");
-    int rightFootBone = GetBoneIndexByName(skeleton,"RightFoot");
-    int leftToeBone = GetBoneIndexByName(skeleton,"LeftToe");
-    int rightToeBone = GetBoneIndexByName(skeleton,"RightToe");
-    if (leftFootBone == -1)
-    std::cerr << "Warning: leftfoot bone not found\n";
-
-if (rightFootBone == -1)
-    std::cerr << "Warning: rightfoot bone not found\n";
-
-if (leftToeBone == -1)
-    std::cerr << "Warning: lefttoebase bone not found\n";
-
-if (rightToeBone == -1)
-    std::cerr << "Warning: righttoebase bone not found\n";
-
-std::cout << "LeftFoot index: " << leftFootBone << "\n";
-std::cout << "RightFoot index: " << rightFootBone << "\n";
-std::cout << "LeftToe index: " << leftToeBone << "\n";
-std::cout << "RightToe index: " << rightToeBone << "\n";
-
+    std::cout << "LeftFoot index: "  << leftFootBone  << "\n";
+    std::cout << "RightFoot index: " << rightFootBone << "\n";
+    std::cout << "LeftToe index: "   << leftToeBone   << "\n";
+    std::cout << "RightToe index: "  << rightToeBone  << "\n";
 
     // ================= ANIMATIONS =================
     Assimp::Importer importer;
-    auto LoadAnim = [&](const std::string& path)->Animation{
-        const aiScene* scene = importer.ReadFile(path,aiProcess_Triangulate|aiProcess_FlipUVs);
-        if(!scene||!scene->HasAnimations()){
-            std::cerr<<"Warning: animation not found: "<<path<<"\n";
-            return Animation("Empty",0.0f,25.0f);
+
+    auto LoadAnim = [&](const std::string& path) -> Animation
+    {
+        const aiScene* scene = importer.ReadFile(
+            path, aiProcess_Triangulate | aiProcess_FlipUVs);
+
+        if (!scene || !scene->HasAnimations())
+        {
+            std::cerr << "Warning: animation not found: " << path << "\n";
+            return Animation("Empty", 0.0f, 25.0f);
         }
-        Animation anim = AssimpAnimationLoader::LoadAnimation(scene,scene->mAnimations[0]);
-        std::cout<<"Loaded animation: "<<anim.name
-                 <<" | duration: "<<anim.duration
-                 <<" | ticksPerSecond: "<<anim.ticksPerSecond
-                 <<" | Total keyframes: "<< anim.GetTotalKeyframeCount() << "\n";
+
+        Animation anim =
+            AssimpAnimationLoader::LoadAnimation(scene, scene->mAnimations[0]);
+
+        std::cout << "Loaded animation: " << anim.name
+                  << " | duration: " << anim.duration
+                  << " | ticksPerSecond: " << anim.ticksPerSecond
+                  << " | Total keyframes: "
+                  << anim.GetTotalKeyframeCount() << "\n";
 
         return anim;
     };
 
     Animation idleAnim = LoadAnim("assets/idle.fbx");
     Animation walkAnim = LoadAnim("assets/walk.fbx");
-    Animation runAnim = LoadAnim("assets/run.fbx");
+    Animation runAnim  = LoadAnim("assets/run.fbx");
 
     Animator animator(&skeleton);
-    animator.Play(&idleAnim); // **important fix: play idle animation**
+    animator.Play(&idleAnim);
 
     AnimationStateMachine fsm(&animator);
-    fsm.SetAnimations(&idleAnim,&walkAnim,&runAnim);
+    fsm.SetAnimations(&idleAnim, &walkAnim, &runAnim);
 
-    // ================= PHYSICS =================
+    // ================= PHYSICS + GAME LOOP =================
+    
+ // ================= PHYSICS =================
     PhysicsWorld physicsWorld;
 
     auto floorBody = std::make_shared<RigidBody>();
@@ -380,6 +447,7 @@ if (rightFootBone != -1)
         camera.FollowPlayerSmooth(playerPos,dt);
         glfwSwapBuffers(window);
     }
+
 
     glfwTerminate();
     return 0;

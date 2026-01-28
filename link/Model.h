@@ -15,6 +15,18 @@
 #include "Animation.h"
 #include "Skeleton.h"
 
+inline std::string NormalizeBone(const std::string& s)
+{
+    std::string n = s;
+    std::transform(n.begin(), n.end(), n.begin(),
+        [](unsigned char c) { return std::tolower(c); });
+
+    size_t colon = n.find(':');
+    if (colon != std::string::npos)
+        n = n.substr(colon + 1);
+
+    return n;
+}
 // ------------------------------------------------------------
 // Model
 // ------------------------------------------------------------

@@ -16,6 +16,7 @@
 // =====================================================
 // Utility
 // =====================================================
+
 std::unordered_map<std::string, int>
 BuildNormalizedBoneMap(const Skeleton& skeleton)
 {
@@ -66,35 +67,27 @@ static void AddBoneData(Vertex& v, int boneID, float weight)
 // =====================================================
 int FindRootBoneIndex(const Skeleton& skeleton)
 {
-    if (skeleton.bones.empty())
-        return -1;
-
-    std::vector<bool> isChild(skeleton.bones.size(), false);
-
-    std::function<void(const AssimpNodeData&)> walk =
-        [&](const AssimpNodeData& node)
-        {
-            for (const auto& child : node.children)
-            {
-                if (child.boneIndex >= 0 &&
-                    child.boneIndex < (int)isChild.size())
-                {
-                    isChild[child.boneIndex] = true;
-                }
-                walk(child);
-            }
-        };
-
-    walk(skeleton.rootNode);
-
-    for (size_t i = 0; i < isChild.size(); ++i)
+    std::function<int(const AssimpNodeData&, int)> walk =
+        [&](const AssimpNodeData& node, int parentBone) -> int
     {
-        if (!isChild[i])
-            return (int)i; // true root bone
-    }
+        int thisBone = node.boneIndex;
 
-    return -1;
+        // If this node IS a bone and parent is NOT a bone → ROOT
+        if (thisBone >= 0 && parentBone == -1)
+            return thisBone;
+
+        for (const auto& child : node.children)
+        {
+            int r = walk(child, thisBone >= 0 ? thisBone : parentBone);
+            if (r != -1)
+                return r;
+        }
+        return -1;
+    };
+
+    return walk(skeleton.rootNode, -1);
 }
+
 
 
 // =====================================================
@@ -132,23 +125,6 @@ Animation* Model::GetAnimation(size_t index)
 {
     if (index >= m_Animations.size()) return nullptr;
     return m_Animations[index].get();
-}
-
-// =====================================================
-// Hierarchy
-// =====================================================
-void Model::ReadHierarchy(AssimpNodeData& dest, const aiNode* src)
-{
-    dest.name = src->mName.C_Str();
-    dest.transform = aiMat4ToGlm(src->mTransformation);
-    dest.children.clear();
-
-    for (unsigned int i = 0; i < src->mNumChildren; ++i)
-    {
-        AssimpNodeData child;
-        ReadHierarchy(child, src->mChildren[i]);
-        dest.children.push_back(child);
-    }
 }
 
 
@@ -252,85 +228,85 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene)
     return Mesh(vertices, indices, textures);
 }
 
-// =====================================================
-// ExtractBones: safely add bones to the skeleton
-// =====================================================
+
+
+// ------------------------------------------------------------
+// Normalize
+// ------------------------------------------------------------
+
+
+// ------------------------------------------------------------
+// Hierarchy
+// ------------------------------------------------------------
+void Model::ReadHierarchy(AssimpNodeData& dest, const aiNode* src)
+{
+    dest.name = NormalizeBone(src->mName.C_Str());
+    dest.transform = aiMat4ToGlm(src->mTransformation);
+    dest.children.clear();
+
+    for (unsigned i = 0; i < src->mNumChildren; ++i)
+    {
+        AssimpNodeData child;
+        ReadHierarchy(child, src->mChildren[i]);
+        dest.children.push_back(child);
+    }
+}
+
+// ------------------------------------------------------------
+// ExtractBones (CRITICAL FIX)
+// ------------------------------------------------------------
 void Model::ExtractBones(aiMesh* mesh)
 {
-    for (unsigned int i = 0; i < mesh->mNumBones; ++i)
+    for (unsigned i = 0; i < mesh->mNumBones; ++i)
     {
         aiBone* bone = mesh->mBones[i];
-        std::string name = bone->mName.C_Str();
+        std::string name = NormalizeBone(bone->mName.C_Str());
 
-        // If this bone was not registered yet
-        if (m_Skeleton.boneMapping.find(name) == m_Skeleton.boneMapping.end())
+        if (m_Skeleton.boneMapping.count(name) == 0)
         {
-            int id = m_BoneCounter++;
-
-            // Map bone name -> ID (CRITICAL)
+            int id = (int)m_Skeleton.bones.size();
             m_Skeleton.boneMapping[name] = id;
 
-            // Ensure bones vector is large enough
-            if (id >= (int)m_Skeleton.bones.size())
-                m_Skeleton.bones.resize(id + 1);
-
-            // Initialize bone info
-            m_Skeleton.bones[id].id = id;
-            m_Skeleton.bones[id].offset = aiMat4ToGlm(bone->mOffsetMatrix);
+            BoneInfo info;
+            info.id = id;
+            info.offset = aiMat4ToGlm(bone->mOffsetMatrix);
+            m_Skeleton.bones.push_back(info);
         }
     }
 }
 
 
-// =====================================================
-// extractBoneWeights: safely fill vertex bone IDs and weights
-// =====================================================
-void Model::extractBoneWeights(std::vector<Vertex>& vertices, aiMesh* mesh)
+// ------------------------------------------------------------
+// extractBoneWeights
+// ------------------------------------------------------------
+void Model::extractBoneWeights(
+    std::vector<Vertex>& vertices,
+    aiMesh* mesh)
 {
-    for (unsigned int i = 0; i < mesh->mNumBones; i++)
+    for (unsigned i = 0; i < mesh->mNumBones; ++i)
     {
         aiBone* bone = mesh->mBones[i];
-        std::string name = bone->mName.C_Str();
+        std::string name = NormalizeBone(bone->mName.C_Str());
 
-        // Find bone ID
         auto it = m_Skeleton.boneMapping.find(name);
         if (it == m_Skeleton.boneMapping.end())
             continue;
 
         int boneID = it->second;
 
-        // Safety: check boneID
-        if (boneID < 0 || boneID >= (int)m_Skeleton.bones.size())
-            continue;
-
-        for (unsigned int j = 0; j < bone->mNumWeights; j++)
+        for (unsigned j = 0; j < bone->mNumWeights; ++j)
         {
-            aiVertexWeight w = bone->mWeights[j];
-
-            if (w.mVertexId >= vertices.size())
-                continue;
-
+            auto& w = bone->mWeights[j];
             Vertex& v = vertices[w.mVertexId];
 
-            // Find a free slot in Weights array
-            bool assigned = false;
-            for (int k = 0; k < MAX_BONE_INFLUENCE; k++)
+            for (int k = 0; k < MAX_BONE_INFLUENCE; ++k)
             {
                 if (v.Weights[k] == 0.0f)
                 {
                     v.BoneIDs[k] = boneID;
                     v.Weights[k] = w.mWeight;
-                    assigned = true;
                     break;
                 }
-            }
-
-            // Warn if too many bones per vertex
-            if (!assigned)
-            {
-                std::cerr << "Warning: Vertex " << w.mVertexId 
-                          << " has more than " << MAX_BONE_INFLUENCE 
-                          << " bone influences. Extra bones ignored.\n";
             }
         }
     }

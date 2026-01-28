@@ -24,18 +24,12 @@ static glm::mat4 RemoveScale(const glm::mat4& m)
     return glm::translate(glm::mat4(1.0f), t) * glm::toMat4(r);
 }
 
-static std::string Normalize(const std::string& input)
+static std::string NormalizeBone(const std::string& s)
 {
-    std::string n = input; // mutable copy
+    std::string n = s;
+    std::transform(n.begin(), n.end(), n.begin(),
+        [](unsigned char c) { return std::tolower(c); });
 
-    // lowercase
-    std::transform(
-        n.begin(), n.end(),
-        n.begin(),
-        [](unsigned char c) { return std::tolower(c); }
-    );
-
-    // strip namespace (mixamo:Hips → hips)
     size_t colon = n.find(':');
     if (colon != std::string::npos)
         n = n.substr(colon + 1);
@@ -111,10 +105,11 @@ void Animator::EvaluateNode(
     Animation*,
     float)
 {
-    std::string key = Normalize(node.name);
+    std::string key = node.name;
     glm::mat4 local = node.transform;
 
     auto it = skeleton->boneMapping.find(key);
+    
     if (it != skeleton->boneMapping.end())
     {
         if (auto* a = current->GetBoneAnimation(key))
@@ -126,6 +121,9 @@ void Animator::EvaluateNode(
         }
 
         int idx = it->second;
+         std::cout << "Skeleton bones:\n";
+        for(auto& [name, idx] : skeleton->boneMapping)
+            std::cout << "  " << name << " -> " << idx << "\n";
 
         // ROOT MOTION — strip before global
         if (idx == skeleton->rootBoneIndex)
@@ -152,6 +150,9 @@ void Animator::EvaluateNode(
         finalBoneMatrices[idx] =
             global * skeleton->bones[idx].offset;
     }
+
+
+
 
     for (const auto& c : node.children)
         EvaluateNode(c, global, nullptr, 0.0f);

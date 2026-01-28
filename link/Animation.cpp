@@ -3,7 +3,6 @@
 #include <cmath>
 #include <iostream>
 
-
 // ---------------- Animation ----------------
 
 Animation::Animation(const std::string& name, float duration, float tps)
@@ -12,8 +11,8 @@ Animation::Animation(const std::string& name, float duration, float tps)
 void Animation::AddBoneAnimation(const BoneAnimation& boneAnim) {
     boneAnimations[boneAnim.boneName] = boneAnim;
 }
-void Animation::DebugPrintBoneNames() const
-{
+
+void Animation::DebugPrintBoneNames() const {
     std::cout << "==== Animation Bone Channels ====\n";
     for (const auto& [name, _] : boneAnimations)
         std::cout << name << "\n";
@@ -34,6 +33,13 @@ float Animation::GetTicksPerSecond() const {
     return ticksPerSecond;
 }
 
+size_t Animation::GetTotalKeyframeCount() const {
+    size_t count = 0;
+    for (const auto& [_, bone] : boneAnimations)
+        count += bone.keyframes.size();
+    return count;
+}
+
 // ---------------- BoneAnimation ----------------
 
 static int FindKeyframe(const std::vector<Keyframe>& keys, float time) {
@@ -48,11 +54,17 @@ glm::vec3 BoneAnimation::InterpolatePosition(float time) const {
     if (keyframes.size() == 1)
         return keyframes[0].position;
 
+    // 🔥 wrap time (prevents freezing)
+    float maxTime = keyframes.back().time;
+    time = fmod(time, maxTime);
+
     int i = FindKeyframe(keyframes, time);
     const Keyframe& a = keyframes[i];
     const Keyframe& b = keyframes[i + 1];
 
-    float t = (time - a.time) / (b.time - a.time);
+    float delta = b.time - a.time;
+    float t = delta > 0.0f ? (time - a.time) / delta : 0.0f;
+
     return glm::mix(a.position, b.position, t);
 }
 
@@ -60,30 +72,35 @@ glm::quat BoneAnimation::InterpolateRotation(float time) const {
     if (keyframes.size() == 1)
         return keyframes[0].rotation;
 
+    // 🔥 wrap time
+    float maxTime = keyframes.back().time;
+    time = fmod(time, maxTime);
+
     int i = FindKeyframe(keyframes, time);
     const Keyframe& a = keyframes[i];
     const Keyframe& b = keyframes[i + 1];
 
-    float t = (time - a.time) / (b.time - a.time);
+    float delta = b.time - a.time;
+    float t = delta > 0.0f ? (time - a.time) / delta : 0.0f;
+
     return glm::slerp(a.rotation, b.rotation, t);
-}
-size_t Animation::GetTotalKeyframeCount() const
-{
-    size_t count = 0;
-    for (const auto& [_, bone] : boneAnimations)
-        count += bone.keyframes.size();
-    return count;
 }
 
 glm::vec3 BoneAnimation::InterpolateScale(float time) const {
     if (keyframes.size() == 1)
         return keyframes[0].scale;
 
+    // 🔥 wrap time
+    float maxTime = keyframes.back().time;
+    time = fmod(time, maxTime);
+
     int i = FindKeyframe(keyframes, time);
     const Keyframe& a = keyframes[i];
     const Keyframe& b = keyframes[i + 1];
 
-    float t = (time - a.time) / (b.time - a.time);
+    float delta = b.time - a.time;
+    float t = delta > 0.0f ? (time - a.time) / delta : 0.0f;
+
     return glm::mix(a.scale, b.scale, t);
 }
 

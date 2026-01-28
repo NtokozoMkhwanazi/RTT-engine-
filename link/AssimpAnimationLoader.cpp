@@ -18,7 +18,6 @@ Animation AssimpAnimationLoader::LoadAnimation(
     const aiScene* scene,
     const aiAnimation* aiAnim
 ) {
-    // --- Create animation using correct constructor ---
     float duration = static_cast<float>(aiAnim->mDuration);
     float ticksPerSecond =
         aiAnim->mTicksPerSecond != 0.0
@@ -31,46 +30,53 @@ Animation AssimpAnimationLoader::LoadAnimation(
         ticksPerSecond
     );
 
-    // --- Load each bone channel ---
     for (unsigned int i = 0; i < aiAnim->mNumChannels; ++i) {
         aiNodeAnim* channel = aiAnim->mChannels[i];
 
         BoneAnimation boneAnim;
+        boneAnim.boneName =
+            NormalizeBoneName(channel->mNodeName.C_Str());
 
-
-boneAnim.boneName = NormalizeBoneName(channel->mNodeName.C_Str());
-
+        unsigned int posCount = channel->mNumPositionKeys;
+        unsigned int rotCount = channel->mNumRotationKeys;
+        unsigned int sclCount = channel->mNumScalingKeys;
 
         unsigned int keyCount =
-            std::max({
-                channel->mNumPositionKeys,
-                channel->mNumRotationKeys,
-                channel->mNumScalingKeys
-            });
+            std::max({ posCount, rotCount, sclCount });
 
         for (unsigned int k = 0; k < keyCount; ++k) {
             Keyframe key{};
-            key.time = 0.0f;
 
-            // Position
-            if (k < channel->mNumPositionKeys) {
-                key.time = static_cast<float>(channel->mPositionKeys[k].mTime);
-                key.position = ToVec3(channel->mPositionKeys[k].mValue);
-            }
+            // --- TIME ---
+            if (k < posCount)
+                key.time = (float)channel->mPositionKeys[k].mTime;
+            else if (k < rotCount)
+                key.time = (float)channel->mRotationKeys[k].mTime;
+            else if (k < sclCount)
+                key.time = (float)channel->mScalingKeys[k].mTime;
+            else
+                key.time = 0.0f;
 
-            // Rotation
-            if (k < channel->mNumRotationKeys) {
-                key.rotation = ToQuat(channel->mRotationKeys[k].mValue);
-            } else {
+            // --- POSITION ---
+            if (k < posCount)
+                key.position =
+                    ToVec3(channel->mPositionKeys[k].mValue);
+            else
+                key.position = glm::vec3(0.0f);
+
+            // --- ROTATION ---
+            if (k < rotCount)
+                key.rotation =
+                    ToQuat(channel->mRotationKeys[k].mValue);
+            else
                 key.rotation = glm::quat(1, 0, 0, 0);
-            }
 
-            // Scale
-            if (k < channel->mNumScalingKeys) {
-                key.scale = ToVec3(channel->mScalingKeys[k].mValue);
-            } else {
+            // --- SCALE ---
+            if (k < sclCount)
+                key.scale =
+                    ToVec3(channel->mScalingKeys[k].mValue);
+            else
                 key.scale = glm::vec3(1.0f);
-            }
 
             boneAnim.keyframes.push_back(key);
         }
@@ -80,4 +86,5 @@ boneAnim.boneName = NormalizeBoneName(channel->mNodeName.C_Str());
 
     return animation;
 }
+
 

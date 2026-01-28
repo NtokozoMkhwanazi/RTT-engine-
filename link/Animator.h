@@ -37,6 +37,7 @@ private:
     Animation* next = nullptr;
 
     std::vector<glm::vec3> m_BoneWorldPositions;
+    
 
     float time = 0.0f;
     float blendTime = 0.0f;
@@ -46,12 +47,15 @@ private:
     glm::vec3 prevRootPos{0.0f};
 
     std::vector<glm::mat4> finalBoneMatrices;
+    std::vector<glm::mat4> globalBoneMatrices;
 
+public : //temporarily
     // -------- FOOT STATE --------
     std::vector<glm::vec3> prevBoneWorldPos;
     std::vector<glm::vec3> currBoneWorldPos;
     std::vector<glm::vec3> ikOffsets;
-
+    
+private : //temporarily
     void EvaluateNode(
         const AssimpNodeData& node,
         const glm::mat4& parent,

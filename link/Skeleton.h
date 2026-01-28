@@ -30,6 +30,14 @@ struct BoneInfo {
     int id = -1;
 };
 
+struct HumanoidBones {
+    int hips;
+    int leftFoot;
+    int rightFoot;
+    int leftToe;
+    int rightToe;
+};
+
 struct Skeleton {
     AssimpNodeData rootNode;
     std::map<std::string, int> boneMapping;

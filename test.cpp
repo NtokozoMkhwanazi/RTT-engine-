@@ -119,19 +119,35 @@ int main()
     Model character("assets/bot.fbx");
     const Skeleton& skeleton = character.GetSkeleton();
 
-    auto GetBoneIndexByName = [&](const Skeleton& skel,const std::string& name)->int{
-        auto it = skel.boneMapping.find(name);
-        if(it != skel.boneMapping.end()) return it->second;
-        return -1;
-    };
+    auto GetBoneIndexByName = [&](const Skeleton& skel, const std::string& name) -> int
+{
+    std::string key = NormalizeBone(name);
+    auto it = skel.boneMapping.find(key);
+    return (it != skel.boneMapping.end()) ? it->second : -1;
+};
 
+    
     int leftFootBone = GetBoneIndexByName(skeleton,"LeftFoot");
     int rightFootBone = GetBoneIndexByName(skeleton,"RightFoot");
     int leftToeBone = GetBoneIndexByName(skeleton,"LeftToe");
     int rightToeBone = GetBoneIndexByName(skeleton,"RightToe");
+    if (leftFootBone == -1)
+    std::cerr << "Warning: leftfoot bone not found\n";
 
-    if(leftFootBone==-1||rightFootBone==-1)
-        std::cerr<<"Warning: Could not find foot bones!\n";
+if (rightFootBone == -1)
+    std::cerr << "Warning: rightfoot bone not found\n";
+
+if (leftToeBone == -1)
+    std::cerr << "Warning: lefttoebase bone not found\n";
+
+if (rightToeBone == -1)
+    std::cerr << "Warning: righttoebase bone not found\n";
+
+std::cout << "LeftFoot index: " << leftFootBone << "\n";
+std::cout << "RightFoot index: " << rightFootBone << "\n";
+std::cout << "LeftToe index: " << leftToeBone << "\n";
+std::cout << "RightToe index: " << rightToeBone << "\n";
+
 
     // ================= ANIMATIONS =================
     Assimp::Importer importer;

@@ -241,9 +241,7 @@ int main()
     AnimationStateMachine fsm(&animator);
     fsm.SetAnimations(&idleAnim, &walkAnim, &runAnim);
 
-    // ================= PHYSICS + GAME LOOP =================
-    
- // ================= PHYSICS =================
+    // ================= PHYSICS =================
     PhysicsWorld physicsWorld;
 
     auto floorBody = std::make_shared<RigidBody>();
@@ -281,11 +279,16 @@ int main()
     float lastTime = (float)glfwGetTime();
     FootLock leftFootLock,rightFootLock;
 
-    // ================= MAIN LOOP =================
+    // ------------------------- MAIN LOOP -------------------------
+    // --- NOTE: mesh/palette/texels declared ONCE per frame ---
+    Mesh& mesh = character.GetMesh(0);
+    auto& palette = mesh.bonePalette;
+    static std::vector<glm::vec4> texels(MAX_BONES*4, glm::vec4(0.0f));
+
     while(!glfwWindowShouldClose(window))
     {
         float now = (float)glfwGetTime();
-        float dt = now-lastTime;
+        float dt = now - lastTime;
         lastTime = now;
 
         glfwPollEvents();
@@ -310,89 +313,82 @@ int main()
         // ----- ANIMATION -----
         fsm.Update(dt,speed);
         animator.Update(dt);
+        
 
-        static float dbgTimer = 0.0f;
-        dbgTimer += dt;
 
-        if (dbgTimer > 1.0f)
-            {
-        dbgTimer = 0.0f;
+        for(int i=0; i<5; ++i)
+    std::cout << "Bone " << i << " world pos: " 
+              << glm::to_string(animator.currBoneWorldPos[i]) << "\n";
 
         const auto& finalBones = animator.GetFinalBoneMatrices();
 
-        auto it = skeleton.boneMapping.find("Hips");
-    if (it != skeleton.boneMapping.end())
-    {
-        std::cout << "Hips matrix:\n"
-                 << glm::to_string(finalBones[it->second])
-                  << "\n";
-    }
-}
-
-    
-
-        // ----- DEBUG: root bone matrix -----
-        auto& final = animator.GetFinalBoneMatrices();
-        if(!final.empty()){}
-            //std::cout<<"Root bone matrix: "<<glm::to_string(final[0])<<"\n";
-
-        auto processFoot = [&](int bone, FootLock& lock)
-{
-    if (bone < 0 || bone >= (int)final.size())
-        return;
-
-    glm::vec3 footWorld = animator.GetBoneWorldPosition(bone, modelMat);
-    bool planted = animator.IsFootPlanted(bone);
-
-    if (planted)
-    {
-        if (!lock.locked)
-        {
-            glm::vec3 hit, normal;
-            if (physicsWorld.raycastDown(footWorld, 1.0f, hit, normal))
-            {
-                lock.locked = true;
-                lock.worldPos = hit;
-            }
+        // ----- UPLOAD BONES ONCE PER FRAME -----
+        for(int i=0;i<(int)palette.globalBoneIndices.size();++i){
+            int g = palette.globalBoneIndices[i];
+            const glm::mat4& m = finalBones[g];
+            texels[i*4+0] = m[0];
+            texels[i*4+1] = m[1];
+            texels[i*4+2] = m[2];
+            texels[i*4+3] = m[3];
         }
-        lock.weight = std::min(lock.weight + dt * 8.0f, 1.0f);
-    }
-    else
-    {
-        lock.weight = std::max(lock.weight - dt * 8.0f, 0.0f);
-        if (lock.weight == 0.0f)
-            lock.locked = false;
-    }
+        glBindTexture(GL_TEXTURE_2D,boneTexID);
+        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,MAX_BONES*4,1,GL_RGBA,GL_FLOAT,texels.data());
 
-    if (lock.locked)
-    {
-        glm::vec3 correction = lock.worldPos - footWorld;
-        glm::mat4 boneGlobal = final[bone];
+        // ----- DEBUG TIMERS -----
+        static float t = 0.0f;
+        t += dt;
+        if(t>1.0f){ t=0.0f; std::cout<<"Bone[0] = "<<glm::to_string(finalBones[0])<<"\n"; }
 
-        glm::vec3 boneOffset =
-            glm::vec3(glm::inverse(boneGlobal) * glm::vec4(correction, 0.0f));
+        static float dbgTimer = 0.0f;
+        dbgTimer += dt;
+        if(dbgTimer > 1.0f){
+            dbgTimer = 0.0f;
+            auto it = skeleton.boneMapping.find("Hips");
+            if(it != skeleton.boneMapping.end())
+                std::cout<<"Hips matrix:\n"<<glm::to_string(finalBones[it->second])<<"\n";
+        }
 
-        animator.AddIKOffset(bone, boneOffset, lock.weight);
-    }
-};
+        // ----- FOOT IK -----
+        auto processFoot = [&](int bone, FootLock& lock)
+        {
+            if(bone<0 || bone>=(int)finalBones.size()) return;
 
+            glm::vec3 footWorld = animator.GetBoneWorldPosition(bone, modelMat);
+            bool planted = animator.IsFootPlanted(bone);
 
-        if (leftFootBone != -1)
-    processFoot(leftFootBone, leftFootLock);
+            if(planted){
+                if(!lock.locked){
+                    glm::vec3 hit, normal;
+                    if(physicsWorld.raycastDown(footWorld,1.0f,hit,normal)){
+                        lock.locked = true;
+                        lock.worldPos = hit;
+                    }
+                }
+                lock.weight = std::min(lock.weight + dt*8.0f,1.0f);
+            } else {
+                lock.weight = std::max(lock.weight - dt*8.0f,0.0f);
+                if(lock.weight==0.0f) lock.locked=false;
+            }
 
-if (rightFootBone != -1)
-    processFoot(rightFootBone, rightFootLock);
+            if(lock.locked){
+                glm::vec3 correction = lock.worldPos - footWorld;
+                glm::mat4 boneGlobal = finalBones[bone];
+                glm::vec3 boneOffset = glm::vec3(glm::inverse(boneGlobal) * glm::vec4(correction,0.0f));
+                animator.AddIKOffset(bone,boneOffset,lock.weight);
+            }
+        };
 
+        if(leftFootBone != -1) processFoot(leftFootBone,leftFootLock);
+        if(rightFootBone != -1) processFoot(rightFootBone,rightFootLock);
 
+        // ----- ROOT MOTION -----
         glm::vec3 rootMotion = animator.ConsumeRootMotion();
         rootMotion.y = 0.0f;
-        rootMotion *= modelScale * 0.1f;
-
+        rootMotion *= modelScale*0.1f;
         playerController.update(dt,rootMotion);
 
+        // ----- PHYSICS -----
         physicsWorld.step(dt);
-
-
 
         // ----- RENDER -----
         glClearColor(0.1f,0.1f,0.15f,1.0f);
@@ -402,7 +398,7 @@ if (rightFootBone != -1)
         glm::mat4 view = camera.GetViewMatrix();
 
         // Floor
-        glm::mat4 floorMat = glm::translate(glm::mat4(1.0f),floorBody->position)*
+        glm::mat4 floorMat = glm::translate(glm::mat4(1.0f),floorBody->position) *
                              glm::scale(glm::mat4(1.0f),floorBody->scale);
         flatShader.use();
         flatShader.setMat4("projection",projection);
@@ -412,27 +408,13 @@ if (rightFootBone != -1)
         floorMesh.Draw();
 
         // Cube
-        glm::mat4 cubeMat = glm::translate(glm::mat4(1.0f),cubeBody->position)*
+        glm::mat4 cubeMat = glm::translate(glm::mat4(1.0f),cubeBody->position) *
                             glm::scale(glm::mat4(1.0f),cubeBody->scale);
         flatShader.setMat4("model",cubeMat);
         flatShader.setVec3("color",glm::vec3(0.8f,0.2f,0.2f));
         cubeMesh.Draw();
 
         // Character
-        Mesh& mesh = character.GetMesh(0);
-        auto& palette = mesh.bonePalette;
-        std::vector<glm::vec4> texels(MAX_BONES*4,glm::vec4(0.0f));
-        for(int local=0;local<(int)palette.globalBoneIndices.size();++local){
-            int global = palette.globalBoneIndices[local];
-            const glm::mat4& m = final[global];
-            texels[local*4+0]=m[0];
-            texels[local*4+1]=m[1];
-            texels[local*4+2]=m[2];
-            texels[local*4+3]=m[3];
-        }
-        glBindTexture(GL_TEXTURE_2D,boneTexID);
-        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,MAX_BONES*4,1,GL_RGBA,GL_FLOAT,texels.data());
-
         skinnedShader.use();
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D,boneTexID);
@@ -444,10 +426,10 @@ if (rightFootBone != -1)
 
         character.Draw(skinnedShader);
 
+        // CAMERA FOLLOW
         camera.FollowPlayerSmooth(playerPos,dt);
         glfwSwapBuffers(window);
     }
-
 
     glfwTerminate();
     return 0;

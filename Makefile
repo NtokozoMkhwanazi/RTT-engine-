@@ -20,7 +20,7 @@ BUILD_DIR := build
 # --- Include paths ---
 INCLUDES := -I. -Isrc
 
-# --- Libraries (your engine dependencies) ---
+# --- Libraries (engine dependencies) ---
 LIBS := -lassimp -lopenal -lz -ldl -lglfw -lGL -lX11 -pthread
 
 # --- Mode flags ---

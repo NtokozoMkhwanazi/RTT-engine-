@@ -1,5 +1,5 @@
 # ============================================================
-#  Game Engine Makefile (Industry-Style)
+#  Game Engine Makefile 
 #  - Debug / Release builds
 #  - Object files in build/
 #  - Executable in bin/

@@ -21,51 +21,29 @@ void Mesh::BuildBonePalette()
     bonePalette.globalBoneIndices.clear();
     bonePalette.globalToLocal.clear();
 
-    // Collect used bones
-    for (const auto& v : vertices)
-    {
-        for (int i = 0; i < MAX_BONES_PER_VERTEX; i++)
-        {
-            int globalID = v.BoneIDs[i];
-            if (globalID < 0) continue;
+    // ✅ CRITICAL FIX: Disable per-mesh palette remapping.
+    // Vertices already have global bone IDs from Assimp (0..64).
+    // Do NOT convert them to local indices — keep them global.
+    // The shader and animator must stay synchronized on global indexing.
+    
+    std::cout << "[Mesh] BuildBonePalette: Skipping per-mesh remapping (using GLOBAL bone IDs)\n";
+    std::cout << "       Vertices will keep their global bone indices (0..64).\n";
+    std::cout << "       Shader will use uPaletteSize = full skeleton size (65).\n";
 
-            if (!bonePalette.globalToLocal.count(globalID))
-            {
-                int localID =
-                    static_cast<int>(bonePalette.globalBoneIndices.size());
-
-                bonePalette.globalToLocal[globalID] = localID;
-                bonePalette.globalBoneIndices.push_back(globalID);
-            }
-        }
-    }
-
-    // Remap vertex bone IDs → local palette indices
+    // Normalize weights (they should already be normalized, but ensure it)
     for (auto& v : vertices)
     {
-        for (int i = 0; i < MAX_BONES_PER_VERTEX; i++)
-        {
-            int globalID = v.BoneIDs[i];
-            if (globalID < 0) continue;
+        float sum =
+            v.Weights.x +
+            v.Weights.y +
+            v.Weights.z +
+            v.Weights.w;
 
-            v.BoneIDs[i] = bonePalette.globalToLocal[globalID];
-        }
+        if (sum > 0.0f)
+            v.Weights /= sum;
     }
-        for (auto& v : vertices)
-{
-    float sum =
-        v.Weights.x +
-        v.Weights.y +
-        v.Weights.z +
-        v.Weights.w;
 
-    if (sum > 0.0f)
-        v.Weights /= sum;
-}
-
-
-    std::cout << "[Mesh] Bone palette size: "
-              << bonePalette.globalBoneIndices.size() << "\n";
+    std::cout << "[Mesh] BuildBonePalette complete: vertices store GLOBAL bone IDs\n";
 }
 
 // --------------------------------------------------
@@ -141,17 +119,18 @@ void Mesh::setupMesh()
 // --------------------------------------------------
 void Mesh::Draw(Shader& shader)
 {
-    // Bind textures (optional)
+    // Always bind VAO for drawing
+    glBindVertexArray(VAO);
+
+    // Bind textures (if present) to samplers named texture_diffuseN
     for (unsigned int i = 0; i < textures.size(); i++)
     {
         glActiveTexture(GL_TEXTURE0 + i);
-        shader.setInt(textures[i].type, i);
+        shader.setInt((std::string("texture_diffuse") + std::to_string(i + 1)).c_str(), i);
         glBindTexture(GL_TEXTURE_2D, textures[i].id);
     }
 
-    glBindVertexArray(VAO);
-
-    // ✅ THIS WAS MISSING — ACTUAL DRAW CALL
+    // Draw
     glDrawElements(
         GL_TRIANGLES,
         static_cast<GLsizei>(indices.size()),

@@ -39,7 +39,7 @@ private:
     std::vector<glm::vec3> m_BoneWorldPositions;
     
 
-    float time = 0.0f;
+   
     float blendTime = 0.0f;
     float blendDuration = 0.0f;
 
@@ -47,15 +47,18 @@ private:
     glm::vec3 prevRootPos{0.0f};
 
     std::vector<glm::mat4> finalBoneMatrices;
-    std::vector<glm::mat4> globalBoneMatrices;
 
-public : //temporarily
+public : //temporarily for debug purposes 
+    std::vector<glm::mat4> globalBoneMatrices;
+    float time = 0.0f;
     // -------- FOOT STATE --------
     std::vector<glm::vec3> prevBoneWorldPos;
     std::vector<glm::vec3> currBoneWorldPos;
     std::vector<glm::vec3> ikOffsets;
     
 private : //temporarily
+    bool debugForceIdentityScale = false;  // Test if scale animation is corrupting legs
+    
     void EvaluateNode(
         const AssimpNodeData& node,
         const glm::mat4& parent,

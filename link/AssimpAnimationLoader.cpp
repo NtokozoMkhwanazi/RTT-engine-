@@ -2,16 +2,22 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <string>
-
+#include <vector>
+#include <algorithm>
+#include <iostream>
 
 #include "BoneName.h"
 
 static glm::vec3 ToVec3(const aiVector3D& v) {
+    // Direct conversion: use Assimp positions as-is
     return glm::vec3(v.x, v.y, v.z);
 }
 
 static glm::quat ToQuat(const aiQuaternion& q) {
-    return glm::quat(q.w, q.x, q.y, q.z);
+    // Direct conversion from Assimp (w, x, y, z) to glm (w, x, y, z).
+    // Assimp and glm both use the same quaternion component order.
+    glm::quat qq(q.w, q.x, q.y, q.z);
+    return glm::normalize(qq);
 }
 
 Animation AssimpAnimationLoader::LoadAnimation(
@@ -37,51 +43,37 @@ Animation AssimpAnimationLoader::LoadAnimation(
         boneAnim.boneName =
             NormalizeBoneName(channel->mNodeName.C_Str());
 
-        unsigned int posCount = channel->mNumPositionKeys;
-        unsigned int rotCount = channel->mNumRotationKeys;
-        unsigned int sclCount = channel->mNumScalingKeys;
+        // Populate position channel
+        for (unsigned int k = 0; k < channel->mNumPositionKeys; ++k) {
+            boneAnim.positionTimes.push_back(channel->mPositionKeys[k].mTime);
+            boneAnim.positionValues.push_back(ToVec3(channel->mPositionKeys[k].mValue));
+        }
 
-        unsigned int keyCount =
-            std::max({ posCount, rotCount, sclCount });
+        // Populate rotation channel
+        for (unsigned int k = 0; k < channel->mNumRotationKeys; ++k) {
+            boneAnim.rotationTimes.push_back(channel->mRotationKeys[k].mTime);
+            // Normalize rotations on load to avoid drift from non-normalized keys
+            boneAnim.rotationValues.push_back(ToQuat(channel->mRotationKeys[k].mValue));
+        }
 
-        for (unsigned int k = 0; k < keyCount; ++k) {
-            Keyframe key{};
-
-            // --- TIME ---
-            if (k < posCount)
-                key.time = (float)channel->mPositionKeys[k].mTime;
-            else if (k < rotCount)
-                key.time = (float)channel->mRotationKeys[k].mTime;
-            else if (k < sclCount)
-                key.time = (float)channel->mScalingKeys[k].mTime;
-            else
-                key.time = 0.0f;
-
-            // --- POSITION ---
-            if (k < posCount)
-                key.position =
-                    ToVec3(channel->mPositionKeys[k].mValue);
-            else
-                key.position = glm::vec3(0.0f);
-
-            // --- ROTATION ---
-            if (k < rotCount)
-                key.rotation =
-                    ToQuat(channel->mRotationKeys[k].mValue);
-            else
-                key.rotation = glm::quat(1, 0, 0, 0);
-
-            // --- SCALE ---
-            if (k < sclCount)
-                key.scale =
-                    ToVec3(channel->mScalingKeys[k].mValue);
-            else
-                key.scale = glm::vec3(1.0f);
-
-            boneAnim.keyframes.push_back(key);
+        // Populate scale channel
+        for (unsigned int k = 0; k < channel->mNumScalingKeys; ++k) {
+            boneAnim.scaleTimes.push_back(channel->mScalingKeys[k].mTime);
+            boneAnim.scaleValues.push_back(ToVec3(channel->mScalingKeys[k].mValue));
         }
 
         animation.AddBoneAnimation(boneAnim);
+    }
+
+    // DEBUG: Print first 3 rotation key times for "rightupleg"
+    const BoneAnimation* debugBone = animation.GetBoneAnimation("rightupleg");
+    if (debugBone && debugBone->rotationTimes.size() > 0) {
+        std::cout << "[ANIMATION DEBUG] rightupleg rotation key times (first 3): ";
+        for (int i = 0; i < std::min(3, (int)debugBone->rotationTimes.size()); ++i) {
+            std::cout << debugBone->rotationTimes[i];
+            if (i < 2) std::cout << ", ";
+        }
+        std::cout << "\n";
     }
 
     return animation;

@@ -1,0 +1,415 @@
+[EXTRACT_BONE] mesh has bone 'hips' -> globalID=0
+[EXTRACT_BONE] mesh has bone 'spine' -> globalID=1
+[EXTRACT_BONE] mesh has bone 'spine1' -> globalID=2
+[EXTRACT_BONE] mesh has bone 'spine2' -> globalID=3
+[EXTRACT_BONE] mesh has bone 'neck' -> globalID=4
+[EXTRACT_BONE] mesh has bone 'head' -> globalID=5
+[EXTRACT_BONE] mesh has bone 'headtopend' -> globalID=6
+[EXTRACT_BONE] mesh has bone 'rightshoulder' -> globalID=7
+[EXTRACT_BONE] mesh has bone 'rightarm' -> globalID=8
+[EXTRACT_BONE] mesh has bone 'rightforearm' -> globalID=9
+[EXTRACT_BONE] mesh has bone 'righthand' -> globalID=10
+[EXTRACT_BONE] mesh has bone 'righthandthumb1' -> globalID=11
+[EXTRACT_BONE] mesh has bone 'righthandthumb2' -> globalID=12
+[EXTRACT_BONE] mesh has bone 'righthandthumb3' -> globalID=13
+[EXTRACT_BONE] mesh has bone 'righthandthumb4' -> globalID=14
+[EXTRACT_BONE] mesh has bone 'righthandindex1' -> globalID=15
+[EXTRACT_BONE] mesh has bone 'righthandindex2' -> globalID=16
+[EXTRACT_BONE] mesh has bone 'righthandindex3' -> globalID=17
+[EXTRACT_BONE] mesh has bone 'righthandindex4' -> globalID=18
+[EXTRACT_BONE] mesh has bone 'righthandmiddle1' -> globalID=19
+[EXTRACT_BONE] mesh has bone 'righthandmiddle2' -> globalID=20
+[EXTRACT_BONE] mesh has bone 'righthandmiddle3' -> globalID=21
+[EXTRACT_BONE] mesh has bone 'righthandmiddle4' -> globalID=22
+[EXTRACT_BONE] mesh has bone 'righthandring1' -> globalID=23
+[EXTRACT_BONE] mesh has bone 'righthandring2' -> globalID=24
+[EXTRACT_BONE] mesh has bone 'righthandring3' -> globalID=25
+[EXTRACT_BONE] mesh has bone 'righthandring4' -> globalID=26
+[EXTRACT_BONE] mesh has bone 'righthandpinky1' -> globalID=27
+[EXTRACT_BONE] mesh has bone 'righthandpinky2' -> globalID=28
+[EXTRACT_BONE] mesh has bone 'righthandpinky3' -> globalID=29
+[EXTRACT_BONE] mesh has bone 'righthandpinky4' -> globalID=30
+[EXTRACT_BONE] mesh has bone 'leftshoulder' -> globalID=31
+[EXTRACT_BONE] mesh has bone 'leftarm' -> globalID=32
+[EXTRACT_BONE] mesh has bone 'leftforearm' -> globalID=33
+[EXTRACT_BONE] mesh has bone 'lefthand' -> globalID=34
+[EXTRACT_BONE] mesh has bone 'lefthandthumb1' -> globalID=35
+[EXTRACT_BONE] mesh has bone 'lefthandthumb2' -> globalID=36
+[EXTRACT_BONE] mesh has bone 'lefthandthumb3' -> globalID=37
+[EXTRACT_BONE] mesh has bone 'lefthandthumb4' -> globalID=38
+[EXTRACT_BONE] mesh has bone 'lefthandindex1' -> globalID=39
+[EXTRACT_BONE] mesh has bone 'lefthandindex2' -> globalID=40
+[EXTRACT_BONE] mesh has bone 'lefthandindex3' -> globalID=41
+[EXTRACT_BONE] mesh has bone 'lefthandindex4' -> globalID=42
+[EXTRACT_BONE] mesh has bone 'lefthandmiddle1' -> globalID=43
+[EXTRACT_BONE] mesh has bone 'lefthandmiddle2' -> globalID=44
+[EXTRACT_BONE] mesh has bone 'lefthandmiddle3' -> globalID=45
+[EXTRACT_BONE] mesh has bone 'lefthandmiddle4' -> globalID=46
+[EXTRACT_BONE] mesh has bone 'lefthandring1' -> globalID=47
+[EXTRACT_BONE] mesh has bone 'lefthandring2' -> globalID=48
+[EXTRACT_BONE] mesh has bone 'lefthandring3' -> globalID=49
+[EXTRACT_BONE] mesh has bone 'lefthandring4' -> globalID=50
+[EXTRACT_BONE] mesh has bone 'lefthandpinky1' -> globalID=51
+[EXTRACT_BONE] mesh has bone 'lefthandpinky2' -> globalID=52
+[EXTRACT_BONE] mesh has bone 'lefthandpinky3' -> globalID=53
+[EXTRACT_BONE] mesh has bone 'lefthandpinky4' -> globalID=54
+[EXTRACT_BONE] mesh has bone 'rightupleg' -> globalID=55
+[EXTRACT_BONE] mesh has bone 'rightleg' -> globalID=56
+[EXTRACT_BONE] mesh has bone 'rightfoot' -> globalID=57
+[EXTRACT_BONE] mesh has bone 'righttoebase' -> globalID=58
+[EXTRACT_BONE] mesh has bone 'righttoeend' -> globalID=59
+[EXTRACT_BONE] mesh has bone 'leftupleg' -> globalID=60
+[EXTRACT_BONE] mesh has bone 'leftleg' -> globalID=61
+[EXTRACT_BONE] mesh has bone 'leftfoot' -> globalID=62
+[EXTRACT_BONE] mesh has bone 'lefttoebase' -> globalID=63
+[EXTRACT_BONE] mesh has bone 'lefttoeend' -> globalID=64
+[AI_BONE_WEIGHTS] bone='hips' globalID=0 weightCount=2220 samples: (v=5,w=1) (v=41,w=1) (v=401,w=1) (v=404,w=1) (v=1,w=1)
+[AI_BONE_WEIGHTS] bone='spine' globalID=1 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='spine1' globalID=2 weightCount=4218 samples: (v=2349,w=1) (v=2818,w=1) (v=3948,w=1) (v=3950,w=1) (v=3225,w=1)
+[AI_BONE_WEIGHTS] bone='spine2' globalID=3 weightCount=3510 samples: (v=2233,w=0.262299) (v=2882,w=0.262299) (v=5150,w=0.262299) (v=5797,w=0.262299) (v=4823,w=0.144097)
+[AI_BONE_WEIGHTS] bone='neck' globalID=4 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='head' globalID=5 weightCount=2086 samples: (v=8087,w=1) (v=8151,w=1) (v=8395,w=1) (v=8211,w=1) (v=8929,w=1)
+[AI_BONE_WEIGHTS] bone='headtopend' globalID=6 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='rightshoulder' globalID=7 weightCount=1536 samples: (v=5157,w=0.125101) (v=5953,w=0.125101) (v=6231,w=0.125101) (v=6251,w=0.125101) (v=5156,w=0.137402)
+[AI_BONE_WEIGHTS] bone='rightarm' globalID=8 weightCount=1594 samples: (v=33150,w=1) (v=33403,w=1) (v=34366,w=1) (v=34370,w=1) (v=34035,w=1)
+[AI_BONE_WEIGHTS] bone='rightforearm' globalID=9 weightCount=2900 samples: (v=34936,w=1) (v=35640,w=1) (v=37205,w=1) (v=37210,w=1) (v=35960,w=1)
+[AI_BONE_WEIGHTS] bone='righthand' globalID=10 weightCount=1168 samples: (v=37692,w=1) (v=38431,w=1) (v=38647,w=1) (v=37740,w=1) (v=38380,w=1)
+[AI_BONE_WEIGHTS] bone='righthandthumb1' globalID=11 weightCount=680 samples: (v=40208,w=1) (v=40596,w=1) (v=40732,w=1) (v=40244,w=1) (v=40572,w=1)
+[AI_BONE_WEIGHTS] bone='righthandthumb2' globalID=12 weightCount=680 samples: (v=39540,w=1) (v=39948,w=1) (v=40072,w=1) (v=39572,w=1) (v=39924,w=1)
+[AI_BONE_WEIGHTS] bone='righthandthumb3' globalID=13 weightCount=680 samples: (v=38860,w=1) (v=39268,w=1) (v=39392,w=1) (v=38892,w=1) (v=39244,w=1)
+[AI_BONE_WEIGHTS] bone='righthandthumb4' globalID=14 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandindex1' globalID=15 weightCount=680 samples: (v=42180,w=1) (v=42588,w=1) (v=42712,w=1) (v=42212,w=1) (v=42564,w=1)
+[AI_BONE_WEIGHTS] bone='righthandindex2' globalID=16 weightCount=680 samples: (v=40900,w=1) (v=41308,w=1) (v=41432,w=1) (v=40932,w=1) (v=41284,w=1)
+[AI_BONE_WEIGHTS] bone='righthandindex3' globalID=17 weightCount=600 samples: (v=41564,w=1) (v=41916,w=1) (v=42032,w=1) (v=41592,w=1) (v=41892,w=1)
+[AI_BONE_WEIGHTS] bone='righthandindex4' globalID=18 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandmiddle1' globalID=19 weightCount=680 samples: (v=42860,w=1) (v=43268,w=1) (v=43392,w=1) (v=42892,w=1) (v=43244,w=1)
+[AI_BONE_WEIGHTS] bone='righthandmiddle2' globalID=20 weightCount=680 samples: (v=43540,w=1) (v=43948,w=1) (v=44072,w=1) (v=43572,w=1) (v=43924,w=1)
+[AI_BONE_WEIGHTS] bone='righthandmiddle3' globalID=21 weightCount=1152 samples: (v=44204,w=1) (v=44556,w=1) (v=44672,w=1) (v=44232,w=1) (v=44532,w=1)
+[AI_BONE_WEIGHTS] bone='righthandmiddle4' globalID=22 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandring1' globalID=23 weightCount=680 samples: (v=44820,w=1) (v=45228,w=1) (v=45352,w=1) (v=44852,w=1) (v=45204,w=1)
+[AI_BONE_WEIGHTS] bone='righthandring2' globalID=24 weightCount=680 samples: (v=45500,w=1) (v=45908,w=1) (v=46032,w=1) (v=45532,w=1) (v=45884,w=1)
+[AI_BONE_WEIGHTS] bone='righthandring3' globalID=25 weightCount=600 samples: (v=46164,w=1) (v=46516,w=1) (v=46632,w=1) (v=46192,w=1) (v=46492,w=1)
+[AI_BONE_WEIGHTS] bone='righthandring4' globalID=26 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandpinky1' globalID=27 weightCount=680 samples: (v=46780,w=1) (v=47188,w=1) (v=47312,w=1) (v=46812,w=1) (v=47164,w=1)
+[AI_BONE_WEIGHTS] bone='righthandpinky2' globalID=28 weightCount=680 samples: (v=47460,w=1) (v=47868,w=1) (v=47992,w=1) (v=47492,w=1) (v=47844,w=1)
+[AI_BONE_WEIGHTS] bone='righthandpinky3' globalID=29 weightCount=600 samples: (v=48124,w=1) (v=48476,w=1) (v=48592,w=1) (v=48152,w=1) (v=48452,w=1)
+[AI_BONE_WEIGHTS] bone='righthandpinky4' globalID=30 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='leftshoulder' globalID=31 weightCount=1536 samples: (v=2323,w=0.0852985) (v=2381,w=0.0852985) (v=3490,w=0.0852985) (v=3494,w=0.0852985) (v=2344,w=0.875399)
+[AI_BONE_WEIGHTS] bone='leftarm' globalID=32 weightCount=1594 samples: (v=17608,w=1) (v=17863,w=1) (v=18824,w=1) (v=18828,w=1) (v=18495,w=1)
+[AI_BONE_WEIGHTS] bone='leftforearm' globalID=33 weightCount=2900 samples: (v=19394,w=1) (v=20098,w=1) (v=21665,w=1) (v=21668,w=1) (v=20418,w=1)
+[AI_BONE_WEIGHTS] bone='lefthand' globalID=34 weightCount=1168 samples: (v=22150,w=1) (v=22887,w=1) (v=23103,w=1) (v=22198,w=1) (v=22838,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandthumb1' globalID=35 weightCount=680 samples: (v=24666,w=1) (v=25054,w=1) (v=25190,w=1) (v=24702,w=1) (v=25030,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandthumb2' globalID=36 weightCount=680 samples: (v=23998,w=1) (v=24406,w=1) (v=24530,w=1) (v=24030,w=1) (v=24382,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandthumb3' globalID=37 weightCount=680 samples: (v=23318,w=1) (v=23726,w=1) (v=23850,w=1) (v=23350,w=1) (v=23702,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandthumb4' globalID=38 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandindex1' globalID=39 weightCount=680 samples: (v=26638,w=1) (v=27046,w=1) (v=27170,w=1) (v=26670,w=1) (v=27022,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandindex2' globalID=40 weightCount=680 samples: (v=25358,w=1) (v=25766,w=1) (v=25890,w=1) (v=25390,w=1) (v=25742,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandindex3' globalID=41 weightCount=600 samples: (v=26022,w=1) (v=26374,w=1) (v=26490,w=1) (v=26050,w=1) (v=26350,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandindex4' globalID=42 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandmiddle1' globalID=43 weightCount=680 samples: (v=27318,w=1) (v=27726,w=1) (v=27850,w=1) (v=27350,w=1) (v=27702,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandmiddle2' globalID=44 weightCount=680 samples: (v=27998,w=1) (v=28406,w=1) (v=28530,w=1) (v=28030,w=1) (v=28382,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandmiddle3' globalID=45 weightCount=600 samples: (v=28662,w=1) (v=29014,w=1) (v=29130,w=1) (v=28690,w=1) (v=28990,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandmiddle4' globalID=46 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandring1' globalID=47 weightCount=680 samples: (v=29278,w=1) (v=29686,w=1) (v=29810,w=1) (v=29310,w=1) (v=29662,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandring2' globalID=48 weightCount=680 samples: (v=29958,w=1) (v=30366,w=1) (v=30490,w=1) (v=29990,w=1) (v=30342,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandring3' globalID=49 weightCount=600 samples: (v=30622,w=1) (v=30974,w=1) (v=31090,w=1) (v=30650,w=1) (v=30950,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandring4' globalID=50 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandpinky1' globalID=51 weightCount=680 samples: (v=31238,w=1) (v=31646,w=1) (v=31770,w=1) (v=31270,w=1) (v=31622,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandpinky2' globalID=52 weightCount=680 samples: (v=31918,w=1) (v=32326,w=1) (v=32450,w=1) (v=31950,w=1) (v=32302,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandpinky3' globalID=53 weightCount=600 samples: (v=32582,w=1) (v=32934,w=1) (v=33050,w=1) (v=32610,w=1) (v=32910,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandpinky4' globalID=54 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='rightupleg' globalID=55 weightCount=2604 samples: (v=54304,w=1) (v=54944,w=1) (v=55240,w=1) (v=55176,w=1) (v=56040,w=1)
+[AI_BONE_WEIGHTS] bone='rightleg' globalID=56 weightCount=1596 samples: (v=52516,w=1) (v=52523,w=1) (v=53500,w=1) (v=53539,w=1) (v=52524,w=1)
+[AI_BONE_WEIGHTS] bone='rightfoot' globalID=57 weightCount=2432 samples: (v=49436,w=1) (v=50140,w=1) (v=50524,w=1) (v=50460,w=1) (v=51340,w=1)
+[AI_BONE_WEIGHTS] bone='righttoebase' globalID=58 weightCount=840 samples: (v=51724,w=1) (v=52175,w=1) (v=52359,w=1) (v=51772,w=1) (v=52156,w=1)
+[AI_BONE_WEIGHTS] bone='righttoeend' globalID=59 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='leftupleg' globalID=60 weightCount=2604 samples: (v=10328,w=1) (v=10968,w=1) (v=11264,w=1) (v=11200,w=1) (v=12064,w=1)
+[AI_BONE_WEIGHTS] bone='leftleg' globalID=61 weightCount=1596 samples: (v=16012,w=1) (v=16017,w=1) (v=16996,w=1) (v=17033,w=1) (v=16020,w=1)
+[AI_BONE_WEIGHTS] bone='leftfoot' globalID=62 weightCount=2432 samples: (v=12932,w=1) (v=13636,w=1) (v=14020,w=1) (v=13956,w=1) (v=14836,w=1)
+[AI_BONE_WEIGHTS] bone='lefttoebase' globalID=63 weightCount=840 samples: (v=15220,w=1) (v=15669,w=1) (v=15853,w=1) (v=15268,w=1) (v=15652,w=1)
+[AI_BONE_WEIGHTS] bone='lefttoeend' globalID=64 weightCount=0 samples:
+[Mesh] BuildBonePalette: Skipping per-mesh remapping (using GLOBAL bone IDs)
+       Vertices will keep their global bone indices (0..64).
+       Shader will use uPaletteSize = full skeleton size (65).
+[Mesh] BuildBonePalette complete: vertices store GLOBAL bone IDs
+[AI_BONE_WEIGHTS] bone='hips' globalID=0 weightCount=1560 samples: (v=0,w=1) (v=77,w=1) (v=1441,w=1) (v=1497,w=1) (v=1,w=1)
+[AI_BONE_WEIGHTS] bone='spine' globalID=1 weightCount=1560 samples: (v=4680,w=1) (v=4757,w=1) (v=6121,w=1) (v=6177,w=1) (v=4681,w=1)
+[AI_BONE_WEIGHTS] bone='spine1' globalID=2 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='spine2' globalID=3 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='neck' globalID=4 weightCount=1560 samples: (v=9360,w=1) (v=9437,w=1) (v=10801,w=1) (v=10857,w=1) (v=9361,w=1)
+[AI_BONE_WEIGHTS] bone='head' globalID=5 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='rightshoulder' globalID=7 weightCount=1560 samples: (v=7800,w=0.2) (v=7879,w=0.2) (v=9242,w=0.2) (v=9297,w=0.2) (v=7803,w=0.2)
+[AI_BONE_WEIGHTS] bone='rightarm' globalID=8 weightCount=1560 samples: (v=7800,w=0.8) (v=7879,w=0.8) (v=9242,w=0.8) (v=9297,w=0.8) (v=7803,w=0.8)
+[AI_BONE_WEIGHTS] bone='rightforearm' globalID=9 weightCount=1560 samples: (v=10920,w=1) (v=10999,w=1) (v=12362,w=1) (v=12417,w=1) (v=10923,w=1)
+[AI_BONE_WEIGHTS] bone='righthand' globalID=10 weightCount=3768 samples: (v=12480,w=1) (v=12559,w=1) (v=13922,w=1) (v=13977,w=1) (v=12483,w=1)
+[AI_BONE_WEIGHTS] bone='righthandthumb1' globalID=11 weightCount=552 samples: (v=14040,w=1) (v=14087,w=1) (v=14522,w=1) (v=14553,w=1) (v=14043,w=1)
+[AI_BONE_WEIGHTS] bone='righthandthumb2' globalID=12 weightCount=552 samples: (v=14592,w=1) (v=14639,w=1) (v=15074,w=1) (v=15105,w=1) (v=14595,w=1)
+[AI_BONE_WEIGHTS] bone='righthandthumb3' globalID=13 weightCount=552 samples: (v=15144,w=1) (v=15191,w=1) (v=15626,w=1) (v=15657,w=1) (v=15147,w=1)
+[AI_BONE_WEIGHTS] bone='righthandthumb4' globalID=14 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandindex1' globalID=15 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandindex2' globalID=16 weightCount=552 samples: (v=16248,w=1) (v=16295,w=1) (v=16730,w=1) (v=16761,w=1) (v=16251,w=1)
+[AI_BONE_WEIGHTS] bone='righthandindex3' globalID=17 weightCount=552 samples: (v=16800,w=1) (v=16847,w=1) (v=17282,w=1) (v=17313,w=1) (v=16803,w=1)
+[AI_BONE_WEIGHTS] bone='righthandindex4' globalID=18 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandmiddle1' globalID=19 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandmiddle2' globalID=20 weightCount=552 samples: (v=17904,w=1) (v=17951,w=1) (v=18386,w=1) (v=18417,w=1) (v=17907,w=1)
+[AI_BONE_WEIGHTS] bone='righthandmiddle3' globalID=21 weightCount=552 samples: (v=17352,w=1) (v=17399,w=1) (v=17834,w=1) (v=17865,w=1) (v=17355,w=1)
+[AI_BONE_WEIGHTS] bone='righthandmiddle4' globalID=22 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandring1' globalID=23 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandring2' globalID=24 weightCount=552 samples: (v=19008,w=1) (v=19055,w=1) (v=19490,w=1) (v=19521,w=1) (v=19011,w=1)
+[AI_BONE_WEIGHTS] bone='righthandring3' globalID=25 weightCount=552 samples: (v=18456,w=1) (v=18503,w=1) (v=18938,w=1) (v=18969,w=1) (v=18459,w=1)
+[AI_BONE_WEIGHTS] bone='righthandring4' globalID=26 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandpinky1' globalID=27 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righthandpinky2' globalID=28 weightCount=552 samples: (v=21216,w=1) (v=21263,w=1) (v=21698,w=1) (v=21729,w=1) (v=21219,w=1)
+[AI_BONE_WEIGHTS] bone='righthandpinky3' globalID=29 weightCount=552 samples: (v=21768,w=1) (v=21815,w=1) (v=22250,w=1) (v=22281,w=1) (v=21771,w=1)
+[AI_BONE_WEIGHTS] bone='righthandpinky4' globalID=30 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='leftshoulder' globalID=31 weightCount=1560 samples: (v=6240,w=0.2) (v=6317,w=0.2) (v=7681,w=0.2) (v=7737,w=0.2) (v=6241,w=0.2)
+[AI_BONE_WEIGHTS] bone='leftarm' globalID=32 weightCount=1560 samples: (v=6240,w=0.8) (v=6317,w=0.8) (v=7681,w=0.8) (v=7737,w=0.8) (v=6241,w=0.8)
+[AI_BONE_WEIGHTS] bone='leftforearm' globalID=33 weightCount=1560 samples: (v=22320,w=1) (v=22397,w=1) (v=23761,w=1) (v=23817,w=1) (v=22321,w=1)
+[AI_BONE_WEIGHTS] bone='lefthand' globalID=34 weightCount=3768 samples: (v=23880,w=1) (v=23957,w=1) (v=25321,w=1) (v=25377,w=1) (v=23881,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandthumb1' globalID=35 weightCount=552 samples: (v=25440,w=1) (v=25485,w=1) (v=25921,w=1) (v=25953,w=1) (v=25441,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandthumb2' globalID=36 weightCount=552 samples: (v=25992,w=1) (v=26037,w=1) (v=26473,w=1) (v=26505,w=1) (v=25993,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandthumb3' globalID=37 weightCount=552 samples: (v=26544,w=1) (v=26589,w=1) (v=27025,w=1) (v=27057,w=1) (v=26545,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandthumb4' globalID=38 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandindex1' globalID=39 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandindex2' globalID=40 weightCount=552 samples: (v=30960,w=1) (v=31005,w=1) (v=31441,w=1) (v=31473,w=1) (v=30961,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandindex3' globalID=41 weightCount=552 samples: (v=33168,w=1) (v=33213,w=1) (v=33649,w=1) (v=33681,w=1) (v=33169,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandindex4' globalID=42 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandmiddle1' globalID=43 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandmiddle2' globalID=44 weightCount=552 samples: (v=30408,w=1) (v=30453,w=1) (v=30889,w=1) (v=30921,w=1) (v=30409,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandmiddle3' globalID=45 weightCount=552 samples: (v=32616,w=1) (v=32661,w=1) (v=33097,w=1) (v=33129,w=1) (v=32617,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandmiddle4' globalID=46 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandring1' globalID=47 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandring2' globalID=48 weightCount=552 samples: (v=29856,w=1) (v=29901,w=1) (v=30337,w=1) (v=30369,w=1) (v=29857,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandring3' globalID=49 weightCount=552 samples: (v=32064,w=1) (v=32109,w=1) (v=32545,w=1) (v=32577,w=1) (v=32065,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandring4' globalID=50 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandpinky1' globalID=51 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefthandpinky2' globalID=52 weightCount=552 samples: (v=29304,w=1) (v=29349,w=1) (v=29785,w=1) (v=29817,w=1) (v=29305,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandpinky3' globalID=53 weightCount=552 samples: (v=31512,w=1) (v=31557,w=1) (v=31993,w=1) (v=32025,w=1) (v=31513,w=1)
+[AI_BONE_WEIGHTS] bone='lefthandpinky4' globalID=54 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='rightupleg' globalID=55 weightCount=1560 samples: (v=3120,w=1) (v=3199,w=1) (v=4562,w=1) (v=4617,w=1) (v=3123,w=1)
+[AI_BONE_WEIGHTS] bone='rightleg' globalID=56 weightCount=1560 samples: (v=35280,w=1) (v=35359,w=1) (v=36722,w=1) (v=36777,w=1) (v=35283,w=1)
+[AI_BONE_WEIGHTS] bone='rightfoot' globalID=57 weightCount=3120 samples: (v=36840,w=1) (v=36919,w=1) (v=38282,w=1) (v=38337,w=1) (v=36843,w=1)
+[AI_BONE_WEIGHTS] bone='righttoebase' globalID=58 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='righttoeend' globalID=59 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='leftupleg' globalID=60 weightCount=1560 samples: (v=1560,w=1) (v=1637,w=1) (v=3001,w=1) (v=3057,w=1) (v=1561,w=1)
+[AI_BONE_WEIGHTS] bone='leftleg' globalID=61 weightCount=1560 samples: (v=33720,w=1) (v=33797,w=1) (v=35161,w=1) (v=35217,w=1) (v=33721,w=1)
+[AI_BONE_WEIGHTS] bone='leftfoot' globalID=62 weightCount=3120 samples: (v=38400,w=1) (v=38477,w=1) (v=39841,w=1) (v=39897,w=1) (v=38401,w=1)
+[AI_BONE_WEIGHTS] bone='lefttoebase' globalID=63 weightCount=0 samples:
+[AI_BONE_WEIGHTS] bone='lefttoeend' globalID=64 weightCount=0 samples:
+[Mesh] BuildBonePalette: Skipping per-mesh remapping (using GLOBAL bone IDs)
+       Vertices will keep their global bone indices (0..64).
+       Shader will use uPaletteSize = full skeleton size (65).
+[Mesh] BuildBonePalette complete: vertices store GLOBAL bone IDs
+Skeleton root bone index: 0
+Model loaded: assets/bot.fbx | Bones: 65
+Vertices influenced by bones: 99796
+Root bone index: 0
+Root bone name: 0
+
+[BIND POSE DEBUG]
+  B0 offset_pos=vec3(-0.000045, -104.286247, -0.207324) scale=(1, 1, 1)
+  B1 offset_pos=vec3(0.000012, -112.964645, -18.496254) scale=(1, 1, 1)
+  B2 offset_pos=vec3(0.000012, -122.967323, -18.496254) scale=(1, 1, 1)
+  B3 offset_pos=vec3(0.000022, -132.722107, -15.081134) scale=(1, 1, 1)
+  B4 offset_pos=vec3(0.000022, -149.587433, -15.081134) scale=(1, 1, 1)
+
+[LEG BONE OFFSETS]
+  B55 (rightupleg) offset_pos=vec3(-8.207796, 97.520592, -0.715090)
+  B56 (rightleg) offset_pos=vec3(-8.207794, 53.049332, 3.333094)
+  B57 (rightfoot) offset_pos=vec3(-8.207796, 7.640914, -5.034102)
+  B58 (righttoebase) offset_pos=vec3(-8.207794, -7.967722, -0.001319)
+  B59 (righttoeend) offset_pos=vec3(-8.205552, -17.245842, -0.191859)
+  B60 (leftupleg) offset_pos=vec3(8.207780, 97.520546, -0.717334)
+  B61 (leftleg) offset_pos=vec3(8.207782, 53.049389, 3.333095)
+  B62 (leftfoot) offset_pos=vec3(8.207780, 7.640835, -5.034269)
+  B63 (lefttoebase) offset_pos=vec3(8.207782, -7.967884, -0.001401)
+  B64 (lefttoeend) offset_pos=vec3(8.205436, -17.246021, -0.196226)
+
+LeftFoot index: 62
+RightFoot index: 57
+LeftToe index: 63
+RightToe index: 58
+[ANIMATION DEBUG] rightupleg rotation key times (first 3): 0, 1, 2
+Loaded animation: mixamo.com | duration: 430 | ticksPerSecond: 30 | Total keyframes: 47886
+[ANIMATION DEBUG] rightupleg rotation key times (first 3): 0, 1, 2
+Loaded animation: mixamo.com | duration: 35 | ticksPerSecond: 30 | Total keyframes: 2466
+[ANIMATION DEBUG] rightupleg rotation key times (first 3): 0, 1, 2
+Loaded animation: mixamo.com | duration: 16 | ticksPerSecond: 30 | Total keyframes: 1212
+
+========== IDLE ANIMATION CHANNELS ==========
+==== Animation Bone Channels ====
+head | POS (431) ROT (431) SCALE (431) 
+hips | POS (431) ROT (431) SCALE (431) 
+leftarm | POS (431) ROT (431) SCALE (431) 
+leftfoot | POS (431) ROT (431) SCALE (431) 
+leftforearm | POS (431) ROT (431) SCALE (431) 
+lefthand | POS (431) ROT (431) SCALE (431) 
+lefthandindex1 | POS (431) ROT (431) SCALE (431) 
+lefthandindex2 | POS (431) ROT (431) SCALE (431) 
+lefthandindex3 | POS (431) ROT (431) SCALE (431) 
+lefthandmiddle1 | POS (431) ROT (431) SCALE (431) 
+lefthandmiddle2 | POS (431) ROT (431) SCALE (431) 
+lefthandmiddle3 | POS (431) ROT (431) SCALE (431) 
+lefthandpinky1 | POS (431) ROT (431) SCALE (431) 
+lefthandpinky2 | POS (431) ROT (431) SCALE (431) 
+lefthandpinky3 | POS (431) ROT (431) SCALE (431) 
+lefthandring1 | POS (431) ROT (431) SCALE (431) 
+lefthandring2 | POS (431) ROT (431) SCALE (431) 
+lefthandring3 | POS (431) ROT (431) SCALE (431) 
+lefthandthumb1 | POS (431) ROT (431) SCALE (431) 
+lefthandthumb2 | POS (431) ROT (431) SCALE (431) 
+lefthandthumb3 | POS (431) ROT (431) SCALE (431) 
+leftleg | POS (431) ROT (431) SCALE (431) 
+leftshoulder | POS (431) ROT (431) SCALE (431) 
+lefttoebase | POS (431) ROT (431) SCALE (431) 
+leftupleg | POS (431) ROT (431) SCALE (431) 
+neck | POS (431) ROT (431) SCALE (431) 
+rightarm | POS (431) ROT (431) SCALE (431) 
+rightfoot | POS (431) ROT (431) SCALE (431) 
+rightforearm | POS (431) ROT (431) SCALE (431) 
+righthand | POS (431) ROT (431) SCALE (431) 
+righthandindex1 | 
+righthandindex2 | 
+righthandindex3 | 
+righthandmiddle1 | 
+righthandmiddle2 | 
+righthandmiddle3 | 
+righthandpinky1 | 
+righthandpinky2 | 
+righthandpinky3 | 
+righthandring1 | 
+righthandring2 | 
+righthandring3 | 
+righthandthumb1 | 
+righthandthumb2 | 
+righthandthumb3 | 
+rightleg | POS (431) ROT (431) SCALE (431) 
+rightshoulder | POS (431) ROT (431) SCALE (431) 
+righttoebase | POS (431) ROT (431) SCALE (431) 
+rightupleg | POS (431) ROT (431) SCALE (431) 
+spine | POS (431) ROT (431) SCALE (431) 
+spine1 | POS (431) ROT (431) SCALE (431) 
+spine2 | POS (431) ROT (431) SCALE (431) 
+
+[Model::Draw] FIRST DRAW: finalBones.size()=65
+  B0 pos=vec3(2.500511, 103.814476, 8.675098)
+  B1 pos=vec3(-4.986470, 104.478989, 15.413945)
+  B2 pos=vec3(-4.000672, 103.534805, 5.784292)
+[Model::Draw] Mesh 0: vertices=56716, sample vertex [0] boneIDs: 0 -1 -1 -1
+[Model::Draw] UploadBoneTexture done, uPaletteSize=65
+[Model::Draw] mesh.Draw() called for mesh 0
+[Model::Draw] Mesh 1: vertices=43080, sample vertex [0] boneIDs: 0 -1 -1 -1
+[Model::Draw] UploadBoneTexture done, uPaletteSize=65
+[Model::Draw] mesh.Draw() called for mesh 1
+
+[BONE DEBUG] Frame 120:
+  B0 pos=vec3(-7.679193, 103.830978, 8.983608) scale=(1, 1, 1)
+  B1 pos=vec3(-1.801280, 104.614136, 19.404266) scale=(1, 1, 1)
+  B2 pos=vec3(-5.168675, 103.718231, 10.707039) scale=(1, 1, 1)
+[LEG WORLD POS]
+  W B55=vec3(-14.151711, 201.452133, 6.461832)
+  W B56=vec3(-13.702097, 245.797592, 5.011500)
+  W B57=vec3(-18.146753, 288.331390, -7.391992)
+  W B58=vec3(-11.703048, 286.847839, 4.739930)
+  W B59=vec3(-11.657342, 277.590057, 5.352291)
+  W B60=vec3(2.005438, 201.068878, 3.585925)
+  W B61=vec3(-1.741291, 245.266815, 4.736839)
+  W B62=vec3(-6.017597, 287.578552, -8.460073)
+  W B63=vec3(-2.472388, 286.010284, 4.801818)
+  W B64=vec3(-2.091743, 276.750977, 5.253856)
+
+[BONE DEBUG] Frame 240:
+  B0 pos=vec3(-7.925821, 103.489304, 7.743910) scale=(1, 1, 1)
+  B1 pos=vec3(-1.466541, 104.361519, 19.007774) scale=(1, 1, 1)
+  B2 pos=vec3(-3.731316, 103.421638, 9.606662) scale=(1, 1, 1)
+[LEG WORLD POS]
+  W B55=vec3(-15.429691, 201.037445, 5.254426)
+  W B56=vec3(-13.914358, 245.358658, 6.724350)
+  W B57=vec3(-18.399250, 287.636139, -6.512988)
+  W B58=vec3(-14.084475, 285.997803, 6.510237)
+  W B59=vec3(-13.874073, 276.734772, 6.995675)
+  W B60=vec3(0.943336, 200.885788, 4.083028)
+  W B61=vec3(-3.377377, 245.025757, 5.430345)
+  W B62=vec3(-6.431304, 287.174133, -8.602403)
+  W B63=vec3(-5.414887, 285.517914, 5.077128)
+  W B64=vec3(-4.919772, 276.259735, 5.430522)
+
+[BONE DEBUG] Frame 360:
+  B0 pos=vec3(-3.380454, 103.103539, 7.382548) scale=(1, 1, 1)
+  B1 pos=vec3(-9.101158, 103.819855, 14.113368) scale=(1, 1, 1)
+  B2 pos=vec3(-9.749785, 103.200836, 4.334324) scale=(1, 1, 1)
+[LEG WORLD POS]
+  W B55=vec3(-9.167500, 200.630890, 1.631807)
+  W B56=vec3(-5.723759, 244.748932, 4.882452)
+  W B57=vec3(-3.360799, 286.789124, -9.600786)
+  W B58=vec3(-4.440432, 285.792908, 4.137761)
+  W B59=vec3(-4.939854, 276.561218, 4.918644)
+  W B60=vec3(7.169837, 200.311249, 3.200383)
+  W B61=vec3(5.681664, 244.627243, 4.842515)
+  W B62=vec3(9.202981, 285.208282, -13.143780)
+  W B63=vec3(5.439844, 284.232727, 0.114908)
+  W B64=vec3(4.678407, 275.009430, 0.774326)
+
+[BONE DEBUG] Frame 480:
+  B0 pos=vec3(-3.666789, 104.356560, 15.683626) scale=(1, 1, 1)
+  B1 pos=vec3(-2.998404, 105.375671, 24.126410) scale=(1, 1, 1)
+  B2 pos=vec3(-2.785308, 104.228722, 15.432862) scale=(1, 1, 1)
+[LEG WORLD POS]
+  W B55=vec3(-15.224347, 201.164658, 7.153825)
+  W B56=vec3(-13.203650, 245.164932, 1.794799)
+  W B57=vec3(-17.561218, 285.076477, -17.461536)
+  W B58=vec3(-13.624039, 284.729340, -4.222051)
+  W B59=vec3(-13.503478, 275.545624, -2.907369)
+  W B60=vec3(1.119024, 201.593903, 5.676949)
+  W B61=vec3(-3.049212, 245.368561, -0.258262)
+  W B62=vec3(-6.992239, 285.360504, -19.437099)
+  W B63=vec3(-5.534973, 286.136749, -5.719243)
+  W B64=vec3(-4.518382, 277.054260, -4.119659)
+
+[BONE DEBUG] Frame 600:
+  B0 pos=vec3(-1.081948, 104.783463, 19.279552) scale=(1, 1, 1)
+  B1 pos=vec3(3.330577, 106.418205, 28.637539) scale=(1, 1, 1)
+  B2 pos=vec3(2.851288, 105.014046, 20.514467) scale=(1, 1, 1)
+[LEG WORLD POS]
+  W B55=vec3(-13.316750, 201.371704, 9.321317)
+  W B56=vec3(-13.013984, 244.615540, -0.613734)
+  W B57=vec3(-18.486612, 283.383026, -21.823597)
+  W B58=vec3(-12.602260, 283.989502, -9.337110)
+  W B59=vec3(-12.299717, 274.927917, -7.367491)
+  W B60=vec3(2.787532, 201.690262, 6.155590)
+  W B61=vec3(-1.996397, 244.997925, -2.233735)
+  W B62=vec3(-7.781057, 284.121307, -22.694134)
+  W B63=vec3(-4.121112, 285.568268, -9.449632)
+  W B64=vec3(-2.191574, 276.681702, -7.608486)
+
+[BONE DEBUG] Frame 720:
+  B0 pos=vec3(-3.406238, 104.794334, 18.817986) scale=(1, 1, 1)
+  B1 pos=vec3(0.181350, 106.337013, 27.659931) scale=(1, 1, 1)
+  B2 pos=vec3(-1.509331, 104.920860, 20.181309) scale=(1, 1, 1)
+[LEG WORLD POS]
+  W B55=vec3(-15.412539, 201.377060, 8.533628)
+  W B56=vec3(-17.356436, 244.455902, -1.919242)
+  W B57=vec3(-25.084934, 283.509338, -21.864792)
+  W B58=vec3(-17.319725, 284.053802, -10.449416)
+  W B59=vec3(-17.154421, 275.035980, -8.273419)
+  W B60=vec3(0.488875, 201.524948, 4.460009)
+  W B61=vec3(-5.870782, 244.784134, -3.091009)
+  W B62=vec3(-13.683293, 284.204590, -22.267063)
+  W B63=vec3(-8.465313, 285.769226, -9.569413)
+  W B64=vec3(-6.215561, 276.942963, -7.803177)
+
+[BONE DEBUG] Frame 840:
+  B0 pos=vec3(1.371589, 104.084373, 8.760290) scale=(1, 1, 1)
+  B1 pos=vec3(-4.352680, 104.586220, 15.979023) scale=(1, 1, 1)
+  B2 pos=vec3(-3.392973, 103.811966, 7.318853) scale=(1, 1, 1)
+[LEG WORLD POS]
+  W B55=vec3(-10.390692, 201.061722, 2.828367)
+  W B56=vec3(-5.781177, 245.185272, 3.659541)
+  W B57=vec3(-6.328549, 287.096436, -11.369812)
+  W B58=vec3(-4.088428, 286.180084, 2.233418)
+  W B59=vec3(-4.435779, 276.972717, 3.323111)
+  W B60=vec3(6.013080, 201.649368, 2.622959)
+  W B61=vec3(4.908646, 245.901718, -0.431976)
+  W B62=vec3(4.848648, 287.950623, -15.081799)
+  W B63=vec3(3.842805, 287.137482, -1.325607)
+  W B64=vec3(4.104918, 277.918396, -0.313737)

@@ -13,20 +13,11 @@
 #include "Mesh.h"
 #include "Shader.h"
 #include "Animation.h"
+#include "Animator.h"
 #include "Skeleton.h"
+#include "BoneName.h"
 
-inline std::string NormalizeBone(const std::string& s)
-{
-    std::string n = s;
-    std::transform(n.begin(), n.end(), n.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-
-    size_t colon = n.find(':');
-    if (colon != std::string::npos)
-        n = n.substr(colon + 1);
-
-    return n;
-}
+// Use canonical bone name normalization from BoneName.h
 // ------------------------------------------------------------
 // Model
 // ------------------------------------------------------------
@@ -34,9 +25,10 @@ class Model
 {
 public:
     explicit Model(const std::string& path);
-
-    void Draw(Shader& shader);
-
+    unsigned int boneTexID = 0;
+    
+    void Draw(Shader& shader, Animator& animator);
+    void UploadBoneTexture(Shader& shader, const std::vector<glm::mat4>& mats);
     Animation* GetAnimation(size_t index);
 
     const Skeleton& GetSkeleton() const { return m_Skeleton; }
@@ -94,7 +86,7 @@ private:
     // --------------------------------------------------------
     // Bones
     // --------------------------------------------------------
-    void ExtractBones(aiMesh* mesh);
+    void ExtractBones(aiMesh* mesh, const AssimpNodeData& rootNode);
     void extractBoneWeights(std::vector<Vertex>& vertices, aiMesh* mesh);
 
     // --------------------------------------------------------

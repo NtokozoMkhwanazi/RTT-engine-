@@ -61,12 +61,6 @@ This engine is designed as a **foundation for building real 3D games**, simulati
 ## 📁 Project Structure
 
 ```text
-src/            Core engine source
-link/           Engine subsystems (animation, physics, rendering), shaers,
-assets/         Models, animations, shaders
-third_party/    External libraries
-```
----
 
 ## 🛠️ Dependencies
 
@@ -86,9 +80,12 @@ Make sure all dependencies are installed before building.
 ## ⚙️ Build Instructions (Linux)
 
 ```bash
-g++ -std=c++17 src/glad.c link/*.cpp test.cpp \
-    -o run \
-    -lassimp -lopenal -lz -ldl -lglfw -lGL -lX11 -pthread -g
+Makefile :
+          make
+          make clean
+          make rebuild
+          make release
+          make MODE=release run
 ```
 ## 🚧 Current Status
 

@@ -62,8 +62,11 @@ void main()
 
     // ---------- TRANSFORMS ----------
     vec4 localPos = vec4(aPos, 1.0);
+
+    // Apply skinning to the local position
     vec4 skinnedPos = skin * localPos;
 
+    // Transform skinned position by model/view/projection
     vec4 worldPos = model * skinnedPos;
     FragPos = worldPos.xyz;
 

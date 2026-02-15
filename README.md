@@ -4,8 +4,9 @@ A lightweight, low-level **C++ game engine** built from scratch with a focus on 
 This engine is designed as a **foundation for building real 3D games**, simulations, and interactive applications..
 
 > ⚠️ This is an **active work-in-progress engine**, developed primarily for learning and experimentation.
-> Screenshots progress
-<img width="1366" height="768" alt="current" src="https://github.com/user-attachments/assets/d9870c39-60f7-42bb-bf9c-a44ffc4b8487" />
+> Screenshot
+<img width="1366" height="768" alt="pallete" src="https://github.com/user-attachments/assets/30f8652a-f8b2-44a5-b21f-2b208e6cf45d" />
+<img width="1366" height="768" alt="pallete2" src="https://github.com/user-attachments/assets/cec64cad-2acf-4771-bc89-a50595bb45b1" />
 <img width="1366" height="768" alt="snipp" src="https://github.com/user-attachments/assets/32d6cdda-3640-4682-bb8c-622e8dd5900c" />
 <img width="1366" height="768" alt="snippets" src="https://github.com/user-attachments/assets/1882dea7-07f7-4a4b-8d8b-686fc336265a" />
 <img width="1366" height="768" alt="snip" src="https://github.com/user-attachments/assets/bae7d0ae-2bc3-4a7a-8e50-8a3417b57eee" />

@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <cfloat>
 
 #include <glm/glm.hpp>
 
@@ -30,6 +31,8 @@ public:
     void Draw(Shader& shader, Animator& animator);
     void UploadBoneTexture(Shader& shader, const std::vector<glm::mat4>& mats);
     Animation* GetAnimation(size_t index);
+    glm::vec3 GetSize() const;
+    void DebugDrawSkeleton(const std::vector<glm::mat4>& boneTransforms, const Skeleton& skeleton);
 
     const Skeleton& GetSkeleton() const { return m_Skeleton; }
     const aiScene* GetScene() const { return scene; }
@@ -70,6 +73,7 @@ private:
     // --------------------------------------------------------
     // Hierarchy
     // --------------------------------------------------------
+    void ReadHierarchyRecursive(AssimpNodeData& dest, const aiNode* src);
     void ReadHierarchy(AssimpNodeData& dest, const aiNode* src);
 
     void BuildNodeBoneMap(

@@ -8,6 +8,7 @@
 
 #include <iostream>
 #include <functional>
+#include <algorithm>
 
 #include <assimp/postprocess.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -20,79 +21,100 @@
 // =====================================================
 
 std::unordered_map<std::string, int>
-BuildNormalizedBoneMap(const Skeleton& skeleton)
+BuildNormalizedBoneMap(const Skeleton &skeleton)
 {
     std::unordered_map<std::string, int> result;
-    for (const auto& [boneName, index] : skeleton.boneMapping)
+    for (const auto &[boneName, index] : skeleton.boneMapping)
         result[NormalizeBoneName(boneName)] = index;
 
     return result;
 }
 
 void Model::BuildNodeBoneMap(
-    AssimpNodeData& node,
-    const std::unordered_map<std::string, int>& normBoneMap)
+    AssimpNodeData &node,
+    const std::unordered_map<std::string, int> &normBoneMap)
 {
     auto it = normBoneMap.find(node.name);
     node.boneIndex = (it != normBoneMap.end()) ? it->second : -1;
-    
-    for (auto& child : node.children)
+
+    for (auto &child : node.children)
         BuildNodeBoneMap(child, normBoneMap);
 }
+static const aiNode *FindNodeRecursive(const aiNode *node, const std::string &target)
+{
+    if (!node)
+        return nullptr;
 
+    std::string n = NormalizeBoneName(node->mName.C_Str());
+    if (n == target)
+        return node;
+
+    for (unsigned i = 0; i < node->mNumChildren; ++i)
+    {
+        const aiNode *found = FindNodeRecursive(node->mChildren[i], target);
+        if (found)
+            return found;
+    }
+
+    return nullptr;
+}
 // =====================================================
-glm::mat4 Model::aiMat4ToGlm(const aiMatrix4x4& m)
+glm::mat4 Model::aiMat4ToGlm(const aiMatrix4x4 &m)
 {
     glm::mat4 r;
-    // Assimp stores matrices row-major (a1..a4 is row 0). glm::mat4 is column-major.
-    // Map rows->columns: r[col][row] = m(row,col)
-    r[0][0] = m.a1; r[1][0] = m.a2; r[2][0] = m.a3; r[3][0] = m.a4;
-    r[0][1] = m.b1; r[1][1] = m.b2; r[2][1] = m.b3; r[3][1] = m.b4;
-    r[0][2] = m.c1; r[1][2] = m.c2; r[2][2] = m.c3; r[3][2] = m.c4;
-    r[0][3] = m.d1; r[1][3] = m.d2; r[2][3] = m.d3; r[3][3] = m.d4;
+
+    // Assimp row-major → GLM column-major
+    r[0][0] = m.a1;
+    r[1][0] = m.a2;
+    r[2][0] = m.a3;
+    r[3][0] = m.a4;
+    r[0][1] = m.b1;
+    r[1][1] = m.b2;
+    r[2][1] = m.b3;
+    r[3][1] = m.b4;
+    r[0][2] = m.c1;
+    r[1][2] = m.c2;
+    r[2][2] = m.c3;
+    r[3][2] = m.c4;
+    r[0][3] = m.d1;
+    r[1][3] = m.d2;
+    r[2][3] = m.d3;
+    r[3][3] = m.d4;
 
     return r;
 }
 
-// Find bind pose transform from hierarchy
-static glm::mat4 FindBindPoseInHierarchy(
-    const AssimpNodeData& node,
-    const std::string& boneName)
-{
-    if (NormalizeBoneName(node.name) == boneName)
-        return node.transform;
-
-    for (const auto& child : node.children)
-    {
-        glm::mat4 result = FindBindPoseInHierarchy(child, boneName);
-        if (result != glm::mat4(0.0f))  // return non-zero result
-            return result;
-    }
-
-    return glm::mat4(0.0f);  // not found
-}
-
 // =====================================================
-static void AddBoneData(Vertex& v, int boneID, float weight)
+// Find bind pose transform from hierarchy (SAFE VERSION)
+// =====================================================
+static bool FindBindPoseInHierarchy(
+    const AssimpNodeData &node,
+    const std::string &boneName,
+    glm::mat4 &out)
 {
-    for (int i = 0; i < MAX_BONE_INFLUENCE; ++i)
+    // node.name is already normalized in ReadHierarchy()
+    if (node.name == boneName)
     {
-        if (v.Weights[i] == 0.0f)
-        {
-            v.BoneIDs[i] = boneID;
-            v.Weights[i] = weight;
-            return;
-        }
+        out = node.transform;
+        return true;
     }
+
+    for (const auto &child : node.children)
+    {
+        if (FindBindPoseInHierarchy(child, boneName, out))
+            return true;
+    }
+
+    return false;
 }
 
 // =====================================================
 // Root bone detection
 // =====================================================
-int FindRootBoneIndex(const Skeleton& skeleton)
+int FindRootBoneIndex(const Skeleton &skeleton)
 {
-    std::function<int(const AssimpNodeData&, int)> walk =
-        [&](const AssimpNodeData& node, int parentBone) -> int
+    std::function<int(const AssimpNodeData &, int)> walk =
+        [&](const AssimpNodeData &node, int parentBone) -> int
     {
         int thisBone = node.boneIndex;
 
@@ -100,7 +122,7 @@ int FindRootBoneIndex(const Skeleton& skeleton)
         if (thisBone >= 0 && parentBone == -1)
             return thisBone;
 
-        for (const auto& child : node.children)
+        for (const auto &child : node.children)
         {
             int r = walk(child, thisBone >= 0 ? thisBone : parentBone);
             if (r != -1)
@@ -112,16 +134,14 @@ int FindRootBoneIndex(const Skeleton& skeleton)
     return walk(skeleton.rootNode, -1);
 }
 
-
-
 // =====================================================
-Model::Model(const std::string& path)
+Model::Model(const std::string &path)
 {
     loadModel(path);
 
     int influenced = 0;
-    for (auto& mesh : meshes)
-        for (auto& v : mesh.vertices)
+    for (auto &mesh : meshes)
+        for (auto &v : mesh.vertices)
             if (v.Weights.x + v.Weights.y + v.Weights.z + v.Weights.w > 0.0f)
                 influenced++;
 
@@ -129,132 +149,105 @@ Model::Model(const std::string& path)
 
     std::cout << "Vertices influenced by bones: " << influenced << "\n";
     std::cout << "Root bone index: " << rootBoneIndex << "\n";
-    
+
     // Find root bone name from boneMapping
     std::string rootBoneName = "";
-    for (const auto& [name, idx] : m_Skeleton.boneMapping) {
-        if (idx == m_Skeleton.rootBoneIndex) {
+    for (const auto &[name, idx] : m_Skeleton.boneMapping)
+    {
+        if (idx == m_Skeleton.rootBoneIndex)
+        {
             rootBoneName = name;
             break;
         }
     }
     std::cout << "Root bone name: " << rootBoneName << "\n";
 
-    // DEBUG: Print bind pose for first few bones
-    std::cout << "\n[BIND POSE DEBUG]\n";
-    for (int i = 0; i < std::min(5, (int)m_Skeleton.bones.size()); ++i) {
-        glm::vec3 pos = glm::vec3(m_Skeleton.bones[i].offset[3]);
-        
-        // Extract scale from offset matrix
-        float sx = glm::length(glm::vec3(m_Skeleton.bones[i].offset[0]));
-        float sy = glm::length(glm::vec3(m_Skeleton.bones[i].offset[1]));
-        float sz = glm::length(glm::vec3(m_Skeleton.bones[i].offset[2]));
-        
-        std::cout << "  B" << i << " offset_pos=" << glm::to_string(pos)
-                  << " scale=(" << sx << ", " << sy << ", " << sz << ")\n";
-    }
-    std::cout << "\n";
-    
-    // DEBUG: Also print leg bone offsets
-    if (m_Skeleton.rootBoneIndex >= 0) {
-        std::cout << "[LEG BONE OFFSETS]\n";
-        for (int i = 0; i < (int)m_Skeleton.bones.size(); ++i) {
-            std::string boneName = "";
-            for (const auto& [name, idx] : m_Skeleton.boneMapping) {
-                if (idx == i) {
-                    boneName = name;
-                    break;
-                }
-            }
-            
-            if (boneName.find("leg") != std::string::npos ||
-                boneName.find("foot") != std::string::npos ||
-                boneName.find("toe") != std::string::npos) {
-                glm::vec3 pos = glm::vec3(m_Skeleton.bones[i].offset[3]);
-                std::cout << "  B" << i << " (" << boneName << ") offset_pos=" 
-                          << glm::to_string(pos) << "\n";
-            }
-        }
-        std::cout << "\n";
-    }
-
     if (m_Skeleton.rootBoneIndex == -1)
     {
         std::cerr << "WARNING: No root bone found. Animations disabled.\n";
     }
 
+    std::cout << "Model loaded: " << path
+              << " | Bones: " << m_Skeleton.bones.size()
+              << " | Meshes: " << meshes.size()
+              << "\n";
 }
 
 // =====================================================
-void Model::Draw(Shader& shader, Animator& animator)
+void Model::Draw(Shader &shader, Animator &animator)
 {
-    const auto& finalBones = animator.GetFinalBoneMatrices();
+    std::cout << "[Model::Draw] Starting draw call\n";
+    const auto &finalBones = animator.GetFinalBoneMatrices();
 
     static bool firstDraw = true;
-    if (firstDraw) {
+    if (firstDraw)
+    {
         std::cout << "[Model::Draw] FIRST DRAW: finalBones.size()=" << finalBones.size() << "\n";
-        for (int i = 0; i < std::min(3, (int)finalBones.size()); i++) {
+        for (int i = 0; i < std::min(3, (int)finalBones.size()); i++)
             std::cout << "  B" << i << " pos=" << glm::to_string(glm::vec3(finalBones[i][3])) << "\n";
-        }
     }
+
+    std::cout << "[Model::Draw] Number of meshes: " << meshes.size() << "\n";
 
     for (size_t meshIndex = 0; meshIndex < meshes.size(); ++meshIndex)
     {
-        auto& mesh = meshes[meshIndex];
-        
-        if (firstDraw) {
-            std::cout << "[Model::Draw] Mesh " << meshIndex << ": vertices=" << mesh.vertices.size() 
-                      << ", sample vertex [0] boneIDs: " << mesh.vertices[0].BoneIDs[0] << " "
-                      << mesh.vertices[0].BoneIDs[1] << " " << mesh.vertices[0].BoneIDs[2] << " "
+        auto &mesh = meshes[meshIndex];
+        std::cout << "[Model::Draw] Processing mesh " << meshIndex << ", vertices count: " << mesh.vertices.size() << "\n";
+
+        if (firstDraw && !mesh.vertices.empty())
+        {
+            std::cout << "[Model::Draw] Mesh " << meshIndex
+                      << ": vertices=" << mesh.vertices.size()
+                      << ", sample vertex [0] boneIDs: "
+                      << mesh.vertices[0].BoneIDs[0] << " "
+                      << mesh.vertices[0].BoneIDs[1] << " "
+                      << mesh.vertices[0].BoneIDs[2] << " "
                       << mesh.vertices[0].BoneIDs[3] << "\n";
+            std::cout << "[Model::Draw] Sample vertex [0] weights: "
+                      << mesh.vertices[0].Weights.x << " "
+                      << mesh.vertices[0].Weights.y << " "
+                      << mesh.vertices[0].Weights.z << " "
+                      << mesh.vertices[0].Weights.w << "\n";
         }
 
-        // ✅ CRITICAL FIX: Always upload the FULL global bone array (size 65).
-        // Do not use per-mesh palette compaction. Vertices store global bone IDs.
-        
-        std::vector<glm::mat4> paletteMats = finalBones; // copy full array
+        // IMPORTANT:
+        // Always upload the FULL global skeleton palette.
+        // Vertex BoneIDs store global indices.
+        std::vector<glm::mat4> paletteMats = finalBones;
 
-        // Upload full palette to boneTex
+        std::cout << "[Model::Draw] About to upload bone texture with " << paletteMats.size() << " matrices\n";
         UploadBoneTexture(shader, paletteMats);
-
-        // IMPORTANT: Tell shader we have the full skeleton
         shader.setInt("uPaletteSize", (int)paletteMats.size());
-        
-        if (firstDraw) {
-            std::cout << "[Model::Draw] UploadBoneTexture done, uPaletteSize=" << (int)paletteMats.size() << "\n";
-        }
 
-        // Draw mesh
+        std::cout << "[Model::Draw] About to draw mesh " << meshIndex << "\n";
         mesh.Draw(shader);
-        
-        if (firstDraw) {
+        std::cout << "[Model::Draw] Finished drawing mesh " << meshIndex << "\n";
+
+        if (firstDraw)
             std::cout << "[Model::Draw] mesh.Draw() called for mesh " << meshIndex << "\n";
-        }
     }
-    
+
+    std::cout << "[Model::Draw] Finished drawing all meshes\n";
     firstDraw = false;
 }
 
-
-
 // =====================================================
-Animation* Model::GetAnimation(size_t index)
+Animation *Model::GetAnimation(size_t index)
 {
-    if (index >= m_Animations.size()) return nullptr;
+    if (index >= m_Animations.size())
+        return nullptr;
     return m_Animations[index].get();
 }
 
-
 // =====================================================
-void Model::loadModel(const std::string& path)
+void Model::loadModel(const std::string &path)
 {
     scene = importer.ReadFile(
         path,
         aiProcess_Triangulate |
-        aiProcess_GenSmoothNormals |
-        aiProcess_FlipUVs |
-        aiProcess_CalcTangentSpace
-    );
+            aiProcess_GenSmoothNormals |
+            aiProcess_FlipUVs |
+            aiProcess_CalcTangentSpace);
 
     if (!scene || !scene->mRootNode)
     {
@@ -264,38 +257,45 @@ void Model::loadModel(const std::string& path)
 
     directory = path.substr(0, path.find_last_of('/'));
 
+    // Build skeleton node hierarchy first
     ReadHierarchy(m_Skeleton.rootNode, scene->mRootNode);
 
+    // Load meshes + extract bones/weights
     processNode(scene->mRootNode, scene);
 
+    // Build node->boneIndex map
     auto normMap = BuildNormalizedBoneMap(m_Skeleton);
     BuildNodeBoneMap(m_Skeleton.rootNode, normMap);
 
+    // Detect root bone
     m_Skeleton.rootBoneIndex = FindRootBoneIndex(m_Skeleton);
-    std::cout << "Skeleton root bone index: "
-              << m_Skeleton.rootBoneIndex << "\n";
+    std::cout << "Skeleton root bone index: " << m_Skeleton.rootBoneIndex << "\n";
 
-    // globalInverseTransform converts scene space to bind pose space
-    // STEP 1: Set to identity (fast fix for visibility)
-    m_Skeleton.globalInverseTransform = glm::mat4(1.0f);
+    // ============================================================
+    // CRITICAL FIX:
+    // globalInverseTransform MUST NOT be identity.
+    // It cancels the scene root transform (FBX conversion transform).
+    // Use scene root for proper coordinate space
+    // ============================================================
+    glm::mat4 rootTransform = aiMat4ToGlm(scene->mRootNode->mTransformation);
+    m_Skeleton.globalInverseTransform = glm::inverse(rootTransform);
 
+    std::cout << "[globalInverseTransform] rootTransform="
+              << glm::to_string(rootTransform) << "\n";
 
+    // Load animations
     for (unsigned i = 0; i < scene->mNumAnimations; ++i)
     {
-        aiAnimation* a = scene->mAnimations[i];
+        aiAnimation *a = scene->mAnimations[i];
         m_Animations.push_back(std::make_unique<Animation>(
             a->mName.C_Str(),
             float(a->mDuration),
-            float(a->mTicksPerSecond > 0 ? a->mTicksPerSecond : 25.0f)
-        ));
+            float(a->mTicksPerSecond > 0 ? a->mTicksPerSecond : 25.0f)));
     }
-
-    std::cout << "Model loaded: " << path
-              << " | Bones: " << m_Skeleton.bones.size() << "\n";
 }
 
 // =====================================================
-void Model::processNode(aiNode* node, const aiScene* scene)
+void Model::processNode(aiNode *node, const aiScene *scene)
 {
     for (unsigned i = 0; i < node->mNumMeshes; ++i)
         meshes.push_back(processMesh(scene->mMeshes[node->mMeshes[i]], scene));
@@ -305,7 +305,7 @@ void Model::processNode(aiNode* node, const aiScene* scene)
 }
 
 // =====================================================
-Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene)
+Mesh Model::processMesh(aiMesh *mesh, const aiScene *scene)
 {
     std::vector<Vertex> vertices(mesh->mNumVertices);
     std::vector<unsigned int> indices;
@@ -313,15 +313,17 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene)
 
     for (unsigned i = 0; i < mesh->mNumVertices; ++i)
     {
-        Vertex& v = vertices[i];
-        v.Position = { mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z };
+        Vertex &v = vertices[i];
+
+        v.Position = {mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z};
+
         v.Normal = mesh->HasNormals()
-            ? glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z)
-            : glm::vec3(0.0f);
+                       ? glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z)
+                       : glm::vec3(0.0f);
 
         v.TexCoords = mesh->mTextureCoords[0]
-            ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y)
-            : glm::vec2(0.0f);
+                          ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y)
+                          : glm::vec2(0.0f);
 
         for (int j = 0; j < MAX_BONE_INFLUENCE; ++j)
         {
@@ -334,12 +336,14 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene)
         for (unsigned j = 0; j < mesh->mFaces[i].mNumIndices; ++j)
             indices.push_back(mesh->mFaces[i].mIndices[j]);
 
+    // Extract bones/weights
     ExtractBones(mesh, m_Skeleton.rootNode);
     extractBoneWeights(vertices, mesh);
 
+    // Materials
     if (mesh->mMaterialIndex >= 0)
     {
-        aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
+        aiMaterial *material = scene->mMaterials[mesh->mMaterialIndex];
         auto diffuseMaps = loadMaterialTextures(material, aiTextureType_DIFFUSE, "albedo");
         textures.insert(textures.end(), diffuseMaps.begin(), diffuseMaps.end());
     }
@@ -347,40 +351,39 @@ Mesh Model::processMesh(aiMesh* mesh, const aiScene* scene)
     return Mesh(vertices, indices, textures);
 }
 
-
-
-// ------------------------------------------------------------
-// Normalize
-// ------------------------------------------------------------
-
-
-// ------------------------------------------------------------
+// =====================================================
 // Hierarchy
-// ------------------------------------------------------------
-void Model::ReadHierarchy(AssimpNodeData& dest, const aiNode* src)
+// =====================================================
+// Helper: find node by name (normalized)
+
+void Model::ReadHierarchyRecursive(AssimpNodeData &dest, const aiNode *src)
 {
     dest.name = NormalizeBoneName(src->mName.C_Str());
-    glm::mat4 transform = aiMat4ToGlm(src->mTransformation);
-    dest.transform = transform;
+    dest.transform = aiMat4ToGlm(src->mTransformation);
     dest.children.clear();
 
     for (unsigned i = 0; i < src->mNumChildren; ++i)
     {
         AssimpNodeData child;
-        ReadHierarchy(child, src->mChildren[i]);
+        ReadHierarchyRecursive(child, src->mChildren[i]);
         dest.children.push_back(child);
     }
 }
 
-// ------------------------------------------------------------
-// ExtractBones (CRITICAL FIX)
-// STEP 2: Extract both offset matrix AND bind pose from hierarchy
-// ------------------------------------------------------------
-void Model::ExtractBones(aiMesh* mesh, const AssimpNodeData& rootNode)
+void Model::ReadHierarchy(AssimpNodeData &dest, const aiNode *sceneRoot)
+{
+    std::cout << "[ReadHierarchy] Using scene root as skeleton root.\n";
+    ReadHierarchyRecursive(dest, sceneRoot);
+}
+
+// =====================================================
+// ExtractBones
+// =====================================================
+void Model::ExtractBones(aiMesh *mesh, const AssimpNodeData &rootNode)
 {
     for (unsigned i = 0; i < mesh->mNumBones; ++i)
     {
-        aiBone* bone = mesh->mBones[i];
+        aiBone *bone = mesh->mBones[i];
         std::string name = NormalizeBoneName(bone->mName.C_Str());
 
         if (m_Skeleton.boneMapping.count(name) == 0)
@@ -390,31 +393,38 @@ void Model::ExtractBones(aiMesh* mesh, const AssimpNodeData& rootNode)
 
             glm::mat4 offsetMat = aiMat4ToGlm(bone->mOffsetMatrix);
 
-            // STEP 2: Extract bind pose transform from hierarchy
-            glm::mat4 bindLocal = FindBindPoseInHierarchy(rootNode, name);
+            glm::mat4 bindLocal(1.0f);
+            bool found = FindBindPoseInHierarchy(rootNode, name, bindLocal);
+
+            if (!found)
+            {
+                // Not fatal. Some bones appear only in mesh bones list.
+                bindLocal = glm::mat4(1.0f);
+            }
 
             BoneInfo info;
             info.id = id;
             info.offset = offsetMat;
             info.bindTransform = bindLocal;
+
             m_Skeleton.bones.push_back(info);
-            // DEBUG: report bone mapping as it's created
-            std::cout << "[EXTRACT_BONE] mesh has bone '" << name << "' -> globalID=" << id << "\n";
+
+            std::cout << "[EXTRACT_BONE] '" << name << "' -> globalID=" << id
+                      << " foundInHierarchy=" << (found ? "YES" : "NO") << "\n";
         }
     }
 }
 
-
-// ------------------------------------------------------------
+// =====================================================
 // extractBoneWeights
-// ------------------------------------------------------------
+// =====================================================
 void Model::extractBoneWeights(
-    std::vector<Vertex>& vertices,
-    aiMesh* mesh)
+    std::vector<Vertex> &vertices,
+    aiMesh *mesh)
 {
     for (unsigned i = 0; i < mesh->mNumBones; ++i)
     {
-        aiBone* bone = mesh->mBones[i];
+        aiBone *bone = mesh->mBones[i];
         std::string name = NormalizeBoneName(bone->mName.C_Str());
 
         auto it = m_Skeleton.boneMapping.find(name);
@@ -423,19 +433,10 @@ void Model::extractBoneWeights(
 
         int boneID = it->second;
 
-        // DEBUG: print first few weights for this aiBone
-        std::cout << "[AI_BONE_WEIGHTS] bone='" << name << "' globalID=" << boneID
-                  << " weightCount=" << bone->mNumWeights << " samples:";
-        for (unsigned j = 0; j < std::min<unsigned>(bone->mNumWeights, 5); ++j) {
-            auto& w = bone->mWeights[j];
-            std::cout << " (v=" << w.mVertexId << ",w=" << w.mWeight << ")";
-        }
-        std::cout << "\n";
-
         for (unsigned j = 0; j < bone->mNumWeights; ++j)
         {
-            auto& w = bone->mWeights[j];
-            Vertex& v = vertices[w.mVertexId];
+            auto &w = bone->mWeights[j];
+            Vertex &v = vertices[w.mVertexId];
 
             for (int k = 0; k < MAX_BONE_INFLUENCE; ++k)
             {
@@ -449,7 +450,9 @@ void Model::extractBoneWeights(
         }
     }
 }
-void Model::UploadBoneTexture(Shader& shader, const std::vector<glm::mat4>& mats)
+
+// =====================================================
+void Model::UploadBoneTexture(Shader &shader, const std::vector<glm::mat4> &mats)
 {
     if (mats.empty())
         return;
@@ -474,9 +477,9 @@ void Model::UploadBoneTexture(Shader& shader, const std::vector<glm::mat4>& mats
 
     for (size_t i = 0; i < mats.size(); i++)
     {
-        const glm::mat4& m = mats[i];
+        const glm::mat4 &m = mats[i];
 
-        // IMPORTANT: store columns (matches your shader)
+        // Store columns (matches shader sampling)
         pixels[i * 4 + 0] = m[0];
         pixels[i * 4 + 1] = m[1];
         pixels[i * 4 + 2] = m[2];
@@ -495,41 +498,54 @@ void Model::UploadBoneTexture(Shader& shader, const std::vector<glm::mat4>& mats
         0,
         GL_RGBA,
         GL_FLOAT,
-        pixels.data()
-    );
+        pixels.data());
 
     shader.setInt("boneTex", 10);
 }
 
 // =====================================================
+glm::vec3 Model::GetSize() const
+{
+    glm::vec3 minBound(FLT_MAX), maxBound(-FLT_MAX);
+    for (const auto &mesh : meshes) {
+        for (const auto &v : mesh.vertices) {
+            minBound = glm::min(minBound, v.Position);
+            maxBound = glm::max(maxBound, v.Position);
+        }
+    }
+    return maxBound - minBound;
+}
+
+// =====================================================
 std::vector<Texture> Model::loadMaterialTextures(
-    aiMaterial* mat,
+    aiMaterial *mat,
     aiTextureType type,
-    const std::string& typeName)
+    const std::string &typeName)
 {
     std::vector<Texture> textures;
+
     for (unsigned i = 0; i < mat->GetTextureCount(type); ++i)
     {
         aiString str;
         mat->GetTexture(type, i, &str);
+
         Texture tex;
         tex.path = str.C_Str();
-        // map to conventional sampler name used in FS.glsl
         tex.type = std::string("texture_diffuse") + std::to_string(textures.size() + 1);
 
-        // Attempt to load the texture image into GL and store id
-        // Uses helper load_texture_image which wraps stb_image + glTexImage2D
-        try {
+        try
+        {
             load_texture_image loader(tex.path.c_str());
             tex.id = loader.texture;
             loader.freeBuffer();
-        } catch (...) {
+        }
+        catch (...)
+        {
             tex.id = 0;
         }
 
         textures.push_back(tex);
-
     }
+
     return textures;
 }
-

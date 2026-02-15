@@ -45,6 +45,8 @@ private:
 
     glm::vec3 rootMotionDelta{0.0f};
     glm::vec3 prevRootPos{0.0f};
+    bool hasPrevRoot = false;
+
 
     std::vector<glm::mat4> finalBoneMatrices;
 

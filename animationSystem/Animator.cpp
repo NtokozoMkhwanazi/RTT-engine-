@@ -11,13 +11,12 @@
 #include <cmath>
 #include <iostream>
 
-
 // No local normalization - use canonical NormalizeBoneName from BoneName.h
 
 // ------------------------------------------------------------
 // Animator
 // ------------------------------------------------------------
-Animator::Animator(const Skeleton* skel)
+Animator::Animator(const Skeleton *skel)
     : skeleton(skel),
       current(nullptr),
       next(nullptr),
@@ -33,9 +32,19 @@ Animator::Animator(const Skeleton* skel)
     prevBoneWorldPos.resize(boneCount, glm::vec3(0.0f));
     currBoneWorldPos.resize(boneCount, glm::vec3(0.0f));
     ikOffsets.resize(boneCount, glm::vec3(0.0f));
+    
+    std::cout << "[Animator] Created with skeleton containing " << boneCount << " bones\n";
+    if (skeleton) {
+        std::cout << "[Animator] Skeleton root bone index: " << skeleton->rootBoneIndex << "\n";
+        std::cout << "[Animator] Global inverse transform:\n";
+        std::cout << "  " << glm::to_string(skeleton->globalInverseTransform[0]) << "\n";
+        std::cout << "  " << glm::to_string(skeleton->globalInverseTransform[1]) << "\n";
+        std::cout << "  " << glm::to_string(skeleton->globalInverseTransform[2]) << "\n";
+        std::cout << "  " << glm::to_string(skeleton->globalInverseTransform[3]) << "\n";
+    }
 }
 
-void Animator::Play(Animation* anim)
+void Animator::Play(Animation *anim)
 {
     current = anim;
     next = nullptr;
@@ -44,11 +53,13 @@ void Animator::Play(Animation* anim)
     // IMPORTANT: reset root motion state when a new animation starts
     prevRootPos = glm::vec3(0.0f);
     rootMotionDelta = glm::vec3(0.0f);
+    hasPrevRoot = false;
 }
 
-void Animator::BlendTo(Animation* anim, float duration)
+void Animator::BlendTo(Animation *anim, float duration)
 {
-    if (!anim || anim == current) return;
+    if (!anim || anim == current)
+        return;
 
     next = anim;
     blendTime = 0.0f;
@@ -57,100 +68,76 @@ void Animator::BlendTo(Animation* anim, float duration)
 
 void Animator::Update(float dt)
 {
-    if (!skeleton) return;
+    if (!skeleton) {
+        std::cout << "[Animator::Update] ERROR: No skeleton!\n";
+        return;
+    }
 
-        debugForceIdentityScale = false;  // set true to test
-    // DEBUG: pause animation and evaluate bind-pose only
-    // Toggle this flag to false when re-enabling animations.
-    static const bool DEBUG_PAUSE_ANIM = false;
-    
-    // DEBUG: Force scale to identity (test if Mixamo scale noise is corrupting hierarchy)
-    // Toggle to true if legs suddenly improve with scale = (1,1,1)
-        debugForceIdentityScale = false;  // set true to test
+    static bool DEBUG_PAUSE_ANIM = false;
+    debugForceIdentityScale = false;
 
-    Animation* savedCurrent = current;
+    std::cout << "[Animator::Update] dt=" << dt << ", time=" << time << ", current anim=" << (current ? current->name : "NULL") << "\n";
+
+    // Save previous positions BEFORE overwriting
+    prevBoneWorldPos = currBoneWorldPos;
+
+    Animation *savedCurrent = current;
+
     if (!DEBUG_PAUSE_ANIM && current)
     {
         time += dt * current->GetTicksPerSecond();
         time = fmod(time, current->GetDuration());
+        std::cout << "[Animator::Update] Animation time updated: " << time << "/" << current->GetDuration() << "\n";
     }
     else
     {
-        // Temporarily disable animation lookup so EvaluateNode uses
-        // the bind-pose transforms stored in the node hierarchy.
         current = nullptr;
+        std::cout << "[Animator::Update] Animation paused or null\n";
     }
 
-    std::fill(finalBoneMatrices.begin(),
-              finalBoneMatrices.end(),
-              glm::mat4(1.0f));
+    finalBoneMatrices.assign(skeleton->bones.size(), glm::mat4(1.0f));
+    globalBoneMatrices.assign(skeleton->bones.size(), glm::mat4(1.0f));
 
-    globalBoneMatrices.resize(skeleton->bones.size(), glm::mat4(1.0f));
+    std::cout << "[Animator::Update] About to evaluate nodes, skeleton root node name: " << skeleton->rootNode.name << "\n";
+    std::cout << "[Animator::Update] Number of skeleton bones: " << skeleton->bones.size() << "\n";
 
-    // Evaluate pose (bind-pose when paused)
-    EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
+    EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, time);
 
-    // Restore animation pointer if we temporarily disabled it
     current = savedCurrent;
 
-    // Save old bone world positions
-    prevBoneWorldPos = currBoneWorldPos;
-
-    // Update bone world positions
+    // Compute current bone positions
     for (size_t i = 0; i < globalBoneMatrices.size(); ++i)
     {
         currBoneWorldPos[i] =
             glm::vec3(globalBoneMatrices[i] * glm::vec4(0, 0, 0, 1));
     }
 
-    // DEBUG: Print first few bone matrices for diagnosis
-    static int frameCount = 0;
-    if (++frameCount % 120 == 0) {
-        std::cout << "\n[BONE DEBUG] Frame " << frameCount << ":\n";
-        for (int i = 0; i < std::min(3, (int)finalBoneMatrices.size()); ++i) {
-            glm::vec3 pos = glm::vec3(finalBoneMatrices[i][3]);
-            
-            // Extract scale
-            float sx = glm::length(glm::vec3(finalBoneMatrices[i][0]));
-            float sy = glm::length(glm::vec3(finalBoneMatrices[i][1]));
-            float sz = glm::length(glm::vec3(finalBoneMatrices[i][2]));
-            
-            std::cout << "  B" << i << " pos=" << glm::to_string(pos) 
-                      << " scale=(" << sx << ", " << sy << ", " << sz << ")\n";
-        }
-        // Debug: specific leg bone world positions (if available)
-        auto printBoneWorld = [&](int idx){
-            if (idx >= 0 && idx < (int)currBoneWorldPos.size())
-                std::cout << "  W B"<<idx<<"="<<glm::to_string(currBoneWorldPos[idx])<<"\n";
-        };
-        std::cout << "[LEG WORLD POS]" << std::endl;
-        for (int b = 55; b <= 59; ++b) printBoneWorld(b);
-        for (int b = 60; b <= 64; ++b) printBoneWorld(b);
-    }
-
-    // -------- ROOT MOTION (ONLY HERE) --------
+    // Root motion
     rootMotionDelta = glm::vec3(0.0f);
 
-    if (skeleton->rootBoneIndex >= 0 &&
-        skeleton->rootBoneIndex < (int)currBoneWorldPos.size())
+    int rootIdx = skeleton->rootBoneIndex;
+    if (rootIdx >= 0 && rootIdx < (int)currBoneWorldPos.size())
     {
-        glm::vec3 currRoot = currBoneWorldPos[skeleton->rootBoneIndex];
+        glm::vec3 currRoot = currBoneWorldPos[rootIdx];
+        std::cout << "[Animator::Update] Root bone position: " << glm::to_string(currRoot) << "\n";
 
-        // First frame: initialize
-        if (prevRootPos == glm::vec3(0.0f))
+        if (!hasPrevRoot)
         {
             prevRootPos = currRoot;
-            rootMotionDelta = glm::vec3(0.0f);
+            hasPrevRoot = true;
+            std::cout << "[Animator::Update] Initialized root position\n";
         }
         else
         {
             rootMotionDelta = currRoot - prevRootPos;
             prevRootPos = currRoot;
+            std::cout << "[Animator::Update] Root motion delta: " << glm::to_string(rootMotionDelta) << "\n";
         }
 
-        // OPTIONAL: remove vertical root motion
-         //rootMotionDelta.y = 0.0f;
+        rootMotionDelta.y = 0.0f;
     }
+    
+    std::cout << "[Animator::Update] Completed update, final matrices size: " << finalBoneMatrices.size() << "\n";
 }
 
 void Animator::EvaluateNode(
@@ -161,84 +148,116 @@ void Animator::EvaluateNode(
 {
     std::string name = NormalizeBoneName(node.name);
 
-    glm::mat4 bindLocal = node.transform;
-    glm::mat4 localTransform = bindLocal;  // Default to bind pose
+    std::cout << "[EvaluateNode] Processing bone: " << name << ", node.boneIndex: " << node.boneIndex << "\n";
 
-    // Apply animation: use animated rotation/scale, NEVER use position keys
-    // Position comes from hierarchy and offset matrix only
+    glm::mat4 bindLocal = node.transform;
+
+    // ---- Decompose bind pose ----
+    glm::vec3 bindScale, bindPos, skew;
+    glm::quat bindRot;
+    glm::vec4 perspective;
+
+    glm::decompose(bindLocal, bindScale, bindRot, bindPos, skew, perspective);
+    bindRot = glm::normalize(bindRot);
+
+    std::cout << "[EvaluateNode] Bind pose - Pos: " << glm::to_string(bindPos) 
+              << ", Rot: " << glm::to_string(bindRot) 
+              << ", Scale: " << glm::to_string(bindScale) << "\n";
+
+    // ---- Start from bind pose ----
+    glm::vec3 pos   = bindPos;
+    glm::quat rot   = bindRot;
+    glm::vec3 scale = bindScale;
+
+    // ---- Apply animation (override bind channels) ----
     if (current)
     {
+        std::cout << "[EvaluateNode] Current animation: " << current->name << "\n";
         if (const BoneAnimation* boneAnim = current->GetBoneAnimation(name))
         {
-            // Only animate rotation and scale - NOT position
-            // Mixamo position keys are in world-space/accumulated space, not local
-            glm::quat rot = boneAnim->InterpolateRotation(time);
-            glm::vec3 scale = boneAnim->InterpolateScale(time);
+            std::cout << "[EvaluateNode] Found bone animation for: " << name << "\n";
             
-            if (debugForceIdentityScale) {
-                scale = glm::vec3(1.0f);
+            // Animation processing for all bones
+
+            if (boneAnim->HasRotationAnimation()) {
+                rot = boneAnim->InterpolateRotation(time);
+                std::cout << "[EvaluateNode] Applied rotation animation to: " << name << "\n";
             }
 
-            // Extract bind pose position (from local hierarchy)
-            glm::vec3 pos = glm::vec3(bindLocal[3]);
+            if (boneAnim->HasScaleAnimation()) {
+                scale = boneAnim->InterpolateScale(time);
+                std::cout << "[EvaluateNode] Applied scale animation to: " << name << "\n";
+            }
 
-            // Rebuild local transform: bind position + animated rotation/scale
-            localTransform =
-                glm::translate(glm::mat4(1.0f), pos) *
-                glm::mat4_cast(rot) *
-                glm::scale(glm::mat4(1.0f), scale);
+            if (debugForceIdentityScale)
+                scale = glm::vec3(1.0f);
+
+            if (boneAnim->HasPositionAnimation()) {
+                pos = boneAnim->InterpolatePosition(time);
+                std::cout << "[EvaluateNode] Applied position animation to bone: " << name << "\n";
+            } else {
+                std::cout << "[EvaluateNode] Kept bind pose position for bone: " << name << "\n";
+            }
+        } else {
+            std::cout << "[EvaluateNode] No bone animation found for: " << name << "\n";
         }
+    } else {
+        std::cout << "[EvaluateNode] No current animation\n";
     }
 
-    // ✅ CORRECT for GLM column-major: parent * local
+    // ---- Rebuild local transform ----
+    glm::mat4 localTransform =
+        glm::translate(glm::mat4(1.0f), pos) *
+        glm::mat4_cast(rot) *
+        glm::scale(glm::mat4(1.0f), scale);
+
+    std::cout << "[EvaluateNode] Local transform built for: " << name << "\n";
+
+    // ---- Global ----
     glm::mat4 globalTransform = parent * localTransform;
 
     int boneIndex = node.boneIndex;
+
     if (boneIndex != -1)
     {
-        // Apply IK offsets AFTER animation
+        std::cout << "[EvaluateNode] Processing bone index: " << boneIndex << " for: " << name << "\n";
+
+        // Store the global transform for this bone before applying IK offset
+        glm::mat4 globalTransformForChildren = globalTransform;
+
+        // Apply IK offset only for the final bone matrix (not for hierarchy)
         glm::mat4 ikOffsetMat =
             glm::translate(glm::mat4(1.0f), ikOffsets[boneIndex]);
 
         glm::mat4 finalGlobal = globalTransform * ikOffsetMat;
 
-        // Store world transform (for root motion + debug)
         globalBoneMatrices[boneIndex] = finalGlobal;
 
-        // CRITICAL FIX: Do NOT multiply by offset for bone transforms!
-        // Offset matrices in Assimp are for VERTEX skinning in the shader.
-        // The skeleton hierarchy position is already in globalAnimated.
-        // Applying offset here causes double-translation.
-        finalBoneMatrices[boneIndex] = skeleton->globalInverseTransform * finalGlobal;
+        finalBoneMatrices[boneIndex] =
+            skeleton->globalInverseTransform *
+            finalGlobal *
+            skeleton->bones[boneIndex].offset;
+
+        std::cout << "[EvaluateNode] Final bone matrix computed for index: " << boneIndex << "\n";
+
+        // Pass the globalTransform (WITHOUT IK offset) to children to maintain proper hierarchy
+        for (const auto& child : node.children) {
+            std::cout << "[EvaluateNode] Recursing to child of: " << name << "\n";
+            EvaluateNode(child, globalTransformForChildren, blendAnim, blendFactor);
+        }
+    } else {
+        std::cout << "[EvaluateNode] Bone index is -1 for: " << name << ", skipping matrix computation\n";
         
-        // DEBUG: Print hierarchy chain
-        static bool debugPrinted = false;
-        if (!debugPrinted && time < 0.05f)
-        {
-            if (name.find("hips") != std::string::npos ||
-                name.find("rightupleg") != std::string::npos ||
-                name.find("rightleg") != std::string::npos ||
-                name.find("rightfoot") != std::string::npos)
-            {
-                glm::vec3 localPos = glm::vec3(bindLocal[3]);
-                glm::vec3 parentPos = glm::vec3(parent[3]);
-                glm::vec3 globalPos = glm::vec3(globalTransform[3]);
-                glm::vec3 offsetPos = glm::vec3(skeleton->bones[boneIndex].offset[3]);
-                glm::vec3 finalPos = glm::vec3(finalBoneMatrices[boneIndex][3]);
-                
-                std::cout << "[CHAIN] '" << name << "' (B" << boneIndex << ")\n"
-                          << "  local_Y  = " << localPos.y << ",  parentGlobal_Y=" << parentPos.y 
-                          << ",  global_Y=" << globalPos.y << ",  offset_Y=" << offsetPos.y 
-                          << ",  final_Y=" << finalPos.y << "\n\n";
-            }
+        // Still pass the global transform to children for proper hierarchy
+        for (const auto& child : node.children) {
+            std::cout << "[EvaluateNode] Recursing to child of: " << name << "\n";
+            EvaluateNode(child, globalTransform, blendAnim, blendFactor);
         }
     }
-
-    for (const auto& child : node.children)
-        EvaluateNode(child, globalTransform, blendAnim, blendFactor);
 }
 
-glm::vec3 Animator::GetBoneWorldPosition(int bone, const glm::mat4& modelMat) const
+
+glm::vec3 Animator::GetBoneWorldPosition(int bone, const glm::mat4 &modelMat) const
 {
     if (bone < 0 || bone >= (int)globalBoneMatrices.size())
         return glm::vec3(0.0f);
@@ -252,9 +271,10 @@ bool Animator::IsFootPlanted(int bone) const
     return std::abs(currBoneWorldPos[bone].y - prevBoneWorldPos[bone].y) < 0.001f;
 }
 
-void Animator::AddIKOffset(int bone, const glm::vec3& offset, float weight)
+void Animator::AddIKOffset(int bone, const glm::vec3 &offset, float weight)
 {
-    if (bone < 0 || bone >= (int)ikOffsets.size()) return;
+    if (bone < 0 || bone >= (int)ikOffsets.size())
+        return;
     ikOffsets[bone] += offset * weight;
 }
 
@@ -265,8 +285,12 @@ glm::vec3 Animator::ConsumeRootMotion()
     return d;
 }
 
-const std::vector<glm::mat4>& Animator::GetFinalBoneMatrices() const
+const std::vector<glm::mat4> &Animator::GetFinalBoneMatrices() const
 {
+    std::cout << "[GetFinalBoneMatrices] Returning " << finalBoneMatrices.size() << " matrices\n";
+    if (!finalBoneMatrices.empty()) {
+        std::cout << "[GetFinalBoneMatrices] First matrix: " << glm::to_string(finalBoneMatrices[0][0]) << "\n";
+        std::cout << "[GetFinalBoneMatrices] Last matrix: " << glm::to_string(finalBoneMatrices.back()[0]) << "\n";
+    }
     return finalBoneMatrices;
 }
-

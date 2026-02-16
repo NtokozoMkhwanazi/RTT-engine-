@@ -157,22 +157,8 @@ public:
         return instance;
     }
 
-    template<typename T>
-    ObjectPool<T>& getObjectPool(size_t initialSize = 10) {
-        std::type_index typeIdx = std::type_index(typeid(T));
-        
-        auto it = objectPools_.find(typeIdx);
-        if (it != objectPools_.end()) {
-            return *static_cast<ObjectPool<T>*>(it->second.get());
-        }
-        
-        // Create new pool
-        auto pool = std::make_unique<ObjectPool<T>>(initialSize);
-        ObjectPool<T>* poolPtr = pool.get();
-        objectPools_[typeIdx] = std::move(pool);
-        
-        return *poolPtr;
-    }
+    // Object pooling functionality has been removed to simplify the memory manager
+    // For a full implementation, a more complex system would be needed
 
     void printMemoryStats() const {
         MemoryTracker::getInstance().printStatistics();
@@ -182,7 +168,5 @@ private:
     MemoryManager() = default;
     ~MemoryManager() = default;
 
-    std::unordered_map<std::type_index, std::unique_ptr<void>> objectPools_;
-    
     mutable std::mutex mutex_;
 };

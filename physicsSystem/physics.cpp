@@ -663,6 +663,38 @@ static void resolveContact(std::shared_ptr<RigidBody>& a,
 }
 
 
+// Fluid simulation properties
+struct FluidVolume {
+    glm::vec3 minBounds;
+    glm::vec3 maxBounds;
+    glm::vec3 flowDirection;
+    float density; // Density of the fluid
+    float viscosity; // Viscosity of the fluid
+    float dragCoefficient; // Drag coefficient for objects in fluid
+    float buoyancyFactor; // Factor affecting buoyancy force
+};
+
+// Container for fluid volumes in the world
+std::vector<FluidVolume> fluidVolumes;
+
+// Add a fluid volume to the physics world
+void addFluidVolume(const FluidVolume& fluid) {
+    fluidVolumes.push_back(fluid);
+}
+
+// Check if a point is inside any fluid volume
+bool isInFluid(const glm::vec3& point, FluidVolume& outFluid) const {
+    for (const auto& fluid : fluidVolumes) {
+        if (point.x >= fluid.minBounds.x && point.x <= fluid.maxBounds.x &&
+            point.y >= fluid.minBounds.y && point.y <= fluid.maxBounds.y &&
+            point.z >= fluid.minBounds.z && point.z <= fluid.maxBounds.z) {
+            outFluid = fluid;
+            return true;
+        }
+    }
+    return false;
+}
+
 // -------------------- Physics step (rotation disabled, models optionally immovable) --------------------
 void PhysicsWorld::step(float dt)
 {
@@ -680,6 +712,27 @@ void PhysicsWorld::step(float dt)
             // Save previous transforms
             b->prevPosition = b->position;
             b->prevRotation = b->rotation;
+
+            // -------- FLUID DYNAMICS --------
+            // Check if body is in a fluid volume
+            FluidVolume fluid;
+            if (isInFluid(b->position, fluid)) {
+                // Calculate buoyancy force
+                glm::vec3 buoyancyForce = -gravity * b->buoyancyFactor * fluid.density * b->mass;
+                
+                // Calculate drag force
+                glm::vec3 dragForce = -b->velocity * fluid.dragCoefficient * glm::length(b->velocity);
+                
+                // Calculate flow force if fluid has flow
+                glm::vec3 flowForce = fluid.flowDirection * fluid.viscosity;
+                
+                // Apply fluid forces
+                if (!b->isModel) {
+                    b->applyForce(buoyancyForce);
+                    b->applyForce(dragForce);
+                    b->applyForce(flowForce);
+                }
+            }
 
             // -------- LINEAR --------
             if (!b->isModel) {
@@ -717,6 +770,22 @@ void PhysicsWorld::step(float dt)
             b->torqueAccumulator = glm::vec3(0.0f);
         }
 
+        // --- constraint solving ---
+        for (auto& constraint : constraints) {
+            constraint->preSolve(subdt);
+        }
+
+        // Solve constraints multiple times for stability
+        for (int i = 0; i < 4; ++i) { // 4 iterations for constraint stability
+            for (auto& constraint : constraints) {
+                constraint->solve(*this, subdt);
+            }
+        }
+
+        for (auto& constraint : constraints) {
+            constraint->postSolve(subdt);
+        }
+
         // --- collision detection ---
         std::vector<std::pair<int,int>> pairs;
         getPotentialPairs(pairs);
@@ -732,7 +801,9 @@ void PhysicsWorld::step(float dt)
             // Use the new collision detection system
             CollisionResult collision = checkCollision(A, B);
             if (collision.collided) {
-                resolveContact(A, B, collision.normal, collision.penetration);
+                // Use advanced collision response with PBR properties
+                resolveContactAdvanced(A, B, collision.normal, collision.penetration, 
+                                      collision.contactPoint);
             }
         }
 
@@ -751,7 +822,8 @@ void PhysicsWorld::step(float dt)
             }
 
             if (b->onGround && !b->isModel) {
-                float friction = 5.0f;
+                // Use dynamic friction coefficient
+                float friction = b->dynamicFriction * 10.0f; // Scale for simulation
                 b->velocity.x -= b->velocity.x * friction * subdt;
                 b->velocity.z -= b->velocity.z * friction * subdt;
 
@@ -760,5 +832,81 @@ void PhysicsWorld::step(float dt)
             }
         }
     }
+}
+
+// Advanced collision response considering PBR material properties
+static void resolveContactAdvanced(std::shared_ptr<RigidBody>& a,
+                                  std::shared_ptr<RigidBody>& b,
+                                  const glm::vec3& normal,
+                                  float penetration,
+                                  const glm::vec3& contactPoint)
+{
+    if (!a || !b) return;
+
+    bool aImmovable = a->isStatic || a->isModel;
+    bool bImmovable = b->isStatic || b->isModel;
+
+    float invMassA = aImmovable ? 0.0f : 1.0f / a->mass;
+    float invMassB = bImmovable ? 0.0f : 1.0f / b->mass;
+    float totalInvMass = invMassA + invMassB;
+
+    if (totalInvMass < 1e-6f) return; // both immovable, skip
+
+    // --- Position correction (penetration resolution) ---
+    glm::vec3 correction = normal * penetration / totalInvMass * 0.8f; // 80% factor for stability
+    if (!aImmovable) a->position -= correction * invMassA;
+    if (!bImmovable) b->position += correction * invMassB;
+
+    // --- Relative velocity along normal ---
+    glm::vec3 relVel = b->velocity - a->velocity;
+    float velAlongNormal = glm::dot(relVel, normal);
+
+    // Bodies separating? Skip impulse
+    if (velAlongNormal > 0.0f) return;
+
+    // --- Restitution based on PBR properties ---
+    // Using metallic property to influence bounciness (higher metallic = more bouncy)
+    float e = (a->restitution * a->metallic + b->restitution * b->metallic) * 0.5f;
+    
+    // If one body immovable and normal is mostly vertical, use material properties for bounce
+    if ((aImmovable || bImmovable) && std::abs(normal.y) > 0.5f) {
+        // Use roughness to dampen bounce (rougher surfaces = less bounce)
+        e = e * (1.0f - (a->roughness + b->roughness) * 0.5f);
+    }
+
+    // --- Impulse ---
+    float j = -(1.0f + e) * velAlongNormal / totalInvMass;
+    glm::vec3 impulse = j * normal;
+
+    if (!aImmovable) a->velocity -= impulse * invMassA;
+    if (!bImmovable) b->velocity += impulse * invMassB;
+
+    // --- Friction based on PBR properties ---
+    glm::vec3 tangent = relVel - glm::dot(relVel, normal) * normal;
+    if (glm::length2(tangent) > 1e-6f) {
+        tangent = glm::normalize(tangent);
+        float jt = -glm::dot(relVel, tangent) / totalInvMass;
+        
+        // Use both static and dynamic friction coefficients
+        float frictionCoeff = std::sqrt(a->staticFriction * b->staticFriction);
+        
+        // Adjust friction based on roughness (rougher = more friction)
+        frictionCoeff *= (1.0f + (a->roughness + b->roughness) * 0.5f);
+        
+        float maxJt = j * frictionCoeff;
+        jt = std::clamp(jt, -maxJt, maxJt);
+        glm::vec3 frictionImpulse = jt * tangent;
+
+        if (!aImmovable) a->velocity -= frictionImpulse * invMassA;
+        if (!bImmovable) b->velocity += frictionImpulse * invMassB;
+    }
+
+    // --- Clamp tiny velocities ---
+    if (!aImmovable && glm::length2(a->velocity) < 1e-6f) a->velocity = glm::vec3(0.0f);
+    if (!bImmovable && glm::length2(b->velocity) < 1e-6f) b->velocity = glm::vec3(0.0f);
+
+    // --- Zero rotation ---
+    if (!aImmovable) a->angularVelocity = glm::vec3(0.0f);
+    if (!bImmovable) b->angularVelocity = glm::vec3(0.0f);
 }
 

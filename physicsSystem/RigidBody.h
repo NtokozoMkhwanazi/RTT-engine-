@@ -46,11 +46,61 @@ struct RigidBody {
     glm::vec3 forceAccumulator {0.0f};
     glm::vec3 torqueAccumulator {0.0f};
 
+    // PBR material properties for rendering
+    glm::vec3 albedo {0.5f, 0.5f, 0.5f};  // Base color
+    float metallic {0.0f};                  // Metallic property (0-1)
+    float roughness {0.5f};                 // Roughness property (0-1)
+    float ao {1.0f};                       // Ambient occlusion
+    
+    // Additional physical properties for more realistic simulation
+    float density {1000.0f};               // Density in kg/m³ (water = 1000)
+    float staticFriction {0.5f};           // Static friction coefficient
+    float dynamicFriction {0.3f};          // Dynamic friction coefficient
+    float rollingResistance {0.01f};       // Rolling resistance coefficient
+    float buoyancyFactor {0.0f};           // Buoyancy effect (0 = no buoyancy, 1 = full buoyancy)
+
     RigidBody() = default;
 
     RigidBody(const glm::vec3& pos, const glm::vec3& scl, float m, bool stat, ColliderType type = ColliderType::BOX)
         : position(pos), prevPosition(pos), scale(scl), mass(m), isStatic(stat), colliderType(type)
     {
+        switch (colliderType) {
+            case ColliderType::BOX:
+                computeBoxInertia();
+                break;
+            case ColliderType::SPHERE:
+                computeSphereInertia();
+                break;
+            case ColliderType::CAPSULE:
+                computeCapsuleInertia();
+                break;
+            default:
+                computeBoxInertia();
+                break;
+        }
+    }
+
+    // Method to calculate mass from density and scale
+    void calculateMassFromDensity() {
+        float volume = 1.0f;
+        switch (colliderType) {
+            case ColliderType::BOX:
+                volume = scale.x * scale.y * scale.z;
+                break;
+            case ColliderType::SPHERE:
+                volume = (4.0f/3.0f) * 3.14159f * scale.x * scale.x * scale.x; // Assuming uniform scale
+                break;
+            case ColliderType::CAPSULE:
+                // Volume of capsule = cylinder volume + sphere volume
+                volume = 3.14159f * scale.x * scale.x * scale.y + (4.0f/3.0f) * 3.14159f * scale.x * scale.x * scale.x;
+                break;
+            default:
+                volume = scale.x * scale.y * scale.z;
+                break;
+        }
+        mass = density * volume;
+        
+        // Recalculate inertia based on new mass
         switch (colliderType) {
             case ColliderType::BOX:
                 computeBoxInertia();

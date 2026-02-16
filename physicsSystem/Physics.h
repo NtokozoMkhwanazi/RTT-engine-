@@ -3,6 +3,7 @@
 #include "RigidBody.h"
 //include "Manifolds.h"
 #include "TOI.h"
+#include "AdvancedConstraints.h"
 
 #include <vector>
 #include <memory>
@@ -31,6 +32,17 @@ struct Capsule {
     float radius;
     float height;
     glm::vec3 axis;  // orientation axis
+};
+
+// Fluid simulation properties
+struct FluidVolume {
+    glm::vec3 minBounds;
+    glm::vec3 maxBounds;
+    glm::vec3 flowDirection;
+    float density; // Density of the fluid
+    float viscosity; // Viscosity of the fluid
+    float dragCoefficient; // Drag coefficient for objects in fluid
+    float buoyancyFactor; // Factor affecting buoyancy force
 };
 
 struct FootLock {
@@ -86,6 +98,10 @@ public:
     std::vector<std::shared_ptr<RigidBody>> getBodiesInAABB(const glm::vec3& min, const glm::vec3& max) const;
     std::shared_ptr<RigidBody> getBodyAtPoint(const glm::vec3& point, float radius = 0.1f) const;
 
+    // Fluid simulation functions
+    void addFluidVolume(const struct FluidVolume& fluid);
+    bool isInFluid(const glm::vec3& point, struct FluidVolume& outFluid) const;
+
 private:
     // Broadphase
     void getPotentialPairs(std::vector<std::pair<int,int>>& outPairs);
@@ -118,6 +134,9 @@ private:
     
     // Constraints
     std::vector<class Constraint*> constraints;
+    
+    // Fluid simulation
+    std::vector<FluidVolume> fluidVolumes;
 };
 
 #include "Constraint.h"

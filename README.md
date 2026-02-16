@@ -4,12 +4,6 @@ A lightweight, low-level **C++ 3D engine** built from scratch with a focus on **
 This engine is designed as a **foundation for building 3D games, scientific simulations, VR/AR applications, training environments, and interactive visualizations**.
 
 > ⚠️ This is an **active work-in-progress engine**, developed primarily for learning and experimentation.
-> Screenshot
-<img width="1366" height="768" alt="pallete" src="https://github.com/user-attachments/assets/30f8652a-f8b2-44a5-b21f-2b208e6cf45d" />
-<img width="1366" height="768" alt="pallete2" src="https://github.com/user-attachments/assets/cec64cad-2acf-4771-bc89-a50595bb45b1" />
-<img width="1366" height="768" alt="snipp" src="https://github.com/user-attachments/assets/32d6cdda-3640-4682-bb8c-622e8dd5900c" />
-<img width="1366" height="768" alt="snippets" src="https://github.com/user-attachments/assets/1882dea7-07f7-4a4b-8d8b-686fc336265a" />
-<img width="1366" height="768" alt="snip" src="https://github.com/user-attachments/assets/bae7d0ae-2bc3-4a7a-8e50-8a3417b57eee" />
 
 ---
 
@@ -211,11 +205,19 @@ The animation system now features:
 
 ### Physics System
 The physics system includes:
-- **Multi-shape collision** (boxes, spheres, capsules)
-- **Constraint system** for joints and connections
-- **Advanced raycasting** with detailed hit information
-- **Continuous collision detection** for fast-moving objects
-- **Flexible rigid body** dynamics
+* Custom physics layer with **advanced collision detection**
+* **Support for multiple collision shapes** (boxes, spheres, capsules)
+* Rigid bodies with mass, friction, and restitution
+* **Constraint system** (joints, springs, distance constraints)
+* **Advanced constraint types** (hinge, slider, plane, cloth)
+* Gravity handling
+* Character controller integration
+* **Raycasting and ground detection**
+* **Continuous collision detection (CCD)**
+* **Fluid simulation with buoyancy and drag**
+* **PBR material properties integration** (albedo, metallic, roughness)
+* Collision resolution with penetration correction
+* **Realistic material response** based on PBR properties
 
 ### Memory Management
 - **Object pooling** for performance-critical objects

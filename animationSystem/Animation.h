@@ -43,6 +43,11 @@ public:
     float GetDuration() const;
     float GetTicksPerSecond() const;
     size_t GetTotalKeyframeCount() const;
+    
+    // Animation compression methods
+    void Compress(float positionTolerance = 0.01f, float rotationTolerance = 0.01f, float scaleTolerance = 0.01f);
+    void ReduceKeyframes(float tolerance = 0.01f);
+    size_t GetCompressedSize() const;
 
 //temp
 public:
@@ -50,5 +55,9 @@ public:
     float duration;
     float ticksPerSecond;
     std::map<std::string, BoneAnimation> boneAnimations;
+    
+    // Compression data
+    bool isCompressed = false;
+    float compressionRatio = 1.0f;
 };
 

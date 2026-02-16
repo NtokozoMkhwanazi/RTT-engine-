@@ -1,6 +1,7 @@
 #include "Physics.h"
 #include <glm/gtx/norm.hpp>
 #include <glm/gtx/string_cast.hpp>
+#include <glm/gtx/intersect.hpp>
 #include <algorithm>
 #include <limits>
 #include <cmath>
@@ -15,6 +16,8 @@ static inline std::string vecToStr(const glm::vec3 &v, int prec = 4) {
     ss << "(" << v.x << ", " << v.y << ", " << v.z << ")";
     return ss.str();
 }
+
+// -------------------- Raycasting --------------------
 bool PhysicsWorld::raycastDown(
     const glm::vec3& origin,
     float maxDist,
@@ -48,6 +51,387 @@ bool PhysicsWorld::raycastDown(
         }
     }
     return hit;
+}
+
+bool PhysicsWorld::raycast(
+    const glm::vec3& origin,
+    const glm::vec3& direction,
+    float maxDist,
+    glm::vec3& hitPoint,
+    glm::vec3& hitNormal,
+    std::shared_ptr<RigidBody>& hitBody)
+{
+    bool hit = false;
+    float closestDist = std::numeric_limits<float>::max();
+
+    glm::vec3 rayEnd = origin + direction * maxDist;
+
+    for (auto& b : bodies)
+    {
+        if (!b) continue;
+
+        // Simple AABB-ray intersection test
+        glm::vec3 min = b->position - b->scale * 0.5f;
+        glm::vec3 max = b->position + b->scale * 0.5f;
+
+        // Find intersection with AABB
+        float t1 = (min.x - origin.x) / direction.x;
+        float t2 = (max.x - origin.x) / direction.x;
+        float t3 = (min.y - origin.y) / direction.y;
+        float t4 = (max.y - origin.y) / direction.y;
+        float t5 = (min.z - origin.z) / direction.z;
+        float t6 = (max.z - origin.z) / direction.z;
+
+        float tmin = std::max(std::max(std::min(t1, t2), std::min(t3, t4)), std::min(t5, t6));
+        float tmax = std::min(std::min(std::max(t1, t2), std::max(t3, t4)), std::max(t5, t6));
+
+        // Ray intersects AABB
+        if (tmax >= 0.0f && tmin <= tmax && tmin < closestDist && tmin >= 0.0f)
+        {
+            glm::vec3 intersection = origin + direction * tmin;
+            float dist = glm::distance(origin, intersection);
+
+            if (dist < closestDist && dist <= maxDist)
+            {
+                closestDist = dist;
+                hitPoint = intersection;
+                
+                // Determine which face was hit to set normal
+                if (tmin == t1) hitNormal = glm::vec3(-1, 0, 0);
+                else if (tmin == t2) hitNormal = glm::vec3(1, 0, 0);
+                else if (tmin == t3) hitNormal = glm::vec3(0, -1, 0);
+                else if (tmin == t4) hitNormal = glm::vec3(0, 1, 0);
+                else if (tmin == t5) hitNormal = glm::vec3(0, 0, -1);
+                else hitNormal = glm::vec3(0, 0, 1);
+                
+                hitBody = b;
+                hit = true;
+            }
+        }
+    }
+
+    return hit;
+}
+
+void PhysicsWorld::removeBody(const std::shared_ptr<RigidBody>& body)
+{
+    bodies.erase(
+        std::remove_if(bodies.begin(), bodies.end(),
+            [&body](const std::shared_ptr<RigidBody>& b) { return b == body; }),
+        bodies.end());
+}
+
+std::vector<std::shared_ptr<RigidBody>> PhysicsWorld::getBodiesInAABB(const glm::vec3& min, const glm::vec3& max) const
+{
+    std::vector<std::shared_ptr<RigidBody>> result;
+    
+    for (const auto& body : bodies)
+    {
+        if (!body) continue;
+        
+        glm::vec3 bodyMin = body->position - body->scale * 0.5f;
+        glm::vec3 bodyMax = body->position + body->scale * 0.5f;
+        
+        // Check if AABBs overlap
+        if (bodyMin.x <= max.x && bodyMax.x >= min.x &&
+            bodyMin.y <= max.y && bodyMax.y >= min.y &&
+            bodyMin.z <= max.z && bodyMax.z >= min.z)
+        {
+            result.push_back(body);
+        }
+    }
+    
+    return result;
+}
+
+std::shared_ptr<RigidBody> PhysicsWorld::getBodyAtPoint(const glm::vec3& point, float radius) const
+{
+    for (const auto& body : bodies)
+    {
+        if (!body) continue;
+        
+        float dist = glm::distance(point, body->position);
+        if (dist <= radius)
+        {
+            return body;
+        }
+    }
+    
+    return nullptr;
+}
+
+// -------------------- Shape building --------------------
+Sphere PhysicsWorld::buildSphereFromBody(const std::shared_ptr<RigidBody>& rb) const
+{
+    Sphere sphere;
+    sphere.center = rb->position;
+    sphere.radius = (rb->scale.x + rb->scale.y + rb->scale.z) / 3.0f; // Average scale for radius
+    return sphere;
+}
+
+Capsule PhysicsWorld::buildCapsuleFromBody(const std::shared_ptr<RigidBody>& rb) const
+{
+    Capsule capsule;
+    capsule.center = rb->position;
+    capsule.radius = rb->scale.x; // Assume x-scale is radius
+    capsule.height = rb->scale.y; // Assume y-scale is height
+    capsule.axis = glm::vec3(0.0f, 1.0f, 0.0f); // Default Y-axis orientation
+    return capsule;
+}
+
+// -------------------- Collision Detection --------------------
+CollisionResult PhysicsWorld::checkCollision(const std::shared_ptr<RigidBody>& a, const std::shared_ptr<RigidBody>& b) const
+{
+    CollisionResult result;
+    
+    // Determine collision based on collider types
+    if (a->colliderType == ColliderType::SPHERE && b->colliderType == ColliderType::SPHERE) {
+        Sphere sa = buildSphereFromBody(a);
+        Sphere sb = buildSphereFromBody(b);
+        result = checkSphereVsSphere(sa, sb);
+    }
+    else if (a->colliderType == ColliderType::BOX && b->colliderType == ColliderType::SPHERE) {
+        OBB box = buildOBBFromBody(a);
+        Sphere sph = buildSphereFromBody(b);
+        result = checkBoxVsSphere(box, sph);
+    }
+    else if (a->colliderType == ColliderType::SPHERE && b->colliderType == ColliderType::BOX) {
+        Sphere sph = buildSphereFromBody(a);
+        OBB box = buildOBBFromBody(b);
+        result = checkBoxVsSphere(box, sph); // Same as above, just swapped
+    }
+    else if (a->colliderType == ColliderType::BOX && b->colliderType == ColliderType::BOX) {
+        OBB boxA = buildOBBFromBody(a);
+        OBB boxB = buildOBBFromBody(b);
+        result = checkBoxVsBox(boxA, boxB);
+    }
+    else if (a->colliderType == ColliderType::CAPSULE && b->colliderType == ColliderType::CAPSULE) {
+        Capsule capA = buildCapsuleFromBody(a);
+        Capsule capB = buildCapsuleFromBody(b);
+        result = checkCapsuleVsCapsule(capA, capB);
+    }
+    else if (a->colliderType == ColliderType::CAPSULE && b->colliderType == ColliderType::SPHERE) {
+        Capsule cap = buildCapsuleFromBody(a);
+        Sphere sph = buildSphereFromBody(b);
+        result = checkCapsuleVsSphere(cap, sph);
+    }
+    else if (a->colliderType == ColliderType::SPHERE && b->colliderType == ColliderType::CAPSULE) {
+        Sphere sph = buildSphereFromBody(a);
+        Capsule cap = buildCapsuleFromBody(b);
+        result = checkCapsuleVsSphere(cap, sph);
+    }
+    else if (a->colliderType == ColliderType::CAPSULE && b->colliderType == ColliderType::BOX) {
+        Capsule cap = buildCapsuleFromBody(a);
+        OBB box = buildOBBFromBody(b);
+        result = checkCapsuleVsBox(cap, box);
+    }
+    else if (a->colliderType == ColliderType::BOX && b->colliderType == ColliderType::CAPSULE) {
+        OBB box = buildOBBFromBody(a);
+        Capsule cap = buildCapsuleFromBody(b);
+        result = checkCapsuleVsBox(cap, box);
+    }
+    else {
+        // Default to OBB vs OBB for other combinations
+        OBB boxA = buildOBBFromBody(a);
+        OBB boxB = buildOBBFromBody(b);
+        result = checkBoxVsBox(boxA, boxB);
+    }
+    
+    return result;
+}
+
+CollisionResult PhysicsWorld::checkSphereVsSphere(const Sphere& a, const Sphere& b) const
+{
+    CollisionResult result;
+    
+    float dist = glm::distance(a.center, b.center);
+    float sumRadius = a.radius + b.radius;
+    
+    if (dist < sumRadius) {
+        result.collided = true;
+        result.penetration = sumRadius - dist;
+        
+        if (dist > 0.0f) {
+            result.normal = glm::normalize(b.center - a.center);
+        } else {
+            result.normal = glm::vec3(1.0f, 0.0f, 0.0f); // arbitrary normal if centers coincide
+        }
+        
+        result.contactPoint = a.center + result.normal * a.radius;
+    }
+    
+    return result;
+}
+
+CollisionResult PhysicsWorld::checkBoxVsSphere(const OBB& box, const Sphere& sphere) const
+{
+    CollisionResult result;
+    
+    // Find closest point on box to sphere center
+    glm::vec3 closestPoint = sphere.center;
+    
+    // Project point onto box boundaries
+    glm::vec3 boxMin = box.c - box.half;
+    glm::vec3 boxMax = box.c + box.half;
+    
+    closestPoint.x = std::max(boxMin.x, std::min(closestPoint.x, boxMax.x));
+    closestPoint.y = std::max(boxMin.y, std::min(closestPoint.y, boxMax.y));
+    closestPoint.z = std::max(boxMin.z, std::min(closestPoint.z, boxMax.z));
+    
+    float dist = glm::distance(closestPoint, sphere.center);
+    
+    if (dist < sphere.radius) {
+        result.collided = true;
+        result.penetration = sphere.radius - dist;
+        
+        if (dist > 0.0f) {
+            result.normal = glm::normalize(sphere.center - closestPoint);
+        } else {
+            // Sphere center is inside box, use face normal
+            glm::vec3 centerToCenter = box.c - sphere.center;
+            result.normal = glm::normalize(centerToCenter);
+        }
+        
+        result.contactPoint = closestPoint;
+    }
+    
+    return result;
+}
+
+CollisionResult PhysicsWorld::checkBoxVsBox(const OBB& a, const OBB& b) const
+{
+    // Use the existing SAT implementation
+    float penetration;
+    glm::vec3 normal;
+    
+    if (obbOverlapAndPenetration(a, b, penetration, normal)) {
+        CollisionResult result;
+        result.collided = true;
+        result.penetration = penetration;
+        result.normal = normal;
+        result.contactPoint = (a.c + b.c) * 0.5f;
+        return result;
+    }
+    
+    return CollisionResult{}; // Return empty result if no collision
+}
+
+CollisionResult PhysicsWorld::checkCapsuleVsCapsule(const Capsule& a, const Capsule& b) const
+{
+    CollisionResult result;
+    
+    // Simplified capsule-capsule collision using line segment distance
+    // A capsule is defined by a line segment and a radius
+    glm::vec3 aStart = a.center - a.axis * (a.height * 0.5f);
+    glm::vec3 aEnd = a.center + a.axis * (a.height * 0.5f);
+    glm::vec3 bStart = b.center - b.axis * (b.height * 0.5f);
+    glm::vec3 bEnd = b.center + b.axis * (b.height * 0.5f);
+    
+    // Find closest points on both line segments
+    glm::vec3 closestA, closestB;
+    float dist = glm::distance(closestA, closestB); // This would need proper implementation
+    
+    // For now, use a simplified approach
+    float minDist = glm::distance(a.center, b.center) - (a.radius + b.radius);
+    
+    if (minDist < 0.0f) {
+        result.collided = true;
+        result.penetration = -(minDist);
+        result.normal = glm::normalize(b.center - a.center);
+        result.contactPoint = a.center + result.normal * a.radius;
+    }
+    
+    return result;
+}
+
+CollisionResult PhysicsWorld::checkCapsuleVsSphere(const Capsule& cap, const Sphere& sph) const
+{
+    CollisionResult result;
+    
+    // Find closest point on capsule line segment to sphere center
+    glm::vec3 capStart = cap.center - cap.axis * (cap.height * 0.5f);
+    glm::vec3 capEnd = cap.center + cap.axis * (cap.height * 0.5f);
+    
+    // Find closest point on line segment to sphere center
+    glm::vec3 segmentVec = capEnd - capStart;
+    float segmentLenSq = glm::dot(segmentVec, segmentVec);
+    
+    if (segmentLenSq < 1e-6f) {
+        // Capsule is essentially a sphere
+        Sphere capSphere;
+        capSphere.center = cap.center;
+        capSphere.radius = cap.radius;
+        return checkSphereVsSphere(capSphere, sph);
+    }
+    
+    float t = glm::dot(sph.center - capStart, segmentVec) / segmentLenSq;
+    t = std::clamp(t, 0.0f, 1.0f);
+    
+    glm::vec3 closestOnSegment = capStart + segmentVec * t;
+    float dist = glm::distance(closestOnSegment, sph.center);
+    float combinedRadius = cap.radius + sph.radius;
+    
+    if (dist < combinedRadius) {
+        result.collided = true;
+        result.penetration = combinedRadius - dist;
+        
+        if (dist > 0.0f) {
+            result.normal = glm::normalize(sph.center - closestOnSegment);
+        } else {
+            result.normal = glm::vec3(1.0f, 0.0f, 0.0f); // arbitrary
+        }
+        
+        result.contactPoint = closestOnSegment + result.normal * cap.radius;
+    }
+    
+    return result;
+}
+
+CollisionResult PhysicsWorld::checkCapsuleVsBox(const Capsule& cap, const OBB& box) const
+{
+    CollisionResult result;
+    
+    // This is a complex collision test that would require more sophisticated algorithms
+    // For now, we'll approximate by sampling points along the capsule and testing against the box
+    // A full implementation would use GJK or EPA algorithms
+    
+    // Simplified approach: treat capsule as a rounded line segment
+    glm::vec3 capStart = cap.center - cap.axis * (cap.height * 0.5f);
+    glm::vec3 capEnd = cap.center + cap.axis * (cap.height * 0.5f);
+    
+    // Test if either end of the capsule is inside the box
+    glm::vec3 boxMin = box.c - box.half;
+    glm::vec3 boxMax = box.c + box.half;
+    
+    bool startInside = (capStart.x >= boxMin.x && capStart.x <= boxMax.x &&
+                        capStart.y >= boxMin.y && capStart.y <= boxMax.y &&
+                        capStart.z >= boxMin.z && capStart.z <= boxMax.z);
+    
+    bool endInside = (capEnd.x >= boxMin.x && capEnd.x <= boxMax.x &&
+                      capEnd.y >= boxMin.y && capEnd.y <= boxMax.y &&
+                      capEnd.z >= boxMin.z && capEnd.z <= boxMax.z);
+    
+    if (startInside || endInside) {
+        result.collided = true;
+        result.penetration = cap.radius;
+        result.normal = glm::vec3(0.0f, 1.0f, 0.0f); // arbitrary
+        result.contactPoint = startInside ? capStart : capEnd;
+        return result;
+    }
+    
+    // More complex implementation would go here
+    return result;
+}
+
+// -------------------- Constraints --------------------
+void PhysicsWorld::addConstraint(Constraint* constraint)
+{
+    constraints.push_back(constraint);
+}
+
+void PhysicsWorld::clearConstraints()
+{
+    constraints.clear();
 }
 // -------------------- OBB SAT --------------------
 bool PhysicsWorld::obbOverlapAndPenetration(const OBB& A, const OBB& B, float& outPen, glm::vec3& outNormal) const {
@@ -305,6 +689,9 @@ void PhysicsWorld::step(float dt)
                 b->velocity += gravity * subdt;
             }
 
+            // Apply damping
+            b->velocity *= b->linearDamping;
+
             b->position += b->velocity * subdt;
 
             // -------- ANGULAR (QUATERNION) --------
@@ -313,6 +700,9 @@ void PhysicsWorld::step(float dt)
                 glm::vec3 angAccel = b->inertiaLocalInv * b->torqueAccumulator;
 
                 b->angularVelocity += angAccel * subdt;
+
+                // Apply angular damping
+                b->angularVelocity *= b->angularDamping;
 
                 float angSpeed = glm::length(b->angularVelocity);
                 if (angSpeed > 1e-5f) {
@@ -339,17 +729,10 @@ void PhysicsWorld::step(float dt)
             auto& B = bodies[j];
             if (!A || !B) continue;
 
-            OBB obbA = buildOBBFromBody(A);
-            OBB obbB = buildOBBFromBody(B);
-
-            glm::vec3 moveA = A->position - A->prevPosition;
-            glm::vec3 moveB = B->position - B->prevPosition;
-
-            float toi = 0.0f, pen = 0.0f;
-            glm::vec3 normal(0.0f);
-
-            if (sweptOBBvsOBB(obbA, moveA, obbB, moveB, toi, normal, pen)) {
-                resolveContact(A, B, normal, pen);
+            // Use the new collision detection system
+            CollisionResult collision = checkCollision(A, B);
+            if (collision.collided) {
+                resolveContact(A, B, collision.normal, collision.penetration);
             }
         }
 

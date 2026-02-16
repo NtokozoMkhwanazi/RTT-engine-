@@ -1,5 +1,5 @@
 # ============================================================
-#  Game Engine Makefile 
+#  Game Engine Makefile (Industry-Style)
 #  - Debug / Release builds
 #  - Object files in build/
 #  - Executable in bin/
@@ -20,7 +20,7 @@ BUILD_DIR := build
 # --- Include paths ---
 INCLUDES := -I. -Isrc
 
-# --- Libraries (engine dependencies) ---
+# --- Libraries (your engine dependencies) ---
 LIBS := -lassimp -lopenal -lz -ldl -lglfw -lGL -lX11 -pthread
 
 # --- Mode flags ---
@@ -39,6 +39,9 @@ SRC_CPP := \
 	$(wildcard physicsSystem/*.cpp) \
 	$(wildcard playerSystem/*.cpp) \
 	$(wildcard shaderSystem/*.cpp) \
+	$(wildcard renderer/*.cpp) \
+	$(wildcard lighting/*.cpp) \
+	$(wildcard memory/*.cpp) \
 	test.cpp
 
 SRC_C := \

@@ -3,6 +3,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <GLFW/glfw3.h>
 #include <iostream>
+#include <vector>
 
 class flyCamera {
 public:
@@ -19,8 +20,11 @@ public:
 
     // Camera options
     float DistanceToTarget;
+    float MinDistance;
+    float MaxDistance;
     float MouseSensitivity;
     float Zoom;
+    float FieldOfView;
 
     // Mouse state
     float LastX, LastY;
@@ -28,6 +32,16 @@ public:
 
     // Smooth follow
     float followSpeed = 5.0f;
+    float rotationSpeed = 2.0f;
+
+    // Camera shake
+    struct ShakeEffect {
+        float intensity = 0.0f;
+        float duration = 0.0f;
+        float decayRate = 1.0f;
+        glm::vec3 direction = glm::vec3(1.0f);
+    };
+    ShakeEffect currentShake;
 
     // Constructor
     flyCamera(glm::vec3 startPos = glm::vec3(0.0f, 2.0f, 10.0f),
@@ -36,8 +50,8 @@ public:
               float pitch = 20.0f,
               float distance = 8.0f)
         : WorldUp(up), Yaw(yaw), Pitch(pitch),
-          MouseSensitivity(0.2f), Zoom(45.0f),
-          DistanceToTarget(distance)
+          MouseSensitivity(0.2f), Zoom(45.0f), FieldOfView(45.0f),
+          DistanceToTarget(distance), MinDistance(1.0f), MaxDistance(50.0f)
     {
         Position = startPos;
         Target = glm::vec3(0.0f);
@@ -49,6 +63,11 @@ public:
     // Get view matrix
     glm::mat4 GetViewMatrix() {
         return glm::lookAt(Position, Target, Up);
+    }
+
+    // Get projection matrix
+    glm::mat4 GetProjectionMatrix(float aspectRatio) {
+        return glm::perspective(glm::radians(FieldOfView), aspectRatio, 0.1f, 1000.0f);
     }
 
     // Smooth third-person follow
@@ -90,12 +109,12 @@ public:
         xoffset *= MouseSensitivity;
         yoffset *= MouseSensitivity;
 
-        Yaw += xoffset;
-        Pitch += yoffset;
+        Yaw += xoffset * rotationSpeed;
+        Pitch += yoffset * rotationSpeed;
 
         // Clamp pitch
-        if (Pitch > 80.0f) Pitch = 80.0f;
-        if (Pitch < -30.0f) Pitch = -30.0f;
+        if (Pitch > 89.0f) Pitch = 89.0f;
+        if (Pitch < -89.0f) Pitch = -89.0f;
 
         updateCameraVectors();
     }
@@ -103,11 +122,91 @@ public:
     // Scroll zoom
     void ProcessMouseScroll(float yoffset) {
         DistanceToTarget -= yoffset;
-        if (DistanceToTarget < 0.00f) DistanceToTarget = 0.00f;
-        if (DistanceToTarget > 50.0f) DistanceToTarget = 50.0f;
+        if (DistanceToTarget < MinDistance) DistanceToTarget = MinDistance;
+        if (DistanceToTarget > MaxDistance) DistanceToTarget = MaxDistance;
+    }
+
+    // Camera shake effect
+    void AddShake(float intensity, float duration, const glm::vec3& direction = glm::vec3(1.0f)) {
+        currentShake.intensity = intensity;
+        currentShake.duration = duration;
+        currentShake.decayRate = intensity / duration;
+        currentShake.direction = direction;
+    }
+
+    // Update camera shake
+    void UpdateShake(float deltaTime) {
+        if (currentShake.duration > 0.0f) {
+            currentShake.duration -= deltaTime;
+            if (currentShake.duration <= 0.0f) {
+                currentShake.intensity = 0.0f;
+            } else {
+                currentShake.intensity -= currentShake.decayRate * deltaTime;
+            }
+            
+            // Apply shake offset
+            if (currentShake.intensity > 0.0f) {
+                // Generate a pseudo-random offset based on time
+                float time = glfwGetTime();
+                glm::vec3 shakeOffset;
+                shakeOffset.x = (sin(time * 100.0f) * 0.5f - 0.25f) * currentShake.intensity * currentShake.direction.x;
+                shakeOffset.y = (cos(time * 123.0f) * 0.5f - 0.25f) * currentShake.intensity * currentShake.direction.y;
+                shakeOffset.z = (sin(time * 147.0f) * 0.5f - 0.25f) * currentShake.intensity * currentShake.direction.z;
+                
+                Position += shakeOffset;
+                Target += shakeOffset;
+            }
+        }
+    }
+
+    // Set field of view
+    void SetFieldOfView(float fov) {
+        FieldOfView = glm::clamp(fov, 1.0f, 120.0f);
+    }
+
+    // Cinematic camera modes
+    enum class CameraMode {
+        FREE_LOOK,
+        THIRD_PERSON,
+        FIRST_PERSON,
+        ORBITAL
+    };
+
+    void SetCameraMode(CameraMode mode) {
+        cameraMode = mode;
+    }
+
+    // Collision detection for camera
+    void SetCollisionEnabled(bool enabled) {
+        collisionEnabled = enabled;
+    }
+
+    void SetCollisionDistance(float distance) {
+        collisionDistance = distance;
+    }
+
+    // Update camera with collision detection
+    void UpdateWithCollision(const std::vector<glm::vec3>& collisionPoints) {
+        if (!collisionEnabled) return;
+
+        // Check for collisions with nearby objects
+        for (const auto& point : collisionPoints) {
+            float dist = glm::distance(Position, point);
+            if (dist < collisionDistance) {
+                // Move camera away from collision point
+                glm::vec3 direction = glm::normalize(Position - point);
+                Position = point + direction * collisionDistance;
+            }
+        }
+
+        updateCameraVectors();
     }
 
 private:
+    CameraMode cameraMode = CameraMode::FREE_LOOK;
+    bool collisionEnabled = false;
+    float collisionDistance = 0.5f;
+
     void updateCameraVectors() {
         // Calculate front, right, up vectors based on orbit
         glm::vec3 front = glm::normalize(Target - Position);

@@ -3,7 +3,6 @@
 #include "RigidBody.h"
 //include "Manifolds.h"
 #include "TOI.h"
-#include "AdvancedConstraints.h"
 
 #include <vector>
 #include <memory>
@@ -101,6 +100,14 @@ public:
     // Fluid simulation functions
     void addFluidVolume(const struct FluidVolume& fluid);
     bool isInFluid(const glm::vec3& point, struct FluidVolume& outFluid) const;
+    
+    // Advanced collision response
+    void resolveContactAdvanced(std::shared_ptr<RigidBody>& a,
+                               std::shared_ptr<RigidBody>& b,
+                               const glm::vec3& normal,
+                               float penetration,
+                               const glm::vec3& contactPoint,
+                               float subdt);
 
 private:
     // Broadphase

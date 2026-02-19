@@ -34,19 +34,8 @@ Animator::Animator(const Skeleton *skel)
     currBoneWorldPos.resize(boneCount, glm::vec3(0.0f));
     ikOffsets.resize(boneCount, glm::vec3(0.0f));
 
-    std::cout << "[Animator] Created with skeleton containing " << boneCount << " bones\n";
-    if (skeleton)
-    {
-        std::cout << "[Animator] Skeleton root bone index: " << skeleton->rootBoneIndex << "\n";
-        std::cout << "[Animator] Global inverse transform:\n";
-        std::cout << "  " << glm::to_string(skeleton->globalInverseTransform[0]) << "\n";
-        std::cout << "  " << glm::to_string(skeleton->globalInverseTransform[1]) << "\n";
-        std::cout << "  " << glm::to_string(skeleton->globalInverseTransform[2]) << "\n";
-        std::cout << "  " << glm::to_string(skeleton->globalInverseTransform[3]) << "\n";
-    }
-    
     // Initialize caching system
-    cachedAnimationTimes.reserve(10); // Reserve space for up to 10 animations
+    cachedAnimationTimes.reserve(10);
     cachedBoneTransforms.reserve(10);
 }
 
@@ -61,6 +50,7 @@ void Animator::Play(Animation *anim)
     activeAnimations.clear();
     if (anim) {
         activeAnimations.emplace_back(anim, 1.0f, 0.0f);  // Single animation with full weight
+        std::cout << "[Animator::Play] Playing: " << anim->name << " (weight=1.0)\n";
     }
 
     // IMPORTANT: reset root motion state when a new animation starts
@@ -71,23 +61,53 @@ void Animator::Play(Animation *anim)
 
 void Animator::BlendTo(Animation *anim, float duration)
 {
-    if (!anim || anim == current)
+    if (!anim) {
+        std::cout << "[BlendTo] NULL animation!\n";
         return;
+    }
 
+    std::cout << "[BlendTo] ptr=" << anim << " dur=" << anim->duration 
+              << " bones=" << anim->boneAnimations.size()
+              << " activeLayers=" << activeAnimations.size() << "\n";
+
+    // Check if this animation is already the main active one at full weight
+    if (!activeAnimations.empty() && activeAnimations[0].animation == anim && activeAnimations[0].targetWeight >= 0.99f) {
+        std::cout << "[BlendTo] Already playing THIS animation (ptr match)\n";
+        return;
+    }
+
+    // Check if this animation is already in the active list (by pointer)
+    for (size_t i = 0; i < activeAnimations.size(); i++) {
+        if (activeAnimations[i].animation == anim) {
+            std::cout << "[BlendTo] Found in layer " << i << ", boosting weight\n";
+            // Already active - boost it to full weight
+            activeAnimations[i].targetWeight = 1.0f;
+            activeAnimations[i].blendDuration = duration;
+            activeAnimations[i].blendProgress = 0.0f;
+            // Reduce other animations
+            for (auto& other : activeAnimations) {
+                if (other.animation != anim) {
+                    other.targetWeight = 0.0f;
+                    other.blendDuration = duration;
+                }
+            }
+            return;
+        }
+    }
+
+    // Animation not in list - add it with target weight 1.0
+    std::cout << "[BlendTo] Adding NEW animation layer\n";
     next = anim;
     blendTime = 0.0f;
     blendDuration = glm::max(duration, 0.001f);
 
-    // Also handle the new animation system
-    if (activeAnimations.empty() && current) {
-        // If we're using the old system, convert to new system
-        activeAnimations.emplace_back(current, 1.0f, duration);
-        activeAnimations.emplace_back(anim, 0.0f, duration);
+    if (activeAnimations.empty()) {
+        activeAnimations.emplace_back(anim, 1.0f, 0.0f);
     } else {
-        // Add the new animation with 0 initial weight
         activeAnimations.emplace_back(anim, 0.0f, duration);
-        
-        // Reduce the weight of the previous animations
+        activeAnimations.back().targetWeight = 1.0f;
+
+        // Reduce weight of existing animations
         for (auto& layer : activeAnimations) {
             if (layer.animation != anim) {
                 layer.targetWeight = 0.0f;
@@ -101,7 +121,7 @@ void Animator::Update(float dt)
 {
     if (!skeleton)
     {
-        std::cout << "[Animator::Update] ERROR: No skeleton!\n";
+        std::cerr << "[Animator::Update] ERROR: No skeleton!\n";
         return;
     }
 
@@ -120,18 +140,13 @@ void Animator::Update(float dt)
                 const_cast<AnimationEventTrigger&>(event).triggered = false;
             }
         }
-        
+
         UpdateAnimationBlending(dt);
     }
-
-    std::cout << "[Animator::Update] dt=" << dt << ", active animations: " << activeAnimations.size() << "\n";
 
     // Initialize matrices
     finalBoneMatrices.assign(skeleton->bones.size(), glm::mat4(1.0f));
     globalBoneMatrices.assign(skeleton->bones.size(), glm::mat4(1.0f));
-
-    std::cout << "[Animator::Update] About to evaluate nodes, skeleton root node name: " << skeleton->rootNode.name << "\n";
-    std::cout << "[Animator::Update] Number of skeleton bones: " << skeleton->bones.size() << "\n";
 
     // Process active animations with proper blending
     if (!activeAnimations.empty())
@@ -169,6 +184,9 @@ void Animator::Update(float dt)
         {
             // Calculate total weight for normalization
             float totalWeight = 0.0f;
+            int dominantLayerIdx = -1;
+            float maxWeight = -1.0f;
+            
             for (const auto& layer : activeAnimations)
             {
                 if (layer.animation && layer.weight > 0.0f && layer.enabled)
@@ -187,30 +205,32 @@ void Animator::Update(float dt)
                 // For proper blending, we need to evaluate each animation separately
                 // and then blend the resulting transforms. This requires a more complex approach
                 // than what's currently implemented in EvaluateNode.
-                
+
                 // For now, we'll use a weighted average approach for the first animation
                 // with a fallback to the legacy system if there are multiple animations
                 if (activeAnimations.size() == 1 && activeAnimations[0].animation && activeAnimations[0].enabled)
                 {
                     // Single animation case - straightforward
                     EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), activeAnimations[0].animation, activeAnimations[0].time);
+                    dominantLayerIdx = 0;
                 }
                 else
                 {
                     // Multiple animations - we need to blend them
                     // This is a simplified approach that prioritizes the animation with highest weight
                     const AnimationLayer* dominantLayer = nullptr;
-                    float maxWeight = -1.0f;
-                    
-                    for (const auto& layer : activeAnimations)
+
+                    for (size_t i = 0; i < activeAnimations.size(); i++)
                     {
+                        const auto& layer = activeAnimations[i];
                         if (layer.animation && layer.weight > maxWeight && layer.enabled)
                         {
                             maxWeight = layer.weight;
                             dominantLayer = &layer;
+                            dominantLayerIdx = i;
                         }
                     }
-                    
+
                     if (dominantLayer && dominantLayer->animation)
                     {
                         // Use the animation with the highest weight as the base
@@ -223,7 +243,26 @@ void Animator::Update(float dt)
                     }
                 }
             }
-            
+
+            // Debug: print dominant animation layer every 30 frames
+            static int debugFrame = 0;
+            debugFrame++;
+            if (debugFrame % 30 == 0 && dominantLayerIdx >= 0) {
+                auto& layer = activeAnimations[dominantLayerIdx];
+                std::cout << "[Animator] Layer#" << dominantLayerIdx
+                          << " ptr=" << layer.animation
+                          << " name=" << layer.animation->name
+                          << " dur=" << layer.animation->duration
+                          << " time=" << layer.time
+                          << " weight=" << layer.weight << "\n";
+                
+                // Print a sample bone transform to verify animation is changing
+                if (!finalBoneMatrices.empty()) {
+                    glm::mat4& boneMat = finalBoneMatrices[55];  // rightupleg
+                    std::cout << "  [Bone55] pos=(" << boneMat[3].x << "," << boneMat[3].y << "," << boneMat[3].z << ")\n";
+                }
+            }
+
             // Update cache if caching is enabled
             if (useCaching)
             {
@@ -232,7 +271,7 @@ void Animator::Update(float dt)
                 {
                     cachedAnimationTimes[i] = activeAnimations[i].time;
                 }
-                
+
                 cachedBoneTransforms.resize(1);
                 cachedBoneTransforms[0] = finalBoneMatrices;
                 cacheValid = true;
@@ -247,12 +286,10 @@ void Animator::Update(float dt)
         {
             animatorTime += dt * current->GetTicksPerSecond();
             animatorTime = fmod(animatorTime, current->GetDuration());
-            std::cout << "[Animator::Update] Animation time updated: " << animatorTime << "/" << current->GetDuration() << "\n";
         }
         else
         {
             current = nullptr;
-            std::cout << "[Animator::Update] Animation paused or null\n";
         }
 
         EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, animatorTime);
@@ -273,25 +310,30 @@ void Animator::Update(float dt)
     if (rootIdx >= 0 && rootIdx < (int)currBoneWorldPos.size())
     {
         glm::vec3 currRoot = currBoneWorldPos[rootIdx];
-        std::cout << "[Animator::Update] Root bone position: " << glm::to_string(currRoot) << "\n";
 
         if (!hasPrevRoot)
         {
             prevRootPos = currRoot;
             hasPrevRoot = true;
-            std::cout << "[Animator::Update] Initialized root position\n";
         }
         else
         {
             rootMotionDelta = currRoot - prevRootPos;
             prevRootPos = currRoot;
-            std::cout << "[Animator::Update] Root motion delta: " << glm::to_string(rootMotionDelta) << "\n";
         }
 
         rootMotionDelta.y = 0.0f;
     }
-
-    std::cout << "[Animator::Update] Completed update, final matrices size: " << finalBoneMatrices.size() << "\n";
+    
+    // Cleanup: Remove animations with 0 weight to prevent buildup
+    if (activeAnimations.size() > 4) {
+        activeAnimations.erase(
+            std::remove_if(activeAnimations.begin(), activeAnimations.end(),
+                [](const AnimationLayer& layer) { 
+                    return layer.weight < 0.01f && layer.targetWeight < 0.01f; 
+                }),
+            activeAnimations.end());
+    }
 }
 
 void Animator::EvaluateNode(
@@ -301,8 +343,6 @@ void Animator::EvaluateNode(
     float blendFactor)
 {
     std::string name = NormalizeBoneName(node.name);
-
-    std::cout << "[EvaluateNode] Processing bone: " << name << ", node.boneIndex: " << node.boneIndex << "\n";
 
     glm::mat4 bindLocal = node.transform;
 
@@ -314,61 +354,44 @@ void Animator::EvaluateNode(
     glm::decompose(bindLocal, bindScale, bindRot, bindPos, skew, perspective);
     bindRot = glm::normalize(bindRot);
 
-    std::cout << "[EvaluateNode] Bind pose - Pos: " << glm::to_string(bindPos)
-              << ", Rot: " << glm::to_string(bindRot)
-              << ", Scale: " << glm::to_string(bindScale) << "\n";
-
     // ---- Start from bind pose ----
+    // Note: We'll override these with animation data if available
     glm::vec3 pos = bindPos;
     glm::quat rot = bindRot;
     glm::vec3 scale = bindScale;
 
     // ---- Apply animation (override bind channels) ----
     Animation *animationToUse = blendAnim ? blendAnim : current;
-    float timeToUse = blendAnim ? blendFactor : animatorTime; // Use the blendFactor as the time for the blend animation
+    float timeToUse = blendAnim ? blendFactor : animatorTime;
 
     if (animationToUse)
     {
-        std::cout << "[EvaluateNode] Animation to use: " << animationToUse->name << "\n";
         if (const BoneAnimation *boneAnim = animationToUse->GetBoneAnimation(name))
         {
-            std::cout << "[EvaluateNode] Found bone animation for: " << name << "\n";
-
-            // Animation processing for all bones
+            // Animation completely replaces bind pose
+            if (boneAnim->HasPositionAnimation())
+            {
+                pos = boneAnim->InterpolatePosition(timeToUse);
+                
+                // Lock root position if enabled (prevents sliding)
+                if (lockRootPosition && node.boneIndex == skeleton->rootBoneIndex) {
+                    pos = bindPos;  // Use bind pose position, ignore animation
+                }
+            }
 
             if (boneAnim->HasRotationAnimation())
             {
                 rot = boneAnim->InterpolateRotation(timeToUse);
-                std::cout << "[EvaluateNode] Applied rotation animation to: " << name << "\n";
             }
 
             if (boneAnim->HasScaleAnimation())
             {
                 scale = boneAnim->InterpolateScale(timeToUse);
-                std::cout << "[EvaluateNode] Applied scale animation to: " << name << "\n";
             }
 
             if (debugForceIdentityScale)
                 scale = glm::vec3(1.0f);
-
-            if (boneAnim->HasPositionAnimation())
-            {
-                pos = boneAnim->InterpolatePosition(timeToUse);
-                std::cout << "[EvaluateNode] Applied position animation to bone: " << name << "\n";
-            }
-            else
-            {
-                std::cout << "[EvaluateNode] Kept bind pose position for bone: " << name << "\n";
-            }
         }
-        else
-        {
-            std::cout << "[EvaluateNode] No bone animation found for: " << name << "\n";
-        }
-    }
-    else
-    {
-        std::cout << "[EvaluateNode] No animation to use\n";
     }
 
     // ---- Rebuild local transform ----
@@ -377,8 +400,6 @@ void Animator::EvaluateNode(
         glm::mat4_cast(rot) *
         glm::scale(glm::mat4(1.0f), scale);
 
-    std::cout << "[EvaluateNode] Local transform built for: " << name << "\n";
-
     // ---- Global ----
     glm::mat4 globalTransform = parent * localTransform;
 
@@ -386,8 +407,6 @@ void Animator::EvaluateNode(
 
     if (boneIndex != -1)
     {
-        std::cout << "[EvaluateNode] Processing bone index: " << boneIndex << " for: " << name << "\n";
-
         glm::mat4 ikOffsetMat =
             glm::translate(glm::mat4(1.0f), ikOffsets[boneIndex]);
 
@@ -395,28 +414,24 @@ void Animator::EvaluateNode(
 
         globalBoneMatrices[boneIndex] = finalGlobal;
 
+        // SKINNING FORMULA:
+        // finalBoneMatrix = boneGlobalTransform * boneOffset
+        // This transforms vertices from bind pose to current pose
         finalBoneMatrices[boneIndex] =
-            skeleton->globalInverseTransform *
             finalGlobal *
             skeleton->bones[boneIndex].offset;
-
-        std::cout << "[EvaluateNode] Final bone matrix computed for index: " << boneIndex << "\n";
 
         // Pass the finalGlobal (with IK offset) as parent to children to maintain proper hierarchy
         for (const auto &child : node.children)
         {
-            std::cout << "[EvaluateNode] Recursing to child of: " << name << "\n";
             EvaluateNode(child, finalGlobal, blendAnim, blendFactor);
         }
     }
     else
     {
-        std::cout << "[EvaluateNode] Bone index is -1 for: " << name << ", skipping matrix computation\n";
-
         // Still pass the global transform to children for proper hierarchy
         for (const auto &child : node.children)
         {
-            std::cout << "[EvaluateNode] Recursing to child of: " << name << "\n";
             EvaluateNode(child, globalTransform, blendAnim, blendFactor);
         }
     }
@@ -456,12 +471,6 @@ glm::vec3 Animator::ConsumeRootMotion()
 
 const std::vector<glm::mat4> &Animator::GetFinalBoneMatrices() const
 {
-    std::cout << "[GetFinalBoneMatrices] Returning " << finalBoneMatrices.size() << " matrices\n";
-    if (!finalBoneMatrices.empty())
-    {
-        std::cout << "[GetFinalBoneMatrices] First matrix: " << glm::to_string(finalBoneMatrices[0][0]) << "\n";
-        std::cout << "[GetFinalBoneMatrices] Last matrix: " << glm::to_string(finalBoneMatrices.back()[0]) << "\n";
-    }
     return finalBoneMatrices;
 }
 
@@ -604,101 +613,140 @@ void Animator::SetAnimationEventCallback(const AnimationEventCallback& callback)
 
 void Animator::UpdateAnimationBlending(float dt)
 {
-    // Update animation times and blend weights
+    // First pass: update times and detect loops
+    std::vector<int> layersNeedingCrossFade;
+
+    for (size_t i = 0; i < activeAnimations.size(); i++)
+    {
+        auto& layer = activeAnimations[i];
+        if (!layer.animation || !layer.enabled) continue;
+
+        float animDuration = layer.animation->GetDuration();
+        float ticksPerSecond = layer.animation->GetTicksPerSecond();
+
+        if (animDuration <= 0.01f) continue;  // Skip very short animations
+
+        float prevTime = layer.time;
+        layer.time += dt * ticksPerSecond;
+
+        // If we crossed the loop point this frame, mark for cross-fade
+        if (prevTime < animDuration && layer.time >= animDuration) {
+            layersNeedingCrossFade.push_back(i);
+            layer.time = fmod(layer.time, animDuration);
+        }
+    }
+
+    // Create cross-fade layers for animations that looped
+    for (int layerIdx : layersNeedingCrossFade) {
+        if (activeAnimations.size() >= 6) break;  // Limit layers
+
+        auto& sourceLayer = activeAnimations[layerIdx];
+        float crossFadeDuration = 0.15f;  // 150ms cross-fade
+
+        // Create new layer starting from beginning
+        AnimationLayer crossFadeLayer(sourceLayer.animation, 1.0f, crossFadeDuration);
+        crossFadeLayer.time = 0.0f;
+        crossFadeLayer.targetWeight = 1.0f;
+        crossFadeLayer.blendProgress = 0.0f;
+
+        // Mark source layer to fade out
+        sourceLayer.targetWeight = 0.0f;
+        sourceLayer.blendDuration = crossFadeDuration;
+        sourceLayer.blendProgress = 0.0f;
+
+        activeAnimations.push_back(crossFadeLayer);
+    }
+
+    // Second pass: update blend weights
     for (auto& layer : activeAnimations)
     {
-        if (layer.animation && layer.enabled)
+        if (!layer.animation || !layer.enabled) continue;
+
+        // Update blend progress and interpolate weight
+        if (layer.blendProgress < 1.0f && layer.blendDuration > 0.0f)
         {
-            layer.time += dt * layer.animation->GetTicksPerSecond();
-            layer.time = fmod(layer.time, layer.animation->GetDuration());
-            
-            // Update blend progress if needed
-            if (layer.blendProgress < 1.0f)
-            {
-                layer.blendProgress = glm::min(1.0f, layer.blendProgress + (dt / layer.blendDuration));
-                
-                // Interpolate weight based on blend progress
-                layer.weight = glm::mix(layer.weight, layer.targetWeight, layer.blendProgress);
+            layer.blendProgress = glm::min(1.0f, layer.blendProgress + (dt / layer.blendDuration));
+            float blendSpeed = 1.0f / layer.blendDuration;
+            layer.weight = glm::mix(layer.weight, layer.targetWeight, blendSpeed * dt);
+
+            if (layer.blendProgress >= 1.0f) {
+                layer.weight = layer.targetWeight;
             }
-            
-            // Handle fade in/out effects
-            // Note: We would need to store original durations to properly calculate progress
-            // For now, we'll implement a simpler approach by tracking fade state separately
-            // This would require extending the AnimationLayer structure to store original values
-            // For simplicity, we'll just handle the timing here
-            if (layer.fadeInDuration > 0.0f)
+        }
+
+        // Trigger animation events
+        for (auto& event : animationEvents)
+        {
+            if (event.animation == layer.animation)
             {
-                // Fade in logic
-                layer.fadeInDuration -= dt;
-                if (layer.fadeInDuration <= 0.0f)
+                float lastFrameTime = layer.time - (dt * layer.animation->GetTicksPerSecond());
+                bool shouldTrigger = false;
+
+                if ((lastFrameTime <= event.time && layer.time >= event.time) ||
+                    (lastFrameTime > layer.time && (lastFrameTime >= event.time || layer.time <= event.time)))
                 {
-                    layer.fadeInDuration = 0.0f;
+                    shouldTrigger = true;
                 }
-            }
-            
-            if (layer.fadeOutDuration > 0.0f)
-            {
-                // Fade out logic
-                layer.fadeOutDuration -= dt;
-                if (layer.fadeOutDuration <= 0.0f)
+
+                if (shouldTrigger && (event.repeatable || !event.triggered))
                 {
-                    layer.fadeOutDuration = 0.0f;
-                    // Optionally disable the layer when fade out is complete
-                    // layer.enabled = false; // Uncomment if you want auto-disable
-                }
-            }
-            
-            // Trigger animation events if any occur at this time
-            for (auto& event : animationEvents)
-            {
-                if (event.animation == layer.animation)
-                {
-                    // Check if we just passed an event time
-                    float lastFrameTime = layer.time - (dt * layer.animation->GetTicksPerSecond());
-                    bool shouldTrigger = false;
-                    
-                    // Check if the event should trigger
-                    if ((lastFrameTime <= event.time && layer.time >= event.time) ||
-                        (lastFrameTime > layer.time && (lastFrameTime >= event.time || layer.time <= event.time))) // Handle loop-around
-                    {
-                        shouldTrigger = true;
+                    if (!event.repeatable) {
+                        const_cast<AnimationEventTrigger&>(event).triggered = true;
                     }
-                    
-                    if (shouldTrigger && (event.repeatable || !event.triggered))
-                    {
-                        // Mark as triggered if not repeatable
-                        if (!event.repeatable) {
-                            const_cast<AnimationEventTrigger&>(event).triggered = true;
-                        }
-                        
-                        // Call the custom callback if available
-                        if (event.callback) {
-                            event.callback();
-                        }
-                        // Otherwise call the default callback
-                        else if (eventCallback) {
-                            eventCallback(event.eventName);
-                        }
+
+                    if (event.callback) {
+                        event.callback();
+                    }
+                    else if (eventCallback) {
+                        eventCallback(event.eventName);
                     }
                 }
             }
         }
     }
+
+    // Cleanup: Remove layers that have faded out (aggressive cleanup)
+    if (activeAnimations.size() > 1) {
+        size_t before = activeAnimations.size();
+        activeAnimations.erase(
+            std::remove_if(activeAnimations.begin(), activeAnimations.end(),
+                [](const AnimationLayer& layer) {
+                    return layer.weight < 0.01f && layer.targetWeight < 0.01f;
+                }),
+            activeAnimations.end());
+        if (activeAnimations.size() != before) {
+            std::cout << "[Cleanup] Removed " << (before - activeAnimations.size()) << " faded layers\n";
+        }
+    }
     
+    // Reorder: Put layer with highest target weight first (this is the "current" animation)
+    if (activeAnimations.size() > 1) {
+        size_t bestIdx = 0;
+        float bestTarget = activeAnimations[0].targetWeight;
+        for (size_t i = 1; i < activeAnimations.size(); i++) {
+            if (activeAnimations[i].targetWeight > bestTarget) {
+                bestTarget = activeAnimations[i].targetWeight;
+                bestIdx = i;
+            }
+        }
+        if (bestIdx != 0) {
+            std::iter_swap(activeAnimations.begin(), activeAnimations.begin() + bestIdx);
+            std::cout << "[Reorder] Swapped layers, now first has target=" << bestTarget << "\n";
+        }
+    }
+
     // Update queued animations
     for (auto& queued : queuedAnimations)
     {
         queued.blendProgress = glm::min(1.0f, queued.blendProgress + (dt / queued.blendDuration));
         queued.weight = glm::mix(0.0f, queued.targetWeight, queued.blendProgress);
-        
+
         if (queued.blendProgress >= 1.0f)
         {
-            // Move to active animations
             activeAnimations.push_back(queued);
         }
     }
-    
-    // Remove completed queued animations
+
     queuedAnimations.erase(
         std::remove_if(queuedAnimations.begin(), queuedAnimations.end(),
                       [](const AnimationLayer& layer) { return layer.blendProgress >= 1.0f; }),
@@ -923,12 +971,183 @@ void Animator::UpdateAnimationLOD(const glm::vec3& viewerPosition, const glm::ve
         // Far away - low detail
         SetAnimationQuality(AnimationQualityLevel::LOW);
     }
-    
+
     // Also adjust based on number of bones if needed
     if (skeleton && skeleton->bones.size() > highDetailBoneThreshold) {
         // Too many bones for high quality, reduce quality
         if (qualityLevel == AnimationQualityLevel::HIGH) {
             SetAnimationQuality(AnimationQualityLevel::MEDIUM);
         }
+    }
+}
+
+// ============================================================
+// FOOT IK IMPLEMENTATION
+// ============================================================
+
+void Animator::SetFootIKEnabled(bool enabled)
+{
+    footIKSettings.enabled = enabled;
+}
+
+void Animator::SetFootIKSettings(const FootIKSettings& settings)
+{
+    footIKSettings = settings;
+}
+
+void Animator::SetFloorHeight(float height)
+{
+    footIKSettings.floorHeight = height;
+}
+
+void Animator::SetFootBones(int leftFoot, int rightFoot, int leftToe, int rightToe)
+{
+    footIKSettings.leftFootBone = leftFoot;
+    footIKSettings.rightFootBone = rightFoot;
+    footIKSettings.leftToeBone = leftToe;
+    footIKSettings.rightToeBone = rightToe;
+}
+
+void Animator::UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMoving)
+{
+    if (!footIKSettings.enabled || !skeleton) return;
+
+    // Disable foot locking when moving - feet should follow animation naturally
+    if (isMoving) {
+        // Release any locked feet
+        leftFootIK.isLocked = false;
+        leftFootIK.lockWeight = glm::max(0.0f, leftFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed * 2.0f);
+        leftFootIK.ankleOffset = glm::vec3(0.0f);
+        
+        rightFootIK.isLocked = false;
+        rightFootIK.lockWeight = glm::max(0.0f, rightFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed * 2.0f);
+        rightFootIK.ankleOffset = glm::vec3(0.0f);
+        return;
+    }
+
+    int leftFoot = footIKSettings.leftFootBone;
+    int rightFoot = footIKSettings.rightFootBone;
+
+    if (leftFoot < 0 || rightFoot < 0) return;  // Foot bones not set
+
+    float floorY = footIKSettings.floorHeight;
+    
+    // Update left foot IK
+    if (leftFoot >= 0 && leftFoot < (int)currBoneWorldPos.size()) {
+        glm::vec3 footWorldPos = modelMatrix * glm::vec4(currBoneWorldPos[leftFoot], 1.0f);
+        
+        // Check if foot is near floor
+        float distToFloor = footWorldPos.y - floorY;
+        bool nearFloor = distToFloor < 0.1f && distToFloor > -0.05f;
+        
+        // Check if foot is moving slowly (planted)
+        float footSpeed = glm::length(currBoneWorldPos[leftFoot] - prevBoneWorldPos[leftFoot]);
+        bool isStationary = footSpeed < 0.05f;
+        
+        // Lock foot when it's near floor and stationary
+        if (nearFloor && isStationary && !leftFootIK.isLocked) {
+            leftFootIK.isLocked = true;
+            leftFootIK.lockedPosition = footWorldPos;
+            leftFootIK.lockedPosition.y = floorY;  // Snap to floor
+            leftFootIK.targetPosition = footWorldPos;
+        }
+        
+        // Update lock weight
+        if (leftFootIK.isLocked) {
+            leftFootIK.lockWeight = glm::min(1.0f, leftFootIK.lockWeight + dt * footIKSettings.footLockBlend);
+            leftFootIK.timeSinceLock += dt;
+            
+            // Release lock when foot moves up
+            if (footWorldPos.y > floorY + 0.1f || !nearFloor) {
+                leftFootIK.isLocked = false;
+            }
+        } else {
+            leftFootIK.lockWeight = glm::max(0.0f, leftFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed);
+            leftFootIK.timeSinceLock = 0.0f;
+        }
+        
+        // Calculate IK offset
+        float ikWeight = leftFootIK.lockWeight * footIKSettings.ikStrength;
+        if (ikWeight > 0.001f) {
+            glm::vec3 targetPos = leftFootIK.lockedPosition;
+            glm::vec3 currentPos = footWorldPos;
+            
+            // Apply offset in world space, then convert to local
+            glm::vec3 offset = targetPos - currentPos;
+            
+            // Clamp offset
+            if (glm::length(offset) > footIKSettings.maxIKDistance) {
+                offset = glm::normalize(offset) * footIKSettings.maxIKDistance;
+            }
+            
+            leftFootIK.ankleOffset = offset * ikWeight;
+        } else {
+            leftFootIK.ankleOffset = glm::vec3(0.0f);
+        }
+    }
+    
+    // Update right foot IK (same logic)
+    if (rightFoot >= 0 && rightFoot < (int)currBoneWorldPos.size()) {
+        glm::vec3 footWorldPos = modelMatrix * glm::vec4(currBoneWorldPos[rightFoot], 1.0f);
+        
+        float distToFloor = footWorldPos.y - floorY;
+        bool nearFloor = distToFloor < 0.1f && distToFloor > -0.05f;
+        
+        float footSpeed = glm::length(currBoneWorldPos[rightFoot] - prevBoneWorldPos[rightFoot]);
+        bool isStationary = footSpeed < 0.05f;
+        
+        if (nearFloor && isStationary && !rightFootIK.isLocked) {
+            rightFootIK.isLocked = true;
+            rightFootIK.lockedPosition = footWorldPos;
+            rightFootIK.lockedPosition.y = floorY;
+            rightFootIK.targetPosition = footWorldPos;
+        }
+        
+        if (rightFootIK.isLocked) {
+            rightFootIK.lockWeight = glm::min(1.0f, rightFootIK.lockWeight + dt * footIKSettings.footLockBlend);
+            rightFootIK.timeSinceLock += dt;
+            
+            if (footWorldPos.y > floorY + 0.1f || !nearFloor) {
+                rightFootIK.isLocked = false;
+            }
+        } else {
+            rightFootIK.lockWeight = glm::max(0.0f, rightFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed);
+            rightFootIK.timeSinceLock = 0.0f;
+        }
+        
+        float ikWeight = rightFootIK.lockWeight * footIKSettings.ikStrength;
+        if (ikWeight > 0.001f) {
+            glm::vec3 targetPos = rightFootIK.lockedPosition;
+            glm::vec3 currentPos = footWorldPos;
+            glm::vec3 offset = targetPos - currentPos;
+            
+            if (glm::length(offset) > footIKSettings.maxIKDistance) {
+                offset = glm::normalize(offset) * footIKSettings.maxIKDistance;
+            }
+            
+            rightFootIK.ankleOffset = offset * ikWeight;
+        } else {
+            rightFootIK.ankleOffset = glm::vec3(0.0f);
+        }
+    }
+    
+    // Apply IK offsets
+    if (leftFoot >= 0 && leftFoot < (int)ikOffsets.size()) {
+        ikOffsets[leftFoot] += leftFootIK.ankleOffset;
+    }
+    if (rightFoot >= 0 && rightFoot < (int)ikOffsets.size()) {
+        ikOffsets[rightFoot] += rightFootIK.ankleOffset;
+    }
+}
+
+void Animator::DebugDrawFootIK()
+{
+    // This would be implemented with debug rendering
+    // For now, just print status
+    if (footIKSettings.enabled) {
+        std::cout << "[FootIK] Left: locked=" << (leftFootIK.isLocked ? "YES" : "NO") 
+                  << " weight=" << leftFootIK.lockWeight
+                  << " | Right: locked=" << (rightFootIK.isLocked ? "YES" : "NO")
+                  << " weight=" << rightFootIK.lockWeight << "\n";
     }
 }

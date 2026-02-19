@@ -32,7 +32,35 @@ public:
     bool IsFootPlanted(int bone) const;
     glm::vec3 GetBoneWorldPosition(int bone, const glm::mat4 &modelMat) const;
 
+    // -------- FOOT IK SYSTEM --------
+    struct FootIKSettings {
+        bool enabled = false;
+        float floorHeight = 0.0f;
+        float ikStrength = 1.0f;
+        float footLockBlend = 0.8f;      // How much to lock foot when planted
+        float ankleFKWeight = 0.5f;       // Blend between FK ankle and IK ankle
+        float maxIKDistance = 0.15f;      // Max distance foot can reach
+        float footLockReleaseSpeed = 2.0f;
+        int leftFootBone = -1;
+        int rightFootBone = -1;
+        int leftToeBone = -1;
+        int rightToeBone = -1;
+    };
+    
+    void SetFootIKEnabled(bool enabled);
+    void SetFootIKSettings(const FootIKSettings& settings);
+    void SetFloorHeight(float height);
+    void SetFootBones(int leftFoot, int rightFoot, int leftToe = -1, int rightToe = -1);
+    void UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMoving = false);  // isMoving disables foot lock
+    void DebugDrawFootIK();  // Call after rendering to debug
+
     glm::vec3 ConsumeRootMotion();
+
+    // Root motion control - lock root bone position to prevent sliding
+    void SetRootMotionEnabled(bool enabled) { rootMotionEnabled = enabled; }
+    bool IsRootMotionEnabled() const { return rootMotionEnabled; }
+    void SetLockRootPosition(bool lock) { lockRootPosition = lock; }
+    bool IsRootPositionLocked() const { return lockRootPosition; }
 
     const std::vector<glm::mat4> &GetFinalBoneMatrices() const;
 
@@ -176,6 +204,19 @@ public: // temporarily for debug purposes
     std::vector<glm::vec3> currBoneWorldPos;
     std::vector<glm::vec3> ikOffsets;
 
+    // -------- FOOT IK STATE --------
+    FootIKSettings footIKSettings;
+    struct FootIKState {
+        glm::vec3 lockedPosition{0.0f};
+        glm::vec3 targetPosition{0.0f};
+        glm::vec3 ankleOffset{0.0f};
+        float lockWeight = 0.0f;  // 0 = fully unlocked, 1 = fully locked
+        bool isLocked = false;
+        float timeSinceLock = 0.0f;
+    };
+    FootIKState leftFootIK;
+    FootIKState rightFootIK;
+
 private:                                  // temporarily
     bool debugForceIdentityScale = false; // Test if scale animation is corrupting legs
 
@@ -202,6 +243,10 @@ private:
     std::vector<float> cachedAnimationTimes;
     std::vector<std::vector<glm::mat4>> cachedBoneTransforms;
     bool cacheValid = false;
+
+    // Root motion control
+    bool rootMotionEnabled = true;
+    bool lockRootPosition = false;  // When true, root bone position is locked to bind pose
 
     void EvaluateNode(
         const AssimpNodeData &node,

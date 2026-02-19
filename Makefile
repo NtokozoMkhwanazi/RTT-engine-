@@ -1,5 +1,5 @@
 # ============================================================
-#  Game Engine Makefile (Industry-Style)
+#  3D Simulation Engine Makefile (Industry-Style)
 #  - Debug / Release builds
 #  - Object files in build/
 #  - Executable in bin/
@@ -42,7 +42,13 @@ SRC_CPP := \
 	$(wildcard renderer/*.cpp) \
 	$(wildcard lighting/*.cpp) \
 	$(wildcard memory/*.cpp) \
+	$(wildcard world/*.cpp) \
 	test.cpp
+
+# Auto-detect all cpp files in world/
+
+# Exclude original implementations (keeping only .original backups)
+# Enhanced versions are now the default (mesh.cpp and model.cpp)
 
 SRC_C := \
 	src/glad.c

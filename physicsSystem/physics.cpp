@@ -64,8 +64,6 @@ bool PhysicsWorld::raycast(
     bool hit = false;
     float closestDist = std::numeric_limits<float>::max();
 
-    glm::vec3 rayEnd = origin + direction * maxDist;
-
     for (auto& b : bodies)
     {
         if (!b) continue;
@@ -95,7 +93,7 @@ bool PhysicsWorld::raycast(
             {
                 closestDist = dist;
                 hitPoint = intersection;
-                
+
                 // Determine which face was hit to set normal
                 if (tmin == t1) hitNormal = glm::vec3(-1, 0, 0);
                 else if (tmin == t2) hitNormal = glm::vec3(1, 0, 0);
@@ -103,7 +101,7 @@ bool PhysicsWorld::raycast(
                 else if (tmin == t4) hitNormal = glm::vec3(0, 1, 0);
                 else if (tmin == t5) hitNormal = glm::vec3(0, 0, -1);
                 else hitNormal = glm::vec3(0, 0, 1);
-                
+
                 hitBody = b;
                 hit = true;
             }
@@ -124,14 +122,14 @@ void PhysicsWorld::removeBody(const std::shared_ptr<RigidBody>& body)
 std::vector<std::shared_ptr<RigidBody>> PhysicsWorld::getBodiesInAABB(const glm::vec3& min, const glm::vec3& max) const
 {
     std::vector<std::shared_ptr<RigidBody>> result;
-    
+
     for (const auto& body : bodies)
     {
         if (!body) continue;
-        
+
         glm::vec3 bodyMin = body->position - body->scale * 0.5f;
         glm::vec3 bodyMax = body->position + body->scale * 0.5f;
-        
+
         // Check if AABBs overlap
         if (bodyMin.x <= max.x && bodyMax.x >= min.x &&
             bodyMin.y <= max.y && bodyMax.y >= min.y &&
@@ -140,7 +138,7 @@ std::vector<std::shared_ptr<RigidBody>> PhysicsWorld::getBodiesInAABB(const glm:
             result.push_back(body);
         }
     }
-    
+
     return result;
 }
 
@@ -149,14 +147,14 @@ std::shared_ptr<RigidBody> PhysicsWorld::getBodyAtPoint(const glm::vec3& point, 
     for (const auto& body : bodies)
     {
         if (!body) continue;
-        
+
         float dist = glm::distance(point, body->position);
         if (dist <= radius)
         {
             return body;
         }
     }
-    
+
     return nullptr;
 }
 
@@ -183,7 +181,7 @@ Capsule PhysicsWorld::buildCapsuleFromBody(const std::shared_ptr<RigidBody>& rb)
 CollisionResult PhysicsWorld::checkCollision(const std::shared_ptr<RigidBody>& a, const std::shared_ptr<RigidBody>& b) const
 {
     CollisionResult result;
-    
+
     // Determine collision based on collider types
     if (a->colliderType == ColliderType::SPHERE && b->colliderType == ColliderType::SPHERE) {
         Sphere sa = buildSphereFromBody(a);
@@ -236,54 +234,54 @@ CollisionResult PhysicsWorld::checkCollision(const std::shared_ptr<RigidBody>& a
         OBB boxB = buildOBBFromBody(b);
         result = checkBoxVsBox(boxA, boxB);
     }
-    
+
     return result;
 }
 
 CollisionResult PhysicsWorld::checkSphereVsSphere(const Sphere& a, const Sphere& b) const
 {
     CollisionResult result;
-    
+
     float dist = glm::distance(a.center, b.center);
     float sumRadius = a.radius + b.radius;
-    
+
     if (dist < sumRadius) {
         result.collided = true;
         result.penetration = sumRadius - dist;
-        
+
         if (dist > 0.0f) {
             result.normal = glm::normalize(b.center - a.center);
         } else {
             result.normal = glm::vec3(1.0f, 0.0f, 0.0f); // arbitrary normal if centers coincide
         }
-        
+
         result.contactPoint = a.center + result.normal * a.radius;
     }
-    
+
     return result;
 }
 
 CollisionResult PhysicsWorld::checkBoxVsSphere(const OBB& box, const Sphere& sphere) const
 {
     CollisionResult result;
-    
+
     // Find closest point on box to sphere center
     glm::vec3 closestPoint = sphere.center;
-    
+
     // Project point onto box boundaries
     glm::vec3 boxMin = box.c - box.half;
     glm::vec3 boxMax = box.c + box.half;
-    
+
     closestPoint.x = std::max(boxMin.x, std::min(closestPoint.x, boxMax.x));
     closestPoint.y = std::max(boxMin.y, std::min(closestPoint.y, boxMax.y));
     closestPoint.z = std::max(boxMin.z, std::min(closestPoint.z, boxMax.z));
-    
+
     float dist = glm::distance(closestPoint, sphere.center);
-    
+
     if (dist < sphere.radius) {
         result.collided = true;
         result.penetration = sphere.radius - dist;
-        
+
         if (dist > 0.0f) {
             result.normal = glm::normalize(sphere.center - closestPoint);
         } else {
@@ -291,10 +289,10 @@ CollisionResult PhysicsWorld::checkBoxVsSphere(const OBB& box, const Sphere& sph
             glm::vec3 centerToCenter = box.c - sphere.center;
             result.normal = glm::normalize(centerToCenter);
         }
-        
+
         result.contactPoint = closestPoint;
     }
-    
+
     return result;
 }
 
@@ -303,7 +301,7 @@ CollisionResult PhysicsWorld::checkBoxVsBox(const OBB& a, const OBB& b) const
     // Use the existing SAT implementation
     float penetration;
     glm::vec3 normal;
-    
+
     if (obbOverlapAndPenetration(a, b, penetration, normal)) {
         CollisionResult result;
         result.collided = true;
@@ -312,50 +310,42 @@ CollisionResult PhysicsWorld::checkBoxVsBox(const OBB& a, const OBB& b) const
         result.contactPoint = (a.c + b.c) * 0.5f;
         return result;
     }
-    
+
     return CollisionResult{}; // Return empty result if no collision
 }
 
 CollisionResult PhysicsWorld::checkCapsuleVsCapsule(const Capsule& a, const Capsule& b) const
 {
     CollisionResult result;
-    
-    // Simplified capsule-capsule collision using line segment distance
+
+    // Simplified capsule-capsule collision using center distance
     // A capsule is defined by a line segment and a radius
-    glm::vec3 aStart = a.center - a.axis * (a.height * 0.5f);
-    glm::vec3 aEnd = a.center + a.axis * (a.height * 0.5f);
-    glm::vec3 bStart = b.center - b.axis * (b.height * 0.5f);
-    glm::vec3 bEnd = b.center + b.axis * (b.height * 0.5f);
-    
-    // Find closest points on both line segments
-    glm::vec3 closestA, closestB;
-    float dist = glm::distance(closestA, closestB); // This would need proper implementation
     
     // For now, use a simplified approach
     float minDist = glm::distance(a.center, b.center) - (a.radius + b.radius);
-    
+
     if (minDist < 0.0f) {
         result.collided = true;
         result.penetration = -(minDist);
         result.normal = glm::normalize(b.center - a.center);
         result.contactPoint = a.center + result.normal * a.radius;
     }
-    
+
     return result;
 }
 
 CollisionResult PhysicsWorld::checkCapsuleVsSphere(const Capsule& cap, const Sphere& sph) const
 {
     CollisionResult result;
-    
+
     // Find closest point on capsule line segment to sphere center
     glm::vec3 capStart = cap.center - cap.axis * (cap.height * 0.5f);
     glm::vec3 capEnd = cap.center + cap.axis * (cap.height * 0.5f);
-    
+
     // Find closest point on line segment to sphere center
     glm::vec3 segmentVec = capEnd - capStart;
     float segmentLenSq = glm::dot(segmentVec, segmentVec);
-    
+
     if (segmentLenSq < 1e-6f) {
         // Capsule is essentially a sphere
         Sphere capSphere;
@@ -363,54 +353,54 @@ CollisionResult PhysicsWorld::checkCapsuleVsSphere(const Capsule& cap, const Sph
         capSphere.radius = cap.radius;
         return checkSphereVsSphere(capSphere, sph);
     }
-    
+
     float t = glm::dot(sph.center - capStart, segmentVec) / segmentLenSq;
     t = std::clamp(t, 0.0f, 1.0f);
-    
+
     glm::vec3 closestOnSegment = capStart + segmentVec * t;
     float dist = glm::distance(closestOnSegment, sph.center);
     float combinedRadius = cap.radius + sph.radius;
-    
+
     if (dist < combinedRadius) {
         result.collided = true;
         result.penetration = combinedRadius - dist;
-        
+
         if (dist > 0.0f) {
             result.normal = glm::normalize(sph.center - closestOnSegment);
         } else {
             result.normal = glm::vec3(1.0f, 0.0f, 0.0f); // arbitrary
         }
-        
+
         result.contactPoint = closestOnSegment + result.normal * cap.radius;
     }
-    
+
     return result;
 }
 
 CollisionResult PhysicsWorld::checkCapsuleVsBox(const Capsule& cap, const OBB& box) const
 {
     CollisionResult result;
-    
+
     // This is a complex collision test that would require more sophisticated algorithms
     // For now, we'll approximate by sampling points along the capsule and testing against the box
     // A full implementation would use GJK or EPA algorithms
-    
+
     // Simplified approach: treat capsule as a rounded line segment
     glm::vec3 capStart = cap.center - cap.axis * (cap.height * 0.5f);
     glm::vec3 capEnd = cap.center + cap.axis * (cap.height * 0.5f);
-    
+
     // Test if either end of the capsule is inside the box
     glm::vec3 boxMin = box.c - box.half;
     glm::vec3 boxMax = box.c + box.half;
-    
+
     bool startInside = (capStart.x >= boxMin.x && capStart.x <= boxMax.x &&
                         capStart.y >= boxMin.y && capStart.y <= boxMax.y &&
                         capStart.z >= boxMin.z && capStart.z <= boxMax.z);
-    
+
     bool endInside = (capEnd.x >= boxMin.x && capEnd.x <= boxMax.x &&
                       capEnd.y >= boxMin.y && capEnd.y <= boxMax.y &&
                       capEnd.z >= boxMin.z && capEnd.z <= boxMax.z);
-    
+
     if (startInside || endInside) {
         result.collided = true;
         result.penetration = cap.radius;
@@ -418,7 +408,7 @@ CollisionResult PhysicsWorld::checkCapsuleVsBox(const Capsule& cap, const OBB& b
         result.contactPoint = startInside ? capStart : capEnd;
         return result;
     }
-    
+
     // More complex implementation would go here
     return result;
 }
@@ -524,9 +514,7 @@ bool PhysicsWorld::isGrounded(std::shared_ptr<RigidBody>& body, float probeDista
     if (!body) return false;
     glm::vec3 bottom = body->position - glm::vec3(0.0f, body->scale.y * 0.5f, 0.0f);
     glm::vec3 probeEnd = bottom - glm::vec3(0.0f, probeDistance, 0.0f);
-    
-   const float EPSILON = 1e-6f;
-    
+
     for (auto& other : bodies) {
         if (!other || other == body || !other->isStatic) continue;
         glm::vec3 otherMin = other->position - other->scale * 0.5f;
@@ -535,7 +523,7 @@ bool PhysicsWorld::isGrounded(std::shared_ptr<RigidBody>& body, float probeDista
             bottom.z < otherMax.z && bottom.z > otherMin.z &&
             probeEnd.y <= otherMax.y && bottom.y >= otherMax.y)
             return true;
-    
+
        glm::vec3 bMin = body->position - body->scale * 0.5f;
        glm::vec3 bMax = body->position + body->scale * 0.5f;
        glm::vec3 oMin = other->position - other->scale * 0.5f;
@@ -597,11 +585,41 @@ void PhysicsWorld::getPotentialPairs(std::vector<std::pair<int,int>>& outPairs) 
     }
 }
 
-// -------------------- Resolve contact --------------------
-static void resolveContact(std::shared_ptr<RigidBody>& a,
-                           std::shared_ptr<RigidBody>& b,
-                           const glm::vec3& normal,
-                           float penetration)
+// -------------------- Resolve contact (deprecated - use resolveContactAdvanced) --------------------
+// This function is kept for backward compatibility but is no longer used
+// static void resolveContact(std::shared_ptr<RigidBody>& a,
+//                            std::shared_ptr<RigidBody>& b,
+//                            const glm::vec3& normal,
+//                            float penetration)
+// {
+//     // Deprecated - see resolveContactAdvanced for PBR-aware collision response
+// }
+
+// Add a fluid volume to the physics world
+void PhysicsWorld::addFluidVolume(const FluidVolume& fluid) {
+    fluidVolumes.push_back(fluid);
+}
+
+// Check if a point is inside any fluid volume
+bool PhysicsWorld::isInFluid(const glm::vec3& point, FluidVolume& outFluid) const {
+    for (const auto& fluid : fluidVolumes) {
+        if (point.x >= fluid.minBounds.x && point.x <= fluid.maxBounds.x &&
+            point.y >= fluid.minBounds.y && point.y <= fluid.maxBounds.y &&
+            point.z >= fluid.minBounds.z && point.z <= fluid.maxBounds.z) {
+            outFluid = fluid;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Advanced collision response considering PBR material properties
+void PhysicsWorld::resolveContactAdvanced(std::shared_ptr<RigidBody>& a,
+                                         std::shared_ptr<RigidBody>& b,
+                                         const glm::vec3& normal,
+                                         float penetration,
+                                         const glm::vec3& contactPoint,
+                                         float subdt)
 {
     if (!a || !b) return;
 
@@ -626,11 +644,15 @@ static void resolveContact(std::shared_ptr<RigidBody>& a,
     // Bodies separating? Skip impulse
     if (velAlongNormal > 0.0f) return;
 
-    // --- Restitution ---
-    float e = std::min(a->restitution, b->restitution);
-    // If one body immovable and normal is mostly vertical, zero bounce
-    if ((aImmovable || bImmovable) && std::abs(normal.y) > 0.5f)
-        e = 0.0f;
+    // --- Restitution based on PBR properties ---
+    // Using metallic property to influence bounciness (higher metallic = more bouncy)
+    float e = (a->restitution * a->metallic + b->restitution * b->metallic) * 0.5f;
+    
+    // If one body immovable and normal is mostly vertical, use material properties for bounce
+    if ((aImmovable || bImmovable) && std::abs(normal.y) > 0.5f) {
+        // Use roughness to dampen bounce (rougher surfaces = less bounce)
+        e = e * (1.0f - (a->roughness + b->roughness) * 0.5f);
+    }
 
     // --- Impulse ---
     float j = -(1.0f + e) * velAlongNormal / totalInvMass;
@@ -639,12 +661,18 @@ static void resolveContact(std::shared_ptr<RigidBody>& a,
     if (!aImmovable) a->velocity -= impulse * invMassA;
     if (!bImmovable) b->velocity += impulse * invMassB;
 
-    // --- Friction ---
+    // --- Friction based on PBR properties ---
     glm::vec3 tangent = relVel - glm::dot(relVel, normal) * normal;
     if (glm::length2(tangent) > 1e-6f) {
         tangent = glm::normalize(tangent);
         float jt = -glm::dot(relVel, tangent) / totalInvMass;
-        float frictionCoeff = std::sqrt(a->friction * b->friction);
+        
+        // Use both static and dynamic friction coefficients
+        float frictionCoeff = std::sqrt(a->staticFriction * b->staticFriction);
+        
+        // Adjust friction based on roughness (rougher = more friction)
+        frictionCoeff *= (1.0f + (a->roughness + b->roughness) * 0.5f);
+        
         float maxJt = j * frictionCoeff;
         jt = std::clamp(jt, -maxJt, maxJt);
         glm::vec3 frictionImpulse = jt * tangent;
@@ -660,39 +688,6 @@ static void resolveContact(std::shared_ptr<RigidBody>& a,
     // --- Zero rotation ---
     if (!aImmovable) a->angularVelocity = glm::vec3(0.0f);
     if (!bImmovable) b->angularVelocity = glm::vec3(0.0f);
-}
-
-
-// Fluid simulation properties
-struct FluidVolume {
-    glm::vec3 minBounds;
-    glm::vec3 maxBounds;
-    glm::vec3 flowDirection;
-    float density; // Density of the fluid
-    float viscosity; // Viscosity of the fluid
-    float dragCoefficient; // Drag coefficient for objects in fluid
-    float buoyancyFactor; // Factor affecting buoyancy force
-};
-
-// Container for fluid volumes in the world
-std::vector<FluidVolume> fluidVolumes;
-
-// Add a fluid volume to the physics world
-void addFluidVolume(const FluidVolume& fluid) {
-    fluidVolumes.push_back(fluid);
-}
-
-// Check if a point is inside any fluid volume
-bool isInFluid(const glm::vec3& point, FluidVolume& outFluid) const {
-    for (const auto& fluid : fluidVolumes) {
-        if (point.x >= fluid.minBounds.x && point.x <= fluid.maxBounds.x &&
-            point.y >= fluid.minBounds.y && point.y <= fluid.maxBounds.y &&
-            point.z >= fluid.minBounds.z && point.z <= fluid.maxBounds.z) {
-            outFluid = fluid;
-            return true;
-        }
-    }
-    return false;
 }
 
 // -------------------- Physics step (rotation disabled, models optionally immovable) --------------------
@@ -803,7 +798,7 @@ void PhysicsWorld::step(float dt)
             if (collision.collided) {
                 // Use advanced collision response with PBR properties
                 resolveContactAdvanced(A, B, collision.normal, collision.penetration, 
-                                      collision.contactPoint);
+                                      collision.contactPoint, subdt);
             }
         }
 
@@ -833,80 +828,3 @@ void PhysicsWorld::step(float dt)
         }
     }
 }
-
-// Advanced collision response considering PBR material properties
-static void resolveContactAdvanced(std::shared_ptr<RigidBody>& a,
-                                  std::shared_ptr<RigidBody>& b,
-                                  const glm::vec3& normal,
-                                  float penetration,
-                                  const glm::vec3& contactPoint)
-{
-    if (!a || !b) return;
-
-    bool aImmovable = a->isStatic || a->isModel;
-    bool bImmovable = b->isStatic || b->isModel;
-
-    float invMassA = aImmovable ? 0.0f : 1.0f / a->mass;
-    float invMassB = bImmovable ? 0.0f : 1.0f / b->mass;
-    float totalInvMass = invMassA + invMassB;
-
-    if (totalInvMass < 1e-6f) return; // both immovable, skip
-
-    // --- Position correction (penetration resolution) ---
-    glm::vec3 correction = normal * penetration / totalInvMass * 0.8f; // 80% factor for stability
-    if (!aImmovable) a->position -= correction * invMassA;
-    if (!bImmovable) b->position += correction * invMassB;
-
-    // --- Relative velocity along normal ---
-    glm::vec3 relVel = b->velocity - a->velocity;
-    float velAlongNormal = glm::dot(relVel, normal);
-
-    // Bodies separating? Skip impulse
-    if (velAlongNormal > 0.0f) return;
-
-    // --- Restitution based on PBR properties ---
-    // Using metallic property to influence bounciness (higher metallic = more bouncy)
-    float e = (a->restitution * a->metallic + b->restitution * b->metallic) * 0.5f;
-    
-    // If one body immovable and normal is mostly vertical, use material properties for bounce
-    if ((aImmovable || bImmovable) && std::abs(normal.y) > 0.5f) {
-        // Use roughness to dampen bounce (rougher surfaces = less bounce)
-        e = e * (1.0f - (a->roughness + b->roughness) * 0.5f);
-    }
-
-    // --- Impulse ---
-    float j = -(1.0f + e) * velAlongNormal / totalInvMass;
-    glm::vec3 impulse = j * normal;
-
-    if (!aImmovable) a->velocity -= impulse * invMassA;
-    if (!bImmovable) b->velocity += impulse * invMassB;
-
-    // --- Friction based on PBR properties ---
-    glm::vec3 tangent = relVel - glm::dot(relVel, normal) * normal;
-    if (glm::length2(tangent) > 1e-6f) {
-        tangent = glm::normalize(tangent);
-        float jt = -glm::dot(relVel, tangent) / totalInvMass;
-        
-        // Use both static and dynamic friction coefficients
-        float frictionCoeff = std::sqrt(a->staticFriction * b->staticFriction);
-        
-        // Adjust friction based on roughness (rougher = more friction)
-        frictionCoeff *= (1.0f + (a->roughness + b->roughness) * 0.5f);
-        
-        float maxJt = j * frictionCoeff;
-        jt = std::clamp(jt, -maxJt, maxJt);
-        glm::vec3 frictionImpulse = jt * tangent;
-
-        if (!aImmovable) a->velocity -= frictionImpulse * invMassA;
-        if (!bImmovable) b->velocity += frictionImpulse * invMassB;
-    }
-
-    // --- Clamp tiny velocities ---
-    if (!aImmovable && glm::length2(a->velocity) < 1e-6f) a->velocity = glm::vec3(0.0f);
-    if (!bImmovable && glm::length2(b->velocity) < 1e-6f) b->velocity = glm::vec3(0.0f);
-
-    // --- Zero rotation ---
-    if (!aImmovable) a->angularVelocity = glm::vec3(0.0f);
-    if (!bImmovable) b->angularVelocity = glm::vec3(0.0f);
-}
-

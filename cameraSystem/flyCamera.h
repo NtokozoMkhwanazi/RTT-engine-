@@ -57,7 +57,11 @@ public:
         Target = glm::vec3(0.0f);
         FirstMouse = true;
         LastX = 400; LastY = 300;
-        updateCameraVectors();
+        // Don't call updateCameraVectors() - it would overwrite Position
+        // Calculate Right and Up from current Position/Target
+        glm::vec3 front = glm::normalize(Target - Position);
+        Right = glm::normalize(glm::cross(front, WorldUp));
+        Up = glm::normalize(glm::cross(Right, front));
     }
 
     // Get view matrix
@@ -202,13 +206,49 @@ public:
         updateCameraVectors();
     }
 
+    // Mouse rotation - takes absolute positions from GLFW (PUBLIC)
+    void ProcessMouseMovementAbsolute(float xpos, float ypos) {
+        if (FirstMouse) { LastX = xpos; LastY = ypos; FirstMouse = false; }
+
+        float xoffset = xpos - LastX;
+        float yoffset = LastY - ypos; // reversed
+        LastX = xpos;
+        LastY = ypos;
+
+        xoffset *= MouseSensitivity;
+        yoffset *= MouseSensitivity;
+
+        Yaw += xoffset * rotationSpeed;
+        Pitch += yoffset * rotationSpeed;
+
+        // Clamp pitch
+        if (Pitch > 89.0f) Pitch = 89.0f;
+        if (Pitch < -89.0f) Pitch = -89.0f;
+
+        updateCameraVectors();
+    }
+
 private:
-    CameraMode cameraMode = CameraMode::FREE_LOOK;
+    CameraMode cameraMode = CameraMode::FIRST_PERSON;
     bool collisionEnabled = false;
     float collisionDistance = 0.5f;
 
     void updateCameraVectors() {
-        // Calculate front, right, up vectors based on orbit
+        // Calculate new position based on Yaw, Pitch, and DistanceToTarget
+        // Yaw=-90 means looking down +Z, Pitch=0 means level
+        float cosPitch = cos(glm::radians(Pitch));
+        float sinPitch = sin(glm::radians(Pitch));
+        float cosYaw = cos(glm::radians(Yaw));
+        float sinYaw = sin(glm::radians(Yaw));
+
+        glm::vec3 offset;
+        offset.x = DistanceToTarget * cosPitch * sinYaw;
+        offset.y = DistanceToTarget * sinPitch;
+        offset.z = DistanceToTarget * cosPitch * cosYaw;
+
+        Position = Target - offset;
+
+        // Calculate right and up vectors
         glm::vec3 front = glm::normalize(Target - Position);
         Right = glm::normalize(glm::cross(front, WorldUp));
         Up = glm::normalize(glm::cross(Right, front));

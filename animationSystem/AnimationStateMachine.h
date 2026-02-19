@@ -1,75 +1,213 @@
 #pragma once
-#include "Animator.h"
 #include "Animation.h"
+#include "Animator.h"
+#include <string>
+#include <map>
+#include <vector>
+#include <functional>
+#include <glm/glm.hpp>
 
-class AnimationStateMachine {
-public:
-    AnimationStateMachine(Animator* animator)
-        : animator(animator) {}
-
-    void SetAnimations(Animation* idle, Animation* walk, Animation* run) {
-        idleAnim = idle;
-        walkAnim = walk;
-        runAnim  = run;
-
-        current = idleAnim;
-        animator->Play(current);
-    }
-
-    // locomotion ∈ [0..1]
-    // 0.0 = idle
-    // 0.5 = walk
-    // 1.0 = run
-    void Update(float dt, float locomotion)
-    {
-        if (!forced)
-        {
-            Animation* next = idleAnim;
-
-            if (locomotion < 0.1f)
-                next = idleAnim;
-            else if (locomotion < runThreshold)
-                next = walkAnim;
-            else
-                next = runAnim;
-
-            if (next && next != current)
-            {
-                animator->BlendTo(next, blendTime);
-                current = next;
-            }
-        }
-
-        animator->Update(dt);
-    }
-
-    // ---- Force a specific animation regardless of speed ----
-    void ForceState(Animation* anim)
-    {
-        if (anim && anim != current)
-        {
-            animator->Play(anim);
-            current = anim;
-        }
-        forced = true;
-    }
-
-    // ---- Reset to automatic speed-based animation ----
-    void ResetForce()
-    {
-        forced = false;
-    }
-
-private:
-    Animator* animator = nullptr;
-
-    Animation* idleAnim = nullptr;
-    Animation* walkAnim = nullptr;
-    Animation* runAnim  = nullptr;
-    Animation* current  = nullptr;
-
-    float blendTime   = 0.2f;
-    float runThreshold = 0.75f; // >= run
-    bool forced = false;
+// ========================================
+// Animation States
+// ========================================
+enum class AnimationState {
+    IDLE,
+    WALK,
+    RUN,
+    JUMP,
+    FALL,
+    CROUCH,
+    CROUCH_WALK,
+    DEATH,
+    NONE
 };
 
+inline std::string AnimationStateToString(AnimationState state) {
+    switch (state) {
+        case AnimationState::IDLE: return "Idle";
+        case AnimationState::WALK: return "Walk";
+        case AnimationState::RUN: return "Run";
+        case AnimationState::JUMP: return "Jump";
+        case AnimationState::FALL: return "Fall";
+        case AnimationState::CROUCH: return "Crouch";
+        case AnimationState::CROUCH_WALK: return "Crouch Walk";
+        case AnimationState::DEATH: return "Death";
+        default: return "None";
+    }
+}
+
+// ========================================
+// Animation State Transition
+// ========================================
+struct AnimationTransition {
+    AnimationState fromState;
+    AnimationState toState;
+    float blendDuration = 0.2f;
+    std::function<bool()> condition;  // Condition to trigger transition
+    
+    AnimationTransition() = default;
+    AnimationTransition(AnimationState from, AnimationState to, float duration = 0.2f)
+        : fromState(from), toState(to), blendDuration(duration) {}
+};
+
+// ========================================
+// Animation State Data
+// ========================================
+struct AnimationStateData {
+    Animation* animation = nullptr;
+    float speed = 1.0f;
+    bool loop = true;
+    bool additive = false;
+    std::string name;
+};
+
+// ========================================
+// Character Movement Input
+// ========================================
+struct CharacterInput {
+    glm::vec2 moveDirection{0.0f, 0.0f};  // WASD input (-1 to 1)
+    float moveMagnitude = 0.0f;            // Length of moveDirection
+    bool jump = false;
+    bool crouch = false;
+    bool sprint = false;
+    bool grounded = true;
+    float verticalVelocity = 0.0f;         // For jump/fall detection
+    
+    void reset() {
+        moveDirection = glm::vec2(0.0f);
+        moveMagnitude = 0.0f;
+        jump = false;
+        crouch = false;
+        sprint = false;
+        verticalVelocity = 0.0f;
+    }
+};
+
+// ========================================
+// Animation State Machine
+// ========================================
+class AnimationStateMachine {
+public:
+    AnimationStateMachine(Animator* animator);
+    ~AnimationStateMachine() = default;
+    
+    // State management
+    void setState(AnimationState state);
+    AnimationState getCurrentState() const { return currentState; }
+    AnimationState getPreviousState() const { return previousState; }
+    
+    // Initialization
+    void initialize();  // Start with initial state (IDLE)
+    
+    // Animation registration
+    void registerAnimation(AnimationState state, Animation* anim, float speed = 1.0f, bool loop = true);
+    void registerAnimations(
+        Animation* idle, Animation* walk, Animation* run,
+        Animation* jump = nullptr, Animation* fall = nullptr,
+        Animation* crouch = nullptr, Animation* crouchWalk = nullptr
+    );
+    
+    // Transition management
+    void addTransition(const AnimationTransition& transition);
+    void addTransition(AnimationState from, AnimationState to, float duration, std::function<bool()> condition);
+    void clearTransitions();
+    
+    // Update
+    void update(float dt, const CharacterInput& input);
+    void update(float dt, float speed, bool grounded, bool jumping, bool crouching, bool sprinting);
+    
+    // Parameters
+    void setSpeed(float speed) { movementSpeed = speed; }
+    void setGrounded(bool grounded) { isGrounded = grounded; }
+    void setVerticalVelocity(float velocity) { verticalVelocity = velocity; }
+    
+    // Blending
+    void setBlendDuration(float duration) { defaultBlendDuration = duration; }
+    void setWalkRunBlendThreshold(float walkThreshold, float runThreshold);
+    
+    // Debug
+    std::string getDebugInfo() const;
+    void printState() const;
+    
+    // State queries
+    bool isInState(AnimationState state) const { return currentState == state; }
+    bool isTransitioning() const { return isTransitioningState; }
+    float getTransitionProgress() const { return transitionProgress; }
+    
+    // Movement parameters
+    float getMovementSpeed() const { return movementSpeed; }
+    float getMaxWalkSpeed() const { return maxWalkSpeed; }
+    float getMaxRunSpeed() const { return maxRunSpeed; }
+    
+private:
+    Animator* animator;
+    AnimationState currentState = AnimationState::NONE;  // Start with NONE, not IDLE
+    AnimationState previousState = AnimationState::NONE;
+    
+    std::map<AnimationState, AnimationStateData> stateAnimations;
+    std::vector<AnimationTransition> transitions;
+    
+    // Movement parameters
+    float movementSpeed = 0.0f;
+    float smoothedSpeed = 0.0f;
+    float speedSmoothRate = 5.0f;  // How fast to smooth speed changes
+    bool isGrounded = true;
+    float verticalVelocity = 0.0f;
+    
+    // Edge detection for key presses
+    bool prevMoving = false;
+    bool prevSprinting = false;
+    bool prevJump = false;
+    
+    // Blend thresholds
+    float maxWalkSpeed = 2.0f;
+    float maxRunSpeed = 6.0f;
+    
+    // Transition state
+    bool isTransitioningState = false;
+    float transitionProgress = 0.0f;
+    float transitionDuration = 0.2f;
+    AnimationState transitionFromState = AnimationState::NONE;
+    AnimationState transitionToState = AnimationState::NONE;
+    
+    // Default blend duration
+    float defaultBlendDuration = 0.15f;
+    
+    // Input tracking
+    CharacterInput currentInput;
+    
+    // Internal methods
+    void evaluateTransitions();
+    void startTransition(AnimationState toState, float duration);
+    void updateTransition(float dt);
+    void applyAnimationBlend();
+    
+    // State-specific updates
+    void updateIdle();
+    void updateWalk();
+    void updateRun();
+    void updateJump();
+    void updateFall();
+    void updateCrouch();
+    void updateCrouchWalk();
+};
+
+// ========================================
+// Animation Graph (Advanced Blending)
+// ========================================
+class AnimationGraph {
+public:
+    struct BlendNode {
+        Animation* animation;
+        float weight;
+        glm::vec2 blendPosition;  // Position in blend space
+    };
+    
+    void addBlendNode(Animation* anim, const glm::vec2& position);
+    void updateWeights(const glm::vec2& targetPosition);
+    void applyToAnimator(Animator* animator, float dt);
+    
+private:
+    std::vector<BlendNode> nodes;
+    glm::vec2 currentPosition;
+};

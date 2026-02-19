@@ -161,7 +161,7 @@ std::map<std::string, std::string> AnimationRetargeting::GenerateMixamoBoneMappi
         {"mixamorig:RightLeg", "right_leg"},
         {"mixamorig:RightFoot", "right_foot"},
         {"mixamorig:RightToeBase", "right_toe"},
-        
+
         // Variations
         {"Hips", "hips"},
         {"Spine", "spine"},
@@ -184,8 +184,8 @@ std::map<std::string, std::string> AnimationRetargeting::GenerateMixamoBoneMappi
         {"RightUpLeg", "right_upleg"},
         {"RightLeg", "right_leg"},
         {"RightFoot", "right_foot"},
-        {"RightToe_End", "right_toe"},};
-
+        {"RightToe_End", "right_toe"},
+    };
 
     // Add Mixamo mappings
     for (const auto &[source, target] : mixamoMappings)

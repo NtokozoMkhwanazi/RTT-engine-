@@ -15,9 +15,9 @@
 
 ## 📖 Overview
 
-**RTT-Engine** is a **general-purpose 3D game engine** designed for building games, simulations, and interactive experiences. Built entirely from scratch in modern C++, the engine emphasizes **modularity**, **performance**, and **deep understanding** of graphics programming and engine architecture.
+**RTT-Engine** is a highly **EXPERIMENTAL!**  general-purpose 3D game engine designed for building games, simulations, and interactive experiences. Built entirely from scratch in modern C++, the engine  **attempts** to emphasizes **modularity**, **performance**, and **deep understanding** of graphics programming and engine architecture.
 
-> 🔧 **This is an engine in **ACTIVE-WORK IN PROGRESS, ALOT OF WORK** , not a game.** It provides the foundation and systems you need to build your own projects — from open-world games to physics simulations to architectural visualizations.
+> 🔧 **This is an engine in **ACTIVE-WORK IN PROGRESS** , not a game.** It provides the foundation and systems you need to **Experiment** with your own projects — from open-world games to physics simulations to architectural visualizations.
 
 ---
 Wireframe debug screenshot :
@@ -33,7 +33,7 @@ Wireframe debug screenshot :
 | **Modularity** | Every system is independent and replaceable. Swap components without breaking the engine. |
 | **Low-Level Control** | No black boxes. You control memory, rendering, physics — everything. |
 | **Performance First** | Optimized for real-time rendering and simulation. Every millisecond counts. |
-| **Educational** | Built to understand how game engines work under the hood. |
+| **Educational** | Built for experimenation with graphics . |
 | **Extensible** | Add new systems, components, and features without rewriting core code. |
 
 ---
@@ -306,7 +306,7 @@ This engine is designed to support:
 - Scientific visualizations
 - Virtual environments
 
-### 🛠️ Tools
+### 🛠️ Tools( not implemented yet)
 - Level editors
 - Terrain generators
 - Animation viewers
@@ -353,18 +353,7 @@ This engine is designed to support:
 
 ---
 
-## 📖 Documentation
 
-| Document | Description |
-|----------|-------------|
-| **[FEATURES_COMPLETE.md](FEATURES_COMPLETE.md)** | Complete feature list |
-| **[OPEN_WORLD_GUIDE.md](OPEN_WORLD_GUIDE.md)** | World streaming technical guide |
-| **[TERRAIN_SYSTEM.md](TERRAIN_SYSTEM.md)** | Terrain implementation details |
-| **[WHATS_NEW.md](WHATS_NEW.md)** | Latest updates |
-| **[ENHANCED_ENGINE_SUMMARY.md](ENHANCED_ENGINE_SUMMARY.md)** | Engine enhancements |
-| **[MESH_SYSTEM_IMPROVEMENTS.md](MESH_SYSTEM_IMPROVEMENTS.md)** | Mesh system updates |
-| **[MODEL_SYSTEM_IMPROVEMENTS.md](MODEL_SYSTEM_IMPROVEMENTS.md)** | Model system updates |
-| **[IMPORT_MODELS_GUIDE.md](IMPORT_MODELS_GUIDE.md)** | Model import guide |
 
 ---
 

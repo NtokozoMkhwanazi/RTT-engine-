@@ -20,7 +20,10 @@
 > 🔧 **This is an engine, not a game.** It provides the foundation and systems you need to build your own projects — from open-world games to physics simulations to architectural visualizations.
 
 ---
-![Uploading screen2.png…]()
+Wireframe debug screenshot :
+ <img width="1199" height="656" alt="screen3" src="https://github.com/user-attachments/assets/0231b15e-6aa1-41f7-9247-3b63a6798397" />
+
+
 
 
 ## 🎯 Design Philosophy

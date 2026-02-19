@@ -17,7 +17,7 @@
 
 **RTT-Engine** is a **general-purpose 3D game engine** designed for building games, simulations, and interactive experiences. Built entirely from scratch in modern C++, the engine emphasizes **modularity**, **performance**, and **deep understanding** of graphics programming and engine architecture.
 
-> 🔧 **This is an engine, not a game.** It provides the foundation and systems you need to build your own projects — from open-world games to physics simulations to architectural visualizations.
+> 🔧 **This is an engine in **ACTIVE-WORK IN PROGRESS** , not a game.** It provides the foundation and systems you need to build your own projects — from open-world games to physics simulations to architectural visualizations.
 
 ---
 Wireframe debug screenshot :

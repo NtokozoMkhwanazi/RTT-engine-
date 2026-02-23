@@ -34,10 +34,8 @@
 
 ## 🏗️ Architecture
 
-![Uploading ChatGPT Image Feb 23, 2026, 08_58_08 PM.png…]()
-![Uploading ChatGPT Image Feb 23, 2026, 08_58_08 PM.png…]()
-![Uploading ChatGPT Image Feb 23, 2026, 08_58_08 PM.png…]()
-![Uploading ChatGPT Image Feb 23, 2026, 08_58_08 PM.png…]()
+
+<img width="1536" height="1024" alt="arch" src="https://github.com/user-attachments/assets/21a0feba-50fa-40b3-9cf1-5099b09b9426" />
 
 
 ---

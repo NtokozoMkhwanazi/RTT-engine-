@@ -7,10 +7,12 @@
 #include <map>
 #include <functional>
 #include <set>
+#include <memory>
 
 #include "Animation.h"
-#include "shaderSystem/Shader.h"
-#include "boneSystem/Skeleton.h"
+#include "../shaderSystem/Shader.h"
+#include "../boneSystem/Skeleton.h"
+#include "BoneMatrixBuffer.h"
 
 class Animator
 {
@@ -20,7 +22,12 @@ public:
     void Play(Animation *animation);
     void BlendTo(Animation *animation, float duration);
     void BlendToWithWeight(Animation *animation, float targetWeight, float duration);
+    void BlendTwoAnimations(Animation *anim1, float weight1, Animation *anim2, float weight2, float dt);
     void AddAnimationLayer(Animation *animation, float weight = 1.0f, float blendDuration = 0.3f);
+    
+    // Time control
+    void SetCurrentTime(float time);
+    float GetCurrentTime() const { return animatorTime; }
 
     void Update(float dt);
 
@@ -30,6 +37,7 @@ public:
     // -------- FOOT LOCKING / IK --------
     void AddIKOffset(int bone, const glm::vec3 &offset, float weight);
     bool IsFootPlanted(int bone) const;
+    bool IsCharacterGrounded() const;  // Check if character has at least one foot planted
     glm::vec3 GetBoneWorldPosition(int bone, const glm::mat4 &modelMat) const;
 
     // -------- FOOT IK SYSTEM --------
@@ -64,10 +72,72 @@ public:
 
     const std::vector<glm::mat4> &GetFinalBoneMatrices() const;
 
+    // =========================================================================
+    // BONE MATRIX BUFFER (UBO/SSBO) - PREFERRED METHOD
+    // =========================================================================
+    
+    /**
+     * Initialize bone buffer for fast matrix uploads
+     * Auto-selects UBO (<=120 bones) or SSBO (>120 bones)
+     * 
+     * @param maxBones Maximum bone capacity (default 120)
+     * @param config Configuration options (preferSSBO for crowds)
+     * @return true if successful
+     */
+    bool InitializeBoneBuffer(size_t maxBones = 120, const BoneBufferConfig& config = BoneBufferConfig());
+    
+    /**
+     * Update bone buffer with current matrices
+     * 
+     * @return true if successful
+     */
+    bool UpdateBoneBuffer();
+    
+    /**
+     * Bind bone buffer to shader
+     * 
+     * @param bindingPoint Binding point (default 0)
+     */
+    void BindBoneBuffer(GLuint bindingPoint = 0) const;
+    
+    /**
+     * Check if bone buffer is available
+     */
+    bool HasBoneBuffer() const { return boneBuffer != nullptr && boneBuffer->IsInitialized(); }
+    
+    /**
+     * Get bone buffer statistics
+     */
+    void PrintBoneBufferStats() const;
+    
+    // =========================================================================
+    // DEPRECATED: Old bone upload methods (use BoneBuffer instead)
+    // =========================================================================
+    
+    [[deprecated("Use InitializeBoneBuffer() instead")]]
+    bool InitializeBoneUBO(size_t maxBones = 120) { return InitializeBoneBuffer(maxBones); }
+    
+    [[deprecated("Use UpdateBoneBuffer() instead")]]
+    bool UpdateBoneUBO() { return UpdateBoneBuffer(); }
+    
+    [[deprecated("Use BindBoneBuffer() instead")]]
+    void BindBoneUBO(GLuint bindingPoint = 0) const { BindBoneBuffer(bindingPoint); }
+    
+    [[deprecated("Use HasBoneBuffer() instead")]]
+    bool HasBoneUBO() const { return HasBoneBuffer(); }
+    
+    [[deprecated("Use PrintBoneBufferStats() instead")]]
+    void PrintBoneUBOStats() const { PrintBoneBufferStats(); }
+
     // Animation blending utilities
     void SetAnimationWeight(int layerIndex, float weight);
     void RemoveAnimationLayer(int layerIndex);
     int GetActiveAnimationCount(void) const { return (int)activeAnimations.size(); }
+
+    // Animation state queries (for testing and debugging)
+    Animation* GetCurrentAnimation() const;
+    int GetActiveAnimationLayerCount() const { return (int)activeAnimations.size(); }
+    float GetActiveAnimationTime(int layerIndex = 0) const;
 
     // Animation Events
     struct AnimationEventTrigger {
@@ -138,17 +208,8 @@ public:
     void SetDistanceBasedLOD(float nearDist, float farDist);
     void SetBoneLODThreshold(int highDetailBones, int lowDetailBones);
     void UpdateAnimationLOD(const glm::vec3& viewerPosition, const glm::vec3& modelPosition);
-    
-private:
-    // Animation Quality of Service
-    AnimationQualityLevel qualityLevel = AnimationQualityLevel::HIGH;
-    float lodNearDistance = 10.0f;
-    float lodFarDistance = 30.0f;
-    int highDetailBoneThreshold = 50;
-    int lowDetailBoneThreshold = 20;
-    bool lodEnabled = true;
 
-private:
+    // Animation layer structure (public for testing)
     struct AnimationLayer
     {
         Animation *animation;
@@ -158,7 +219,7 @@ private:
         float blendDuration;
         float time;
         float normalizedWeight;
-        
+
         // Advanced layering features
         int priority = 0;                    // Higher priority layers blend over lower ones
         bool additive = false;               // Whether this layer is additive
@@ -166,7 +227,7 @@ private:
         float fadeInDuration = 0.0f;         // Time to fade this layer in
         float fadeOutDuration = 0.0f;        // Time to fade this layer out
         bool enabled = true;                 // Whether this layer is currently enabled
-        
+
         // Advanced blending features
         BlendType blendType = BlendType::LINEAR;
         glm::vec2 direction = glm::vec2(0.0f, 1.0f);  // Movement direction for directional blending
@@ -179,6 +240,16 @@ private:
             : animation(anim), weight(w), targetWeight(w), blendProgress(0.0f), blendDuration(dur), time(0.0f), normalizedWeight(1.0f) {}
     };
 
+private:
+    // Animation Quality of Service
+    AnimationQualityLevel qualityLevel = AnimationQualityLevel::HIGH;
+    float lodNearDistance = 10.0f;
+    float lodFarDistance = 30.0f;
+    int highDetailBoneThreshold = 50;
+    int lowDetailBoneThreshold = 20;
+    bool lodEnabled = true;
+
+private:
     const Skeleton *skeleton = nullptr;
     Animation *current = nullptr;
     Animation *next = nullptr;
@@ -191,8 +262,8 @@ private:
     float blendTime = 0.0f;
     float blendDuration = 0.0f;
 
-    glm::vec3 rootMotionDelta{0.0f};
     glm::vec3 prevRootPos{0.0f};
+    glm::vec3 rootMotionDelta{0.0f};
     bool hasPrevRoot = false;
 
     std::vector<glm::mat4> finalBoneMatrices;
@@ -219,6 +290,9 @@ public: // temporarily for debug purposes
 
 private:                                  // temporarily
     bool debugForceIdentityScale = false; // Test if scale animation is corrupting legs
+
+    // Bone Matrix Buffer (UBO/SSBO)
+    std::unique_ptr<BoneMatrixBuffer> boneBuffer;
 
     // Animation Events
     std::set<AnimationEventTrigger> animationEvents;

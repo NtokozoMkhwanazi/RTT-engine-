@@ -18,13 +18,13 @@ public:
     float Yaw;
     float Pitch;
 
-    // Camera options
+    // Camera options (order matches constructor initialization list)
+    float FieldOfView;
+    float Zoom;
+    float MouseSensitivity;
     float DistanceToTarget;
     float MinDistance;
     float MaxDistance;
-    float MouseSensitivity;
-    float Zoom;
-    float FieldOfView;
 
     // Mouse state
     float LastX, LastY;
@@ -50,7 +50,8 @@ public:
               float pitch = 20.0f,
               float distance = 8.0f)
         : WorldUp(up), Yaw(yaw), Pitch(pitch),
-          MouseSensitivity(0.2f), Zoom(45.0f), FieldOfView(45.0f),
+          FieldOfView(45.0f), Zoom(45.0f),
+          MouseSensitivity(0.2f),
           DistanceToTarget(distance), MinDistance(1.0f), MaxDistance(50.0f)
     {
         Position = startPos;

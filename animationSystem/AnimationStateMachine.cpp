@@ -6,6 +6,13 @@
 // ========================================
 // AnimationStateMachine Implementation
 // ========================================
+// 
+// UNREAL-STYLE STATE MACHINE DESIGN:
+// 1. States have explicit ENTRY and EXIT conditions
+// 2. One-shot animations (jump) lock state until complete
+// 3. Movement uses blend space concept (idle/walk/run blended)
+// 4. Crouch is explicit toggle, not hold-based
+// 5. Transitions only happen when rules allow
 
 AnimationStateMachine::AnimationStateMachine(Animator* animator)
     : animator(animator),
@@ -18,12 +25,24 @@ AnimationStateMachine::AnimationStateMachine(Animator* animator)
       prevMoving(false),
       prevSprinting(false),
       prevJump(false),
+      prevCrouch(false),
+      jumpAnimationPlaying(false),
+      jumpAnimationStartTime(0.0f),
+      useBlendSpace(true),
+      idleToWalkThreshold(0.3f),
+      walkToRunThreshold(0.6f),
+      blendWeight(0.0f),
+      targetBlendWeight(0.0f),
+      blendSmoothRate(10.0f),
       maxWalkSpeed(2.0f),
       maxRunSpeed(6.0f),
       isTransitioningState(false),
       transitionProgress(0.0f),
       transitionDuration(0.2f),
-      defaultBlendDuration(0.15f)
+      transitionFromState(AnimationState::NONE),
+      transitionToState(AnimationState::NONE),
+      defaultBlendDuration(0.15f),
+      currentInput()
 {
     if (!animator) {
         std::cerr << "[AnimationStateMachine] ERROR: Null animator!\n";
@@ -137,6 +156,12 @@ void AnimationStateMachine::setState(AnimationState state)
               << AnimationStateToString(currentState) << "\n";
 }
 
+void AnimationStateMachine::setBlendBands(float idleToWalk, float walkToRun)
+{
+    idleToWalkThreshold = idleToWalk;
+    walkToRunThreshold = walkToRun;
+}
+
 void AnimationStateMachine::setWalkRunBlendThreshold(float walkThreshold, float runThreshold)
 {
     maxWalkSpeed = walkThreshold;
@@ -161,72 +186,176 @@ void AnimationStateMachine::update(float dt, float speed, bool grounded, bool ju
     // First: complete any pending transition
     if (isTransitioningState) {
         updateTransition(dt);
-        // After transition completes, currentState is updated - fall through to process new input
     }
 
     // Detect edges (key press/release events)
     bool isMoving = (speed > 0.1f);
-    bool sprintPressed = sprinting && !prevSprinting;
-    bool sprintReleased = !sprinting && prevSprinting;
-    bool jumpPressed = jumping && !prevJump;
+    bool movingJustStarted = isMoving && !prevMoving;
+    bool movingJustStopped = !isMoving && prevMoving;
+    bool sprintJustPressed = sprinting && !prevSprinting;
+    bool sprintJustReleased = !sprinting && prevSprinting;
+    bool jumpJustPressed = jumping && !prevJump;
+    bool crouchJustPressed = crouching && !prevCrouch;
+    bool crouchJustReleased = !crouching && prevCrouch;
 
+    // Update previous state tracking
     prevMoving = isMoving;
     prevSprinting = sprinting;
     prevJump = jumping;
+    prevCrouch = crouching;
 
-    // Determine target state based on CURRENT state and inputs
-    // Priority: JUMP > CROUCH > RUN > WALK > IDLE
-    // Note: FALL disabled for testing - jump loops back to idle
+    // Track jump animation playback
+    if (currentState == AnimationState::JUMP) {
+        jumpAnimationPlaying = true;
+        jumpAnimationStartTime += dt;
+    }
+
+    // ============================================================
+    // GRADIENT BAND INTERPOLATION (Blend Space) for Locomotion
+    // ============================================================
+    // Instead of discrete idle/walk/run states, we continuously blend
+    // based on movement speed using gradient bands:
+    //
+    // Speed:     0.0 ---- 0.3 ---- 0.6 ---- 1.0
+    //           IDLE  →  WALK  →   RUN
+    // Blend:    0.0    0.25   0.5    0.75   1.0
+    //
+    // This eliminates popping and creates smooth transitions!
+    // ============================================================
+
     AnimationState targetState = currentState;
+    bool canExitCurrentState = true;
 
-    // JUMP: Highest priority - only trigger on jump PRESS when grounded
-    if (jumpPressed && grounded) {
-        targetState = AnimationState::JUMP;
-    }
-    // FALL: DISABLED - jump animation plays then returns to idle
-    // This is for testing smooth transitions
-    else if (crouching) {
-        if (isMoving) {
-            targetState = AnimationState::CROUCH_WALK;
-        } else {
-            targetState = AnimationState::CROUCH;
+    // ------------------------------------------------------------
+    // STEP 1: Check if we can exit current state (EXIT RULES)
+    // ------------------------------------------------------------
+    
+    if (currentState == AnimationState::JUMP) {
+        // JUMP is a ONE-SHOT animation - cannot exit until:
+        // 1. Animation has played for minimum duration (0.3s)
+        // 2. Character is grounded again
+        float minJumpDuration = 0.3f;
+        if (jumpAnimationPlaying && jumpAnimationStartTime < minJumpDuration) {
+            canExitCurrentState = false;  // Still playing jump wind-up
+        }
+        if (!grounded) {
+            canExitCurrentState = false;  // Still in air
+        }
+        // Reset jump tracking when we can exit
+        if (canExitCurrentState && grounded) {
+            jumpAnimationPlaying = false;
+            jumpAnimationStartTime = 0.0f;
         }
     }
-    // MOVEMENT: Respond immediately to movement input
-    else if (isMoving) {
-        if (sprinting) {
-            targetState = AnimationState::RUN;
-        } else {
+    
+    if (currentState == AnimationState::CROUCH || currentState == AnimationState::CROUCH_WALK) {
+        // CROUCH states use TOGGLE behavior - only exit when:
+        // 1. Crouch button is released (toggle off)
+        // 2. OR crouch button is pressed again (toggle off)
+        if (crouching && !crouchJustReleased && !crouchJustPressed) {
+            canExitCurrentState = false;  // Still in crouch hold, don't exit
+        }
+    }
+
+    // ------------------------------------------------------------
+    // STEP 2: Calculate blend weights using gradient bands
+    // ------------------------------------------------------------
+    
+    if (useBlendSpace && !crouching && grounded && currentState != AnimationState::JUMP) {
+        // Normalize speed to blend weight (0.0 to 1.0)
+        // 0.0 = idle, 0.5 = walk, 1.0 = run
+        float normalizedSpeed = speed / maxRunSpeed;
+        targetBlendWeight = glm::clamp(normalizedSpeed, 0.0f, 1.0f);
+        
+        // Smooth blend weight transition
+        blendWeight = glm::mix(blendWeight, targetBlendWeight, blendSmoothRate * dt);
+        
+        // Determine dominant state based on blend weight
+        if (blendWeight < 0.25f) {
+            targetState = AnimationState::IDLE;
+        } else if (blendWeight < 0.6f) {
             targetState = AnimationState::WALK;
-        }
-    }
-    // IDLE: No input
-    else {
-        targetState = AnimationState::IDLE;
-    }
-
-    // Sprint transitions
-    if (grounded && !crouching && isMoving) {
-        if (sprintPressed && currentState == AnimationState::WALK) {
+        } else {
             targetState = AnimationState::RUN;
-        } else if (sprintReleased && currentState == AnimationState::RUN) {
-            targetState = AnimationState::WALK;
+        }
+        
+        // Apply blend space animation mixing
+        applyBlendSpaceAnimation(dt);
+    }
+
+    // ------------------------------------------------------------
+    // STEP 3: If we can exit, evaluate transition candidates
+    // ------------------------------------------------------------
+    
+    if (canExitCurrentState && !isTransitioningState) {
+        
+        // PRIORITY 1: Jump (highest priority action)
+        if (jumpJustPressed && grounded && !crouching) {
+            targetState = AnimationState::JUMP;
+            jumpAnimationPlaying = true;
+            jumpAnimationStartTime = 0.0f;
+            std::cout << "[FSM] JUMP triggered (edge detect)\n";
+        }
+        // PRIORITY 2: Crouch toggle
+        else if (crouchJustPressed && grounded) {
+            if (currentState == AnimationState::CROUCH || currentState == AnimationState::CROUCH_WALK) {
+                // Toggle OFF: Crouch → Idle
+                targetState = AnimationState::IDLE;
+                std::cout << "[FSM] CROUCH OFF (toggle)\n";
+            } else {
+                // Toggle ON: Any → Crouch
+                targetState = AnimationState::CROUCH;
+                std::cout << "[FSM] CROUCH ON (toggle)\n";
+            }
+        }
+        // PRIORITY 3: Movement states handled by blend space (if enabled)
+        else if (useBlendSpace && !crouching && grounded) {
+            // Blend space handles smooth idle/walk/run transitions
+            // Just ensure we're transitioning to the right dominant state
+            if (targetState != currentState && currentState != AnimationState::JUMP) {
+                // Let blend space handle it - no explicit transition needed
+                // unless state changed significantly
+            }
+        }
+        // PRIORITY 3b: Movement states (discrete, if blend space disabled)
+        else if (!useBlendSpace && !crouching && grounded) {
+            if (movingJustStarted) {
+                targetState = sprinting ? AnimationState::RUN : AnimationState::WALK;
+                std::cout << "[FSM] MOVE START: " << (sprinting ? "RUN" : "WALK") << "\n";
+            }
+            else if (movingJustStopped) {
+                targetState = AnimationState::IDLE;
+                std::cout << "[FSM] MOVE STOP → IDLE\n";
+            }
+            else if (sprintJustPressed && isMoving && currentState == AnimationState::WALK) {
+                targetState = AnimationState::RUN;
+                std::cout << "[FSM] SPRINT PRESSED → RUN\n";
+            }
+            else if (sprintJustReleased && isMoving && currentState == AnimationState::RUN) {
+                targetState = AnimationState::WALK;
+                std::cout << "[FSM] SPRINT RELEASED → WALK\n";
+            }
+        }
+        // PRIORITY 4: Crouch movement
+        else if (crouching && grounded) {
+            if (isMoving) {
+                targetState = AnimationState::CROUCH_WALK;
+            }
+            else if (currentState != AnimationState::CROUCH) {
+                targetState = AnimationState::CROUCH;
+            }
+        }
+        // PRIORITY 5: Default to idle when no input
+        else if (!isMoving && !crouching && grounded && currentState != AnimationState::IDLE) {
+            targetState = AnimationState::IDLE;
+            std::cout << "[FSM] NO INPUT → IDLE\n";
         }
     }
 
-    // Debug output
-    static int frameCount = 0;
-    frameCount++;
-    if (frameCount % 30 == 0) {
-        std::cout << "[FSM] spd=" << speed << " grounded=" << grounded
-                  << " jump=" << jumping << " vVel=" << verticalVelocity
-                  << " sprint=" << sprinting << " crouch=" << crouching
-                  << " target=" << AnimationStateToString(targetState)
-                  << " current=" << AnimationStateToString(currentState)
-                  << " isTrans=" << isTransitioningState << "\n";
-    }
-
-    // Transition if state changed and not already transitioning
+    // ------------------------------------------------------------
+    // STEP 4: Execute transition if state changed
+    // ------------------------------------------------------------
+    
     if (targetState != currentState && !isTransitioningState) {
         startTransition(targetState, defaultBlendDuration);
     }
@@ -234,6 +363,72 @@ void AnimationStateMachine::update(float dt, float speed, bool grounded, bool ju
     // Update animator to advance animation time
     if (animator) {
         animator->Update(dt);
+    }
+
+    // Debug output every 60 frames
+    static int frameCount = 0;
+    frameCount++;
+    if (frameCount % 60 == 0) {
+        std::cout << "[FSM] State=" << AnimationStateToString(currentState)
+                  << " Speed=" << speed << " Grounded=" << grounded
+                  << " BlendWeight=" << blendWeight << " TargetBlend=" << targetBlendWeight
+                  << " canExit=" << canExitCurrentState
+                  << " jumpPlaying=" << jumpAnimationPlaying
+                  << " jumpTime=" << jumpAnimationStartTime << "\n";
+    }
+}
+
+// ============================================================
+// GRADIENT BAND INTERPOLATION - Apply blended animations
+// ============================================================
+void AnimationStateMachine::applyBlendSpaceAnimation(float dt)
+{
+    if (!animator || !useBlendSpace) return;
+    
+    // Blend space uses blend weight to mix idle/walk/run
+    // Weight 0.0 = 100% idle
+    // Weight 0.5 = 100% walk  
+    // Weight 1.0 = 100% run
+    // In-between = smooth interpolation
+    
+    Animation* idleAnim = nullptr;
+    Animation* walkAnim = nullptr;
+    Animation* runAnim = nullptr;
+    
+    auto it = stateAnimations.find(AnimationState::IDLE);
+    if (it != stateAnimations.end()) idleAnim = it->second.animation;
+    
+    it = stateAnimations.find(AnimationState::WALK);
+    if (it != stateAnimations.end()) walkAnim = it->second.animation;
+    
+    it = stateAnimations.find(AnimationState::RUN);
+    if (it != stateAnimations.end()) runAnim = it->second.animation;
+    
+    // Determine which animations to blend based on blend weight
+    if (blendWeight < 0.5f) {
+        // Blending idle ↔ walk
+        float idleWeight = 1.0f - (blendWeight * 2.0f);  // 1.0 → 0.0
+        float walkWeight = blendWeight * 2.0f;            // 0.0 → 1.0
+        
+        if (idleAnim && walkAnim) {
+            animator->BlendTwoAnimations(idleAnim, idleWeight, walkAnim, walkWeight, dt);
+        } else if (idleAnim) {
+            animator->Play(idleAnim);
+        } else if (walkAnim) {
+            animator->Play(walkAnim);
+        }
+    } else {
+        // Blending walk ↔ run
+        float walkWeight = 2.0f - (blendWeight * 2.0f);  // 1.0 → 0.0
+        float runWeight = (blendWeight - 0.5f) * 2.0f;    // 0.0 → 1.0
+        
+        if (walkAnim && runAnim) {
+            animator->BlendTwoAnimations(walkAnim, walkWeight, runAnim, runWeight, dt);
+        } else if (walkAnim) {
+            animator->Play(walkAnim);
+        } else if (runAnim) {
+            animator->Play(runAnim);
+        }
     }
 }
 

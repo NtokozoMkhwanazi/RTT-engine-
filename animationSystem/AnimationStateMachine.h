@@ -90,15 +90,15 @@ class AnimationStateMachine {
 public:
     AnimationStateMachine(Animator* animator);
     ~AnimationStateMachine() = default;
-    
+
     // State management
     void setState(AnimationState state);
     AnimationState getCurrentState() const { return currentState; }
     AnimationState getPreviousState() const { return previousState; }
-    
+
     // Initialization
     void initialize();  // Start with initial state (IDLE)
-    
+
     // Animation registration
     void registerAnimation(AnimationState state, Animation* anim, float speed = 1.0f, bool loop = true);
     void registerAnimations(
@@ -106,34 +106,51 @@ public:
         Animation* jump = nullptr, Animation* fall = nullptr,
         Animation* crouch = nullptr, Animation* crouchWalk = nullptr
     );
+
+    // GRADIENT BAND INTERPOLATION (Blend Space)
+    // Uses continuous blending instead of discrete states for locomotion
+    void setBlendSpaceEnabled(bool enabled) { useBlendSpace = enabled; }
+    bool isBlendSpaceEnabled() const { return useBlendSpace; }
     
+    // Blend band configuration
+    void setBlendBands(float idleToWalk, float walkToRun);
+    void setWalkRunBlendThreshold(float walkThreshold, float runThreshold);  // Legacy support
+    float getIdleToWalkThreshold() const { return idleToWalkThreshold; }
+    float getWalkToRunThreshold() const { return walkToRunThreshold; }
+
     // Transition management
     void addTransition(const AnimationTransition& transition);
     void addTransition(AnimationState from, AnimationState to, float duration, std::function<bool()> condition);
     void clearTransitions();
-    
+
     // Update
     void update(float dt, const CharacterInput& input);
     void update(float dt, float speed, bool grounded, bool jumping, bool crouching, bool sprinting);
-    
+
     // Parameters
     void setSpeed(float speed) { movementSpeed = speed; }
     void setGrounded(bool grounded) { isGrounded = grounded; }
     void setVerticalVelocity(float velocity) { verticalVelocity = velocity; }
-    
+
     // Blending
     void setBlendDuration(float duration) { defaultBlendDuration = duration; }
-    void setWalkRunBlendThreshold(float walkThreshold, float runThreshold);
-    
+
     // Debug
     std::string getDebugInfo() const;
     void printState() const;
-    
+
     // State queries
     bool isInState(AnimationState state) const { return currentState == state; }
     bool isTransitioning() const { return isTransitioningState; }
     float getTransitionProgress() const { return transitionProgress; }
     
+    // Blend space queries
+    float getCurrentBlendWeight() const { return blendWeight; }
+    float getTargetBlendWeight() const { return targetBlendWeight; }
+    
+    // GRADIENT BAND INTERPOLATION
+    void applyBlendSpaceAnimation(float dt);  // Apply blended animations based on weight
+
     // Movement parameters
     float getMovementSpeed() const { return movementSpeed; }
     float getMaxWalkSpeed() const { return maxWalkSpeed; }
@@ -158,6 +175,19 @@ private:
     bool prevMoving = false;
     bool prevSprinting = false;
     bool prevJump = false;
+    bool prevCrouch = false;
+    
+    // One-shot animation tracking (for jump, etc.)
+    bool jumpAnimationPlaying = false;
+    float jumpAnimationStartTime = 0.0f;
+    
+    // GRADIENT BAND INTERPOLATION (Blend Space)
+    bool useBlendSpace = true;  // Enable continuous blending for locomotion
+    float idleToWalkThreshold = 0.3f;   // Speed where idle→walk blend starts
+    float walkToRunThreshold = 0.6f;    // Speed where walk→run blend starts
+    float blendWeight = 0.0f;           // Current blend weight (0=idle, 0.5=walk, 1=run)
+    float targetBlendWeight = 0.0f;     // Target blend weight
+    float blendSmoothRate = 10.0f;      // How fast blend weight changes
     
     // Blend thresholds
     float maxWalkSpeed = 2.0f;

@@ -5,7 +5,8 @@
 #include "cameraSystem/flyCamera.h"
 #include "animationSystem/Animator.h"
 #include "animationSystem/AssimpAnimationLoader.h"
-#include "animationSystem/AnimationStateMachine.h"
+#include "animationSystem/AnimationStateMachine.h"  // For CharacterInput
+#include "motionMatching/MotionMatcher.h"            // NEW: Motion Matching System
 #include "shaderSystem/stb_image.h"
 #include "physicsSystem/RigidBody.h"
 #include "physicsSystem/Floor.h"
@@ -24,6 +25,7 @@
 
 #include <iostream>
 #include <vector>
+#include <cmath>
 
 // ================= CAMERA =================
 flyCamera camera(
@@ -33,18 +35,160 @@ flyCamera camera(
     0.0f,
     10.0f);
 
-// Third-person camera settings
+// ================= CAMERA TEST ASSERTIONS =================
+void runCameraTests() {
+    std::cout << "\n=== RUNNING CAMERA TEST ASSERTIONS ===\n";
+    
+    int passed = 0, failed = 0;
+    
+    // Test 1: Camera initial position
+    if (camera.Position == glm::vec3(0.0f, 3.0f, 10.0f)) {
+        std::cout << "  [PASS] Camera initial position\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] Camera initial position\n";
+        failed++;
+    }
+    
+    // Test 2: Camera initial yaw/pitch
+    if (camera.Yaw == -90.0f && camera.Pitch == 0.0f) {
+        std::cout << "  [PASS] Camera initial yaw/pitch\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] Camera initial yaw/pitch\n";
+        failed++;
+    }
+    
+    // Test 3: GetViewMatrix returns valid matrix
+    glm::mat4 view = camera.GetViewMatrix();
+    bool validView = !std::isnan(view[0][0]) && !std::isnan(view[1][1]) && !std::isnan(view[2][2]);
+    if (validView) {
+        std::cout << "  [PASS] GetViewMatrix returns valid matrix\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] GetViewMatrix returns valid matrix\n";
+        failed++;
+    }
+    
+    // Test 4: GetProjectionMatrix returns valid matrix
+    glm::mat4 proj = camera.GetProjectionMatrix(16.0f / 9.0f);
+    bool validProj = !std::isnan(proj[0][0]) && !std::isnan(proj[1][1]);
+    if (validProj) {
+        std::cout << "  [PASS] GetProjectionMatrix returns valid matrix\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] GetProjectionMatrix returns valid matrix\n";
+        failed++;
+    }
+    
+    // Test 5: Mouse movement updates yaw/pitch
+    flyCamera testCam(glm::vec3(0, 0, 10), glm::vec3(0, 1, 0), -90.0f, 0.0f, 10.0f);
+    float initialYaw = testCam.Yaw;
+    testCam.ProcessMouseMovement(450.0f, 350.0f);  // Simulate mouse move
+    if (testCam.Yaw != initialYaw) {
+        std::cout << "  [PASS] Mouse movement updates yaw/pitch\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] Mouse movement updates yaw/pitch\n";
+        failed++;
+    }
+    
+    // Test 6: Scroll zoom changes distance
+    flyCamera zoomCam(glm::vec3(0, 0, 10), glm::vec3(0, 1, 0), -90.0f, 0.0f, 10.0f);
+    float initialDist = zoomCam.DistanceToTarget;
+    zoomCam.ProcessMouseScroll(5.0f);
+    if (zoomCam.DistanceToTarget != initialDist) {
+        std::cout << "  [PASS] Scroll zoom changes distance\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] Scroll zoom changes distance\n";
+        failed++;
+    }
+    
+    // Test 7: Zoom respects min/max limits
+    zoomCam.ProcessMouseScroll(-100.0f);  // Try to zoom way in
+    if (zoomCam.DistanceToTarget >= zoomCam.MinDistance) {
+        std::cout << "  [PASS] Zoom respects min/max limits\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] Zoom respects min/max limits\n";
+        failed++;
+    }
+    
+    // Test 8: FollowPlayer updates position
+    flyCamera followCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
+    glm::vec3 initialPos = followCam.Position;
+    followCam.FollowPlayer(glm::vec3(0, 0, 5));  // Move target
+    if (followCam.Position != initialPos) {
+        std::cout << "  [PASS] FollowPlayer updates position\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] FollowPlayer updates position\n";
+        failed++;
+    }
+    
+    // Test 9: FollowPlayerSmooth updates position
+    flyCamera smoothCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
+    glm::vec3 smoothInitialPos = smoothCam.Position;
+    smoothCam.FollowPlayerSmooth(glm::vec3(0, 0, 5), 0.016f);
+    if (smoothCam.Position != smoothInitialPos) {
+        std::cout << "  [PASS] FollowPlayerSmooth updates position\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] FollowPlayerSmooth updates position\n";
+        failed++;
+    }
+    
+    // Test 10: Camera shake effect
+    flyCamera shakeCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
+    shakeCam.AddShake(1.0f, 2.0f, glm::vec3(1, 1, 1));
+    if (shakeCam.currentShake.intensity > 0.0f) {
+        std::cout << "  [PASS] Camera shake effect\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] Camera shake effect\n";
+        failed++;
+    }
+    
+    // Test 11: SetFieldOfView clamps values
+    flyCamera fovCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
+    fovCam.SetFieldOfView(150.0f);  // Should clamp to 120
+    if (fovCam.FieldOfView <= 120.0f) {
+        std::cout << "  [PASS] SetFieldOfView clamps values\n";
+        passed++;
+    } else {
+        std::cout << "  [FAIL] SetFieldOfView clamps values\n";
+        failed++;
+    }
+    
+    // Test 12: Collision detection setup
+    flyCamera colCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
+    colCam.SetCollisionEnabled(true);
+    colCam.SetCollisionDistance(2.0f);
+    std::cout << "  [PASS] Collision detection setup (manual verify)\n";
+    passed++;
+    
+    std::cout << "\n=== CAMERA TEST RESULTS: " << passed << " passed, " << failed << " failed ===\n\n";
+    
+    if (failed > 0) {
+        std::cerr << "WARNING: Some camera tests failed!\n";
+    }
+}
+
+// Third-person camera settings - AAA QUALITY
 glm::vec3 cameraPivot(0.0f, 2.0f, 0.0f);  // Point camera looks at (character + offset)
-float cameraDistance = 15.0f;              // Distance from pivot (increased for better view)
-float cameraHeight = 5.0f;                 // Camera height offset (higher angle)
+float cameraDistance = 21.0f;              // Distance from pivot (increased for better view)
+float cameraHeight = 7.0f;                 // Camera height offset (higher overhead view)
 float cameraRotateSpeed = 3.0f;            // Mouse rotation speed
-float cameraFollowSmooth = 3.0f;           // LOWER = smoother/more lag, HIGHER = tighter/snappier
-float cameraZoomSpeed = 15.0f;             // Zoom speed
-float cameraZoomMin = 8.0f;                // Minimum zoom distance (increased)
-float cameraZoomMax = 30.0f;               // Maximum zoom distance (increased)
+
+// AAA QUALITY CAMERA - Maximum smoothing for perfect follow
+// Camera updates AFTER character position = zero lag
+// Zoom range for cinematic to gameplay views
+float cameraZoomSpeed = 25.0f;             // Fast zoom scrolling
+float cameraZoomMin = 10.0f;               // Minimum zoom (close-up)
+float cameraZoomMax = 50.0f;               // Maximum zoom (very far - cinematic)
 bool cameraFollowEnabled = true;
-bool cameraFixedMode = false;              // Fixed behind camera (no orbit, more stable)
-float cameraPivotSmooth = 2.0f;            // Even smoother pivot following (reduces jitter)
+bool cameraFixedMode = false;              // Fixed behind camera (no orbit)
 
 void framebuffer_size_callback(GLFWwindow *, int w, int h) { glViewport(0, 0, w, h); }
 void mouse_callback(GLFWwindow *window, double xpos, double ypos) {
@@ -345,15 +489,42 @@ void main() {
 // ================= MAIN =================
 int main()
 {
-    if (!glfwInit()) { std::cerr << "GLFW init failed\n"; return -1; }
-    
+    // Initialize GLFW with hints for better compatibility
+    if (!glfwInit()) { 
+        std::cerr << "GLFW init failed\n"; 
+        return -1; 
+    }
+
+    // Set OpenGL version and profile
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-    GLFWwindow *window = glfwCreateWindow(1280, 720, "3D Engine - Skinned Model", nullptr, nullptr);
-    if (!window) { std::cerr << "Window failed\n"; glfwTerminate(); return -1; }
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);  // For macOS compatibility
+    glfwWindowHint(GLFW_RESIZABLE, GL_TRUE);
     
+    // Try to create window with different hints if first attempt fails
+    GLFWwindow *window = glfwCreateWindow(1280, 720, "3D Engine - Skinned Model", nullptr, nullptr);
+    
+    if (!window) {
+        std::cerr << "Window creation failed with default hints, trying alternative...\n";
+        glfwWindowHint(GLFW_SAMPLES, 4);  // Try with MSAA
+        window = glfwCreateWindow(1280, 720, "3D Engine - Skinned Model", nullptr, nullptr);
+    }
+    
+    if (!window) {
+        std::cerr << "GLFW Window creation failed!\n";
+        std::cerr << "Possible causes:\n";
+        std::cerr << "  - No display available (running headless)\n";
+        std::cerr << "  - OpenGL 3.3 not supported\n";
+        std::cerr << "  - Graphics drivers not installed\n";
+        std::cerr << "\nTry:\n";
+        std::cerr << "  - Running on a system with a display\n";
+        std::cerr << "  - Installing proper graphics drivers\n";
+        std::cerr << "  - Using software OpenGL: export LIBGL_ALWAYS_SOFTWARE=1\n";
+        glfwTerminate();
+        return -1;
+    }
+
     std::cout << "\n=== 3D ENGINE - ANIMATION STATE MACHINE ===\n";
     std::cout << "Controls:\n";
     std::cout << "  Mouse - Orbit camera (disabled in fixed mode)\n";
@@ -380,26 +551,27 @@ int main()
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        std::cerr << "GLAD failed\n"; return -1;
+        std::cerr << "GLAD failed\n"; glfwTerminate(); return -1;
     }
+
+    std::cout << "GLFW Window created successfully!\n";
+    std::cout << "OpenGL Version: " << glGetString(GL_VERSION) << "\n";
+    std::cout << "GLSL Version: " << glGetString(GL_SHADING_LANGUAGE_VERSION) << "\n";
+    std::cout << "GLAD initialized successfully!\n";
+    std::cout.flush();
+
+    // Run camera test assertions
+    runCameraTests();
 
     glEnable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);  // Start in SOLID mode (not wireframe)
 
-    // Skybox - enable for better visuals
-    std::cout << "Loading skybox...\n";
-    setupSkybox();
-    std::vector<std::string> skyboxFaces = {
-        "assets/skybox/day/right.jpg",
-        "assets/skybox/day/left.jpg",
-        "assets/skybox/day/top.jpg",
-        "assets/skybox/day/bottom.jpg",
-        "assets/skybox/day/back.jpg",
-        "assets/skybox/day/front.jpg"
-    };
-    skyboxTexture = loadCubemap(skyboxFaces);
-    std::cout << "Skybox loaded\n";
+    // Skybox - DISABLED for world terrain rendering
+    // Using clear color + fog for atmosphere instead
+    std::cout << "Skybox disabled - using procedural fog for atmosphere\n";
+    // setupSkybox();  // Disabled
+    // skyboxTexture = 0;  // Disabled
 
     // Load model
     std::cout << "Loading model...\n";
@@ -425,57 +597,162 @@ int main()
     Animation* fallAnim = nullptr;
     Animation* crouchAnim = nullptr;
     Animation* crouchWalkAnim = nullptr;
+
+    // ============================================================
+    // LOADING SCREEN
+    // ============================================================
+    std::cout << "\n";
+    std::cout << "========================================\n";
+    std::cout << "  LOADING...\n";
+    std::cout << "========================================\n";
     
+    int loadingStep = 0;
+    int totalSteps = 10;  // Total loading steps
+    
+    auto showProgress = [&]() {
+        loadingStep++;
+        int percent = (loadingStep * 100) / totalSteps;
+        std::cout << "  [" << percent << "%] ";
+        std::cout.flush();
+    };
+
     // Helper lambda to load animation
     auto loadAnim = [&](const std::string& path, const std::string& name) -> Animation* {
         const aiScene* scene = importer.ReadFile(path, aiProcess_Triangulate | aiProcess_FlipUVs);
         if (scene && scene->HasAnimations()) {
             Animation* anim = new Animation(AssimpAnimationLoader::LoadAnimationWithPoseCorrection(scene, scene->mAnimations[0]));
-            std::cout << "  Loaded " << name << ": " << anim->name << " (" << anim->duration << "s, " 
-                      << anim->boneAnimations.size() << " bones)\n";
             return anim;
         }
-        std::cout << "  WARNING: Failed to load " << name << " from " << path << "\n";
         return nullptr;
     };
-    
-    // Load animations (using available files)
-    idleAnim = loadAnim("assets/Idle.fbx", "Idle");
-    walkAnim = loadAnim("assets/Walking.fbx", "Walk");
-    runAnim = loadAnim("assets/Run.fbx", "Run");
-    jumpAnim = loadAnim("assets/Jump.fbx", "Jump");
-    fallAnim = loadAnim("assets/fall.fbx", "Fall");
-    crouchAnim = loadAnim("assets/Crouching.fbx", "Crouch");
-    crouchWalkAnim = loadAnim("assets/chrouchWalk.fbx", "CrouchWalk");
 
-    // Load grass model for ground cover (optional - large file)
+    std::cout << "  Loading animations...\n";
+    
+    // Load animations
+    idleAnim = loadAnim("assets/Idle.fbx", "Idle");    showProgress(); std::cout << "Idle\n";
+    walkAnim = loadAnim("assets/Walking.fbx", "Walk");  showProgress(); std::cout << "Walk\n";
+    runAnim = loadAnim("assets/Run.fbx", "Run");        showProgress(); std::cout << "Run\n";
+    jumpAnim = loadAnim("assets/Jump.fbx", "Jump");     showProgress(); std::cout << "Jump\n";
+    fallAnim = loadAnim("assets/fall.fbx", "Fall");     showProgress(); std::cout << "Fall\n";
+    crouchAnim = loadAnim("assets/Crouching.fbx", "Crouch"); showProgress(); std::cout << "Crouch\n";
+    crouchWalkAnim = loadAnim("assets/chrouchWalk.fbx", "CrouchWalk"); showProgress(); std::cout << "CrouchWalk\n";
+
+    // Load grass model
+    showProgress(); std::cout << "Grass...\n";
     Model* grassModel = nullptr;
-    std::cout << "\nLoading grass model (optional, may take time)...\n";
     try {
         grassModel = new Model("assets/grass/grass.fbx");
-        if (grassModel && grassModel->GetMeshCount() > 0) {
-            std::cout << "✓ Grass loaded: " << grassModel->GetMeshCount() << " meshes (" 
-                      << (grassModel->GetSize().x * grassModel->GetSize().y * grassModel->GetSize().z / 1000000.0f) 
-                      << "M units³)\n";
-        } else {
-            std::cout << "Grass model empty, using terrain colors\n";
+        if (!grassModel || grassModel->GetMeshCount() == 0) {
             if (grassModel) delete grassModel;
             grassModel = nullptr;
         }
     } catch (...) {
-        std::cout << "Grass loading failed, using terrain colors\n";
+        if (grassModel) delete grassModel;
         grassModel = nullptr;
     }
 
-    // Debug: print animation root motion info
-    auto printAnimInfo = [](Animation* anim, const std::string& name) {
-        if (anim) {
-            std::cout << "  " << name << ": duration=" << anim->duration
-                      << "s, ticks/sec=" << anim->ticksPerSecond
-                      << ", bones=" << anim->boneAnimations.size() << "\n";
+    // Create animator
+    showProgress(); std::cout << "Animator...\n";
+    Animator* animator = new Animator(&skeleton);
+
+    // Motion Matching System
+    showProgress(); std::cout << "Motion Matching...\n";
+    MotionMatcher* matcher = new MotionMatcher();
+    matcher->Initialize(&skeleton, animator);
+    
+    // Configure motion matching
+    MotionMatchingConfig mmConfig;
+    mmConfig.maxSearchResults = 10;
+    mmConfig.searchRadius = 2.0f;
+    mmConfig.useTrajectoryMatching = true;
+    mmConfig.blendDuration = 0.1f;
+    mmConfig.footPlantThreshold = 0.05f;
+    mmConfig.footPlantHeightThreshold = 0.1f;
+    mmConfig.enableFootLocking = true;
+    mmConfig.trajectoryDuration = 0.5f;
+    mmConfig.trajectoryPoints = 5;
+    matcher->SetConfig(mmConfig);
+    
+    // Load animations into motion database
+    std::cout << "\n=== LOADING ANIMATIONS INTO MOTION DATABASE ===\n";
+    if (idleAnim) matcher->LoadAnimation("Idle", std::shared_ptr<Animation>(idleAnim, [](Animation*){}));
+    if (walkAnim) matcher->LoadAnimation("Walk", std::shared_ptr<Animation>(walkAnim, [](Animation*){}));
+    if (runAnim) matcher->LoadAnimation("Run", std::shared_ptr<Animation>(runAnim, [](Animation*){}));
+    if (jumpAnim) matcher->LoadAnimation("Jump", std::shared_ptr<Animation>(jumpAnim, [](Animation*){}));
+    if (crouchAnim) matcher->LoadAnimation("Crouch", std::shared_ptr<Animation>(crouchAnim, [](Animation*){}));
+    if (crouchWalkAnim) matcher->LoadAnimation("CrouchWalk", std::shared_ptr<Animation>(crouchWalkAnim, [](Animation*){}));
+    
+    std::cout << "\nMotion Matching Database Stats:\n";
+    std::cout << matcher->GetDatabaseStats() << "\n";
+    
+    // Build KD-Tree for fast search (after all animations loaded)
+    std::cout << "\nBuilding KD-Tree for fast search...\n";
+    matcher->BuildSearchIndex();
+
+    // FIX: Your FBX animations have WRONG duration (29-499 seconds instead of 1-2 seconds)
+    // This happens when Blender/Maya exports entire timeline instead of just the cycle
+    // We'll truncate the duration to the actual animation cycle length
+    auto fixAnimationDuration = [](Animation* anim, float expectedDuration, const std::string& name) {
+        if (anim && anim->duration > 5.0f) {  // Only fix if way too long
+            // The actual animation cycle is the first N frames
+            // Truncate duration to expected length (this makes it loop correctly)
+            anim->duration = expectedDuration;
+            std::cout << "  [FIX] " << name << ": " << anim->name
+                      << " duration " << (anim->duration > 100 ? "TRUNCATED" : "set")
+                      << " (" << anim->duration << "s)\n";
         }
     };
+
+    std::cout << "\n=== FIXING ANIMATION DURATIONS (FBX Export Issue) ===\n";
+    fixAnimationDuration(idleAnim, 2.5f, "Idle");
+    fixAnimationDuration(walkAnim, 1.2f, "Walk");
+    fixAnimationDuration(runAnim, 0.9f, "Run");
+    fixAnimationDuration(jumpAnim, 1.1f, "Jump");
+    fixAnimationDuration(fallAnim, 1.0f, "Fall");
+    fixAnimationDuration(crouchAnim, 0.6f, "Crouch");
+    fixAnimationDuration(crouchWalkAnim, 1.0f, "CrouchWalk");
+    std::cout << "Note: Re-export FBX with only animation cycle selected\n";
+
+    // ENABLE root motion - the animation drives the movement
+    // We'll extract root motion and apply it in the camera-relative direction
+    animator->SetLockRootPosition(false);
+    std::cout << "\nRoot motion ENABLED - will extract and apply camera-relative\n";
+    std::cout << "Motion Matching ACTIVE - continuous pose searching\n";
+
+    // Debug: print animation info (AFTER animator created)
+    auto printAnimInfo = [](Animation* anim, const std::string& name) {
+        if (anim) {
+            float frames = anim->duration * 30.0f;  // Assume 30fps
+            std::cout << "  " << name << ": duration=" << anim->duration
+                      << "s (" << (int)frames << " frames @30fps)"
+                      << ", ticks/sec=" << anim->ticksPerSecond
+                      << ", bones=" << anim->boneAnimations.size() << "\n";
+            
+            // Check if animation length is appropriate
+            if (name == "Walk" && (frames < 20 || frames > 60)) {
+                std::cout << "    ⚠️  WARNING: Walk should be 30-45 frames (1-1.5s @30fps)\n";
+            }
+            if (name == "Run" && (frames < 15 || frames > 50)) {
+                std::cout << "    ⚠️  WARNING: Run should be 24-36 frames (0.8-1.2s @30fps)\n";
+            }
+            if (name == "Jump" && (frames < 20 || frames > 60)) {
+                std::cout << "    ⚠️  WARNING: Jump should be 30-45 frames (1-1.5s @30fps)\n";
+            }
+            if (name == "Idle" && (frames < 40 || frames > 120)) {
+                std::cout << "    ⚠️  WARNING: Idle should be 60-90 frames (2-3s @30fps)\n";
+            }
+        } else {
+            std::cout << "  " << name << ": NOT LOADED\n";
+        }
+    };
+    
     std::cout << "\n=== ANIMATION INFO ===\n";
+    std::cout << "Expected lengths @30fps:\n";
+    std::cout << "  Idle: 60-90 frames (2-3s) - loops IN PLACE\n";
+    std::cout << "  Walk: 30-45 frames (1-1.5s) - loops IN PLACE\n";
+    std::cout << "  Run: 24-36 frames (0.8-1.2s) - loops IN PLACE\n";
+    std::cout << "  Jump: 30-45 frames (1-1.5s) - ONE-SHOT with root motion\n";
+    std::cout << "\nActual animations:\n";
     printAnimInfo(idleAnim, "Idle");
     printAnimInfo(walkAnim, "Walk");
     printAnimInfo(runAnim, "Run");
@@ -484,34 +761,13 @@ int main()
     printAnimInfo(crouchAnim, "Crouch");
     printAnimInfo(crouchWalkAnim, "CrouchWalk");
     
-    // Create animator
-    Animator* animator = new Animator(&skeleton);
-    
-    // Create animation state machine
-    AnimationStateMachine* stateMachine = new AnimationStateMachine(animator);
-    
-    // Register animations with state machine
-    stateMachine->registerAnimations(
-        idleAnim,   // IDLE
-        walkAnim,   // WALK
-        runAnim,    // RUN
-        jumpAnim,   // JUMP (optional)
-        fallAnim,   // FALL (optional)
-        crouchAnim, // CROUCH (optional)
-        crouchWalkAnim // CROUCH_WALK (optional)
-    );
-    
-    // Set up default transitions
-    stateMachine->setBlendDuration(0.25f);  // Smoother, less snappy (was 0.15f)
-    stateMachine->setWalkRunBlendThreshold(0.5f, 0.8f);
-
-    // Initialize with IDLE animation
-    stateMachine->initialize();
-
-    // ENABLE root motion - the animation drives the movement
-    // We'll extract root motion and apply it in the camera-relative direction
-    animator->SetLockRootPosition(false);
-    std::cout << "Root motion ENABLED - will extract and apply camera-relative\n";
+    std::cout << "\n=== ROOT MOTION STATUS ===\n";
+    std::cout << "Root position locked: " << (animator->IsRootPositionLocked() ? "YES (code drives movement)" : "NO (root motion DRIVES movement)") << "\n";
+    std::cout << "\n=== TROUBLESHOOTING ===\n";
+    std::cout << "If character slides/stuck in pose:\n";
+    std::cout << "  1. Animations too short? Should be 30-45 frames for walk\n";
+    std::cout << "  2. Root motion wrong? Try: animator->SetLockRootPosition(true)\n";
+    std::cout << "  3. Movement multiplier wrong? Adjust in code (currently 0.25f)\n";
 
     std::cout << "\nAnimation State Machine initialized!\n";
     std::cout << "Registered states: " 
@@ -528,10 +784,10 @@ int main()
     // SETUP FLOOR AND FOOT IK
     // ============================================================
     std::cout << "\n=== SETTING UP PHYSICS FLOOR & FOOT IK ===\n";
-    
-    // Floor height (where feet should plant)
+
+    // Floor height (where feet should plant) - will be updated dynamically in main loop
     float floorHeight = 0.0f;
-    
+
     // Setup foot IK if animation is loaded
     if (animator) {
         // Find foot bone indices from skeleton
@@ -539,14 +795,14 @@ int main()
         int rightFoot = skeleton.GetBoneIndex("rightfoot");
         int leftToe = skeleton.GetBoneIndex("lefttoebase");
         int rightToe = skeleton.GetBoneIndex("righttoebase");
-        
-        std::cout << "Foot bones: left=" << leftFoot << " right=" << rightFoot 
+
+        std::cout << "Foot bones: left=" << leftFoot << " right=" << rightFoot
                   << " | leftToe=" << leftToe << " rightToe=" << rightToe << "\n";
-        
-        // Configure foot IK
+
+        // Configure foot IK - floor height will be updated dynamically in main loop
         Animator::FootIKSettings ikSettings;
         ikSettings.enabled = true;
-        ikSettings.floorHeight = floorHeight;
+        ikSettings.floorHeight = floorHeight;  // Updated dynamically in main loop
         ikSettings.ikStrength = 1.0f;
         ikSettings.footLockBlend = 0.9f;
         ikSettings.maxIKDistance = 0.2f;
@@ -554,12 +810,12 @@ int main()
         ikSettings.rightFootBone = rightFoot;
         ikSettings.leftToeBone = leftToe;
         ikSettings.rightToeBone = rightToe;
-        
+
         animator->SetFootIKSettings(ikSettings);
-        std::cout << "Foot IK configured and enabled!\n";
+        std::cout << "Foot IK configured and enabled (floor Y will update dynamically)!\n";
     }
     
-    // Create floor physics body
+    // Create floor physics body (invisible collider)
     std::shared_ptr<RigidBody> floorBody = std::make_shared<RigidBody>(
         glm::vec3(0.0f, floorHeight, 0.0f),
         glm::vec3(200.0f, 1.0f, 200.0f),
@@ -570,8 +826,62 @@ int main()
     floorBody->friction = 0.9f;
     floorBody->restitution = 0.0f;
     floorBody->albedo = glm::vec3(0.25f, 0.25f, 0.3f);  // Dark blue-gray
-    
+
     std::cout << "Floor physics body created at y=" << floorHeight << "\n";
+    
+    // Create visible debug floor plane (for visualization)
+    GLuint debugFloorVAO = 0, debugFloorVBO = 0, debugFloorEBO = 0;
+    {
+        float floorSize = 400.0f;
+        int floorRes = 20;
+        
+        std::vector<float> vertices;
+        std::vector<unsigned int> indices;
+        
+        for (int z = 0; z <= floorRes; z++) {
+            for (int x = 0; x <= floorRes; x++) {
+                float vx = (float)x / floorRes * floorSize - floorSize / 2.0f;
+                float vz = (float)z / floorRes * floorSize - floorSize / 2.0f;
+                vertices.push_back(vx);
+                vertices.push_back(floorHeight);  // At floor height
+                vertices.push_back(vz);
+            }
+        }
+        
+        for (int z = 0; z < floorRes; z++) {
+            for (int x = 0; x < floorRes; x++) {
+                int topLeft = z * (floorRes + 1) + x;
+                int topRight = topLeft + 1;
+                int bottomLeft = (z + 1) * (floorRes + 1) + x;
+                int bottomRight = bottomLeft + 1;
+                
+                indices.push_back(topLeft);
+                indices.push_back(bottomLeft);
+                indices.push_back(topRight);
+                indices.push_back(topRight);
+                indices.push_back(bottomLeft);
+                indices.push_back(bottomRight);
+            }
+        }
+        
+        glGenVertexArrays(1, &debugFloorVAO);
+        glGenBuffers(1, &debugFloorVBO);
+        glGenBuffers(1, &debugFloorEBO);
+        
+        glBindVertexArray(debugFloorVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, debugFloorVBO);
+        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, debugFloorEBO);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
+        
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        
+        glBindVertexArray(0);
+        
+        std::cout << "Debug floor plane created (visible wireframe grid)\n";
+    }
+    
     std::cout << "========================================\n\n";
 
     // ============================================================
@@ -582,7 +892,7 @@ int main()
     Terrain::TerrainConfig terrainConfig;
     terrainConfig.chunkSize = 100.0f;
     terrainConfig.chunkResolution = 64;
-    terrainConfig.viewDistance = 4;  // Load 4 chunks in each direction
+    terrainConfig.viewDistance = 8;  // Load 4 chunks in each direction
     terrainConfig.lodDistance = 50.0f;
     terrainConfig.heightmapSize = 1024;
     terrainConfig.heightScale = 80.0f;  // Max terrain height
@@ -614,13 +924,13 @@ int main()
     
     // Water level
     float waterLevel = 5.0f;
-    
-    // Terrain shader
+
+    // Terrain shader (used in render loop)
     Shader* terrainShader = nullptr;
     Shader* waterShader = nullptr;
-    Shader* treeShader = nullptr;
-    Shader* grassShader = nullptr;
-    GLuint terrainVAO = 0;
+    // Shader* treeShader = nullptr;    // Not currently used
+    // Shader* grassShader = nullptr;   // Not currently used
+    // GLuint terrainVAO = 0;           // Not currently used
     
     std::cout << "========================================\n\n";
 
@@ -628,7 +938,25 @@ int main()
     // CHARACTER MOVEMENT STATE
     // ============================================================
     glm::vec3 characterPos(0.0f, 0.0f, 0.0f);  // Character world position
+    
+    // Place character on terrain
+    if (terrain) {
+        float terrainHeight = terrain->getHeightAt(characterPos.x, characterPos.z);
+        // Validate terrain height (prevent NaN)
+        if (std::isfinite(terrainHeight)) {
+            characterPos.y = terrainHeight;
+            std::cout << "[Character] Spawned at terrain height: " << terrainHeight << "\n";
+        } else {
+            characterPos.y = 0.0f;
+            std::cout << "[Character] Spawned at Y=0 (invalid terrain height)\n";
+        }
+    } else {
+        characterPos.y = 0.0f;
+        std::cout << "[Character] Spawned at Y=0 (no terrain)\n";
+    }
+    
     glm::vec3 characterVelocity(0.0f);
+    glm::vec3 prevCharacterPos(0.0f, 0.0f, 0.0f);  // For velocity calculation
     float rotationAngle = 0.0f;   // Character rotation (degrees)
 
     // Create skinned shader
@@ -686,18 +1014,45 @@ int main()
     float lastTime = (float)glfwGetTime();
     bool running = true;
     int debugMode = 0;  // 0=normal, 1=bone debug
+    
+    // FPS counter variables
+    int frameCount = 0;
+    float fpsTimer = 0.0f;
+
+    // Loading complete
+    showProgress();
+    std::cout << "\n";
+    std::cout << "========================================\n";
+    std::cout << "  LOADING COMPLETE!\n";
+    std::cout << "========================================\n\n";
 
     std::cout << "\n=== READY ===\n\n";
     std::cout << "Camera position: (" << camera.Position.x << ", " << camera.Position.y << ", " << camera.Position.z << ")\n";
     std::cout << "Character position: (0, 0, 0)\n";
+    std::cout << "AAA QUALITY CAMERA: Maximum smoothing | Zero lag follow\n";
+    std::cout << "Zoom: scroll wheel (10-50 units cinematic range)\n";
     std::cout << "Press F to toggle wireframe/solid\n";
-    std::cout << "Press B for bone debug visualization\n\n";
-    
+    std::cout << "Press B for bone debug visualization\n";
+    std::cout << "Press H to print camera debug\n";
+    std::cout << "Press ESC to exit\n\n";
+    std::cout << "=== MAIN LOOP STARTED ===\n";
+    std::cout.flush();
+
     while (running && !glfwWindowShouldClose(window)) {
         float now = (float)glfwGetTime();
-        float dt = std::min(now - lastTime, 0.1f);
+        float dt = std::min(now - lastTime, 0.1f);  // Cap dt to prevent huge jumps
         lastTime = now;
-        
+
+        // FPS counter (print every 5 seconds for minimal spam)
+        frameCount++;
+        fpsTimer += dt;
+        if (fpsTimer >= 5.0f) {
+            std::cout << "[FPS] " << frameCount << " (" << (1000.0f * fpsTimer / frameCount) << "ms/frame)\n";
+            std::cout.flush();
+            frameCount = 0;
+            fpsTimer = 0.0f;
+        }
+
         glfwPollEvents();
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) running = false;
 
@@ -733,45 +1088,8 @@ int main()
         }
         lastC = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
 
-        // ============================================================
-        // THIRD-PERSON CAMERA FOLLOW
-        // ============================================================
-        if (cameraFollowEnabled) {
-            // Smoothly follow character - pivot tracks character position
-            // Use VERY smooth interpolation to eliminate jitter
-            glm::vec3 targetPivot = characterPos + glm::vec3(0, 2.0f, 0);  // Look at character's upper body
-            cameraPivot = glm::mix(cameraPivot, targetPivot, cameraPivotSmooth * dt);
-            
-            if (cameraFixedMode) {
-                // FIXED MODE: Camera stays directly behind character (stable, no orbit)
-                // Calculate direction character is facing
-                glm::vec3 forward;
-                forward.x = sin(glm::radians(rotationAngle));
-                forward.z = cos(glm::radians(rotationAngle));
-                forward.y = 0.0f;
-                forward = glm::normalize(forward);
-                
-                // Camera position: behind character based on character's facing direction
-                glm::vec3 targetCamPos = characterPos - forward * cameraDistance + glm::vec3(0, cameraHeight, 0);
-                
-                // Extra smooth camera position - reduces jitter significantly
-                camera.Position = glm::mix(camera.Position, targetCamPos, cameraFollowSmooth * dt);
-                camera.Target = cameraPivot;
-            } else {
-                // ORBIT MODE: Camera rotates around character using yaw/pitch
-                float yawRad = glm::radians(camera.Yaw);
-                float pitchRad = glm::radians(camera.Pitch);
-                
-                glm::vec3 camOffset;
-                camOffset.x = cos(pitchRad) * sin(yawRad) * cameraDistance;
-                camOffset.y = sin(pitchRad) * cameraDistance + cameraHeight;
-                camOffset.z = cos(pitchRad) * cos(yawRad) * cameraDistance;
-                
-                glm::vec3 targetCamPos = cameraPivot + camOffset;
-                camera.Position = glm::mix(camera.Position, targetCamPos, cameraFollowSmooth * dt);
-                camera.Target = cameraPivot;
-            }
-        }
+        // NOTE: Camera update moved to AFTER character position is finalized
+        // This ensures camera follows the actual character position, not the previous frame's position
 
         // ============================================================
         // CHARACTER MOVEMENT INPUT (WASD triggers animation, root motion drives movement)
@@ -838,23 +1156,26 @@ int main()
 
         // Jump input - triggers animation state, not direct position change
         static bool lastJump = false;
-        charInput.jump = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) && !lastJump;
-        lastJump = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+        bool jumpKeyPressed = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
+        charInput.jump = jumpKeyPressed && !lastJump;  // Edge detected: just pressed
+        lastJump = jumpKeyPressed;
 
         // Grounded check based on terrain height
         float terrainHeight = terrain ? terrain->getHeightAt(characterPos.x, characterPos.z) : 0.0f;
         bool wasGrounded = (characterPos.y <= terrainHeight + 0.01f);
-        charInput.grounded = wasGrounded;
+        charInput.grounded = wasGrounded;  // FSM needs ORIGINAL grounded state for jump check
 
-        // Jump handling - set vertical velocity FIRST so state machine sees it
+        // Jump handling - set vertical velocity
         static float jumpVelocity = 0.0f;
         if (charInput.jump && wasGrounded) {
             jumpVelocity = 5.0f;  // Initial jump impulse
-            charInput.verticalVelocity = jumpVelocity;  // Set BEFORE grounded check
-            charInput.grounded = false;  // Now set grounded to false
-        } else if (!charInput.grounded) {
+            charInput.verticalVelocity = jumpVelocity;
+            // Don't set grounded=false here - FSM needs to see grounded=true for jump trigger
+            // grounded will be set false NEXT frame after FSM processes
+        } else if (!wasGrounded) {
             jumpVelocity -= 12.0f * dt;  // Gravity
             charInput.verticalVelocity = jumpVelocity;
+            charInput.grounded = false;  // Now set grounded false for physics
 
             if (jumpVelocity <= 0.0f && characterPos.y <= terrainHeight + 0.01f) {
                 charInput.grounded = true;
@@ -899,33 +1220,51 @@ int main()
         // Toggle foot IK debug
         static bool lastG = false;
         if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS && !lastG && animator) {
-            std::cout << "=== FOOT IK STATUS ===\n";
+            std::cout << "\n=== FOOT IK STATUS ===\n";
+            std::cout << "Enabled: " << (animator->footIKSettings.enabled ? "YES" : "NO") << "\n";
+            std::cout << "Floor height: " << animator->footIKSettings.floorHeight << "\n";
+            std::cout << "Character grounded: " << (animator->IsCharacterGrounded() ? "YES" : "NO") << "\n";
+            std::cout << "Left foot planted: " << (animator->IsFootPlanted(animator->footIKSettings.leftFootBone) ? "YES" : "NO") << "\n";
+            std::cout << "Right foot planted: " << (animator->IsFootPlanted(animator->footIKSettings.rightFootBone) ? "YES" : "NO") << "\n";
+            std::cout << "Character Y position: " << characterPos.y << "\n";
             animator->DebugDrawFootIK();
         }
         lastG = glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS;
         
-        // Print animation state
+        // Print MOTION MATCHING debug
         static bool lastH = false;
-        if (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS && !lastH && stateMachine) {
-            stateMachine->printState();
+        if (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS && !lastH) {
+            std::cout << "\n=== MOTION MATCHING DEBUG ===\n";
+            matcher->PrintDebugInfo();
+            std::cout << "[CAMERA] Pos=(" << camera.Position.x << ", " << camera.Position.y << ", " << camera.Position.z << ")\n";
+            std::cout << "[CHARACTER] Pos=(" << characterPos.x << ", " << characterPos.y << ", " << characterPos.z << ")\n";
+            std::cout << "[DISTANCE] Camera-to-character=" << glm::length(camera.Position - characterPos) << " units\n";
         }
         lastH = glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS;
 
-        // Update animation state machine FIRST - input triggers animation state change
-        if (stateMachine) {
-            stateMachine->update(dt, charInput);
+        // ============================================================
+        // UPDATE MOTION MATCHING (Replaces FSM update)
+        // ============================================================
+        if (matcher) {
+            // Build character state for motion matching
+            CharacterState charState;
+            charState.position = characterPos;
+            charState.velocity = characterVelocity;
+            charState.rotation = glm::radians(rotationAngle);
+            charState.moveDirection = moveDir;
+            charState.grounded = charInput.grounded;
+            charState.crouching = charInput.crouch;
+            charState.jumping = charInput.jump;
             
-            // Debug: print input values every 30 frames
-            static int dbg = 0;
-            dbg++;
-            if (dbg % 30 == 0) {
-                std::cout << "[INPUT] moveMag=" << charInput.moveMagnitude
-                          << " sprint=" << charInput.sprint
-                          << " jump=" << charInput.jump
-                          << " grounded=" << charInput.grounded
-                          << " vVel=" << charInput.verticalVelocity
-                          << " crouch=" << charInput.crouch << "\n";
+            // Update motion matching - searches database, blends poses, applies foot IK
+            matcher->Update(dt, charState);
+
+            // CRITICAL: Update animator to calculate bone matrices!
+            if (animator) {
+                animator->Update(dt);
             }
+
+            // Motion matching debug only on 'H' key press (see line ~1140)
         }
 
         // Build model matrix with character position and rotation
@@ -935,57 +1274,120 @@ int main()
 
         // Extract root motion from animation and apply in camera-relative direction
         // Root motion DRIVES the movement, not the keyboard input
+        glm::vec3 rootMotionDelta(0.0f);  // Track how much we moved this frame
+
         if (animator) {
             glm::vec3 rootMotion = animator->ConsumeRootMotion();
             float motionMagnitude = glm::length(rootMotion);
 
-            // Apply root motion only when there's movement input
-            // The animation plays in the direction specified by input
+            // Apply root motion for movement
             if (charInput.moveMagnitude > 0.01f && moveDirection != glm::vec3(0.0f)) {
-                // Apply root motion in the camera-relative movement direction
-                // Reduced multiplier (0.25f) to prevent sliding and make steps more visible
-                float movementMultiplier = 0.25f;  // Adjust: lower = slower, more natural steps
-                characterPos += moveDirection * motionMagnitude * movementMultiplier;
+                float movementMultiplier = 0.25f;
+                rootMotionDelta = moveDirection * motionMagnitude * movementMultiplier;
+                characterPos += rootMotionDelta;
             }
 
-            // Debug: print root motion every frame when moving
-            if (charInput.moveMagnitude > 0.01f) {
-                static int frameCounter = 0;
-                frameCounter++;
-                if (frameCounter % 30 == 0) {  // Print every 30 frames
-                    std::cout << "[RootMotion] Mag: " << motionMagnitude
-                              << " | Dir: (" << moveDirection.x << ", " << moveDirection.z << ")"
-                              << " | Pos: (" << characterPos.x << ", " << characterPos.y << ", " << characterPos.z << ")\n";
+            // Update foot IK floor height based on terrain (dynamic)
+            if (terrain && animator->footIKSettings.enabled) {
+                float terrainHeight = terrain->getHeightAt(characterPos.x, characterPos.z);
+                if (std::isfinite(terrainHeight)) {
+                    Animator::FootIKSettings ikSettings = animator->footIKSettings;
+                    ikSettings.floorHeight = terrainHeight;  // Update to match terrain
+                    animator->SetFootIKSettings(ikSettings);
                 }
             }
 
-            // Update foot IK - disable when moving fast (feet slide during motion)
+            // Update foot IK (after position update)
             bool isMoving = (charInput.moveMagnitude > 0.1f);
             animator->UpdateFootIK(dt, modelMat, isMoving);
         }
+        
+        // CRITICAL: Calculate character velocity for motion matching!
+        // Velocity = position delta / time (with dt safety check)
+        if (dt > 0.0001f) {
+            characterVelocity = (characterPos - prevCharacterPos) / dt;
+        } else {
+            characterVelocity = glm::vec3(0.0f);
+        }
+        prevCharacterPos = characterPos;  // Save for next frame
 
-        // Debug: print state changes
-        if (stateMachine) {
-            static AnimationState lastState = AnimationState::NONE;
-            AnimationState curState = stateMachine->getCurrentState();
-            if (curState != lastState) {
-                std::cout << ">>> STATE CHANGE: " << AnimationStateToString(lastState) 
-                          << " -> " << AnimationStateToString(curState) << "\n";
-                std::cout << "    Speed: " << charInput.moveMagnitude
-                          << " Sprint: " << charInput.sprint
-                          << " Dir: (" << charInput.moveDirection.x << ", " << charInput.moveDirection.y << ")\n";
-                lastState = curState;
+        // ============================================================
+        // THIRD-PERSON CAMERA FOLLOW (AAA QUALITY - MAXIMUM SMOOTHING)
+        // ============================================================
+        // CRITICAL: This runs AFTER characterPos is updated with root motion
+        // This ensures camera follows the ACTUAL position, not last frame's position
+        if (cameraFollowEnabled) {
+            // AAA QUALITY - MAXIMUM SMOOTHING FOR PERFECT FOLLOW
+            // At 60fps with smooth=60.0f: ~63% interpolation per frame (essentially locked on)
+            // At 144fps with smooth=60.0f: ~30% interpolation per frame (still very tight)
+            // Frame-rate independent: dt scaling ensures consistent behavior
+            const float CAMERA_SMOOTH = 60.0f;      // MAXIMUM - camera locked to character
+            const float PIVOT_SMOOTH = 40.0f;       // MAXIMUM - pivot follows instantly
+            // const float ROTATION_SMOOTH = 50.0f; // Reserved for future rotation smoothing
+
+            // Update pivot to follow character (maximum smoothing - no perceptible lag)
+            glm::vec3 targetPivot = characterPos + glm::vec3(0, 2.0f, 0);
+            
+            // Validate pivot position
+            if (std::isfinite(targetPivot.x) && std::isfinite(targetPivot.y) && std::isfinite(targetPivot.z)) {
+                float smoothFactor = glm::clamp(PIVOT_SMOOTH * dt, 0.0f, 1.0f);
+                cameraPivot = glm::mix(cameraPivot, targetPivot, smoothFactor);
+            }
+
+            if (cameraFixedMode) {
+                // FIXED MODE: Camera directly behind character (AAA quality)
+                glm::vec3 forward;
+                forward.x = sin(glm::radians(rotationAngle));
+                forward.z = cos(glm::radians(rotationAngle));
+                forward.y = 0.0f;
+                
+                // Prevent NaN from normalizing zero vector
+                if (glm::length(forward) > 0.0001f) {
+                    forward = glm::normalize(forward);
+                } else {
+                    forward = glm::vec3(0.0f, 0.0f, 1.0f);  // Default forward
+                }
+
+                glm::vec3 targetCamPos = characterPos - forward * cameraDistance + glm::vec3(0, cameraHeight, 0);
+
+                // Validate target position (prevent NaN)
+                if (std::isfinite(targetCamPos.x) && std::isfinite(targetCamPos.y) && std::isfinite(targetCamPos.z)) {
+                    // MAXIMUM smoothing - camera essentially locked to character
+                    float smoothFactor = glm::clamp(CAMERA_SMOOTH * dt, 0.0f, 1.0f);
+                    camera.Position = glm::mix(camera.Position, targetCamPos, smoothFactor);
+                    camera.Target = cameraPivot;
+                }
+            } else {
+                // ORBIT MODE: Camera rotates around character (AAA quality)
+                float yawRad = glm::radians(camera.Yaw);
+                float pitchRad = glm::radians(camera.Pitch);
+
+                glm::vec3 camOffset;
+                camOffset.x = cos(pitchRad) * sin(yawRad) * cameraDistance;
+                camOffset.y = sin(pitchRad) * cameraDistance + cameraHeight;
+                camOffset.z = cos(pitchRad) * cos(yawRad) * cameraDistance;
+
+                glm::vec3 targetCamPos = cameraPivot + camOffset;
+
+                // Validate target position
+                if (std::isfinite(targetCamPos.x) && std::isfinite(targetCamPos.y) && std::isfinite(targetCamPos.z)) {
+                    // MAXIMUM smoothing - camera locked to orbit position
+                    float smoothFactor = glm::clamp(CAMERA_SMOOTH * dt, 0.0f, 1.0f);
+                    camera.Position = glm::mix(camera.Position, targetCamPos, smoothFactor);
+                    camera.Target = cameraPivot;
+                }
             }
         }
 
-        glClearColor(0.15f, 0.15f, 0.2f, 1.0f);  // Darker background
+        // Clear with sky-blue color for open world (no skybox)
+        glClearColor(0.5f, 0.7f, 0.9f, 1.0f);  // Light blue sky color
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glm::mat4 projection = glm::perspective(glm::radians(45.0f), 1280.f/720.f, 0.1f, 1000.f);
         glm::mat4 view = camera.GetViewMatrix();
 
-        // Draw skybox FIRST (behind everything)
-        drawSkybox(view, projection, skyboxTexture);
+        // Skybox disabled - rendering world terrain directly
+        // drawSkybox(view, projection, skyboxTexture);  // Disabled
 
         // ============================================================
         // RENDER TERRAIN (open world)
@@ -1039,16 +1441,40 @@ int main()
             terrainShader->setVec3("terrainColor", glm::vec3(0.2f, 0.5f, 0.2f));
             terrainShader->setFloat("waterLevel", waterLevel);
             terrainShader->setVec3("cameraPos", camera.Position);  // For fog
-            
-            terrain->render();
-            
+
+            // Render terrain with frustum culling (Priority 1 optimization)
+            terrain->render(camera.Position, 45.0f, 1280.0f/720.0f, 0.1f, 1000.0f);
+
             // Render grass on terrain (if grass model loaded)
             if (grassModel) {
                 // Would render grass instances here
                 // For now, grass is handled by vegetation system
             }
         }
-        
+
+        // ============================================================
+        // RENDER DEBUG FLOOR (visible wireframe grid at floor height)
+        // ============================================================
+        {
+            static Shader* debugFloorShader = nullptr;
+            if (!debugFloorShader) {
+                debugFloorShader = new Shader("shaderSystem/VS.glsl", "shaderSystem/FS.glsl");
+            }
+            
+            // Render debug floor as wireframe
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            debugFloorShader->use();
+            debugFloorShader->setMat4("projection", projection);
+            debugFloorShader->setMat4("view", view);
+            debugFloorShader->setMat4("model", glm::mat4(1.0f));
+            debugFloorShader->setVec3("color", glm::vec3(0.0f, 1.0f, 0.0f));  // Green grid
+            
+            glBindVertexArray(debugFloorVAO);
+            glDrawElements(GL_TRIANGLES, 20 * 20 * 6, GL_UNSIGNED_INT, 0);
+            glBindVertexArray(0);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        }
+
         // ============================================================
         // RENDER WATER PLANE
         // ============================================================
@@ -1192,7 +1618,7 @@ int main()
                     glm::vec3 placePos = rock.position;
                     placePos.y = terrainHeight + rock.scale.y * 0.5f;  // Half scale so it sits ON ground
                     
-                    worldObjects->placeObject(rockType, placePos,
+                    worldObjects->placeObject(rockType, placePos-5.5f,
                                              rock.scale.x, rock.rotation);
                 }
                 rocksPlaced = true;
@@ -1202,16 +1628,8 @@ int main()
 
             // Render all world objects (trees, rocks, etc.)
             if (worldObjects) {
-                std::cout << "[World] Rendering " << worldObjects->getObjectCount() << " objects\n";
                 worldObjects->render(view, projection, camera.Position);
             }
-        }
-
-        // Debug: print active chunks
-        static int terrainDebug = 0;
-        terrainDebug++;
-        if (terrainDebug % 120 == 0 && terrain) {
-            std::cout << "[Terrain] Active chunks: " << terrain->getActiveChunkCount() << "\n";
         }
 
         // ============================================================

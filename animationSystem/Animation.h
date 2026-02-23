@@ -54,8 +54,9 @@ public:
     std::string name;
     float duration;
     float ticksPerSecond;
+    float speed = 1.0f;  // Playback speed multiplier (1.0 = normal, 2.0 = double speed)
     std::map<std::string, BoneAnimation> boneAnimations;
-    
+
     // Compression data
     bool isCompressed = false;
     float compressionRatio = 1.0f;

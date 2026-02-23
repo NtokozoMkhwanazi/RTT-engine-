@@ -50,13 +50,28 @@ void Animator::Play(Animation *anim)
     activeAnimations.clear();
     if (anim) {
         activeAnimations.emplace_back(anim, 1.0f, 0.0f);  // Single animation with full weight
-        std::cout << "[Animator::Play] Playing: " << anim->name << " (weight=1.0)\n";
     }
 
     // IMPORTANT: reset root motion state when a new animation starts
     prevRootPos = glm::vec3(0.0f);
     rootMotionDelta = glm::vec3(0.0f);
     hasPrevRoot = false;
+}
+
+void Animator::SetCurrentTime(float time)
+{
+    if (!current) return;
+
+    // Clamp to animation duration
+    animatorTime = fmod(time, current->GetDuration());
+    if (animatorTime < 0.0f) {
+        animatorTime += current->GetDuration();
+    }
+    
+    // ALSO update activeAnimations time (for new system)
+    if (!activeAnimations.empty()) {
+        activeAnimations[0].time = animatorTime;
+    }
 }
 
 void Animator::BlendTo(Animation *anim, float duration)
@@ -277,6 +292,11 @@ void Animator::Update(float dt)
                 cacheValid = true;
             }
         }
+        
+        // Sync animatorTime with activeAnimations[0].time for backward compatibility
+        if (!activeAnimations.empty()) {
+            animatorTime = activeAnimations[0].time;
+        }
     }
     else
     {
@@ -284,7 +304,10 @@ void Animator::Update(float dt)
         Animation *savedCurrent = current;
         if (!DEBUG_PAUSE_ANIM && current)
         {
-            animatorTime += dt * current->GetTicksPerSecond();
+            // Apply animation speed multiplier
+            float ticksPerSecond = current->GetTicksPerSecond();
+            float speed = current->speed;  // Speed multiplier (1.0 = normal)
+            animatorTime += dt * ticksPerSecond * speed;
             animatorTime = fmod(animatorTime, current->GetDuration());
         }
         else
@@ -452,7 +475,28 @@ bool Animator::IsFootPlanted(int bone) const
         return false;
 
     // Check if the bone's Y position hasn't changed significantly (indicating it's planted on the ground)
-    return std::abs(currBoneWorldPos[bone].y - prevBoneWorldPos[bone].y) < 0.001f;
+    float verticalVelocity = std::abs(currBoneWorldPos[bone].y - prevBoneWorldPos[bone].y);
+    
+    // Also check if foot is near ground level
+    float footHeight = currBoneWorldPos[bone].y;
+    bool nearGround = footHeight < (footIKSettings.floorHeight + 0.2f);
+    
+    return (verticalVelocity < 0.01f) && nearGround;
+}
+
+// Helper function to get foot planting status for debugging
+bool Animator::IsCharacterGrounded() const
+{
+    if (!footIKSettings.enabled) return false;
+    
+    int leftFoot = footIKSettings.leftFootBone;
+    int rightFoot = footIKSettings.rightFootBone;
+    
+    bool leftPlanted = (leftFoot >= 0) ? IsFootPlanted(leftFoot) : false;
+    bool rightPlanted = (rightFoot >= 0) ? IsFootPlanted(rightFoot) : false;
+    
+    // Character is grounded if at least one foot is planted
+    return leftPlanted || rightPlanted;
 }
 
 void Animator::AddIKOffset(int bone, const glm::vec3 &offset, float weight)
@@ -474,6 +518,76 @@ const std::vector<glm::mat4> &Animator::GetFinalBoneMatrices() const
     return finalBoneMatrices;
 }
 
+// ============================================================================
+// BONE MATRIX BUFFER IMPLEMENTATION (UBO/SSBO)
+// ============================================================================
+
+bool Animator::InitializeBoneBuffer(size_t maxBones, const BoneBufferConfig& config)
+{
+    if (!boneBuffer) {
+        boneBuffer = std::make_unique<BoneMatrixBuffer>();
+    }
+    
+    bool success = boneBuffer->Initialize(maxBones, config);
+    
+    if (success) {
+        std::cout << "[Animator] Bone buffer initialized: " << maxBones << " bones (" 
+                  << boneBuffer->GetBufferTypeString() << ")\n";
+    }
+    
+    return success;
+}
+
+bool Animator::UpdateBoneBuffer()
+{
+    if (!boneBuffer || !boneBuffer->IsInitialized()) {
+        return false;
+    }
+    
+    return boneBuffer->Update(finalBoneMatrices);
+}
+
+void Animator::BindBoneBuffer(GLuint bindingPoint) const
+{
+    if (boneBuffer && boneBuffer->IsInitialized()) {
+        boneBuffer->Bind(bindingPoint);
+    }
+}
+
+void Animator::PrintBoneBufferStats() const
+{
+    if (boneBuffer) {
+        boneBuffer->PrintStats();
+    }
+}
+
+Animation* Animator::GetCurrentAnimation() const
+{
+    // Return the primary active animation (highest weight)
+    if (activeAnimations.empty()) return nullptr;
+    
+    // Find animation with highest weight
+    const AnimationLayer* bestLayer = nullptr;
+    float maxWeight = -1.0f;
+    
+    for (const auto& layer : activeAnimations) {
+        if (layer.animation && layer.weight > maxWeight && layer.enabled) {
+            maxWeight = layer.weight;
+            bestLayer = &layer;
+        }
+    }
+    
+    return bestLayer ? bestLayer->animation : current;
+}
+
+float Animator::GetActiveAnimationTime(int layerIndex) const
+{
+    if (layerIndex < 0 || layerIndex >= static_cast<int>(activeAnimations.size())) {
+        return 0.0f;
+    }
+    return activeAnimations[layerIndex].time;
+}
+
 void Animator::BlendToWithWeight(Animation *anim, float targetWeight, float duration)
 {
     if (!anim)
@@ -492,6 +606,33 @@ void Animator::BlendToWithWeight(Animation *anim, float targetWeight, float dura
         // If the animation doesn't exist, add it as a new layer
         activeAnimations.emplace_back(anim, 0.0f, duration);
         activeAnimations.back().targetWeight = targetWeight;
+    }
+}
+
+// GRADIENT BAND INTERPOLATION: Blend two animations with explicit weights
+void Animator::BlendTwoAnimations(Animation *anim1, float weight1, Animation *anim2, float weight2, float dt)
+{
+    if (!anim1 && !anim2) return;
+    
+    // Normalize weights
+    float totalWeight = weight1 + weight2;
+    if (totalWeight < 0.001f) return;
+    
+    weight1 /= totalWeight;
+    weight2 /= totalWeight;
+    
+    // Clear existing layers and set up two-animation blend
+    activeAnimations.clear();
+    
+    if (anim1) {
+        activeAnimations.emplace_back(anim1, weight1, 0.1f);
+        activeAnimations.back().targetWeight = weight1;
+        activeAnimations.back().blendProgress = 1.0f;  // Already blended
+    }
+    if (anim2) {
+        activeAnimations.emplace_back(anim2, weight2, 0.1f);
+        activeAnimations.back().targetWeight = weight2;
+        activeAnimations.back().blendProgress = 1.0f;  // Already blended
     }
 }
 
@@ -622,12 +763,13 @@ void Animator::UpdateAnimationBlending(float dt)
         if (!layer.animation || !layer.enabled) continue;
 
         float animDuration = layer.animation->GetDuration();
-        float ticksPerSecond = layer.animation->GetTicksPerSecond();
+        float speed = layer.animation->speed;  // Speed multiplier
 
         if (animDuration <= 0.01f) continue;  // Skip very short animations
 
         float prevTime = layer.time;
-        layer.time += dt * ticksPerSecond;
+        // layer.time is in seconds, dt is in seconds
+        layer.time += dt * speed;
 
         // If we crossed the loop point this frame, mark for cross-fade
         if (prevTime < animDuration && layer.time >= animDuration) {
@@ -973,7 +1115,7 @@ void Animator::UpdateAnimationLOD(const glm::vec3& viewerPosition, const glm::ve
     }
 
     // Also adjust based on number of bones if needed
-    if (skeleton && skeleton->bones.size() > highDetailBoneThreshold) {
+    if (skeleton && static_cast<int>(skeleton->bones.size()) > highDetailBoneThreshold) {
         // Too many bones for high quality, reduce quality
         if (qualityLevel == AnimationQualityLevel::HIGH) {
             SetAnimationQuality(AnimationQualityLevel::MEDIUM);

@@ -26,9 +26,15 @@ public:
     
     // Update terrain (stream chunks based on camera position)
     void update(const glm::vec3& cameraPos, float dt);
-    
-    // Render all visible chunks
-    void render() const;
+
+    // Render all visible chunks (with frustum culling)
+    void render(const glm::vec3& cameraPos, float fovDegrees = 45.0f, 
+                float aspectRatio = 16.0f/9.0f, float nearPlane = 0.1f, 
+                float farPlane = 1000.0f) const;
+
+    // Render all chunks (no culling - deprecated)
+    [[deprecated("Use render(cameraPos, ...) for frustum culling")]]
+    void render() const { render(glm::vec3(0.0f)); }
     
     // Get height at world position (for collision)
     float getHeightAt(float worldX, float worldZ) const;

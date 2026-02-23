@@ -3,7 +3,7 @@
 #include <map>
 #include <string>
 #include <vector>
-#include "animationSystem/AnimationTypes.h"
+#include "../animationSystem/AnimationTypes.h"
 #include "BoneName.h"
 
 #define MAX_BONES 120

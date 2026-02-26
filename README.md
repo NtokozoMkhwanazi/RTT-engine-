@@ -1,4 +1,4 @@
-# 🎮 RTT-Engine — simple 3D Game Engine
+# 🎮 RTT-Engine
 
 <div align="center">
 

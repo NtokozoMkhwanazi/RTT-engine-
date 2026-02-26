@@ -398,7 +398,7 @@ Check shader compilation, verify asset paths
 
 <div align="center">
 
-**Built by Ntokozo (RTT-DEV)**
+**(RTT-DEV)**
 
 [![GitHub](https://img.shields.io/badge/GitHub-NtokozoMkhwanazi-black?style=for-the-badge&logo=github)](https://github.com/NtokozoMkhwanazi)
 

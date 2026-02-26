@@ -16,7 +16,7 @@
 
 ## 📖 Overview
 
- Welcome to **RTTEngine** a simple approach at a 3D Game Engine with a strong focus on Learning the complex field of **computer graphics**, **applications of Mathematics** and **software engineering princples & optimization techniques**.    
+ Welcome to **RTTEngine** a simple approach at a **3D Game Engine** with a strong focus on Learning the complex field of **computer graphics**, **applications of Mathematics** and **software engineering princples & optimization techniques**.    
 
 ---
 
@@ -52,15 +52,13 @@
 
 **Bone Matrix Buffer**
 - Auto UBO/SSBO selection
-- 9.3x faster bone uploads
-- Supports 1000+ bones
 
 **World Rendering**
-- Frustum culling (40-60% reduction)
-- Distance LOD (4 levels, 50-70% reduction)
-- Instanced rendering (10-50x fewer calls)
-- Occlusion culling (20-30% reduction)
-- Texture atlasing (5-10x fewer binds)
+- Frustum culling 
+- Distance LOD 
+- Instanced rendering 
+- Occlusion culling 
+- Texture atlasing 
 
 **Memory Management**
 - Memory arenas (O(1) allocation)
@@ -323,18 +321,9 @@ mmConfig.blendDuration = 0.1f;
 
 ---
 
-## 📚 Documentation
 
-1. `ENGINE_STATUS_REPORT.md` - Complete engine status
-2. `WORLD_OPTIMIZATIONS_COMPLETE.md` - World optimizations
-3. `BONE_MATRIX_BUFFER_UBO_SSBO.md` - Bone buffer system
-4. `KDTREE_SAH_OPTIMIZATION.md` - SAH KD-Tree
-5. `MEMORY_MANAGEMENT_COMPLETE.md` - Memory systems
-6. `FOOT_IK_CHARACTER_GROUNDING_FIX.md` - Foot IK
-7. `DEBUG_FLOOR_VISUALIZATION.md` - Debug floor
-8. `MOTION_ANIMATOR_BUG_REPORT.md` - Motion matching fixes
 
-Total: 500+ pages
+
 
 ---
 

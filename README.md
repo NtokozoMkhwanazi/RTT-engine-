@@ -1,8 +1,8 @@
-# 🎮 RTT-Engine — Custom 3D Game Engine
+# 🎮 RTT-Engine — simple 3D Game Engine
 
 <div align="center">
 
-**A high-performance C++ game engine built from scratch**
+**A simple C++ game engine**
 
 [![C++](https://img.shields.io/badge/C%2B%2B-17-blue?style=for-the-badge&logo=c%2B%2B)]()
 [![OpenGL](https://img.shields.io/badge/OpenGL-3.3+-green?style=for-the-badge&logo=opengl)]()
@@ -16,7 +16,7 @@
 
 ## 📖 Overview
 
-**RTT-Engine** is a professional-grade 3D game engine for building games, simulations, and interactive experiences. Built from scratch in modern C++ with focus on modularity, performance, and deep understanding of graphics programming.
+ Welcome to **RTTEngine** a simple approach at a 3D Game Engine with a strong focus on Learning the complex field of **computer graphics**, **applications of Mathematics** and **software engineering princples & optimization techniques**.    
 
 ---
 
@@ -378,6 +378,7 @@ MIT License — See LICENSE file for details.
 | OpenGL | Graphics API |
 | GLM | Mathematics |
 | Google Test | Unit testing |
+| Papers & textbooks | techniques & experimentation |
 
 ---
 

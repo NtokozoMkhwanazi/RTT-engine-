@@ -173,12 +173,66 @@ void Terrain::update(const glm::vec3& cameraPos, float dt) {
     }
 }
 
-void Terrain::render() const {
+void Terrain::render(const glm::vec3& cameraPos, float fovDegrees, float aspectRatio, 
+                     float nearPlane, float farPlane) const {
     if (!m_initialized) return;
-    
+
+    int renderedChunks = 0;
+    int frustumCulled = 0;
+    int occlusionCulled = 0;
+
+    // First pass: collect visible chunks (frustum culling)
+    std::vector<const TerrainChunk*> visibleChunks;
+    visibleChunks.reserve(m_chunks.size());
+
     for (const auto& [key, chunk] : m_chunks) {
-        chunk->render();
+        // Frustum culling (Priority 1 optimization)
+        if (!chunk->isVisibleInFrustum(cameraPos, fovDegrees, aspectRatio, nearPlane, farPlane)) {
+            frustumCulled++;
+            continue;
+        }
+
+        // LOD-based culling (don't render lowest LOD)
+        if (chunk->getLOD() >= 3) {
+            frustumCulled++;
+            continue;
+        }
+
+        visibleChunks.push_back(chunk.get());
     }
+
+    // Second pass: occlusion culling (Priority 4 optimization)
+    // Sort by distance (render closest first for better occlusion)
+    std::sort(visibleChunks.begin(), visibleChunks.end(),
+        [&cameraPos](const TerrainChunk* a, const TerrainChunk* b) {
+            return a->getDistanceToCamera(cameraPos) < b->getDistanceToCamera(cameraPos);
+        });
+
+    // Render with occlusion culling
+    for (size_t i = 0; i < visibleChunks.size(); i++) {
+        const TerrainChunk* chunk = visibleChunks[i];
+        bool occluded = false;
+
+        // Check against closer chunks (simple occlusion test)
+        for (size_t j = 0; j < i && !occluded; j++) {
+            if (!chunk->isPotentiallyVisible(cameraPos, visibleChunks[j])) {
+                occluded = true;
+            }
+        }
+
+        if (occluded) {
+            occlusionCulled++;
+            continue;
+        }
+
+        chunk->render();
+        renderedChunks++;
+    }
+
+    // Debug output (can be removed in release)
+    // std::cout << "[Terrain] Rendered: " << renderedChunks 
+    //           << ", Frustum culled: " << frustumCulled
+    //           << ", Occlusion culled: " << occlusionCulled << "\n";
 }
 
 float Terrain::getHeightAt(float worldX, float worldZ) const {

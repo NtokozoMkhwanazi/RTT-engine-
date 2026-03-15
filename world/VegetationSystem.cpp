@@ -15,6 +15,132 @@ VegetationSystem::VegetationSystem(const VegetationConfig& config)
 void VegetationSystem::clear() {
     m_trees.clear();
     m_rocks.clear();
+    m_instanceBuffersDirty = true;
+}
+
+void VegetationSystem::buildInstanceData() {
+    m_treeInstances.clear();
+    m_rockInstances.clear();
+
+    // Convert trees to instance data
+    for (const auto& tree : m_trees) {
+        TreeInstance inst;
+        inst.position = tree.position;
+        inst.scale = tree.height / 10.0f;  // Scale based on height
+        inst.type = tree.type;
+        m_treeInstances.push_back(inst);
+    }
+
+    // Convert rocks to instance data
+    for (const auto& rock : m_rocks) {
+        RockInstance inst;
+        inst.position = rock.position;
+        inst.rotation = rock.rotation;
+        inst.scale = rock.scale;
+        inst.type = rock.type;
+        m_rockInstances.push_back(inst);
+    }
+
+    m_instanceBuffersDirty = true;
+}
+
+void VegetationSystem::createInstanceBuffers() {
+    if (m_treeInstanceVBO == 0) {
+        glGenBuffers(1, &m_treeInstanceVBO);
+    }
+    if (m_rockInstanceVBO == 0) {
+        glGenBuffers(1, &m_rockInstanceVBO);
+    }
+    updateInstanceBuffers();
+}
+
+void VegetationSystem::updateInstanceBuffers() {
+    if (!m_instanceBuffersDirty) return;
+
+    buildInstanceData();
+
+    // Update tree instance buffer
+    if (m_treeInstanceVBO != 0 && !m_treeInstances.empty()) {
+        glBindBuffer(GL_ARRAY_BUFFER, m_treeInstanceVBO);
+        glBufferData(GL_ARRAY_BUFFER, m_treeInstances.size() * sizeof(TreeInstance),
+                     m_treeInstances.data(), GL_STATIC_DRAW);
+    }
+
+    // Update rock instance buffer
+    if (m_rockInstanceVBO != 0 && !m_rockInstances.empty()) {
+        glBindBuffer(GL_ARRAY_BUFFER, m_rockInstanceVBO);
+        glBufferData(GL_ARRAY_BUFFER, m_rockInstances.size() * sizeof(RockInstance),
+                     m_rockInstances.data(), GL_STATIC_DRAW);
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    m_instanceBuffersDirty = false;
+}
+
+void VegetationSystem::renderTreesInstanced(GLuint treeVAO) const {
+    if (m_treeInstances.empty() || m_treeInstanceVBO == 0) return;
+
+    glBindVertexArray(treeVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_treeInstanceVBO);
+
+    // Set up instanced attribute pointers (location 3, 4, 5 for mat4-like data)
+    // Position (location 3)
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(TreeInstance), (void*)0);
+    glVertexAttribDivisor(3, 1);  // Per-instance
+
+    // Scale and type (location 4)
+    glEnableVertexAttribArray(4);
+    glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, sizeof(TreeInstance),
+                         (void*)(sizeof(float) * 3));
+    glVertexAttribDivisor(4, 1);
+
+    // Draw instanced
+    glDrawElementsInstanced(GL_TRIANGLES, 0, GL_UNSIGNED_INT, 0, m_treeInstances.size());
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+void VegetationSystem::renderRocksInstanced(GLuint rockVAO) const {
+    if (m_rockInstances.empty() || m_rockInstanceVBO == 0) return;
+
+    glBindVertexArray(rockVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_rockInstanceVBO);
+
+    // Set up instanced attribute pointers
+    // Position (location 3)
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(RockInstance), (void*)0);
+    glVertexAttribDivisor(3, 1);
+
+    // Rotation (location 4)
+    glEnableVertexAttribArray(4);
+    glVertexAttrib1f(4, 0.0f);  // Use rotation from instance data in shader
+    glVertexAttribDivisor(4, 0);
+
+    // Scale (location 5)
+    glEnableVertexAttribArray(5);
+    glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, sizeof(RockInstance),
+                         (void*)(sizeof(float) * 4));
+    glVertexAttribDivisor(5, 1);
+
+    // Draw instanced
+    glDrawElementsInstanced(GL_TRIANGLES, 0, GL_UNSIGNED_INT, 0, m_rockInstances.size());
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+void VegetationSystem::cleanupInstanceBuffers() {
+    if (m_treeInstanceVBO != 0) {
+        glDeleteBuffers(1, &m_treeInstanceVBO);
+        m_treeInstanceVBO = 0;
+    }
+    if (m_rockInstanceVBO != 0) {
+        glDeleteBuffers(1, &m_rockInstanceVBO);
+        m_rockInstanceVBO = 0;
+    }
 }
 
 void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,

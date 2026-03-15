@@ -10,7 +10,7 @@ WorldObjectManager::~WorldObjectManager() {
 
 void WorldObjectManager::initialize(const std::string& assetDir) {
     std::cout << "[WorldObjectManager] Initializing...\n";
-    
+
     // Define default object configurations
     // Trees
     m_configs[WorldObjectType::TREE_PINE] = {
@@ -22,10 +22,10 @@ void WorldObjectManager::initialize(const std::string& assetDir) {
     m_configs[WorldObjectType::TREE_BIRCH] = {
         assetDir + "birch_tree.fbx", 0.85f, 1.2f, {15.0f, 45.0f, 90.0f}
     };
-    
+
     // Rocks
     m_configs[WorldObjectType::ROCK_BOULDER] = {
-        assetDir + "Rock2.fbx", 0.5f, 2.0f, {10.0f, 30.0f, 60.0f}
+        assetDir + "Rock0.fbx", 0.5f, 2.0f, {10.0f, 30.0f, 60.0f}
     };
     m_configs[WorldObjectType::ROCK_STONE] = {
         assetDir + "stone.fbx", 0.3f, 0.8f, {8.0f, 20.0f, 40.0f}
@@ -33,25 +33,25 @@ void WorldObjectManager::initialize(const std::string& assetDir) {
     m_configs[WorldObjectType::ROCK_CLIFF] = {
         assetDir + "Rock1.fbx", 1.0f, 3.0f, {30.0f, 80.0f, 150.0f}
     };
-    
-    
-    // Vegetation
+
+
+    // Vegetation - Use actual files from assets/World_objects/
     m_configs[WorldObjectType::GRASS_CLUSTER] = {
-        assetDir + "grass_cluster.fbx", 0.6f, 1.0f, {5.0f, 15.0f, 30.0f}
+        assetDir + "grass.fbx", 0.6f, 1.0f, {5.0f, 15.0f, 30.0f}
     };
     m_configs[WorldObjectType::FLOWER_PATCH] = {
         assetDir + "flowers.fbx", 0.5f, 0.8f, {5.0f, 12.0f, 25.0f}
     };
     m_configs[WorldObjectType::BUSH] = {
-        assetDir + "bush.fbx", 0.7f, 1.2f, {10.0f, 25.0f, 50.0f}
+        assetDir + "stone.fbx", 0.7f, 1.2f, {10.0f, 25.0f, 50.0f}
     };
-    
-    // Props
+
+    // Props - Bear and Datsun models
     m_configs[WorldObjectType::LOG] = {
-        assetDir + "log.fbx", 0.8f, 1.5f, {15.0f, 40.0f, 80.0f}
+        assetDir + "Bear_DEMO.fbx", 0.8f, 1.5f, {15.0f, 40.0f, 80.0f}
     };
     m_configs[WorldObjectType::STUMP] = {
-        assetDir + "stump.fbx", 0.6f, 1.0f, {10.0f, 30.0f, 60.0f}
+        assetDir + "datsun.fbx", 0.6f, 1.0f, {10.0f, 30.0f, 60.0f}
     };
     
     // Load all models

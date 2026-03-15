@@ -37,7 +37,7 @@ Welcome to **RTT-Engine** — a modern 3D Game Engine built with a strong focus 
 ---
 
 ## 🏗️ Architecture
-![description](file:///home/run-time-terror/Documents/3D%20GAME%20ENGINE/assets/pic.png)
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        ecs_test.cpp (Main)                      │
@@ -46,14 +46,14 @@ Welcome to **RTT-Engine** — a modern 3D Game Engine built with a strong focus 
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    ecs::World (ECS Container)                   │
-│  ┌──────────────────┐  ┌──────────────────┐                    │
-│  │  EntityManager   │  │ ComponentManager │                    │
-│  └──────────────────┘  └──────────────────┘                    │
+│  ┌──────────────────┐  ┌──────────────────┐                     │
+│  │  EntityManager   │  │ ComponentManager │                     │
+│  └──────────────────┘  └──────────────────┘                     │
 │                                                                 │
-│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐  │
-│  │  Camera    │ │  Physics   │ │  Render    │ │ Animation  │  │
-│  │  System    │ │  System    │ │  System    │ │  System    │  │
-│  └────────────┘ └────────────┘ └────────────┘ └────────────┘  │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐    │
+│  │  Camera    │ │  Physics   │ │  Render    │ │ Animation  │    │
+│  │  System    │ │  System    │ │  System    │ │  System    │    │
+│  └────────────┘ └────────────┘ └────────────┘ └────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
                               │
         ┌─────────────────────┼─────────────────────┐

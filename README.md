@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**A simple C++ game engine **
+**A simple C++ game engine**
 
 [![C++](https://img.shields.io/badge/C%2B%2B-17-blue?style=for-the-badge&logo=c%2B%2B)]()
 [![OpenGL](https://img.shields.io/badge/OpenGL-3.3+-green?style=for-the-badge&logo=opengl)]()

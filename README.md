@@ -39,7 +39,36 @@ Welcome to **RTT-Engine** — a modern 3D Game Engine built with a strong focus 
 ## 🏗️ Architecture
 
 ```
-
+┌─────────────────────────────────────────────────────────────────┐
+│                        ecs_test.cpp (Main)                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    ecs::World (ECS Container)                   │
+│  ┌──────────────────┐  ┌──────────────────┐                    │
+│  │  EntityManager   │  │ ComponentManager │                    │
+│  └──────────────────┘  └──────────────────┘                    │
+│                                                                 │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐  │
+│  │  Camera    │ │  Physics   │ │  Render    │ │ Animation  │  │
+│  │  System    │ │  System    │ │  System    │ │  System    │  │
+│  └────────────┘ └────────────┘ └────────────┘ └────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Components  │    │   Systems    │    │   Engine     │
+│  (Data)      │    │   (Logic)    │    │   Modules    │
+├──────────────┤    ├──────────────┤    ├──────────────┤
+│ Transform    │    │ RenderSystem │───►│ ModelManager │
+│ Mesh         │    │ PhysicsSys   │───►│ Terrain      │
+│ Camera       │    │ CameraSys    │    │ Animation    │
+│ RigidBody    │    │ AnimationSys │───►│ (Legacy)     │
+│ Animator     │    │ LightSystem  │    │              │
+│ Light        │    │              │    │              │
+└──────────────┘    └──────────────┘    └──────────────┘
 ```
 
 ### ECS Design Philosophy

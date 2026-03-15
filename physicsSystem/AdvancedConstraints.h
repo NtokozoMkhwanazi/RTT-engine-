@@ -39,76 +39,185 @@ private:
 };
 
 // Hinge constraint - allows rotation around a single axis
+// Full implementation with position and rotation constraints
 class HingeConstraint : public Constraint
 {
 public:
     HingeConstraint(std::shared_ptr<RigidBody> bodyA, std::shared_ptr<RigidBody> bodyB,
                     const glm::vec3 &anchor, const glm::vec3 &hingeAxis)
-        : bodyA(bodyA), bodyB(bodyB), anchor(anchor), hingeAxis(glm::normalize(hingeAxis)) {}
+        : bodyA(bodyA), bodyB(bodyB), anchor(anchor), hingeAxis(glm::normalize(hingeAxis)),
+          lowerLimit(-glm::pi<float>()), upperLimit(glm::pi<float>()), useLimits(false) {}
+
+    // Set rotation limits (in radians)
+    void SetLimits(float lower, float upper)
+    {
+        lowerLimit = lower;
+        upperLimit = upper;
+        useLimits = true;
+    }
+
+    // Disable rotation limits
+    void DisableLimits()
+    {
+        useLimits = false;
+    }
+
+    // Get current hinge angle
+    float GetCurrentAngle() const
+    {
+        if (!bodyA || !bodyB) return 0.0f;
+
+        // Get hinge axes in world space
+        glm::vec3 axisA = bodyA->rotation * hingeAxis;
+        glm::vec3 axisB = bodyB->rotation * hingeAxis;
+
+        // Calculate angle between axes
+        float dot = glm::dot(axisA, axisB);
+        float angle = acos(glm::clamp(dot, -1.0f, 1.0f));
+
+        // Determine sign using cross product
+        glm::vec3 cross = glm::cross(axisA, axisB);
+        if (glm::dot(cross, hingeAxis) < 0)
+        {
+            angle = -angle;
+        }
+
+        return angle;
+    }
 
     void solve(class PhysicsWorld &world, float dt) override
     {
         if (!bodyA || !bodyB)
             return;
 
-        // Maintain the anchor point position constraint
-        glm::vec3 worldAnchorA = bodyA->position;
-        glm::vec3 worldAnchorB = bodyB->position;
+        // =========================================================================
+        // POSITION CONSTRAINT: Maintain anchor point
+        // =========================================================================
+        // Calculate world-space anchor positions for both bodies
+        glm::vec3 localAnchorA = anchor - bodyA->position;
+        glm::vec3 localAnchorB = anchor - bodyB->position;
 
-        glm::vec3 delta = worldAnchorB - worldAnchorA;
-        float distance = glm::length(delta);
+        glm::vec3 worldAnchorA = bodyA->position + (bodyA->rotation * localAnchorA);
+        glm::vec3 worldAnchorB = bodyB->position + (bodyB->rotation * localAnchorB);
 
-        if (distance > 0.01f)
-        {                                        // Small threshold to avoid division by zero
-            glm::vec3 correction = delta * 0.1f; // Small stiffness
+        // Calculate position error
+        glm::vec3 positionError = worldAnchorB - worldAnchorA;
+        float errorLength = glm::length(positionError);
 
+        // Solve position constraint with Baumgarte stabilization
+        if (errorLength > 0.001f)
+        {
+            // Calculate effective mass for position constraint
             float massA = bodyA->isStatic ? 0.0f : bodyA->mass;
             float massB = bodyB->isStatic ? 0.0f : bodyB->mass;
             float totalMass = massA + massB;
 
             if (totalMass > 0.0f)
             {
+                // Baumgarte stabilization factor (0.1 = soft, 0.3 = stiff)
+                const float baumgarteFactor = 0.2f;
+                glm::vec3 positionCorrection = positionError * baumgarteFactor;
+
+                // Apply position correction
                 if (!bodyA->isStatic)
                 {
-                    bodyA->position += correction * (massB / totalMass);
+                    bodyA->position += positionCorrection * (massB / totalMass);
                 }
                 if (!bodyB->isStatic)
                 {
-                    bodyB->position -= correction * (massA / totalMass);
+                    bodyB->position -= positionCorrection * (massA / totalMass);
+                }
+
+                // Recalculate world anchors after position correction
+                worldAnchorA = bodyA->position + (bodyA->rotation * localAnchorA);
+                worldAnchorB = bodyB->position + (bodyB->rotation * localAnchorB);
+            }
+        }
+
+        // =========================================================================
+        // ROTATION CONSTRAINT: Align hinge axes
+        // =========================================================================
+        // Get hinge axes in world space
+        glm::vec3 worldHingeAxisA = bodyA->rotation * hingeAxis;
+        glm::vec3 worldHingeAxisB = bodyB->rotation * hingeAxis;
+
+        // Calculate the rotation needed to align the axes
+        glm::vec3 crossProduct = glm::cross(worldHingeAxisA, worldHingeAxisB);
+        float dotProduct = glm::dot(worldHingeAxisA, worldHingeAxisB);
+
+        // Calculate angular error (axis misalignment)
+        float angularError = atan2(glm::length(crossProduct), dotProduct);
+
+        if (glm::abs(angularError) > 0.001f)
+        {
+            // Calculate corrective angular impulse
+            glm::vec3 correctionAxis = glm::normalize(crossProduct);
+
+            // Calculate effective angular mass
+            glm::mat3 invInertiaA = bodyA->isStatic ? glm::mat3(0.0f) : bodyA->getInverseInertiaTensor();
+            glm::mat3 invInertiaB = bodyB->isStatic ? glm::mat3(0.0f) : bodyB->getInverseInertiaTensor();
+
+            // Transform correction axis to local space
+            glm::vec3 localCorrectionA = glm::inverse(bodyA->rotation) * correctionAxis;
+            glm::vec3 localCorrectionB = glm::inverse(bodyB->rotation) * correctionAxis;
+
+            // Calculate effective mass for rotation
+            float kA = bodyA->isStatic ? 0.0f : glm::dot(localCorrectionA, invInertiaA * localCorrectionA);
+            float kB = bodyB->isStatic ? 0.0f : glm::dot(localCorrectionB, invInertiaB * localCorrectionB);
+            float invEffectiveMass = kA + kB;
+
+            if (invEffectiveMass > 0.0001f)
+            {
+                // Calculate impulse magnitude with Baumgarte stabilization
+                const float angularBaumgarte = 0.3f;
+                float impulseMagnitude = -(angularError * angularBaumgarte) / invEffectiveMass;
+
+                // Apply angular impulse to angular velocities
+                if (!bodyA->isStatic)
+                {
+                    bodyA->angularVelocity -= invInertiaA * localCorrectionA * impulseMagnitude;
+                }
+                if (!bodyB->isStatic)
+                {
+                    bodyB->angularVelocity += invInertiaB * localCorrectionB * impulseMagnitude;
                 }
             }
         }
 
-        // Constrain rotation to maintain hinge axis alignment
-        // This is a simplified implementation - a full hinge constraint would be more complex
-        glm::vec3 currentHingeDir = bodyA->rotation * hingeAxis;
-        glm::vec3 targetHingeDir = bodyB->rotation * hingeAxis;
+        // =========================================================================
+        // ROTATION LIMITS: Enforce hinge angle limits
+        // =========================================================================
+        if (useLimits)
+        {
+            float currentAngle = GetCurrentAngle();
 
-        // Align the hinge axes approximately
-        glm::quat rotationDiff = glm::rotation(currentHingeDir, targetHingeDir);
-        glm::vec3 axis;
-        float angle;
-        if (rotationDiff.w < 0.9999f)
-        { // Avoid gimbal lock
-            rotationDiff = glm::normalize(rotationDiff);
-            float sinHalfAngle = glm::sqrt(1.0f - rotationDiff.w * rotationDiff.w);
-            if (sinHalfAngle > 0.0001f)
+            // Check if angle is outside limits
+            if (currentAngle < lowerLimit)
             {
-                axis = glm::vec3(rotationDiff.x, rotationDiff.y, rotationDiff.z) / sinHalfAngle;
-                angle = 2.0f * acos(rotationDiff.w);
-
-                // Apply small corrective rotation
-                glm::quat correctionRot = glm::angleAxis(angle * 0.1f, axis);
-
-                if (!bodyA->isStatic)
-                {
-                    bodyA->rotation = glm::normalize(correctionRot * bodyA->rotation);
-                }
-                if (!bodyB->isStatic)
-                {
-                    bodyB->rotation = glm::normalize(correctionRot * bodyB->rotation);
-                }
+                // Apply corrective impulse to push angle back to lower limit
+                float angleError = lowerLimit - currentAngle;
+                applyAngularCorrection(worldHingeAxisA, worldHingeAxisB, angleError);
             }
+            else if (currentAngle > upperLimit)
+            {
+                // Apply corrective impulse to push angle back to upper limit
+                float angleError = upperLimit - currentAngle;
+                applyAngularCorrection(worldHingeAxisA, worldHingeAxisB, -angleError);
+            }
+        }
+
+        // =========================================================================
+        // VELOCITY DAMPING: Stabilize the constraint
+        // =========================================================================
+        // Apply small damping to prevent oscillation
+        const float dampingFactor = 0.98f;
+        if (!bodyA->isStatic)
+        {
+            bodyA->angularVelocity *= dampingFactor;
+        }
+        if (!bodyB->isStatic)
+        {
+            bodyB->angularVelocity *= dampingFactor;
         }
     }
 
@@ -116,6 +225,47 @@ private:
     std::shared_ptr<RigidBody> bodyA, bodyB;
     glm::vec3 anchor;
     glm::vec3 hingeAxis;
+    float lowerLimit;
+    float upperLimit;
+    bool useLimits;
+
+    // Helper function to apply angular correction for limits
+    void applyAngularCorrection(const glm::vec3 &axisA, const glm::vec3 &axisB, float angleError)
+    {
+        // Calculate rotation axis for correction
+        glm::vec3 correctionAxis = glm::normalize(glm::cross(axisA, axisB));
+        if (glm::length(correctionAxis) < 0.001f)
+        {
+            // Axes are parallel, use hinge axis as fallback
+            correctionAxis = hingeAxis;
+        }
+
+        // Calculate effective angular mass
+        glm::mat3 invInertiaA = bodyA->isStatic ? glm::mat3(0.0f) : bodyA->getInverseInertiaTensor();
+        glm::mat3 invInertiaB = bodyB->isStatic ? glm::mat3(0.0f) : bodyB->getInverseInertiaTensor();
+
+        glm::vec3 localCorrectionA = glm::inverse(bodyA->rotation) * correctionAxis;
+        glm::vec3 localCorrectionB = glm::inverse(bodyB->rotation) * correctionAxis;
+
+        float kA = bodyA->isStatic ? 0.0f : glm::dot(localCorrectionA, invInertiaA * localCorrectionA);
+        float kB = bodyB->isStatic ? 0.0f : glm::dot(localCorrectionB, invInertiaB * localCorrectionB);
+        float invEffectiveMass = kA + kB;
+
+        if (invEffectiveMass > 0.0001f)
+        {
+            const float limitStiffness = 0.5f;
+            float impulseMagnitude = -(angleError * limitStiffness) / invEffectiveMass;
+
+            if (!bodyA->isStatic)
+            {
+                bodyA->angularVelocity -= invInertiaA * localCorrectionA * impulseMagnitude;
+            }
+            if (!bodyB->isStatic)
+            {
+                bodyB->angularVelocity += invInertiaB * localCorrectionB * impulseMagnitude;
+            }
+        }
+    }
 };
 
 // Slider constraint - allows motion along a single axis

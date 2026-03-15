@@ -32,18 +32,33 @@ Animation AssimpAnimationLoader::LoadAnimation(
             ? static_cast<float>(aiAnim->mTicksPerSecond)
             : 25.0f;
 
-    Animation animation(
-        aiAnim->mName.C_Str(),
-        duration,
-        ticksPerSecond);
+    // Get animation name (handle null/empty)
+    std::string animName = "Unknown";
+    if (aiAnim->mName.length > 0) {
+        const char* nameStr = aiAnim->mName.C_Str();
+        if (nameStr == nullptr) {
+            throw std::runtime_error("Assimp: aiAnim->mName.C_Str() returned nullptr at " + 
+                                     std::string(__FILE__) + ":" + std::to_string(__LINE__));
+        }
+        animName = nameStr;
+    }
+
+    Animation animation(animName, duration, ticksPerSecond);
 
     for (unsigned int i = 0; i < aiAnim->mNumChannels; ++i)
     {
         aiNodeAnim *channel = aiAnim->mChannels[i];
 
         BoneAnimation boneAnim;
-        boneAnim.boneName =
-            NormalizeBoneName(channel->mNodeName.C_Str());
+        
+        // Get bone name with null check and throw
+        const char* boneNameCStr = channel->mNodeName.C_Str();
+        if (boneNameCStr == nullptr) {
+            throw std::runtime_error("Assimp: channel->mNodeName.C_Str() returned nullptr for channel " + 
+                                     std::to_string(i) + " at " + std::string(__FILE__) + ":" + 
+                                     std::to_string(__LINE__));
+        }
+        boneAnim.boneName = NormalizeBoneName(std::string(boneNameCStr));
 
         // Populate position channel
         for (unsigned int k = 0; k < channel->mNumPositionKeys; ++k)

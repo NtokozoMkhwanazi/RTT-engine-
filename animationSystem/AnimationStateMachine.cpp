@@ -229,22 +229,23 @@ void AnimationStateMachine::update(float dt, float speed, bool grounded, bool ju
     // ------------------------------------------------------------
     // STEP 1: Check if we can exit current state (EXIT RULES)
     // ------------------------------------------------------------
-    
+
     if (currentState == AnimationState::JUMP) {
         // JUMP is a ONE-SHOT animation - cannot exit until:
-        // 1. Animation has played for minimum duration (0.3s)
-        // 2. Character is grounded again
-        float minJumpDuration = 0.3f;
-        if (jumpAnimationPlaying && jumpAnimationStartTime < minJumpDuration) {
-            canExitCurrentState = false;  // Still playing jump wind-up
-        }
-        if (!grounded) {
-            canExitCurrentState = false;  // Still in air
-        }
-        // Reset jump tracking when we can exit
-        if (canExitCurrentState && grounded) {
+        // 1. Animation has played for minimum duration (0.4s)
+        // 2. OR character is grounded (landed)
+        // Both conditions must be true to exit smoothly
+        float minJumpDuration = 0.4f;
+        
+        // Can exit if BOTH conditions are met:
+        // - Played long enough
+        // - Currently grounded
+        if (jumpAnimationStartTime >= minJumpDuration && grounded) {
+            canExitCurrentState = true;
             jumpAnimationPlaying = false;
             jumpAnimationStartTime = 0.0f;
+        } else {
+            canExitCurrentState = false;
         }
     }
     
@@ -260,16 +261,16 @@ void AnimationStateMachine::update(float dt, float speed, bool grounded, bool ju
     // ------------------------------------------------------------
     // STEP 2: Calculate blend weights using gradient bands
     // ------------------------------------------------------------
-    
+
     if (useBlendSpace && !crouching && grounded && currentState != AnimationState::JUMP) {
         // Normalize speed to blend weight (0.0 to 1.0)
         // 0.0 = idle, 0.5 = walk, 1.0 = run
         float normalizedSpeed = speed / maxRunSpeed;
         targetBlendWeight = glm::clamp(normalizedSpeed, 0.0f, 1.0f);
-        
+
         // Smooth blend weight transition
         blendWeight = glm::mix(blendWeight, targetBlendWeight, blendSmoothRate * dt);
-        
+
         // Determine dominant state based on blend weight
         if (blendWeight < 0.25f) {
             targetState = AnimationState::IDLE;
@@ -278,8 +279,13 @@ void AnimationStateMachine::update(float dt, float speed, bool grounded, bool ju
         } else {
             targetState = AnimationState::RUN;
         }
-        
-        // Apply blend space animation mixing
+
+        // CRITICAL FIX: Only apply blend space when state CHANGES
+        // This prevents animation time reset and allows full animation cycles
+
+        // Only re-blend if state changed significantly
+        // CRITICAL FIX: Update blend space EVERY frame for instant WASD response
+        // Don't wait for state changes - blend weight should follow input immediately
         applyBlendSpaceAnimation(dt);
     }
 
@@ -355,9 +361,12 @@ void AnimationStateMachine::update(float dt, float speed, bool grounded, bool ju
     // ------------------------------------------------------------
     // STEP 4: Execute transition if state changed
     // ------------------------------------------------------------
-    
+
     if (targetState != currentState && !isTransitioningState) {
-        startTransition(targetState, defaultBlendDuration);
+        // CRITICAL FIX: Instant transition for JUMP (one-shot action)
+        // Use blend for locomotion, instant for actions
+        float blendDur = (targetState == AnimationState::JUMP) ? 0.02f : defaultBlendDuration;
+        startTransition(targetState, blendDur);
     }
 
     // Update animator to advance animation time
@@ -384,52 +393,53 @@ void AnimationStateMachine::update(float dt, float speed, bool grounded, bool ju
 void AnimationStateMachine::applyBlendSpaceAnimation(float dt)
 {
     if (!animator || !useBlendSpace) return;
-    
+
     // Blend space uses blend weight to mix idle/walk/run
     // Weight 0.0 = 100% idle
-    // Weight 0.5 = 100% walk  
+    // Weight 0.5 = 100% walk
     // Weight 1.0 = 100% run
-    // In-between = smooth interpolation
-    
+
     Animation* idleAnim = nullptr;
     Animation* walkAnim = nullptr;
     Animation* runAnim = nullptr;
-    
+
     auto it = stateAnimations.find(AnimationState::IDLE);
     if (it != stateAnimations.end()) idleAnim = it->second.animation;
-    
+
     it = stateAnimations.find(AnimationState::WALK);
     if (it != stateAnimations.end()) walkAnim = it->second.animation;
-    
+
     it = stateAnimations.find(AnimationState::RUN);
     if (it != stateAnimations.end()) runAnim = it->second.animation;
+
+    // CRITICAL FIX: Don't use BlendTwoAnimations - it disrupts playback!
+    // Instead, determine the DOMINANT animation and Play() it
+    // The blend weight is used for smooth state determination, not layer blending
     
-    // Determine which animations to blend based on blend weight
-    if (blendWeight < 0.5f) {
-        // Blending idle ↔ walk
-        float idleWeight = 1.0f - (blendWeight * 2.0f);  // 1.0 → 0.0
-        float walkWeight = blendWeight * 2.0f;            // 0.0 → 1.0
-        
-        if (idleAnim && walkAnim) {
-            animator->BlendTwoAnimations(idleAnim, idleWeight, walkAnim, walkWeight, dt);
-        } else if (idleAnim) {
-            animator->Play(idleAnim);
-        } else if (walkAnim) {
-            animator->Play(walkAnim);
-        }
+    Animation* dominantAnim = nullptr;
+    
+    if (blendWeight < 0.25f) {
+        // Idle dominant
+        dominantAnim = idleAnim;
+    } else if (blendWeight < 0.6f) {
+        // Walk dominant
+        dominantAnim = walkAnim;
     } else {
-        // Blending walk ↔ run
-        float walkWeight = 2.0f - (blendWeight * 2.0f);  // 1.0 → 0.0
-        float runWeight = (blendWeight - 0.5f) * 2.0f;    // 0.0 → 1.0
-        
-        if (walkAnim && runAnim) {
-            animator->BlendTwoAnimations(walkAnim, walkWeight, runAnim, runWeight, dt);
-        } else if (walkAnim) {
-            animator->Play(walkAnim);
-        } else if (runAnim) {
-            animator->Play(runAnim);
-        }
+        // Run dominant
+        dominantAnim = runAnim;
     }
+    
+    // Only change animation if it's different from current
+    // This allows animations to play through without interruption
+    static Animation* lastPlayedAnim = nullptr;
+    
+    if (dominantAnim && dominantAnim != lastPlayedAnim) {
+        animator->Play(dominantAnim);
+        lastPlayedAnim = dominantAnim;
+    }
+    
+    // NOTE: Don't call animator->Update(dt) here - it's called in the main FSM update
+    // Calling it twice would advance animation time double speed
 }
 
 void AnimationStateMachine::evaluateTransitions()
@@ -449,9 +459,9 @@ void AnimationStateMachine::evaluateTransitions()
 
 void AnimationStateMachine::startTransition(AnimationState toState, float duration)
 {
-    std::cout << ">>> TRANSITION: " << AnimationStateToString(currentState) 
+    std::cout << ">>> TRANSITION: " << AnimationStateToString(currentState)
               << " -> " << AnimationStateToString(toState) << "\n";
-    
+
     if (toState == currentState) {
         std::cout << "    SKIP: Same state\n";
         return;
@@ -481,8 +491,12 @@ void AnimationStateMachine::startTransition(AnimationState toState, float durati
     transitionDuration = duration;
     transitionProgress = 0.0f;
     isTransitioningState = true;
+    
+    // CRITICAL FIX: Update currentState immediately for correct state queries
+    // The blend weight controls visual blending, not the logical state
+    currentState = toState;
 
-    std::cout << "    Animation ptr=" << it->second.animation 
+    std::cout << "    Animation ptr=" << it->second.animation
               << " dur=" << it->second.animation->duration
               << " bones=" << it->second.animation->boneAnimations.size() << "\n";
 
@@ -505,12 +519,11 @@ void AnimationStateMachine::updateTransition(float dt)
     if (transitionProgress >= 1.0f) {
         transitionProgress = 1.0f;
         isTransitioningState = false;
-        previousState = transitionFromState;
-        currentState = transitionToState;
-        std::cout << "[Anim] State: " << AnimationStateToString(currentState) 
+        // State was already updated in startTransition(), just clear transition state
+        std::cout << "[Anim] State: " << AnimationStateToString(currentState)
                   << " (transition complete, dur=" << transitionDuration << ")\n";
     } else {
-        std::cout << "[Trans] Progress: " << (int)(transitionProgress * 100) 
+        std::cout << "[Trans] Progress: " << (int)(transitionProgress * 100)
                   << "% dur=" << transitionDuration << " dt=" << dt << "\n";
     }
 }

@@ -127,35 +127,44 @@ void FootPlantingSystem::FootState::Update(
     float groundHeight,
     const MotionMatchingConfig& config,
     float dt) {
-    
+
     position = newPos;
     velocity = newVel;
-    
+
     float speed = glm::length(newVel);
     float footHeight = position.y - groundHeight;
-    
+
     if (planted) {
         // Currently planted - check if should release
-        if (plantTimer < 0.1f) {
-            return;  // Just planted, don't release yet
-        }
+        // CRITICAL FIX: More responsive foot release for proper gait cycles
         
-        // Foot is moving up or fast
-        if (newVel.y > 0.5f) {
+        // Release immediately if foot is moving up (heel lift)
+        if (newVel.y > 0.3f) {  // Lowered threshold from 0.5f to 0.3f
             planted = false;
             plantTimer = 0.0f;
-            releaseTimer = 0.1f;  // Cooldown
+            releaseTimer = 0.05f;  // Reduced cooldown from 0.1f to 0.05f
             return;
         }
-        
+
+        // Release if foot is moving horizontally fast enough
         float speed = glm::length(newVel);
-        if (speed > config.footPlantThreshold * 2.0f) {
+        if (speed > config.footPlantThreshold * 1.5f) {  // Reduced from 2.0f to 1.5f
             planted = false;
             plantTimer = 0.0f;
-            releaseTimer = 0.1f;
+            releaseTimer = 0.05f;  // Reduced cooldown
             return;
         }
-        
+
+        // CRITICAL: Release foot after maximum plant duration to prevent "stuck" feet
+        // Most gait cycles have a foot plant duration of 0.3-0.6s
+        // Force release after 0.8s to ensure cycle completes
+        if (plantTimer > 0.8f) {
+            planted = false;
+            plantTimer = 0.0f;
+            releaseTimer = 0.05f;
+            return;
+        }
+
         // Stay planted
         plantTimer += dt;
     } else {
@@ -170,7 +179,7 @@ void FootPlantingSystem::FootState::Update(
             plantTimer = 0.0f;
         }
     }
-    
+
     UpdateDebug();
 }
 

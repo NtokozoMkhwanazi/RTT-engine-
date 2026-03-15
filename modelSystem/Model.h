@@ -11,12 +11,12 @@
 #include <assimp/scene.h>
 #include <assimp/Importer.hpp>
 
-#include "meshSystem/Mesh.h"
-#include "shaderSystem/Shader.h"
-#include "animationSystem/Animation.h"
-#include "animationSystem/Animator.h"
-#include "boneSystem/Skeleton.h"
-#include "boneSystem/BoneName.h"
+#include "../meshSystem/Mesh.h"
+#include "../shaderSystem/Shader.h"
+#include "../animationSystem/Animation.h"
+#include "../animationSystem/Animator.h"
+#include "../boneSystem/Skeleton.h"
+#include "../boneSystem/BoneName.h"
 
 // ============================================================
 // Material Types

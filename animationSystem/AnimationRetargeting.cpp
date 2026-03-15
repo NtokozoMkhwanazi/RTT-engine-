@@ -1,6 +1,7 @@
 #include "AnimationRetargeting.h"
 #include "../boneSystem/BoneName.h"
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/matrix_decompose.hpp>
 #include <iostream>
 #include <algorithm>
 #include <cctype>
@@ -351,18 +352,73 @@ glm::mat4 AnimationRetargeting::MapBoneTransform(
     const Skeleton &targetSkel,
     float scale)
 {
-    // This is a simplified implementation
-    // In a full implementation, this would handle complex transformations
-    // between different skeleton structures
-
-    // For now, just apply scaling to the translation component
-    glm::mat4 result = sourceTransform;
-    glm::vec3 translation = glm::vec3(result[3]);
-    translation *= scale;
-    result[3][0] = translation.x;
-    result[3][1] = translation.y;
-    result[3][2] = translation.z;
-
+    // Full implementation for animation retargeting between different skeletons
+    
+    // Step 1: Decompose source transform into TRS
+    glm::vec3 sourceScale, sourceTranslation;
+    glm::quat sourceRotation;
+    glm::vec3 sourceSkew;
+    glm::vec4 sourcePerspective;
+    glm::decompose(sourceTransform, sourceScale, sourceRotation, sourceTranslation, sourceSkew, sourcePerspective);
+    
+    // Step 2: Get bind pose information for both bones
+    int sourceBoneIdx = sourceSkel.GetBoneIndex(sourceBoneName);
+    int targetBoneIdx = targetSkel.GetBoneIndex(targetBoneName);
+    
+    glm::mat4 sourceBindTransform = (sourceBoneIdx >= 0 && static_cast<size_t>(sourceBoneIdx) < sourceSkel.bones.size())
+        ? sourceSkel.bones[sourceBoneIdx].bindTransform : glm::mat4(1.0f);
+    
+    glm::mat4 targetBindTransform = (targetBoneIdx >= 0 && static_cast<size_t>(targetBoneIdx) < targetSkel.bones.size())
+        ? targetSkel.bones[targetBoneIdx].bindTransform : glm::mat4(1.0f);
+    
+    // Step 3: Decompose bind poses
+    glm::vec3 sourceBindScale, sourceBindTranslation;
+    glm::quat sourceBindRotation;
+    glm::vec3 sourceBindSkew;
+    glm::vec4 sourceBindPerspective;
+    glm::decompose(sourceBindTransform, sourceBindScale, sourceBindRotation, sourceBindTranslation, sourceBindSkew, sourceBindPerspective);
+    
+    glm::vec3 targetBindScale, targetBindTranslation;
+    glm::quat targetBindRotation;
+    glm::vec3 targetBindSkew;
+    glm::vec4 targetBindPerspective;
+    glm::decompose(targetBindTransform, targetBindScale, targetBindRotation, targetBindTranslation, targetBindSkew, targetBindPerspective);
+    
+    // Step 4: Calculate relative transform (animation delta from bind pose)
+    // This extracts just the animation, removing the skeleton-specific bind pose
+    glm::quat relativeRotation = sourceRotation * glm::inverse(sourceBindRotation);
+    glm::vec3 relativeScale;
+    for (int i = 0; i < 3; i++) {
+        relativeScale[i] = (sourceBindScale[i] != 0.0f) ? sourceScale[i] / sourceBindScale[i] : 1.0f;
+    }
+    
+    // For translation, we need to handle root bones differently
+    bool isRootBone = (sourceBoneName == "Hips" || sourceBoneName == "Root" || 
+                       sourceBoneName.find("Root") != std::string::npos);
+    
+    glm::vec3 relativeTranslation;
+    if (isRootBone) {
+        // Root bone: apply full translation with scale
+        relativeTranslation = sourceTranslation * scale;
+    } else {
+        // Non-root bones: translation is usually local, keep it relative
+        relativeTranslation = sourceTranslation - sourceBindTranslation;
+        relativeTranslation *= scale;
+    }
+    
+    // Step 5: Apply relative transform to target bind pose
+    glm::quat finalRotation = relativeRotation * targetBindRotation;
+    glm::vec3 finalScale;
+    for (int i = 0; i < 3; i++) {
+        finalScale[i] = relativeScale[i] * targetBindScale[i];
+    }
+    glm::vec3 finalTranslation = relativeTranslation + targetBindTranslation;
+    
+    // Step 6: Rebuild final transform matrix
+    glm::mat4 result = glm::translate(glm::mat4(1.0f), finalTranslation);
+    result *= glm::mat4_cast(finalRotation);
+    result *= glm::scale(glm::mat4(1.0f), finalScale);
+    
     return result;
 }
 

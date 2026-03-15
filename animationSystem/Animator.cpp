@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cmath>
 #include <iostream>
+#include <map>
 
 // No local normalization - use canonical NormalizeBoneName from BoneName.h
 
@@ -130,6 +131,13 @@ void Animator::BlendTo(Animation *anim, float duration)
             }
         }
     }
+    
+    // CRITICAL FIX: Reset root motion state when transitioning to new animation
+    // This prevents old root motion from affecting the new animation
+    prevRootPos = glm::vec3(0.0f);
+    rootMotionDelta = glm::vec3(0.0f);
+    hasPrevRoot = false;
+    std::cout << "[BlendTo] Reset root motion state for transition\n";
 }
 
 void Animator::Update(float dt)
@@ -145,6 +153,10 @@ void Animator::Update(float dt)
 
     // Save previous positions BEFORE overwriting
     prevBoneWorldPos = currBoneWorldPos;
+
+    // CRITICAL FIX: Clear IK offsets at start of each frame
+    // They accumulate in UpdateFootIK() if not cleared
+    std::fill(ikOffsets.begin(), ikOffsets.end(), glm::vec3(0.0f));
 
     // Update animation times and blend weights
     if (!DEBUG_PAUSE_ANIM)
@@ -326,14 +338,54 @@ void Animator::Update(float dt)
             glm::vec3(globalBoneMatrices[i] * glm::vec4(0, 0, 0, 1));
     }
 
-    // Root motion
+    // Root motion extraction
+    // CRITICAL FIX: Mixamo animations often have static "mixamo.com" root
+    // but moving "Hips" bone. We need to check BOTH for root motion.
     rootMotionDelta = glm::vec3(0.0f);
 
+    // First try: Use the skeleton's root bone index
     int rootIdx = skeleton->rootBoneIndex;
+    glm::vec3 currRoot(0.0f);
+    bool foundRoot = false;
+
     if (rootIdx >= 0 && rootIdx < (int)currBoneWorldPos.size())
     {
-        glm::vec3 currRoot = currBoneWorldPos[rootIdx];
+        currRoot = currBoneWorldPos[rootIdx];
+        foundRoot = true;
+    }
 
+    // Second try: If root bone has no motion, try "Hips" bone (Mixamo style)
+    // This fixes the footskating issue where root is static but hips move
+    int hipsIdx = skeleton->GetBoneIndex("Hips");
+    if (hipsIdx >= 0 && hipsIdx < (int)currBoneWorldPos.size())
+    {
+        // Check if hips has more motion than root
+        glm::vec3 hipsPos = currBoneWorldPos[hipsIdx];
+        
+        if (!hasPrevRoot)
+        {
+            prevRootPos = hipsPos;
+            hasPrevRoot = true;
+            currRoot = hipsPos;
+            foundRoot = true;
+        }
+        else
+        {
+            glm::vec3 hipsMotion = hipsPos - prevRootPos;
+            float hipsMotionMag = glm::length(hipsMotion);
+            
+            // If hips has significant motion, use it instead of root
+            if (hipsMotionMag > 0.001f)
+            {
+                currRoot = hipsPos;
+                foundRoot = true;
+            }
+        }
+    }
+
+    // Compute root motion delta
+    if (foundRoot)
+    {
         if (!hasPrevRoot)
         {
             prevRootPos = currRoot;
@@ -345,7 +397,19 @@ void Animator::Update(float dt)
             prevRootPos = currRoot;
         }
 
+        // Zero out vertical motion (we only want horizontal movement)
         rootMotionDelta.y = 0.0f;
+    }
+
+    // DEBUG: Print root motion info if significant
+    static float rootMotionDebugTimer = 0.0f;
+    rootMotionDebugTimer += dt;
+    if (rootMotionDebugTimer > 5.0f && glm::length(rootMotionDelta) > 0.001f)
+    {
+        std::cout << "[RootMotion] Delta=(" << rootMotionDelta.x << ", " 
+                  << rootMotionDelta.y << ", " << rootMotionDelta.z << ")"
+                  << " Mag=" << glm::length(rootMotionDelta) << "\n";
+        rootMotionDebugTimer = 0.0f;
     }
     
     // Cleanup: Remove animations with 0 weight to prevent buildup
@@ -613,26 +677,65 @@ void Animator::BlendToWithWeight(Animation *anim, float targetWeight, float dura
 void Animator::BlendTwoAnimations(Animation *anim1, float weight1, Animation *anim2, float weight2, float dt)
 {
     if (!anim1 && !anim2) return;
-    
+
     // Normalize weights
     float totalWeight = weight1 + weight2;
     if (totalWeight < 0.001f) return;
-    
+
     weight1 /= totalWeight;
     weight2 /= totalWeight;
-    
-    // Clear existing layers and set up two-animation blend
-    activeAnimations.clear();
-    
-    if (anim1) {
-        activeAnimations.emplace_back(anim1, weight1, 0.1f);
-        activeAnimations.back().targetWeight = weight1;
-        activeAnimations.back().blendProgress = 1.0f;  // Already blended
+
+    // CRITICAL FIX: Don't clear layers - preserve animation time!
+    // Find or create layer for anim1
+    bool foundAnim1 = false;
+    for (auto& layer : activeAnimations) {
+        if (layer.animation == anim1) {
+            // Smoothly interpolate weight to prevent popping
+            layer.targetWeight = weight1;
+            if (std::abs(layer.weight - weight1) > 0.01f) {
+                layer.weight = glm::mix(layer.weight, weight1, 10.0f * dt);
+            } else {
+                layer.weight = weight1;
+            }
+            layer.enabled = true;
+            foundAnim1 = true;
+            break;
+        }
     }
-    if (anim2) {
-        activeAnimations.emplace_back(anim2, weight2, 0.1f);
+    if (!foundAnim1 && anim1) {
+        activeAnimations.emplace_back(anim1, weight1, 0.0f);
+        activeAnimations.back().targetWeight = weight1;
+        activeAnimations.back().blendProgress = 1.0f;
+    }
+    
+    // Find or create layer for anim2
+    bool foundAnim2 = false;
+    for (auto& layer : activeAnimations) {
+        if (layer.animation == anim2) {
+            // Smoothly interpolate weight to prevent popping
+            layer.targetWeight = weight2;
+            if (std::abs(layer.weight - weight2) > 0.01f) {
+                layer.weight = glm::mix(layer.weight, weight2, 10.0f * dt);
+            } else {
+                layer.weight = weight2;
+            }
+            layer.enabled = true;
+            foundAnim2 = true;
+            break;
+        }
+    }
+    if (!foundAnim2 && anim2) {
+        activeAnimations.emplace_back(anim2, weight2, 0.0f);
         activeAnimations.back().targetWeight = weight2;
-        activeAnimations.back().blendProgress = 1.0f;  // Already blended
+        activeAnimations.back().blendProgress = 1.0f;
+    }
+    
+    // Disable any other layers that shouldn't be active (but don't remove them)
+    for (auto& layer : activeAnimations) {
+        if (layer.animation != anim1 && layer.animation != anim2) {
+            layer.targetWeight = 0.0f;
+            layer.enabled = false;
+        }
     }
 }
 
@@ -767,18 +870,26 @@ void Animator::UpdateAnimationBlending(float dt)
 
         if (animDuration <= 0.01f) continue;  // Skip very short animations
 
-        float prevTime = layer.time;
         // layer.time is in seconds, dt is in seconds
         layer.time += dt * speed;
 
         // If we crossed the loop point this frame, mark for cross-fade
-        if (prevTime < animDuration && layer.time >= animDuration) {
-            layersNeedingCrossFade.push_back(i);
+        // DISABLED for motion matching - it handles looping manually
+        // float prevTime = layer.time;
+        // if (prevTime < animDuration && layer.time >= animDuration) {
+        //     layersNeedingCrossFade.push_back(i);
+        //     layer.time = fmod(layer.time, animDuration);
+        // }
+
+        // Simple looping without cross-fade
+        if (layer.time >= animDuration) {
             layer.time = fmod(layer.time, animDuration);
         }
     }
 
-    // Create cross-fade layers for animations that looped
+    // DISABLED: Create cross-fade layers for animations that looped
+    // Motion matching handles smooth transitions, we don't need cross-fade on loop
+    /*
     for (int layerIdx : layersNeedingCrossFade) {
         if (activeAnimations.size() >= 6) break;  // Limit layers
 
@@ -798,6 +909,7 @@ void Animator::UpdateAnimationBlending(float dt)
 
         activeAnimations.push_back(crossFadeLayer);
     }
+    */
 
     // Second pass: update blend weights
     for (auto& layer : activeAnimations)
@@ -847,21 +959,56 @@ void Animator::UpdateAnimationBlending(float dt)
         }
     }
 
-    // Cleanup: Remove layers that have faded out (aggressive cleanup)
+    // Cleanup: Remove layers that have faded out
+    // CRITICAL FIX: Be VERY conservative - only remove layers that have been 
+    // fully faded for multiple frames to prevent animation popping
+    static std::map<Animation*, int> s_fadeOutCounter;  // Track frames at zero weight
+    
     if (activeAnimations.size() > 1) {
         size_t before = activeAnimations.size();
-        activeAnimations.erase(
-            std::remove_if(activeAnimations.begin(), activeAnimations.end(),
-                [](const AnimationLayer& layer) {
-                    return layer.weight < 0.01f && layer.targetWeight < 0.01f;
-                }),
-            activeAnimations.end());
-        if (activeAnimations.size() != before) {
+        
+        // First pass: mark layers for removal
+        std::vector<size_t> layersToRemove;
+        for (size_t i = 0; i < activeAnimations.size(); i++) {
+            auto& layer = activeAnimations[i];
+            
+            // Only consider removal if:
+            // 1. Weight is essentially zero
+            // 2. Target weight is zero
+            // 3. Blend is complete
+            // 4. Has been at zero for multiple frames (prevents popping)
+            if (layer.weight < 0.001f 
+                && layer.targetWeight < 0.001f
+                && layer.blendProgress >= 1.0f)
+            {
+                // Track how long this layer has been faded
+                s_fadeOutCounter[layer.animation]++;
+                
+                // Only remove after 10 frames (~0.16s) at zero weight
+                if (s_fadeOutCounter[layer.animation] > 10) {
+                    layersToRemove.push_back(i);
+                    s_fadeOutCounter.erase(layer.animation);
+                }
+            } else {
+                // Reset counter if layer becomes active again
+                s_fadeOutCounter.erase(layer.animation);
+            }
+        }
+        
+        // Remove marked layers (in reverse order to preserve indices)
+        for (auto it = layersToRemove.rbegin(); it != layersToRemove.rend(); ++it) {
+            activeAnimations.erase(activeAnimations.begin() + *it);
+        }
+
+        if (activeAnimations.size() != before && activeAnimations.size() > 0) {
             std::cout << "[Cleanup] Removed " << (before - activeAnimations.size()) << " faded layers\n";
         }
     }
-    
-    // Reorder: Put layer with highest target weight first (this is the "current" animation)
+
+    // CRITICAL FIX: Disable automatic layer reordering
+    // Reordering causes animation time resets and popping
+    // The blend weights should determine which animation is dominant, not layer order
+    /*
     if (activeAnimations.size() > 1) {
         size_t bestIdx = 0;
         float bestTarget = activeAnimations[0].targetWeight;
@@ -876,6 +1023,7 @@ void Animator::UpdateAnimationBlending(float dt)
             std::cout << "[Reorder] Swapped layers, now first has target=" << bestTarget << "\n";
         }
     }
+    */
 
     // Update queued animations
     for (auto& queued : queuedAnimations)
@@ -1154,131 +1302,248 @@ void Animator::UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMovin
 {
     if (!footIKSettings.enabled || !skeleton) return;
 
-    // Disable foot locking when moving - feet should follow animation naturally
-    if (isMoving) {
-        // Release any locked feet
-        leftFootIK.isLocked = false;
-        leftFootIK.lockWeight = glm::max(0.0f, leftFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed * 2.0f);
-        leftFootIK.ankleOffset = glm::vec3(0.0f);
-        
-        rightFootIK.isLocked = false;
-        rightFootIK.lockWeight = glm::max(0.0f, rightFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed * 2.0f);
-        rightFootIK.ankleOffset = glm::vec3(0.0f);
-        return;
-    }
-
     int leftFoot = footIKSettings.leftFootBone;
     int rightFoot = footIKSettings.rightFootBone;
 
     if (leftFoot < 0 || rightFoot < 0) return;  // Foot bones not set
 
-    float floorY = footIKSettings.floorHeight;
+    // NaN protection: Check if bone positions are valid
+    if (leftFoot >= (int)currBoneWorldPos.size() || rightFoot >= (int)currBoneWorldPos.size()) {
+        static int warnCount = 0;
+        if (++warnCount < 5) {
+            std::cout << "[FootIK] WARNING: Bone index out of range! L=" << leftFoot 
+                      << " R=" << rightFoot << " size=" << currBoneWorldPos.size() << "\n";
+        }
+        return;
+    }
+
+    // Check for NaN in bone positions
+    glm::vec3& leftFootPos = currBoneWorldPos[leftFoot];
+    glm::vec3& rightFootPos = currBoneWorldPos[rightFoot];
     
+    bool leftValid = std::isfinite(leftFootPos.x) && std::isfinite(leftFootPos.y) && std::isfinite(leftFootPos.z);
+    bool rightValid = std::isfinite(rightFootPos.x) && std::isfinite(rightFootPos.y) && std::isfinite(rightFootPos.z);
+    
+    if (!leftValid || !rightValid) {
+        static int warnCount = 0;
+        if (++warnCount < 5) {
+            std::cout << "[FootIK] WARNING: NaN in bone positions! L=(" 
+                      << leftFootPos.x << "," << leftFootPos.y << "," << leftFootPos.z << ") R=("
+                      << rightFootPos.x << "," << rightFootPos.y << "," << rightFootPos.z << ")\n";
+            // Debug: Check a few more bones to see pattern
+            if (currBoneWorldPos.size() > 0) {
+                glm::vec3& rootPos = currBoneWorldPos[0];
+                std::cout << "[FootIK]   Root bone[0]: (" << rootPos.x << "," << rootPos.y << "," << rootPos.z << ")\n";
+            }
+            if (currBoneWorldPos.size() > 55) {
+                glm::vec3& hipPos = currBoneWorldPos[55];
+                std::cout << "[FootIK]   Bone[55] (rightupleg): (" << hipPos.x << "," << hipPos.y << "," << hipPos.z << ")\n";
+            }
+        }
+        // Clear IK offsets to prevent NaN propagation
+        if (leftFoot < (int)ikOffsets.size()) ikOffsets[leftFoot] = glm::vec3(0.0f);
+        if (rightFoot < (int)ikOffsets.size()) ikOffsets[rightFoot] = glm::vec3(0.0f);
+        return;
+    }
+
+    float floorY = footIKSettings.floorHeight;
+
+    // DEBUG: Print foot IK status every 30 frames
+    static int debugFrame = 0;
+    bool printDebug = (++debugFrame % 30 == 0);
+
+    if (printDebug) {
+        std::cout << "[FootIK] floorY=" << floorY << " charPos.y≈" << (currBoneWorldPos.size() > 0 ? currBoneWorldPos[0].y : -1) << "\n";
+        std::cout << "[FootIK] modelMatrix translation: (" << modelMatrix[3].x << "," << modelMatrix[3].y << "," << modelMatrix[3].z << ")\n";
+        std::cout << "[FootIK] foot bone[" << leftFoot << "] local: (" 
+                  << (currBoneWorldPos.size() > (size_t)leftFoot ? currBoneWorldPos[leftFoot].x : -999) << ","
+                  << (currBoneWorldPos.size() > (size_t)leftFoot ? currBoneWorldPos[leftFoot].y : -999) << ","
+                  << (currBoneWorldPos.size() > (size_t)leftFoot ? currBoneWorldPos[leftFoot].z : -999) << ")\n";
+    }
+
+    // CRITICAL FIX: Foot IK must work DURING movement!
+    // isMoving only affects how quickly we release locked feet
+    float releaseSpeedMult = isMoving ? 2.0f : 1.0f;  // Faster release when moving
+
     // Update left foot IK
     if (leftFoot >= 0 && leftFoot < (int)currBoneWorldPos.size()) {
-        glm::vec3 footWorldPos = modelMatrix * glm::vec4(currBoneWorldPos[leftFoot], 1.0f);
+        glm::vec3 footLocalPos = currBoneWorldPos[leftFoot];
+        glm::vec3 prevFootLocalPos = currBoneWorldPos[leftFoot];
         
-        // Check if foot is near floor
-        float distToFloor = footWorldPos.y - floorY;
-        bool nearFloor = distToFloor < 0.1f && distToFloor > -0.05f;
+        // Debug: Check for NaN before transform
+        bool footValid = std::isfinite(footLocalPos.x) && std::isfinite(footLocalPos.y) && std::isfinite(footLocalPos.z);
+        bool modelValid = std::isfinite(modelMatrix[3].x) && std::isfinite(modelMatrix[3].y) && std::isfinite(modelMatrix[3].z);
         
-        // Check if foot is moving slowly (planted)
-        float footSpeed = glm::length(currBoneWorldPos[leftFoot] - prevBoneWorldPos[leftFoot]);
-        bool isStationary = footSpeed < 0.05f;
-        
-        // Lock foot when it's near floor and stationary
-        if (nearFloor && isStationary && !leftFootIK.isLocked) {
-            leftFootIK.isLocked = true;
-            leftFootIK.lockedPosition = footWorldPos;
-            leftFootIK.lockedPosition.y = floorY;  // Snap to floor
-            leftFootIK.targetPosition = footWorldPos;
+        if (!footValid) {
+            static int warnCount = 0;
+            if (++warnCount < 3) {
+                std::cout << "[FootIK] ERROR: footLocalPos is NaN! bone=" << leftFoot 
+                          << " pos=(" << footLocalPos.x << "," << footLocalPos.y << "," << footLocalPos.z << ")\n";
+            }
+            footLocalPos = glm::vec3(0.0f);  // Prevent NaN propagation
         }
         
+        glm::vec3 footWorldPos = modelMatrix * glm::vec4(footLocalPos, 1.0f);
+        glm::vec3 prevFootPos = modelMatrix * glm::vec4(prevBoneWorldPos[leftFoot], 1.0f);
+
+        // Check if foot is near floor
+        // CRITICAL: Walk animations have feet 0.3-0.8 units above ground even when planted
+        // We need a generous threshold to catch the plant phase
+        float distToFloor = footWorldPos.y - floorY;
+        bool nearFloor = distToFloor < 0.8f && distToFloor > -0.1f;  // Increased from 0.15 to 0.8
+
+        // Check if foot is moving slowly (planted)
+        float footSpeed = glm::length(footWorldPos - prevFootPos);
+        float plantThreshold = isMoving ? 0.08f : 0.05f;  // Higher threshold when moving
+        bool isStationary = footSpeed < plantThreshold;
+
+        // CRITICAL FIX: Check for animation loop discontinuity
+        if (leftFootIK.isLocked) {
+            float distFromLock = glm::length(footWorldPos - leftFootIK.lockedPosition);
+            if (distFromLock > 0.3f) {  // Foot moved too far - likely animation loop
+                leftFootIK.isLocked = false;
+                leftFootIK.lockWeight = 0.0f;
+                leftFootIK.ankleOffset = glm::vec3(0.0f);
+                if (printDebug) std::cout << "[FootIK] LEFT: Force release (discontinuity " << distFromLock << "m)\n";
+            }
+        }
+
+        // Lock foot when it's near floor and stationary (works during walking!)
+        if (nearFloor && isStationary && !leftFootIK.isLocked) {
+            leftFootIK.isLocked = true;
+            leftFootIK.lockedPosition = footWorldPos;  // Use ACTUAL foot position, don't snap to floor
+            leftFootIK.targetPosition = footWorldPos;
+            if (printDebug) std::cout << "[FootIK] LEFT: LOCKED @ y=" << footWorldPos.y << " (speed=" << footSpeed << ")\n";
+        }
+
         // Update lock weight
         if (leftFootIK.isLocked) {
             leftFootIK.lockWeight = glm::min(1.0f, leftFootIK.lockWeight + dt * footIKSettings.footLockBlend);
             leftFootIK.timeSinceLock += dt;
-            
-            // Release lock when foot moves up
-            if (footWorldPos.y > floorY + 0.1f || !nearFloor) {
+
+            // CRITICAL: Auto-release after max lock duration to prevent stuck feet
+            // Gait cycle: ~0.5-0.6s per step
+            if (leftFootIK.timeSinceLock > 0.6f) {
                 leftFootIK.isLocked = false;
+                leftFootIK.timeSinceLock = 0.0f;
+                if (printDebug) std::cout << "[FootIK] LEFT: Timeout release\n";
+            }
+
+            // Release lock when foot moves up significantly from LOCKED position
+            float releaseThreshold = isMoving ? 0.12f : 0.08f;
+            float distFromLock = footWorldPos.y - leftFootIK.lockedPosition.y;
+            if (distFromLock > releaseThreshold || (isMoving && footSpeed > 0.25f)) {
+                leftFootIK.isLocked = false;
+                if (printDebug) std::cout << "[FootIK] LEFT: Lift release (dy=" << distFromLock << " speed=" << footSpeed << ")\n";
             }
         } else {
-            leftFootIK.lockWeight = glm::max(0.0f, leftFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed);
+            leftFootIK.lockWeight = glm::max(0.0f, leftFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed * releaseSpeedMult);
             leftFootIK.timeSinceLock = 0.0f;
         }
-        
+
         // Calculate IK offset
         float ikWeight = leftFootIK.lockWeight * footIKSettings.ikStrength;
         if (ikWeight > 0.001f) {
             glm::vec3 targetPos = leftFootIK.lockedPosition;
             glm::vec3 currentPos = footWorldPos;
-            
-            // Apply offset in world space, then convert to local
             glm::vec3 offset = targetPos - currentPos;
-            
-            // Clamp offset
+
             if (glm::length(offset) > footIKSettings.maxIKDistance) {
                 offset = glm::normalize(offset) * footIKSettings.maxIKDistance;
             }
-            
+
             leftFootIK.ankleOffset = offset * ikWeight;
         } else {
             leftFootIK.ankleOffset = glm::vec3(0.0f);
         }
+
+        if (printDebug) {
+            std::cout << "[FootIK Debug] LEFT: pos=(" << footWorldPos.x << "," << footWorldPos.y << "," << footWorldPos.z 
+                      << ") speed=" << footSpeed << " locked=" << (leftFootIK.isLocked ? "YES" : "NO")
+                      << " weight=" << leftFootIK.lockWeight << " isMoving=" << isMoving << "\n";
+        }
     }
-    
+
     // Update right foot IK (same logic)
     if (rightFoot >= 0 && rightFoot < (int)currBoneWorldPos.size()) {
         glm::vec3 footWorldPos = modelMatrix * glm::vec4(currBoneWorldPos[rightFoot], 1.0f);
-        
+        glm::vec3 prevFootPos = modelMatrix * glm::vec4(prevBoneWorldPos[rightFoot], 1.0f);
+
         float distToFloor = footWorldPos.y - floorY;
-        bool nearFloor = distToFloor < 0.1f && distToFloor > -0.05f;
-        
-        float footSpeed = glm::length(currBoneWorldPos[rightFoot] - prevBoneWorldPos[rightFoot]);
-        bool isStationary = footSpeed < 0.05f;
-        
+        bool nearFloor = distToFloor < 0.8f && distToFloor > -0.1f;  // Increased from 0.15 to 0.8
+
+        float footSpeed = glm::length(footWorldPos - prevFootPos);
+        float plantThreshold = isMoving ? 0.08f : 0.05f;
+        bool isStationary = footSpeed < plantThreshold;
+
+        // CRITICAL FIX: Check for animation loop discontinuity
+        if (rightFootIK.isLocked) {
+            float distFromLock = glm::length(footWorldPos - rightFootIK.lockedPosition);
+            if (distFromLock > 0.3f) {
+                rightFootIK.isLocked = false;
+                rightFootIK.lockWeight = 0.0f;
+                rightFootIK.ankleOffset = glm::vec3(0.0f);
+                if (printDebug) std::cout << "[FootIK] RIGHT: Force release (discontinuity " << distFromLock << "m)\n";
+            }
+        }
+
         if (nearFloor && isStationary && !rightFootIK.isLocked) {
             rightFootIK.isLocked = true;
-            rightFootIK.lockedPosition = footWorldPos;
-            rightFootIK.lockedPosition.y = floorY;
+            rightFootIK.lockedPosition = footWorldPos;  // Use ACTUAL foot position
             rightFootIK.targetPosition = footWorldPos;
+            if (printDebug) std::cout << "[FootIK] RIGHT: LOCKED @ y=" << footWorldPos.y << " (speed=" << footSpeed << ")\n";
         }
-        
+
         if (rightFootIK.isLocked) {
             rightFootIK.lockWeight = glm::min(1.0f, rightFootIK.lockWeight + dt * footIKSettings.footLockBlend);
             rightFootIK.timeSinceLock += dt;
-            
-            if (footWorldPos.y > floorY + 0.1f || !nearFloor) {
+
+            if (rightFootIK.timeSinceLock > 0.6f) {
                 rightFootIK.isLocked = false;
+                rightFootIK.timeSinceLock = 0.0f;
+                if (printDebug) std::cout << "[FootIK] RIGHT: Timeout release\n";
+            }
+
+            // Release lock when foot moves up significantly from LOCKED position
+            float releaseThreshold = isMoving ? 0.12f : 0.08f;
+            float distFromLock = footWorldPos.y - rightFootIK.lockedPosition.y;
+            if (distFromLock > releaseThreshold || (isMoving && footSpeed > 0.25f)) {
+                rightFootIK.isLocked = false;
+                if (printDebug) std::cout << "[FootIK] RIGHT: Lift release (dy=" << distFromLock << " speed=" << footSpeed << ")\n";
             }
         } else {
-            rightFootIK.lockWeight = glm::max(0.0f, rightFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed);
+            rightFootIK.lockWeight = glm::max(0.0f, rightFootIK.lockWeight - dt * footIKSettings.footLockReleaseSpeed * releaseSpeedMult);
             rightFootIK.timeSinceLock = 0.0f;
         }
-        
+
         float ikWeight = rightFootIK.lockWeight * footIKSettings.ikStrength;
         if (ikWeight > 0.001f) {
             glm::vec3 targetPos = rightFootIK.lockedPosition;
             glm::vec3 currentPos = footWorldPos;
             glm::vec3 offset = targetPos - currentPos;
-            
+
             if (glm::length(offset) > footIKSettings.maxIKDistance) {
                 offset = glm::normalize(offset) * footIKSettings.maxIKDistance;
             }
-            
+
             rightFootIK.ankleOffset = offset * ikWeight;
         } else {
             rightFootIK.ankleOffset = glm::vec3(0.0f);
         }
+
+        if (printDebug) {
+            std::cout << "[FootIK Debug] RIGHT: pos=(" << footWorldPos.x << "," << footWorldPos.y << "," << footWorldPos.z 
+                      << ") speed=" << footSpeed << " locked=" << (rightFootIK.isLocked ? "YES" : "NO")
+                      << " weight=" << rightFootIK.lockWeight << " isMoving=" << isMoving << "\n";
+        }
     }
-    
-    // Apply IK offsets
+
+    // Apply IK offsets - SET not ADD (we cleared them at frame start)
     if (leftFoot >= 0 && leftFoot < (int)ikOffsets.size()) {
-        ikOffsets[leftFoot] += leftFootIK.ankleOffset;
+        ikOffsets[leftFoot] = leftFootIK.ankleOffset;
     }
     if (rightFoot >= 0 && rightFoot < (int)ikOffsets.size()) {
-        ikOffsets[rightFoot] += rightFootIK.ankleOffset;
+        ikOffsets[rightFoot] = rightFootIK.ankleOffset;
     }
 }
 

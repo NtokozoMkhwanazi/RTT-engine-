@@ -79,6 +79,20 @@ public:
      */
     void SetConfig(const MotionMatchingConfig& config) { this->config = config; }
     const MotionMatchingConfig& GetConfig() const { return config; }
+
+    /**
+     * Set current motion database
+     * Used by HybridAnimGraph for database switching
+     * Note: This does NOT take ownership, just sets a reference
+     * 
+     * @param database Motion database to use for searching
+     */
+    void SetCurrentDatabase(const MotionDatabase& database);
+
+    /**
+     * Check if initialized
+     */
+    bool IsInitialized() const { return initialized; }
     
     // =========================================================================
     // MAIN UPDATE
@@ -162,28 +176,91 @@ public:
     /**
      * Get database (for testing)
      */
-    MotionDatabase& GetDatabase() { return database; }
-    const MotionDatabase& GetDatabase() const { return database; }
-    
+    MotionDatabase* GetDatabase() { return database.get(); }
+    const MotionDatabase* GetDatabase() const { return database.get(); }
+
     /**
      * Get database stats
      */
     std::string GetDatabaseStats() const;
-    
+
+    // =========================================================================
+    // DATABASE SWITCHING (for Hybrid MM+FSM system)
+    // =========================================================================
+
+    /**
+     * Set a new motion database
+     *
+     * Use for switching between different contexts:
+     * - Walking database
+     * - Crouching database
+     * - Combat movement database
+     * - Airborne database
+     *
+     * @param newDatabase Database to switch to (takes ownership via unique_ptr)
+     * @param blendDuration How long to blend between databases (0 = instant)
+     */
+    void SetDatabase(std::unique_ptr<MotionDatabase> newDatabase, float blendDuration = 0.2f);
+
+    /**
+     * Get current database name
+     */
+    std::string GetCurrentDatabaseName() const { return currentDatabaseName; }
+
+    /**
+     * Check if database is valid for motion matching
+     *
+     * Motion matching requires DYNAMIC root bones (root motion).
+     * If all poses have near-zero velocity, MM won't work well.
+     *
+     * @return true if database has sufficient root motion
+     */
+    bool IsDatabaseValidForMM() const;
+
+    /**
+     * Get root motion threshold
+     *
+     * Poses with root velocity below this are considered "static"
+     * and may not work well with motion matching.
+     */
+    float GetStaticRootThreshold() const { return staticRootThreshold; }
+
+    /**
+     * Set root motion threshold
+     */
+    void SetStaticRootThreshold(float threshold) { staticRootThreshold = threshold; }
+
+    /**
+     * Check if current animation has static root
+     *
+     * @return true if current pose has near-zero root velocity
+     */
+    bool HasStaticRoot() const;
+
+    /**
+     * Enable/disable motion matching fallback
+     *
+     * When enabled, MM will fall back to FSM-style playback
+     * for animations with static root bones.
+     */
+    void SetStaticRootFallback(bool enabled) { enableStaticRootFallback = enabled; }
+    bool GetStaticRootFallback() const { return enableStaticRootFallback; }
+
 private:
-    // Core systems
-    MotionDatabase database;
+    // Core systems (using unique_ptr for proper ownership)
+    std::unique_ptr<MotionDatabase> database;
+    const MotionDatabase* currentDatabaseRef{nullptr};  // Reference for database switching
     TrajectoryPredictor trajectoryPredictor;
     FootPlantingSystem footPlanting;
     MotionKDTree searchTree;  // KD-Tree for fast search
-    
-    // Animator reference
-    Animator* animator{nullptr};
+
+    // Animator reference (order matters for initialization list)
     const Skeleton* skeleton{nullptr};  // Store skeleton for feature extraction
-    
+    Animator* animator{nullptr};
+
     // Configuration
     MotionMatchingConfig config;
-    
+
     // Current state
     bool initialized{false};
     int currentPoseIndex{-1};
@@ -191,7 +268,7 @@ private:
     float blendProgress{0.0f};
     int blendFromPose{-1};
     int blendToPose{-1};
-    
+
     // Character state
     glm::vec3 characterPosition{0.0f};
     glm::vec3 characterVelocity{0.0f};
@@ -199,13 +276,30 @@ private:
     glm::vec2 moveDirection{0.0f, 1.0f};
     bool isGrounded{true};
     bool isCrouching{false};
-    
+
     // Debug
     MotionMatchingDebug debug;
-    
+
+    // Database switching (for hybrid MM+FSM)
+    std::string currentDatabaseName{"Default"};
+    std::unique_ptr<MotionDatabase> pendingDatabase;  // Database being blended to
+    float databaseBlendProgress{0.0f};
+    float databaseBlendDuration{0.0f};
+    bool isBlendingDatabases{false};
+
+    // Static root detection
+    float staticRootThreshold{0.1f};  // Velocity below this is considered "static"
+    bool enableStaticRootFallback{false};  // DISABLED - always search for best pose
+    bool hasStaticRoot{false};  // Current pose has static root
+
+    // Track current animation to avoid redundant Play() calls
+    Animation* currentAnimationPtr{nullptr};
+
     // Internal methods
     void UpdateTrajectory();
     void SearchAndBlend(float dt);
     void ApplyFootIK(float dt);
     void UpdateDebugInfo();
+    void UpdateDatabaseBlend(float dt);
+    bool CheckStaticRoot();
 };

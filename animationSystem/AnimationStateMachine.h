@@ -167,36 +167,36 @@ private:
     // Movement parameters
     float movementSpeed = 0.0f;
     float smoothedSpeed = 0.0f;
-    float speedSmoothRate = 5.0f;  // How fast to smooth speed changes
+    float speedSmoothRate = 20.0f;  // How fast to smooth speed changes (INCREASED for responsiveness)
     bool isGrounded = true;
     float verticalVelocity = 0.0f;
-    
+
     // Edge detection for key presses
     bool prevMoving = false;
     bool prevSprinting = false;
     bool prevJump = false;
     bool prevCrouch = false;
-    
+
     // One-shot animation tracking (for jump, etc.)
     bool jumpAnimationPlaying = false;
     float jumpAnimationStartTime = 0.0f;
-    
+
     // GRADIENT BAND INTERPOLATION (Blend Space)
     bool useBlendSpace = true;  // Enable continuous blending for locomotion
     float idleToWalkThreshold = 0.3f;   // Speed where idle→walk blend starts
     float walkToRunThreshold = 0.6f;    // Speed where walk→run blend starts
     float blendWeight = 0.0f;           // Current blend weight (0=idle, 0.5=walk, 1=run)
     float targetBlendWeight = 0.0f;     // Target blend weight
-    float blendSmoothRate = 10.0f;      // How fast blend weight changes
-    
+    float blendSmoothRate = 30.0f;      // How fast blend weight changes (INCREASED for instant response)
+
     // Blend thresholds
     float maxWalkSpeed = 2.0f;
     float maxRunSpeed = 6.0f;
-    
+
     // Transition state
     bool isTransitioningState = false;
     float transitionProgress = 0.0f;
-    float transitionDuration = 0.2f;
+    float transitionDuration = 0.08f;  // REDUCED from 0.2f for snappy transitions
     AnimationState transitionFromState = AnimationState::NONE;
     AnimationState transitionToState = AnimationState::NONE;
     

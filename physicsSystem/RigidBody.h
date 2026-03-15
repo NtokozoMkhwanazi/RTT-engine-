@@ -51,13 +51,20 @@ struct RigidBody {
     float metallic {0.0f};                  // Metallic property (0-1)
     float roughness {0.5f};                 // Roughness property (0-1)
     float ao {1.0f};                       // Ambient occlusion
-    
+
     // Additional physical properties for more realistic simulation
     float density {1000.0f};               // Density in kg/m³ (water = 1000)
     float staticFriction {0.5f};           // Static friction coefficient
     float dynamicFriction {0.3f};          // Dynamic friction coefficient
     float rollingResistance {0.01f};       // Rolling resistance coefficient
     float buoyancyFactor {0.0f};           // Buoyancy effect (0 = no buoyancy, 1 = full buoyancy)
+
+    // Get inverse inertia tensor in world space
+    glm::mat3 getInverseInertiaTensor() const {
+        // Transform local inertia to world space using rotation
+        glm::mat3 rotMat = glm::mat4_cast(rotation);
+        return rotMat * inertiaLocalInv * glm::transpose(rotMat);
+    }
 
     RigidBody() = default;
 

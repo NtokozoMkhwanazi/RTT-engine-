@@ -9,8 +9,8 @@
 #include <unordered_map>
 #include <memory>
 
-#include "shaderSystem/Shader.h"
-#include "animationSystem/AnimationConfig.h"
+#include "../shaderSystem/Shader.h"
+#include "../animationSystem/AnimationConfig.h"
 
 // ============================================================
 // Configuration
@@ -274,7 +274,8 @@ public:
     // Setup
     void SetupMesh();
     void UpdateVertexBuffer();  // For dynamic meshes
-    
+    void UpdateIndexBuffer();   // Update index buffer after optimization
+
     // Bounding volumes
     void CalculateBoundingVolumes();
     const BoundingBox& GetBoundingBox() const { return boundingBox; }
@@ -318,29 +319,61 @@ namespace MeshUtils
     // Calculate tangents and bitangents
     void CalculateTangents(std::vector<Vertex>& vertices,
                           const std::vector<unsigned int>& indices);
-    
+
     // Recalculate normals from geometry
     void RecalculateNormals(std::vector<Vertex>& vertices,
                            const std::vector<unsigned int>& indices);
-    
+
     // Optimize vertex cache for better GPU performance
     void OptimizeVertexCache(std::vector<unsigned int>& indices,
                             size_t vertexCount);
-    
+
     // Simplify mesh (basic vertex decimation)
     void SimplifyMesh(std::vector<Vertex>& vertices,
                      std::vector<unsigned int>& indices,
                      float reductionRatio);
-    
+
     // Merge multiple meshes
     Mesh MergeMeshes(const std::vector<Mesh>& meshes);
-    
+
     // Transform mesh
     void TransformMesh(Mesh& mesh, const glm::mat4& transform);
-    
+
     // Flip UV coordinates
     void FlipUVs(std::vector<Vertex>& vertices, bool flipU = false, bool flipV = true);
-    
+
     // Center mesh at origin
     glm::mat4 CenterMesh(std::vector<Vertex>& vertices);
+
+    // ============================================================
+    // Advanced Mesh Optimization
+    // ============================================================
+
+    // Fast Triangle Reordering (Forsyth Algorithm)
+    // Optimizes triangle order for maximum post-transform cache hits
+    // Returns the optimized index buffer
+    void OptimizeTriangleOrderingForsyth(std::vector<unsigned int>& indices,
+                                         size_t vertexCount,
+                                         size_t cacheSize = 24);
+
+    // Vertex Clustering for Mesh Reduction
+    // Clusters vertices within a 3D grid and merges them
+    // gridCellSize: size of each grid cell (world units)
+    // Returns simplified mesh data
+    void VertexClustering(std::vector<Vertex>& vertices,
+                         std::vector<unsigned int>& indices,
+                         float gridCellSize);
+
+    // Combined optimization: reorder + cluster
+    // Best for maximum performance gain
+    struct MeshOptimizationConfig
+    {
+        bool reorderTriangles = true;
+        bool clusterVertices = false;
+        float clusterCellSize = 0.1f;  // Adjust based on mesh scale
+        size_t targetCacheSize = 24;
+    };
+
+    void OptimizeMeshForRendering(Mesh& mesh, 
+                                  const MeshOptimizationConfig& config);
 }

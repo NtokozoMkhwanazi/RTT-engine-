@@ -5,6 +5,7 @@
 #include "shaderSystem/stb_image.h"
 #include "shaderSystem/load_texture_image.h"
 #include "boneSystem/BoneName.h"
+#include "renderer/DefaultTexture.h"
 
 #include <iostream>
 #include <functional>
@@ -424,67 +425,125 @@ Mesh Model::processMesh(aiMesh *mesh, const aiScene *scene)
 PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory)
 {
     PBRMaterial material;
-    
+
     // Albedo (diffuse)
     aiColor3D diffuse(0.0f, 0.0f, 0.0f);
     if (mat->Get(AI_MATKEY_COLOR_DIFFUSE, diffuse) == AI_SUCCESS) {
         material.albedo = glm::vec3(diffuse.r, diffuse.g, diffuse.b);
     }
-    
+
     // Check for albedo texture
     if (mat->GetTextureCount(aiTextureType_DIFFUSE) > 0) {
         aiString str;
         mat->GetTexture(aiTextureType_DIFFUSE, 0, &str);
-        std::string path = directory + "/" + str.C_Str();
+        
+        // FIX: Handle texture paths from FBX (may have .fbm subfolder or backslashes)
+        std::string texturePath = str.C_Str();
+        
+        // Replace backslashes with forward slashes
+        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+        
+        // Remove .fbm/ or .fbm subfolder if present
+        size_t fbmPos = texturePath.find(".fbm/");
+        if (fbmPos != std::string::npos) {
+            texturePath = texturePath.substr(fbmPos + 5);  // Skip ".fbm/"
+        }
+        
+        // Try loading from same directory as model
+        std::string path = directory + "/" + texturePath;
+        
+        // Extract just the filename for fallback
+        size_t lastSlash = texturePath.find_last_of('/');
+        std::string filename = (lastSlash != std::string::npos) ? texturePath.substr(lastSlash + 1) : texturePath;
+        
         material.albedoMap = loadTexture(path, aiTextureType_DIFFUSE);
+        
+        // If texture failed to load, try with just filename in same directory
+        if (material.albedoMap == 0) {
+            std::string fallbackPath = directory + "/" + filename;
+            material.albedoMap = loadTexture(fallbackPath, aiTextureType_DIFFUSE);
+        }
+        
+        // If still failed, use default grey texture
+        if (material.albedoMap == 0) {
+            material.albedoMap = DefaultTexture::GetGreyTexture();
+            std::cout << "[Material] Using default grey texture for: " << filename << "\n";
+        }
+        
+        material.hasAlbedoMap = true;  // Always true now (either loaded or default)
+    } else {
+        // No texture specified - use default grey
+        material.albedoMap = DefaultTexture::GetGreyTexture();
         material.hasAlbedoMap = true;
-    }
-    
-    // Metallic
-    float metallic = 0.0f;
-    if (mat->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == AI_SUCCESS) {
-        material.metallic = metallic;
     }
     
     // Check for metallic texture
     if (mat->GetTextureCount(aiTextureType_METALNESS) > 0) {
         aiString str;
         mat->GetTexture(aiTextureType_METALNESS, 0, &str);
-        std::string path = directory + "/" + str.C_Str();
+        std::string texturePath = str.C_Str();
+        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+        size_t fbmPos = texturePath.find(".fbm/");
+        if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
+        std::string path = directory + "/" + texturePath;
         material.metallicMap = loadTexture(path, aiTextureType_METALNESS);
+        if (material.metallicMap == 0) {
+            material.metallicMap = DefaultTexture::GetGreyTexture();  // Default grey for metallic
+        }
         material.hasMetallicMap = true;
     }
-    
+
     // Roughness
     float roughness = 0.5f;
     if (mat->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness) == AI_SUCCESS) {
         material.roughness = roughness;
     }
-    
+
     // Check for roughness texture
     if (mat->GetTextureCount(aiTextureType_DIFFUSE_ROUGHNESS) > 0) {
         aiString str;
         mat->GetTexture(aiTextureType_DIFFUSE_ROUGHNESS, 0, &str);
-        std::string path = directory + "/" + str.C_Str();
+        std::string texturePath = str.C_Str();
+        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+        size_t fbmPos = texturePath.find(".fbm/");
+        if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
+        std::string path = directory + "/" + texturePath;
         material.roughnessMap = loadTexture(path, aiTextureType_DIFFUSE_ROUGHNESS);
+        if (material.roughnessMap == 0) {
+            material.roughnessMap = DefaultTexture::GetGreyTexture();
+        }
         material.hasRoughnessMap = true;
     }
-    
+
     // Normal map
     if (mat->GetTextureCount(aiTextureType_NORMALS) > 0) {
         aiString str;
         mat->GetTexture(aiTextureType_NORMALS, 0, &str);
-        std::string path = directory + "/" + str.C_Str();
+        std::string texturePath = str.C_Str();
+        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+        size_t fbmPos = texturePath.find(".fbm/");
+        if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
+        std::string path = directory + "/" + texturePath;
         material.normalMap = loadTexture(path, aiTextureType_NORMALS);
-        material.hasNormalMap = true;
+        if (material.normalMap == 0) {
+            material.normalMap = DefaultTexture::GetGreyTexture();
+        }
+        material.hasNormalMap = (material.normalMap > 0);
     }
-    
+
     // AO (Ambient Occlusion)
     if (mat->GetTextureCount(aiTextureType_AMBIENT_OCCLUSION) > 0) {
         aiString str;
         mat->GetTexture(aiTextureType_AMBIENT_OCCLUSION, 0, &str);
-        std::string path = directory + "/" + str.C_Str();
+        std::string texturePath = str.C_Str();
+        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+        size_t fbmPos = texturePath.find(".fbm/");
+        if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
+        std::string path = directory + "/" + texturePath;
         material.aoMap = loadTexture(path, aiTextureType_AMBIENT_OCCLUSION);
+        if (material.aoMap == 0) {
+            material.aoMap = DefaultTexture::GetGreyTexture();
+        }
         material.hasAOMap = true;
     }
     
@@ -526,21 +585,27 @@ PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory
 // =====================================================
 unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
 {
+    // Check if OpenGL context is available
+    if (!glGenTextures) {
+        std::cerr << "[Model] WARNING: No OpenGL context available, skipping texture: " << path << "\n";
+        return 0;  // Return 0 (invalid texture ID) instead of crashing
+    }
+    
     unsigned int textureID = 0;
     glGenTextures(1, &textureID);
     glBindTexture(GL_TEXTURE_2D, textureID);
-    
+
     // Set texture parameters
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    
+
     // Load texture
     int width, height, nrComponents;
     stbi_set_flip_vertically_on_load(true);
     unsigned char *data = stbi_load(path.c_str(), &width, &height, &nrComponents, 0);
-    
+
     if (data)
     {
         GLenum format;
@@ -552,10 +617,10 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
             format = GL_RGBA;
         else
             format = GL_RGB;
-        
+
         glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
         glGenerateMipmap(GL_TEXTURE_2D);
-        
+
         stbi_image_free(data);
     }
     else
@@ -563,7 +628,7 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
         std::cerr << "Texture failed to load at path: " << path << std::endl;
         stbi_image_free(data);
     }
-    
+
     return textureID;
 }
 
@@ -809,6 +874,11 @@ void Model::UploadBoneTexture(Shader &shader, const std::vector<glm::mat4> &mats
 {
     if (mats.empty())
         return;
+    
+    // Check if OpenGL context is available
+    if (!glGenTextures) {
+        return;  // Silently skip - no GL context (e.g., in unit tests)
+    }
 
     // Create once
     if (boneTexID == 0)

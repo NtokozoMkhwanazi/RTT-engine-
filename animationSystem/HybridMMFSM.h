@@ -1,0 +1,320 @@
+#pragma once
+#include "AnimationStateMachine.h"
+#include "../motionMatching/MotionMatcher.h"
+#include "../motionMatching/MotionDatabase.h"
+#include <memory>
+#include <vector>
+#include <unordered_map>
+#include <functional>
+#include <string>
+
+// ============================================================================
+// HYBRID MM + FSM SYSTEM (FIXED - Proper shared_ptr ownership)
+// ============================================================================
+//
+// Architecture:
+// - FSM manages high-level states (Jump, Fall, Crouch, Combat)
+// - MM handles smooth locomotion blending (Idle↔Walk↔Run)
+// - Each FSM state has its own optimized motion database
+// - Uses inertialization for state transitions (not crossfade)
+// - Cache-friendly Struct-of-Arrays for motion data
+//
+// CRITICAL FIXES:
+// 1. All animations stored as shared_ptr with PROPER ownership
+// 2. Motion databases OWN their animations (no raw pointers)
+// 3. Clear ownership semantics - caller creates, system owns
+// 4. Cache-friendly data layout for motion matching search
+//
+// This is the AAA approach: MM for smoothness, FSM for state logic
+// ============================================================================
+
+enum class HybridState {
+    LOCOMOTION,      // MM handles idle/walk/run
+    JUMP,            // One-shot jump animation
+    FALL,            // Falling animation (looping)
+    CROUCH,          // Crouch idle
+    CROUCH_WALK,     // Crouch walk (MM with crouch database)
+    COMBAT,          // Combat state
+    VAULT,           // Vaulting/climbing
+    CUSTOM           // User-defined state
+};
+
+inline std::string HybridStateToString(HybridState state) {
+    switch (state) {
+        case HybridState::LOCOMOTION: return "Locomotion";
+        case HybridState::JUMP: return "Jump";
+        case HybridState::FALL: return "Fall";
+        case HybridState::CROUCH: return "Crouch";
+        case HybridState::CROUCH_WALK: return "CrouchWalk";
+        case HybridState::COMBAT: return "Combat";
+        case HybridState::VAULT: return "Vault";
+        case HybridState::CUSTOM: return "Custom";
+        default: return "Unknown";
+    }
+}
+
+/**
+ * Hybrid Transition with Inertialization Support
+ */
+struct HybridTransition {
+    HybridState from;
+    HybridState to;
+    float blendDuration = 0.1f;
+    float inertializationDuration = 0.15f;  // For momentum-based blending
+    std::function<bool()> condition;
+    bool useInertialization = true;  // Use inertialization instead of crossfade
+    
+    // Explicit default constructor to ensure proper initialization
+    HybridTransition() 
+        : from(HybridState::LOCOMOTION)
+        , to(HybridState::LOCOMOTION)
+        , blendDuration(0.1f)
+        , inertializationDuration(0.15f)
+        , condition(nullptr)
+        , useInertialization(true) {}
+};
+
+/**
+ * Character State Input (for Hybrid MM+FSM)
+ */
+struct HybridMMFSMState {
+    // Input
+    glm::vec2 moveDirection{0.0f, 0.0f};
+    float moveMagnitude{0.0f};
+    bool jump{false};
+    bool crouch{false};
+    bool sprint{false};
+
+    // State
+    glm::vec3 position{0.0f, 0.0f, 0.0f};
+    glm::vec3 velocity{0.0f, 0.0f, 0.0f};
+    float rotation{0.0f};
+    bool grounded{true};
+
+    // Explicit default constructor to ensure proper initialization
+    HybridMMFSMState()
+        : moveDirection(0.0f, 0.0f)
+        , moveMagnitude(0.0f)
+        , jump(false)
+        , crouch(false)
+        , sprint(false)
+        , position(0.0f, 0.0f, 0.0f)
+        , velocity(0.0f, 0.0f, 0.0f)
+        , rotation(0.0f)
+        , grounded(true) {}
+};
+
+/**
+ * Inertialization State - Tracks momentum during transitions
+ *
+ * This is CRITICAL for realistic state changes. Instead of simple crossfading,
+ * we preserve momentum and let animations drift back into sync naturally.
+ */
+struct InertializationState {
+    bool active{false};
+    float progress{0.0f};
+    float duration{0.0f};
+
+    // Source state (where we're transitioning FROM)
+    glm::vec3 sourceRootPos{0.0f, 0.0f, 0.0f};
+    float sourceRootRot{0.0f};
+    glm::vec3 sourceVelocity{0.0f, 0.0f, 0.0f};
+
+    // Target state (where we're transitioning TO)
+    glm::vec3 targetRootPos{0.0f, 0.0f, 0.0f};
+    float targetRootRot{0.0f};
+    glm::vec3 targetVelocity{0.0f, 0.0f, 0.0f};
+
+    // Momentum preservation
+    glm::vec3 preservedMomentum{0.0f, 0.0f, 0.0f};
+    float driftRecoveryRate{5.0f};  // How fast to recover from drift
+
+    // Explicit default constructor to ensure proper initialization
+    InertializationState()
+        : active(false)
+        , progress(0.0f)
+        , duration(0.0f)
+        , sourceRootPos(0.0f, 0.0f, 0.0f)
+        , sourceRootRot(0.0f)
+        , sourceVelocity(0.0f, 0.0f, 0.0f)
+        , targetRootPos(0.0f, 0.0f, 0.0f)
+        , targetRootRot(0.0f)
+        , targetVelocity(0.0f, 0.0f, 0.0f)
+        , preservedMomentum(0.0f, 0.0f, 0.0f)
+        , driftRecoveryRate(5.0f) {}
+
+    void Reset() {
+        active = false;
+        progress = 0.0f;
+        duration = 0.0f;
+        sourceRootPos = glm::vec3(0.0f, 0.0f, 0.0f);
+        sourceRootRot = 0.0f;
+        sourceVelocity = glm::vec3(0.0f, 0.0f, 0.0f);
+        targetRootPos = glm::vec3(0.0f, 0.0f, 0.0f);
+        targetRootRot = 0.0f;
+        targetVelocity = glm::vec3(0.0f, 0.0f, 0.0f);
+        preservedMomentum = glm::vec3(0.0f, 0.0f, 0.0f);
+    }
+};
+
+class HybridMMFSM {
+public:
+    HybridMMFSM();
+    ~HybridMMFSM();
+
+    // =========================================================================
+    // INITIALIZATION
+    // =========================================================================
+
+    void Initialize(const Skeleton* skeleton, Animator* animator);
+
+    // =========================================================================
+    // ANIMATION LOADING (FIXED - Proper shared_ptr ownership)
+    // =========================================================================
+
+    /**
+     * Load locomotion animations (for MM)
+     * 
+     * CRITICAL: This takes OWNERSHIP via shared_ptr.
+     * The animation will be stored in the motion matcher's database.
+     * 
+     * Usage:
+     *   auto walkAnim = std::make_shared<Animation>("Walk", duration, fps);
+     *   hybridFSM.LoadLocomotionAnimation("Walk", walkAnim);
+     *   // walkAnim is now owned by the system - don't delete it!
+     * 
+     * @param name Animation name (e.g., "Walk", "Run")
+     * @param anim Animation to load (MUST be std::shared_ptr<Animation>)
+     */
+    void LoadLocomotionAnimation(const std::string& name, std::shared_ptr<Animation> anim);
+
+    /**
+     * Load state-specific animation (for FSM states)
+     * 
+     * CRITICAL: This takes OWNERSHIP via shared_ptr.
+     * The animation is stored in the state's motion database.
+     * 
+     * Usage:
+     *   auto jumpAnim = std::make_shared<Animation>("Jump", duration, fps);
+     *   hybridFSM.LoadStateAnimation(HybridState::JUMP, "Jump", jumpAnim);
+     *   // jumpAnim is now owned by the system
+     * 
+     * @param state Which FSM state this belongs to
+     * @param name Animation name
+     * @param anim Animation to load (MUST be std::shared_ptr<Animation>)
+     */
+    void LoadStateAnimation(HybridState state, const std::string& name, std::shared_ptr<Animation> anim);
+
+    /**
+     * Build all motion databases (call after loading animations)
+     * 
+     * This constructs KD-Trees for fast pose searching.
+     */
+    void BuildDatabases();
+
+    // =========================================================================
+    // STATE MANAGEMENT
+    // =========================================================================
+
+    /**
+     * Add transition with inertialization support
+     */
+    void AddTransition(HybridState from, HybridState to, float duration,
+                       std::function<bool()> condition, bool useInertialization = true);
+
+    /**
+     * Add transition with custom inertialization duration
+     */
+    void AddTransitionWithInertialization(HybridState from, HybridState to,
+                                          float blendDuration, float inertializationDuration,
+                                          std::function<bool()> condition);
+
+    HybridState GetCurrentState() const { return currentState; }
+    bool IsInState(HybridState state) const { return currentState == state; }
+    bool IsTransitioning() const { return isTransitioning || inertialization.active; }
+    bool IsUsingInertialization() const { return inertialization.active; }
+    
+    // Get current character state (for transition conditions)
+    const HybridMMFSMState& GetCharacterState() const { return characterState; }
+    
+    // Get motion matcher debug info
+    std::string GetMotionMatcherDebug() const;
+    
+    // Get motion matcher database size
+    size_t GetMotionMatcherDatabaseSize() const;
+
+    // =========================================================================
+    // MAIN UPDATE
+    // =========================================================================
+
+    void Update(float dt, const HybridMMFSMState& state);
+
+    // =========================================================================
+    // DEBUG
+    // =========================================================================
+
+    std::string GetDebugInfo() const;
+    void SetDebugEnabled(bool enabled) { debugEnabled = enabled; }
+
+    // =========================================================================
+    // DATABASE ACCESS (for advanced usage)
+    // =========================================================================
+
+    /**
+     * Get motion database for a specific state
+     */
+    const MotionDatabase* GetStateDatabase(HybridState state) const;
+
+    /**
+     * Check if state has a valid motion database
+     */
+    bool HasStateDatabase(HybridState state) const;
+
+private:
+    const Skeleton* skeleton{nullptr};
+    Animator* animator{nullptr};
+
+    // Motion Matching for locomotion
+    MotionMatcher motionMatcher;
+    bool mmActive{false};
+
+    // FSM states
+    HybridState currentState{HybridState::LOCOMOTION};
+    HybridState previousState{HybridState::LOCOMOTION};
+    std::vector<HybridTransition> transitions;
+    bool isTransitioning{false};
+    float transitionProgress{0.0f};
+    float transitionDuration{0.0f};
+    HybridState transitionFrom{HybridState::LOCOMOTION};
+    HybridState transitionTo{HybridState::LOCOMOTION};
+
+    // Inertialization state (for smooth transitions)
+    InertializationState inertialization;
+
+    // State-specific MM databases (OWN their animations via shared_ptr)
+    // Using unique_ptr for exclusive ownership, accessed via raw pointer
+    std::unordered_map<HybridState, std::unique_ptr<MotionDatabase>> stateDatabases;
+
+    // Character state
+    HybridMMFSMState characterState;
+
+    // Debug
+    bool debugEnabled{false};
+
+    // Internal methods
+    void UpdateStateMachine(float dt);
+    void UpdateLocomotion(float dt);
+    void UpdateJump(float dt);
+    void UpdateFall(float dt);
+    void UpdateCrouch(float dt);
+    void EvaluateTransitions();
+    void StartTransition(HybridState toState);
+    void UpdateInertialization(float dt);
+    void ApplyInertializationBlending(float dt);
+    
+    /**
+     * Calculate inertialization blend weight
+     * Uses exponential decay for natural-looking momentum
+     */
+    float CalculateInertializationWeight(float progress) const;
+};

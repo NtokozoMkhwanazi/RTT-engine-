@@ -47,7 +47,7 @@ bool TextureAtlas::initialize() {
 
 int TextureAtlas::addTexture(const std::string& path) {
     // For now, just create a placeholder region
-    // In full implementation, would load texture and pack into atlas
+    // TODO :In full implementation, would load texture and pack into atlas
     
     TextureEntry entry;
     entry.name = path;

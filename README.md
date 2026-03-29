@@ -1,6 +1,6 @@
 # RTT Engine - 3D Game Engine
-![GitHub stars](https://img.shields.io/github/stars/NtokozoMkhwanazi/RTT-engine?style=social)
-![GitHub forks](https://img.shields.io/github/forks/NtokozoMkhwanazi/RTT-engine?style=social)
+![GitHub stars](https://img.shields.io/github/stars/NtokozoMkhwanazi/RTT-engine-?style=social)
+![GitHub forks](https://img.shields.io/github/forks/NtokozoMkhwanazi/RTT-engine-?style=social)
 ![GitHub issues](https://img.shields.io/github/issues/NtokozoMkhwanazi/RTT-engine-)
 ![GitHub license](https://img.shields.io/github/license/NtokozoMkhwanazi/RTT-engine-)
 ![C++](https://img.shields.io/badge/C++17-ISO-blue)

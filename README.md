@@ -1,6 +1,6 @@
 # RTT Engine - 3D Game Engine
 
-SIMPLE lightweight 3d game engine project with  **systems programming patterns and engineering principles** in mind, built for **scalability and high-performance** using the **power and speed** of the C++ Language. openGL graphics API for relative ease of use compared to Vulkan. Dear imgui UI/UX editor for its seemless integration with th C++ language and backend API openGL . This project contains comprehensive documentation, clear Codebase structure and pdf containing a few of the advanced algorithms used in this project. This project is **actively under-development and maintained**
+**simple lightweight** 3D game engine project with  **systems programming patterns and engineering principles** in mind, built for **scalability and high-performance** using the **power and speed** of the C++ Language. openGL graphics API for relative ease of use compared to Vulkan. Dear imgui UI/UX editor for its seemless integration with th C++ language and backend API openGL . This project contains comprehensive documentation, clear Codebase structure and pdf containing a few of the advanced algorithms used in this project. This project is **actively under-development and maintained**
 
 ## 📸 Screenshots
 

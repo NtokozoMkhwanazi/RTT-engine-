@@ -1,8 +1,8 @@
-# ECS Framework - Enhanced Documentation
+# ECS Framework - Documentation
 
 ## Overview
 
-This ECS (Entity Component System) framework has been a bit tweaked to almost resemble the ones found in modern game engines like Unity DOTS and Unreal Engine be it at a much-smaller scale.
+This ECS (Entity Component System) framework has been tweaked a bit to almost resemble the ones found in modern game engines like Unity DOTS and Unreal Engine be it at a much-smaller scale.
 
 ## New Features
 

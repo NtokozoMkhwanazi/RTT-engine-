@@ -540,6 +540,3 @@ ecs/
 
 ---
 
-## License
-
-Same as the main engine license.

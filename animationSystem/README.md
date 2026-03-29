@@ -170,6 +170,3 @@ See documentation in `docs/animation/`:
 - [FOOT_IK_CHARACTER_GROUNDING_FIX.md](../docs/animation/FOOT_IK_CHARACTER_GROUNDING_FIX.md)
 
 ---
-
-**Status:** ✅ Production Ready
-**Last Updated:** March 27, 2025

@@ -318,17 +318,81 @@ CollisionResult PhysicsWorld::checkCapsuleVsCapsule(const Capsule& a, const Caps
 {
     CollisionResult result;
 
-    // Simplified capsule-capsule collision using center distance
-    // A capsule is defined by a line segment and a radius
+    // Full capsule-capsule collision using closest points on line segments
+    // A capsule is defined by a line segment (center axis) and a radius
     
-    // For now, use a simplified approach
-    float minDist = glm::distance(a.center, b.center) - (a.radius + b.radius);
-
-    if (minDist < 0.0f) {
+    // Calculate capsule line segment endpoints
+    glm::vec3 aStart = a.center - a.axis * (a.height * 0.5f);
+    glm::vec3 aEnd = a.center + a.axis * (a.height * 0.5f);
+    glm::vec3 bStart = b.center - b.axis * (b.height * 0.5f);
+    glm::vec3 bEnd = b.center + b.axis * (b.height * 0.5f);
+    
+    // Find closest points on line segments using full algorithm
+    glm::vec3 u = aEnd - aStart;
+    glm::vec3 v = bEnd - bStart;
+    glm::vec3 w = aStart - bStart;
+    
+    float a_dot = glm::dot(u, u);
+    float b_dot = glm::dot(v, v);
+    float c_dot = glm::dot(u, v);
+    float d_dot = glm::dot(u, w);
+    float e_dot = glm::dot(v, w);
+    
+    float denom = a_dot * b_dot - c_dot * c_dot;
+    float s, t;
+    
+    // Handle parallel segments
+    if (denom < 1e-6f) {
+        s = 0.0f;
+        t = (b_dot > 0.0f) ? glm::clamp(-e_dot / b_dot, 0.0f, 1.0f) : 0.0f;
+    } else {
+        // Compute closest points using full formula
+        s = glm::clamp((b_dot * d_dot - c_dot * e_dot) / denom, 0.0f, 1.0f);
+        t = glm::clamp((a_dot * e_dot - c_dot * d_dot) / denom, 0.0f, 1.0f);
+        
+        // Check if we need to clamp to segment endpoints
+        if (s < 0.0f) {
+            s = 0.0f;
+            t = glm::clamp(-e_dot / b_dot, 0.0f, 1.0f);
+        } else if (s > 1.0f) {
+            s = 1.0f;
+            t = glm::clamp((c_dot - e_dot) / b_dot, 0.0f, 1.0f);
+        }
+        
+        if (t < 0.0f) {
+            t = 0.0f;
+            s = glm::clamp(d_dot / a_dot, 0.0f, 1.0f);
+        } else if (t > 1.0f) {
+            t = 1.0f;
+            s = glm::clamp((d_dot + c_dot) / a_dot, 0.0f, 1.0f);
+        }
+    }
+    
+    // Calculate closest points
+    glm::vec3 closestA = aStart + s * u;
+    glm::vec3 closestB = bStart + t * v;
+    
+    // Calculate distance between closest points
+    glm::vec3 diff = closestA - closestB;
+    float distSq = glm::dot(diff, diff);
+    float radiusSum = a.radius + b.radius;
+    
+    // Check for collision
+    if (distSq < radiusSum * radiusSum) {
         result.collided = true;
-        result.penetration = -(minDist);
-        result.normal = glm::normalize(b.center - a.center);
-        result.contactPoint = a.center + result.normal * a.radius;
+        float dist = glm::sqrt(distSq);
+        result.penetration = radiusSum - dist;
+        
+        // Calculate contact normal
+        if (dist > 1e-6f) {
+            result.normal = diff / dist;
+        } else {
+            // Capsules are nearly touching at same point, use perpendicular axis
+            result.normal = glm::normalize(glm::vec3(-u.y, u.x, 0.0f));
+        }
+        
+        // Calculate contact point (midpoint between closest points)
+        result.contactPoint = (closestA + closestB) * 0.5f;
     }
 
     return result;
@@ -381,35 +445,94 @@ CollisionResult PhysicsWorld::checkCapsuleVsBox(const Capsule& cap, const OBB& b
 {
     CollisionResult result;
 
-    // This is a complex collision test that would require more sophisticated algorithms
-    // For now, we'll approximate by sampling points along the capsule and testing against the box
-    // A full implementation would use GJK or EPA algorithms
-
-    // Simplified approach: treat capsule as a rounded line segment
+    // Full capsule-box collision using closest point on box to capsule line segment
+    // A capsule is defined by a line segment and a radius
+    
+    // Calculate capsule line segment endpoints in world space
     glm::vec3 capStart = cap.center - cap.axis * (cap.height * 0.5f);
     glm::vec3 capEnd = cap.center + cap.axis * (cap.height * 0.5f);
-
-    // Test if either end of the capsule is inside the box
-    glm::vec3 boxMin = box.c - box.half;
-    glm::vec3 boxMax = box.c + box.half;
-
-    bool startInside = (capStart.x >= boxMin.x && capStart.x <= boxMax.x &&
-                        capStart.y >= boxMin.y && capStart.y <= boxMax.y &&
-                        capStart.z >= boxMin.z && capStart.z <= boxMax.z);
-
-    bool endInside = (capEnd.x >= boxMin.x && capEnd.x <= boxMax.x &&
-                      capEnd.y >= boxMin.y && capEnd.y <= boxMax.y &&
-                      capEnd.z >= boxMin.z && capEnd.z <= boxMax.z);
-
-    if (startInside || endInside) {
+    
+    // Find closest point on box to capsule line segment
+    // First, transform capsule endpoints to box's local space
+    glm::mat3 boxRot = glm::mat3(box.axis[0], box.axis[1], box.axis[2]);
+    glm::mat3 invBoxRot = glm::transpose(boxRot);
+    
+    glm::vec3 localCapStart = invBoxRot * (capStart - box.c);
+    glm::vec3 localCapEnd = invBoxRot * (capEnd - box.c);
+    
+    // Find closest point on line segment to box in local space
+    glm::vec3 closestLocal;
+    
+    // Clamp to box bounds in local space
+    for (int i = 0; i < 3; i++) {
+        // Find closest point on line segment for this axis
+        float t0 = (box.half[i] - localCapStart[i]) / (localCapEnd[i] - localCapStart[i]);
+        float t1 = (-box.half[i] - localCapStart[i]) / (localCapEnd[i] - localCapStart[i]);
+        
+        // Check if line segment intersects box slab
+        if (glm::abs(localCapStart[i]) <= box.half[i] && 
+            glm::abs(localCapEnd[i]) <= box.half[i]) {
+            // Both points inside slab, use midpoint
+            closestLocal[i] = (localCapStart[i] + localCapEnd[i]) * 0.5f;
+        } else {
+            // Find closest point on segment to slab
+            float t = glm::clamp((-localCapStart[i]) / (localCapEnd[i] - localCapStart[i]), 0.0f, 1.0f);
+            float pointOnSeg = localCapStart[i] + t * (localCapEnd[i] - localCapStart[i]);
+            closestLocal[i] = glm::clamp(pointOnSeg, -box.half[i], box.half[i]);
+        }
+    }
+    
+    // Transform closest point back to world space
+    glm::vec3 closestWorld = box.c + boxRot * closestLocal;
+    
+    // Find closest point on capsule segment to closest point on box
+    glm::vec3 segmentVec = capEnd - capStart;
+    float segmentLenSq = glm::dot(segmentVec, segmentVec);
+    
+    glm::vec3 closestOnCapsule;
+    if (segmentLenSq < 1e-6f) {
+        // Capsule is essentially a sphere
+        closestOnCapsule = cap.center;
+    } else {
+        float t = glm::dot(closestWorld - capStart, segmentVec) / segmentLenSq;
+        t = glm::clamp(t, 0.0f, 1.0f);
+        closestOnCapsule = capStart + segmentVec * t;
+    }
+    
+    // Calculate distance between closest points
+    glm::vec3 diff = closestOnCapsule - closestWorld;
+    float distSq = glm::dot(diff, diff);
+    
+    // Check for collision
+    if (distSq < cap.radius * cap.radius) {
         result.collided = true;
-        result.penetration = cap.radius;
-        result.normal = glm::vec3(0.0f, 1.0f, 0.0f); // arbitrary
-        result.contactPoint = startInside ? capStart : capEnd;
-        return result;
+        float dist = glm::sqrt(distSq);
+        result.penetration = cap.radius - dist;
+        
+        // Calculate contact normal
+        if (dist > 1e-6f) {
+            result.normal = diff / dist;
+        } else {
+            // Use box normal based on which face is closest
+            glm::vec3 absLocal = glm::abs(closestLocal);
+            int maxAxis = 0;
+            float maxDist = glm::abs(absLocal[maxAxis] - box.half[maxAxis]);
+            
+            for (int i = 1; i < 3; i++) {
+                float d = glm::abs(absLocal[i] - box.half[i]);
+                if (d < maxDist) {
+                    maxDist = d;
+                    maxAxis = i;
+                }
+            }
+            
+            result.normal = box.axis[maxAxis] * (closestLocal[maxAxis] > 0 ? 1.0f : -1.0f);
+        }
+        
+        // Calculate contact point
+        result.contactPoint = closestWorld;
     }
 
-    // More complex implementation would go here
     return result;
 }
 

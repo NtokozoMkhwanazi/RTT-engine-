@@ -222,11 +222,12 @@ private:
         const std::vector<float>& b) const;
 
     // Feature weights (tune search behavior)
+    // CRITICAL: speed weight must be HIGH to ensure correct animation selection
     struct FeatureWeights {
-        float speed = 3.0f;           // Weight for speed dimension
-        float velocityX = 2.0f;       // Weight for X velocity
-        float velocityZ = 2.0f;       // Weight for Z velocity
-        float direction = 1.5f;       // Weight for direction
+        float speed = 15.0f;          // HIGH weight - speed magnitude is MOST important
+        float velocityX = 1.0f;       // Lower - direction less important
+        float velocityZ = 1.0f;       // Lower - direction less important
+        float direction = 0.5f;       // Low - direction can be corrected by blending
         float footPlant = 1.0f;       // Weight for foot plant state
     };
 

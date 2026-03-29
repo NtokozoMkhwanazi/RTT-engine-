@@ -99,11 +99,22 @@ struct ModelInstance {
 // ============================================================
 // Model Class
 // ============================================================
+// Model Class
+// ============================================================
 class Model
 {
 public:
-    explicit Model(const std::string& path);
+    explicit Model(const std::string& path = "");
     ~Model();
+
+    // Factory method for programmatic mesh creation
+    static Model* CreateFromVAO(GLuint VAO, GLsizei indexCount);
+
+    // Debug methods for programmatic mesh creation
+    void setDebugVAO(GLuint VAO) { m_debugVAO = VAO; }
+    void setDebugIndexCount(GLsizei count) { m_debugIndexCount = count; }
+    GLuint getDebugVAO() const { return m_debugVAO; }
+    GLsizei getDebugIndexCount() const { return m_debugIndexCount; }
     
     // Rendering
     void Draw(Shader& shader, Animator& animator);
@@ -174,9 +185,13 @@ private:
     // Bone bookkeeping
     int m_BoneCounter = 0;
     unsigned int boneTexID = 0;
-    
+
     // Debug output flag
     bool debugOutput = false;
+
+    // Debug VAO for programmatic meshes
+    GLuint m_debugVAO = 0;
+    GLsizei m_debugIndexCount = 0;
     
     // Loading
     void loadModel(const std::string& path);

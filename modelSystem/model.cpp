@@ -132,9 +132,12 @@ Model::Model(const std::string &path)
     if (debugOutput) {
         std::cout << "[Model] Loading: " << path << std::endl;
     }
-    
-    loadModel(path);
-    calculateBoundingVolumes();
+
+    // Only load if path is not empty
+    if (!path.empty()) {
+        loadModel(path);
+        calculateBoundingVolumes();
+    }
 
     if (debugOutput) {
         int influenced = 0;
@@ -173,6 +176,17 @@ Model::~Model()
     if (boneTexID != 0) {
         glDeleteTextures(1, &boneTexID);
     }
+}
+
+// =====================================================
+// Factory Methods
+// =====================================================
+Model* Model::CreateFromVAO(GLuint VAO, GLsizei indexCount)
+{
+    Model* model = new Model("");
+    model->setDebugVAO(VAO);
+    model->setDebugIndexCount(indexCount);
+    return model;
 }
 
 // =====================================================

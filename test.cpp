@@ -1,1766 +1,1749 @@
-#define GLM_ENABLE_EXPERIMENTAL
-
-#include "shaderSystem/Shader.h"
-#include "modelSystem/Model.h"
-#include "cameraSystem/flyCamera.h"
-#include "animationSystem/Animator.h"
-#include "animationSystem/AssimpAnimationLoader.h"
-#include "animationSystem/AnimationStateMachine.h"  // For CharacterInput
-#include "motionMatching/MotionMatcher.h"            // NEW: Motion Matching System
-#include "shaderSystem/stb_image.h"
-#include "physicsSystem/RigidBody.h"
-#include "physicsSystem/Floor.h"
-#include "world/Terrain.h"
-#include "world/VegetationSystem.h"
-#include "world/WorldObjectManager.h"
+/**
+ * ============================================================================
+ * RTT ENGINE EDITOR - Unreal Engine Style (Robust)
+ * ============================================================================
+ * Professional game engine editor with improved robustness:
+ * - No static buffers that outlive ECS data
+ * - Proper resource cleanup
+ * - Safe entity selection handling
+ * - Window resize handling
+ * - Input validation
+ * 
+ * NOTE: If icons appear as squares/boxes, install a Nerd Font:
+ *   sudo apt install fonts-font-awesome
+ * ============================================================================
+ */
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
-#include <assimp/Importer.hpp>
-#include <assimp/scene.h>
-#include <assimp/postprocess.h>
-
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtx/quaternion.hpp>
+
+#include "ecs/ECS.h"
+#include "ecs/components/Components.h"
+#include "ecs/systems/Systems.h"
+#include "cameraSystem/flyCamera.h"
+#include "renderer/GPUProfilerAdvanced.h"
+#include "renderer/Renderer.h"
+#include "ecs/systems/RenderSystem.h"
+
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
 
 #include <iostream>
 #include <vector>
-#include <cmath>
+#include <string>
+#include <cstring>
+#include <algorithm>
+#include <sys/stat.h>
 
-// ================= CAMERA =================
-flyCamera camera(
-    glm::vec3(0.0f, 3.0f, 10.0f),
-    glm::vec3(0, 2, 0),
-    -90.0f,
-    0.0f,
-    10.0f);
+// Icon definitions (FontAwesome free icons)
+#define ICON_MIN_FA 0xf000
+#define ICON_MAX_FA 0xf8ff
+#define ICON_FA_SEARCH "\xef\x80\x82"
+#define ICON_FA_FOLDER "\xef\x81\xbb"
+#define ICON_FA_FILE "\xef\x85\x9b"
+#define ICON_FA_CUBE "\xef\x86\xb3"
+#define ICON_FA_IMAGE "\xef\x80\xbe"
+#define ICON_FA_PLAY "\xef\x81\x8b"
+#define ICON_FA_PAUSE "\xef\x81\x8c"
+#define ICON_FA_STOP "\xef\x81\x8d"
+#define ICON_FA_UNDO "\xef\x83\xa2"
+#define ICON_FA_REDO "\xef\x83\xa5"
+#define ICON_FA_SAVE "\xef\x83\x87"
+#define ICON_FA_OPEN "\xef\x82\x82"
+#define ICON_FA_PLUS "\xef\x81\xa7"
+#define ICON_FA_TRASH "\xef\x87\xb8"
+#define ICON_FA_COG "\xef\x80\x93"
+#define ICON_FA_INFO "\xef\x84\xa9"
+#define ICON_FA_TIMES "\xef\x80\x8d"
+#define ICON_FA_CHECK "\xef\x80\x8c"
+#define ICON_FA_ARROWS_ALT "\xef\x82\xb2"
+#define ICON_FA_ROTATE "\xef\x8b\xb1"
+#define ICON_FA_EXPAND "\xef\x81\xa5"
+#define ICON_FA_COMPRESS "\xef\x81\xa6"
+#define ICON_FA_GLOBE "\xef\x82\xac"
+#define ICON_FA_HOME "\xef\x80\x95"
 
-// ================= CAMERA TEST ASSERTIONS =================
-void runCameraTests() {
-    std::cout << "\n=== RUNNING CAMERA TEST ASSERTIONS ===\n";
+// ============================================================================
+// FBO for Viewport
+// ============================================================================
+struct Framebuffer {
+    GLuint fbo = 0;
+    GLuint colorTex = 0;
+    GLuint rbo = 0;
+    int width = 1280;
+    int height = 720;
     
-    int passed = 0, failed = 0;
-    
-    // Test 1: Camera initial position
-    if (camera.Position == glm::vec3(0.0f, 3.0f, 10.0f)) {
-        std::cout << "  [PASS] Camera initial position\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] Camera initial position\n";
-        failed++;
-    }
-    
-    // Test 2: Camera initial yaw/pitch
-    if (camera.Yaw == -90.0f && camera.Pitch == 0.0f) {
-        std::cout << "  [PASS] Camera initial yaw/pitch\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] Camera initial yaw/pitch\n";
-        failed++;
-    }
-    
-    // Test 3: GetViewMatrix returns valid matrix
-    glm::mat4 view = camera.GetViewMatrix();
-    bool validView = !std::isnan(view[0][0]) && !std::isnan(view[1][1]) && !std::isnan(view[2][2]);
-    if (validView) {
-        std::cout << "  [PASS] GetViewMatrix returns valid matrix\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] GetViewMatrix returns valid matrix\n";
-        failed++;
-    }
-    
-    // Test 4: GetProjectionMatrix returns valid matrix
-    glm::mat4 proj = camera.GetProjectionMatrix(16.0f / 9.0f);
-    bool validProj = !std::isnan(proj[0][0]) && !std::isnan(proj[1][1]);
-    if (validProj) {
-        std::cout << "  [PASS] GetProjectionMatrix returns valid matrix\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] GetProjectionMatrix returns valid matrix\n";
-        failed++;
-    }
-    
-    // Test 5: Mouse movement updates yaw/pitch
-    flyCamera testCam(glm::vec3(0, 0, 10), glm::vec3(0, 1, 0), -90.0f, 0.0f, 10.0f);
-    float initialYaw = testCam.Yaw;
-    testCam.ProcessMouseMovement(450.0f, 350.0f);  // Simulate mouse move
-    if (testCam.Yaw != initialYaw) {
-        std::cout << "  [PASS] Mouse movement updates yaw/pitch\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] Mouse movement updates yaw/pitch\n";
-        failed++;
-    }
-    
-    // Test 6: Scroll zoom changes distance
-    flyCamera zoomCam(glm::vec3(0, 0, 10), glm::vec3(0, 1, 0), -90.0f, 0.0f, 10.0f);
-    float initialDist = zoomCam.DistanceToTarget;
-    zoomCam.ProcessMouseScroll(5.0f);
-    if (zoomCam.DistanceToTarget != initialDist) {
-        std::cout << "  [PASS] Scroll zoom changes distance\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] Scroll zoom changes distance\n";
-        failed++;
-    }
-    
-    // Test 7: Zoom respects min/max limits
-    zoomCam.ProcessMouseScroll(-100.0f);  // Try to zoom way in
-    if (zoomCam.DistanceToTarget >= zoomCam.MinDistance) {
-        std::cout << "  [PASS] Zoom respects min/max limits\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] Zoom respects min/max limits\n";
-        failed++;
-    }
-    
-    // Test 8: FollowPlayer updates position
-    flyCamera followCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
-    glm::vec3 initialPos = followCam.Position;
-    followCam.FollowPlayer(glm::vec3(0, 0, 5));  // Move target
-    if (followCam.Position != initialPos) {
-        std::cout << "  [PASS] FollowPlayer updates position\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] FollowPlayer updates position\n";
-        failed++;
-    }
-    
-    // Test 9: FollowPlayerSmooth updates position
-    flyCamera smoothCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
-    glm::vec3 smoothInitialPos = smoothCam.Position;
-    smoothCam.FollowPlayerSmooth(glm::vec3(0, 0, 5), 0.016f);
-    if (smoothCam.Position != smoothInitialPos) {
-        std::cout << "  [PASS] FollowPlayerSmooth updates position\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] FollowPlayerSmooth updates position\n";
-        failed++;
-    }
-    
-    // Test 10: Camera shake effect
-    flyCamera shakeCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
-    shakeCam.AddShake(1.0f, 2.0f, glm::vec3(1, 1, 1));
-    if (shakeCam.currentShake.intensity > 0.0f) {
-        std::cout << "  [PASS] Camera shake effect\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] Camera shake effect\n";
-        failed++;
-    }
-    
-    // Test 11: SetFieldOfView clamps values
-    flyCamera fovCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
-    fovCam.SetFieldOfView(150.0f);  // Should clamp to 120
-    if (fovCam.FieldOfView <= 120.0f) {
-        std::cout << "  [PASS] SetFieldOfView clamps values\n";
-        passed++;
-    } else {
-        std::cout << "  [FAIL] SetFieldOfView clamps values\n";
-        failed++;
-    }
-    
-    // Test 12: Collision detection setup
-    flyCamera colCam(glm::vec3(0, 5, 10), glm::vec3(0, 2, 0), -90.0f, 0.0f, 10.0f);
-    colCam.SetCollisionEnabled(true);
-    colCam.SetCollisionDistance(2.0f);
-    std::cout << "  [PASS] Collision detection setup (manual verify)\n";
-    passed++;
-    
-    std::cout << "\n=== CAMERA TEST RESULTS: " << passed << " passed, " << failed << " failed ===\n\n";
-    
-    if (failed > 0) {
-        std::cerr << "WARNING: Some camera tests failed!\n";
-    }
-}
-
-// Third-person camera settings - AAA QUALITY
-glm::vec3 cameraPivot(0.0f, 2.0f, 0.0f);  // Point camera looks at (character + offset)
-float cameraDistance = 21.0f;              // Distance from pivot (increased for better view)
-float cameraHeight = 7.0f;                 // Camera height offset (higher overhead view)
-float cameraRotateSpeed = 3.0f;            // Mouse rotation speed
-
-// AAA QUALITY CAMERA - Maximum smoothing for perfect follow
-// Camera updates AFTER character position = zero lag
-// Zoom range for cinematic to gameplay views
-float cameraZoomSpeed = 25.0f;             // Fast zoom scrolling
-float cameraZoomMin = 10.0f;               // Minimum zoom (close-up)
-float cameraZoomMax = 50.0f;               // Maximum zoom (very far - cinematic)
-bool cameraFollowEnabled = true;
-bool cameraFixedMode = false;              // Fixed behind camera (no orbit)
-
-void framebuffer_size_callback(GLFWwindow *, int w, int h) { glViewport(0, 0, w, h); }
-void mouse_callback(GLFWwindow *window, double xpos, double ypos) {
-    // Only allow orbit in non-fixed mode
-    if (cameraFixedMode) return;
-    
-    // Orbit camera around pivot using yaw/pitch
-    static double lastX = xpos, lastY = ypos;
-    static bool firstMouse = true;
-    
-    if (firstMouse) {
-        lastX = xpos;
-        lastY = ypos;
-        firstMouse = false;
-    }
-    
-    float dx = (float)(xpos - lastX);
-    float dy = (float)(lastY - ypos);  // Inverted for natural feel
-    lastX = xpos;
-    lastY = ypos;
-    
-    // Update camera yaw and pitch
-    camera.Yaw += dx * 0.1f;
-    camera.Pitch = glm::clamp(camera.Pitch + dy * 0.1f, -80.0f, 80.0f);
-}
-void scroll_callback(GLFWwindow *window, double xoffset, double yoffset) {
-    // Smooth zoom - adjust target distance
-    cameraDistance -= (float)yoffset * cameraZoomSpeed * 0.1f;
-    cameraDistance = glm::clamp(cameraDistance, cameraZoomMin, cameraZoomMax);
-}
-
-// ================= SKYBOX =================
-GLuint skyboxVAO = 0, skyboxVBO = 0;
-GLuint skyboxTexture = 0;
-
-void setupSkybox() {
-    float skyboxVertices[] = {
-        -1.0f,  1.0f, -1.0f,  -1.0f, -1.0f, -1.0f,   1.0f, -1.0f, -1.0f,
-         1.0f, -1.0f, -1.0f,   1.0f,  1.0f, -1.0f,  -1.0f,  1.0f, -1.0f,
-        -1.0f, -1.0f,  1.0f,  -1.0f, -1.0f, -1.0f,  -1.0f,  1.0f, -1.0f,
-        -1.0f,  1.0f, -1.0f,  -1.0f,  1.0f,  1.0f,  -1.0f, -1.0f,  1.0f,
-         1.0f, -1.0f, -1.0f,   1.0f, -1.0f,  1.0f,   1.0f,  1.0f,  1.0f,
-         1.0f,  1.0f,  1.0f,   1.0f,  1.0f, -1.0f,   1.0f, -1.0f, -1.0f,
-        -1.0f, -1.0f,  1.0f,  -1.0f, -1.0f, -1.0f,   1.0f, -1.0f, -1.0f,
-         1.0f, -1.0f, -1.0f,   1.0f, -1.0f,  1.0f,  -1.0f, -1.0f,  1.0f,
-        -1.0f,  1.0f, -1.0f,  -1.0f,  1.0f,  1.0f,   1.0f,  1.0f,  1.0f,
-         1.0f,  1.0f,  1.0f,   1.0f,  1.0f, -1.0f,  -1.0f,  1.0f, -1.0f,
-    };
-    
-    glGenVertexArrays(1, &skyboxVAO);
-    glGenBuffers(1, &skyboxVBO);
-    glBindVertexArray(skyboxVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, skyboxVBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(skyboxVertices), skyboxVertices, GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-    glBindVertexArray(0);
-}
-
-GLuint loadTexture(const std::string& path) {
-    int width, height, nrChannels;
-    stbi_set_flip_vertically_on_load(false);
-    unsigned char *data = stbi_load(path.c_str(), &width, &height, &nrChannels, 0);
-    
-    GLuint texture;
-    glGenTextures(1, &texture);
-    
-    if (data) {
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    void init(int w, int h) {
+        cleanup();
+        width = w; height = h;
+        
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        
+        glGenTextures(1, &colorTex);
+        glBindTexture(GL_TEXTURE_2D, colorTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        stbi_image_free(data);
-    } else {
-        std::cerr << "Failed to load texture: " << path << "\n";
-    }
-    
-    return texture;
-}
-
-GLuint loadCubemap(const std::vector<std::string>& faces) {
-    GLuint textureID;
-    glGenTextures(1, &textureID);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, textureID);
-    
-    int width, height, nrChannels;
-    for (unsigned int i = 0; i < faces.size(); i++) {
-        stbi_set_flip_vertically_on_load(false);
-        unsigned char *data = stbi_load(faces[i].c_str(), &width, &height, &nrChannels, 0);
-        if (data) {
-            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
-            stbi_image_free(data);
-        } else {
-            std::cerr << "Cubemap face failed to load: " << faces[i] << "\n";
-            stbi_image_free(data);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex, 0);
+        
+        glGenRenderbuffers(1, &rbo);
+        glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);
+        
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            std::cerr << "ERROR: Framebuffer incomplete!\n";
         }
-    }
-    
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-    
-    return textureID;
-}
-
-void drawSkybox(glm::mat4 view, glm::mat4 projection, GLuint skyboxTex) {
-    glDepthFunc(GL_LEQUAL);
-    
-    static Shader* skyboxShader = nullptr;
-    if (!skyboxShader) {
-        skyboxShader = new Shader("shaderSystem/skyboxVS.glsl", "shaderSystem/skyboxFS.glsl");
-    }
-    
-    skyboxShader->use();
-    skyboxShader->setMat4("projection", projection);
-    skyboxShader->setMat4("view", glm::mat4(glm::mat3(view)));  // Remove translation
-    
-    glBindVertexArray(skyboxVAO);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxTex);
-    glDrawArrays(GL_TRIANGLES, 0, 36);
-    glBindVertexArray(0);
-    
-    glDepthFunc(GL_LESS);
-}
-
-// ================= SKINNED SHADER =================
-class SkinnedShader {
-public:
-    unsigned int ID;
-
-    SkinnedShader() {
-        const char* vs = R"(
-#version 330 core
-layout(location=0) in vec3 aPos;
-layout(location=1) in vec3 aNormal;
-layout(location=2) in vec2 aTex;
-layout(location=5) in ivec4 aBoneIDs;
-layout(location=6) in vec4 aWeights;
-
-out vec3 FragPos;
-out vec3 Normal;
-out vec2 TexCoords;
-out vec4 vBoneIDs;
-out vec4 vWeights;
-
-uniform sampler2D boneTex;
-uniform mat4 model;
-uniform mat4 view;
-uniform mat4 projection;
-uniform int uPaletteSize;
-
-mat4 GetBone(int boneID) {
-    if (boneID < 0 || boneID >= uPaletteSize) return mat4(1.0);
-    int x = boneID * 4;
-    return mat4(
-        texelFetch(boneTex, ivec2(x, 0), 0),
-        texelFetch(boneTex, ivec2(x+1, 0), 0),
-        texelFetch(boneTex, ivec2(x+2, 0), 0),
-        texelFetch(boneTex, ivec2(x+3, 0), 0)
-    );
-}
-
-void main() {
-    vBoneIDs = vec4(aBoneIDs);
-    vWeights = aWeights;
-    TexCoords = aTex;
-
-    // Normalize weights
-    float sum = aWeights.x + aWeights.y + aWeights.z + aWeights.w;
-    vec4 weights = (sum > 0.0) ? (aWeights / sum) : vec4(0.0);
-
-    // Build skin matrix
-    mat4 skin = mat4(0.0);
-    bool validSkin = false;
-
-    for (int i = 0; i < 4; i++) {
-        int boneID = aBoneIDs[i];
-        float w = weights[i];
-        if (boneID >= 0 && boneID < uPaletteSize && w > 0.0) {
-            mat4 boneMat = GetBone(boneID);
-            skin += boneMat * w;
-            validSkin = true;
-        }
-    }
-
-    if (!validSkin) {
-        // No valid bone influence - use bind pose (identity)
-        skin = mat4(1.0);
-    }
-
-    // Apply skinning
-    vec4 skinnedPos = skin * vec4(aPos, 1.0);
-    vec4 worldPos = model * skinnedPos;
-
-    FragPos = worldPos.xyz;
-
-    // Transform normal
-    mat3 normalMat = transpose(inverse(mat3(model) * mat3(skin)));
-    Normal = normalize(normalMat * aNormal);
-
-    gl_Position = projection * view * worldPos;
-}
-)";
-
-        const char* fs = R"(
-#version 330 core
-out vec4 FragColor;
-in vec3 FragPos;
-in vec3 Normal;
-in vec2 TexCoords;
-in vec4 vBoneIDs;
-in vec4 vWeights;
-
-uniform vec3 color;
-uniform vec3 lightPos;
-uniform vec3 viewPos;
-uniform int uDebugMode;  // 0=normal, 1=show bone IDs, 2=show weights
-
-void main() {
-    if (uDebugMode == 1) {
-        // Show bone IDs as color
-        vec3 boneColor = vec3(vBoneIDs.xyz / 65.0);
-        FragColor = vec4(boneColor, 1.0);
-        return;
-    }
-    
-    if (uDebugMode == 2) {
-        // Show bone IDs mapped to colors (not weights)
-        // Map bone ID to a color based on ID
-        vec3 boneColor;
-        if (vBoneIDs.x >= 55.0 && vBoneIDs.x <= 62.0) {
-            // Leg bones: green-cyan range
-            boneColor = vec3(0.0, (vBoneIDs.x - 55.0) / 7.0, 1.0);
-        } else if (vBoneIDs.x >= 30.0 && vBoneIDs.x <= 40.0) {
-            // Arm bones: yellow-orange range
-            boneColor = vec3(1.0, (40.0 - vBoneIDs.x) / 10.0, 0.0);
-        } else {
-            // Other bones: blue-purple range
-            boneColor = vec3(0.5, 0.0, vBoneIDs.x / 65.0);
-        }
-        FragColor = vec4(boneColor, 1.0);
-        return;
-    }
-    
-    // Diffuse lighting
-    vec3 norm = normalize(Normal);
-    vec3 lightDir = normalize(lightPos - FragPos);
-    float diff = max(dot(norm, lightDir), 0.0);
-    
-    // Simple shading
-    vec3 ambient = 0.3 * color;
-    vec3 diffuse = diff * color;
-    
-    FragColor = vec4(ambient + diffuse, 1.0);
-}
-)";
-
-        unsigned int vsObj = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(vsObj, 1, &vs, nullptr);
-        glCompileShader(vsObj);
         
-        unsigned int fsObj = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fsObj, 1, &fs, nullptr);
-        glCompileShader(fsObj);
-        
-        ID = glCreateProgram();
-        glAttachShader(ID, vsObj);
-        glAttachShader(ID, fsObj);
-        glLinkProgram(ID);
-        
-        glDeleteShader(vsObj);
-        glDeleteShader(fsObj);
-        
-        std::cout << "Skinned shader compiled: ID=" << ID << "\n";
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
     
-    void use() { glUseProgram(ID); }
-    
-    void setMat4(const std::string& name, glm::mat4 val) {
-        glUniformMatrix4fv(glGetUniformLocation(ID, name.c_str()), 1, GL_FALSE, &val[0][0]);
+    void resize(int w, int h) {
+        if (w <= 0 || h <= 0 || (w == width && h == height)) return;
+        init(w, h);
     }
     
-    void setVec3(const std::string& name, glm::vec3 val) {
-        glUniform3fv(glGetUniformLocation(ID, name.c_str()), 1, &val[0]);
+    void cleanup() {
+        if (fbo) glDeleteFramebuffers(1, &fbo);
+        if (colorTex) glDeleteTextures(1, &colorTex);
+        if (rbo) glDeleteRenderbuffers(1, &rbo);
+        fbo = 0; colorTex = 0; rbo = 0;
     }
     
-    void setInt(const std::string& name, int val) {
-        glUniform1i(glGetUniformLocation(ID, name.c_str()), val);
+    void bind() {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glViewport(0, 0, width, height);
+    }
+    
+    void unbind() {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 };
 
-// ================= MAIN =================
-int main()
-{
-    // Initialize GLFW with hints for better compatibility
-    if (!glfwInit()) { 
-        std::cerr << "GLFW init failed\n"; 
-        return -1; 
+static Framebuffer g_viewportFB;
+
+// ============================================================================
+// Shader Helper
+// ============================================================================
+static GLuint g_shaderProg = 0;
+
+static void initShader() {
+    const char* vs = R"(
+#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+uniform mat4 model, view, projection;
+out vec3 FragPos, Normal;
+void main() {
+    FragPos = vec3(model * vec4(aPos, 1.0));
+    Normal = mat3(transpose(inverse(model))) * aNormal;
+    gl_Position = projection * view * vec4(FragPos, 1.0);
+}
+)";
+    const char* fs = R"(
+#version 330 core
+in vec3 FragPos, Normal;
+uniform vec3 color, lightPos, viewPos;
+out vec4 FragColor;
+void main() {
+    vec3 ambient = 0.2 * vec3(1.0);
+    vec3 norm = normalize(Normal);
+    vec3 lightDir = normalize(lightPos - FragPos);
+    float diff = max(dot(norm, lightDir), 0.0);
+    vec3 diffuse = diff * vec3(1.0);
+    vec3 viewDir = normalize(viewPos - FragPos);
+    vec3 reflectDir = reflect(-lightDir, norm);
+    float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
+    vec3 specular = 0.3 * spec * vec3(1.0);
+    FragColor = vec4((ambient + diffuse + specular) * color, 1.0);
+}
+)";
+    GLuint vsObj = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vsObj, 1, &vs, nullptr);
+    glCompileShader(vsObj);
+    
+    GLuint fsObj = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fsObj, 1, &fs, nullptr);
+    glCompileShader(fsObj);
+    
+    g_shaderProg = glCreateProgram();
+    glAttachShader(g_shaderProg, vsObj);
+    glAttachShader(g_shaderProg, fsObj);
+    glLinkProgram(g_shaderProg);
+    
+    glDeleteShader(vsObj);
+    glDeleteShader(fsObj);
+}
+
+static void useShader() { glUseProgram(g_shaderProg); }
+static void setMat4(const char* n, const glm::mat4& m) { 
+    GLint loc = glGetUniformLocation(g_shaderProg, n);
+    if (loc >= 0) glUniformMatrix4fv(loc, 1, GL_FALSE, &m[0][0]);
+}
+static void setVec3(const char* n, const glm::vec3& v) {
+    GLint loc = glGetUniformLocation(g_shaderProg, n);
+    if (loc >= 0) glUniform3fv(loc, 1, &v[0]);
+}
+
+// ============================================================================
+// Cube Mesh
+// ============================================================================
+static GLuint g_cubeVAO = 0, g_cubeVBO = 0, g_cubeEBO = 0;
+
+static void initCube() {
+    float verts[] = {
+        -0.5f,-0.5f,-0.5f, 0,0,-1,  0.5f,-0.5f,-0.5f, 0,0,-1,  0.5f,0.5f,-0.5f, 0,0,-1,
+         0.5f,0.5f,-0.5f, 0,0,-1, -0.5f,0.5f,-0.5f, 0,0,-1, -0.5f,-0.5f,-0.5f, 0,0,-1,
+        -0.5f,-0.5f, 0.5f, 0,0, 1,  0.5f,-0.5f, 0.5f, 0,0, 1,  0.5f, 0.5f, 0.5f, 0,0, 1,
+         0.5f, 0.5f, 0.5f, 0,0, 1, -0.5f, 0.5f, 0.5f, 0,0, 1, -0.5f,-0.5f, 0.5f, 0,0, 1,
+        -0.5f, 0.5f, 0.5f,-1,0, 0, -0.5f, 0.5f,-0.5f,-1,0, 0, -0.5f,-0.5f,-0.5f,-1,0, 0,
+        -0.5f,-0.5f,-0.5f,-1,0, 0, -0.5f,-0.5f, 0.5f,-1,0, 0, -0.5f, 0.5f, 0.5f,-1,0, 0,
+         0.5f, 0.5f, 0.5f, 1,0, 0,  0.5f, 0.5f,-0.5f, 1,0, 0,  0.5f,-0.5f,-0.5f, 1,0, 0,
+         0.5f,-0.5f,-0.5f, 1,0, 0,  0.5f,-0.5f, 0.5f, 1,0, 0,  0.5f, 0.5f, 0.5f, 1,0, 0,
+        -0.5f,-0.5f,-0.5f, 0,-1, 0,  0.5f,-0.5f,-0.5f, 0,-1, 0,  0.5f,-0.5f, 0.5f, 0,-1, 0,
+         0.5f,-0.5f, 0.5f, 0,-1, 0, -0.5f,-0.5f, 0.5f, 0,-1, 0, -0.5f,-0.5f,-0.5f, 0,-1, 0,
+        -0.5f, 0.5f,-0.5f, 0, 1, 0,  0.5f, 0.5f,-0.5f, 0, 1, 0,  0.5f, 0.5f, 0.5f, 0, 1, 0,
+         0.5f, 0.5f, 0.5f, 0, 1, 0, -0.5f, 0.5f, 0.5f, 0, 1, 0, -0.5f, 0.5f,-0.5f, 0, 1, 0
+    };
+    unsigned int idx[] = {
+        0,1,2,2,3,4,5, 6,7,7,8,9, 10,11,12,12,13,14,
+        15,16,17,17,18,19, 20,21,22,22,23,24, 25,26,27,27,28,29,
+        30,31,32,32,33,34, 35,36,37,37,38,39
+    };
+    
+    glGenVertexArrays(1, &g_cubeVAO);
+    glGenBuffers(1, &g_cubeVBO);
+    glGenBuffers(1, &g_cubeEBO);
+    
+    glBindVertexArray(g_cubeVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_cubeVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_cubeEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx), idx, GL_STATIC_DRAW);
+    
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)(3*sizeof(float)));
+    glEnableVertexAttribArray(1);
+    
+    glBindVertexArray(0);
+}
+
+static void drawCube() {
+    glBindVertexArray(g_cubeVAO);
+    glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0);
+    glBindVertexArray(0);
+}
+
+static void cleanupCube() {
+    if (g_cubeVAO) glDeleteVertexArrays(1, &g_cubeVAO);
+    if (g_cubeVBO) glDeleteBuffers(1, &g_cubeVBO);
+    if (g_cubeEBO) glDeleteBuffers(1, &g_cubeEBO);
+    g_cubeVAO = 0; g_cubeVBO = 0; g_cubeEBO = 0;
+}
+
+// ============================================================================
+// Globals
+// ============================================================================
+static ecs::World g_world;
+static flyCamera* g_camera = nullptr;
+static ecs::EntityID g_selected = ecs::INVALID_ENTITY_ID;
+static float g_fps = 0.0f;
+
+// Renderer and Render System
+static Renderer g_renderer;
+static ecs::RenderSystem g_renderSystem;
+static Model* g_currentModel = nullptr;
+
+// Editor State
+enum class GizmoType { None, Translate, Rotate, Scale };
+enum class SpaceType { Local, World };
+static GizmoType g_gizmoType = GizmoType::Translate;
+static SpaceType g_spaceType = SpaceType::World;
+static bool g_showGrid = true;
+static bool g_showGizmo = true;
+
+// Viewport camera controls
+static bool g_isViewing = false;
+static glm::vec2 g_lastMousePos;
+
+// UI State (non-static to avoid lifetime issues)
+struct UIState {
+    char searchBuffer[128] = "";
+    char pathBuffer[256] = "/Game/Assets";
+    int leftPanelTab = 0;  // 0=Outliner, 1=Details
+    int bottomPanelTab = 0;  // 0=Content, 1=Console, 2=Profiler
+};
+static UIState g_uiState;
+
+// Game State
+static bool g_isPlaying = false;
+static bool g_wasPlaying = false;
+static float g_gameSpeed = 1.0f;
+
+// Console/Log system
+struct LogMessage {
+    std::string text;
+    float timestamp;
+    int level;  // 0=info, 1=warning, 2=error
+};
+static std::vector<LogMessage> g_consoleMessages;
+static bool g_showConsole = true;
+static int g_consoleFilter = -1;  // -1=all, 0=info, 1=warning, 2=error
+
+void logMessage(const std::string& text, int level = 0) {
+    LogMessage msg;
+    msg.text = text;
+    msg.timestamp = glfwGetTime();
+    msg.level = level;
+    g_consoleMessages.push_back(msg);
+    
+    // Keep only last 1000 messages
+    if (g_consoleMessages.size() > 1000) {
+        g_consoleMessages.erase(g_consoleMessages.begin());
+    }
+    
+    // Also print to stdout
+    const char* levelStr = level == 2 ? "[ERROR] " : level == 1 ? "[WARN] " : "[INFO] ";
+    std::cout << levelStr << text << "\n";
+}
+
+// Entity management
+void deleteSelectedEntity() {
+    if (g_selected == ecs::INVALID_ENTITY_ID) return;
+
+    // TODO: Properly destroy entity through ECS
+    logMessage("Deleted entity " + std::to_string(g_selected), 0);
+    g_selected = ecs::INVALID_ENTITY_ID;
+}
+
+void duplicateSelectedEntity() {
+    if (g_selected == ecs::INVALID_ENTITY_ID) return;
+
+    ecs::Entity entity{g_selected};
+    auto* t = g_world.getComponentArchetype<ecs::TransformComponent>(entity);
+    auto* m = g_world.getComponentArchetype<ecs::MeshComponent>(entity);
+
+    if (t && m) {
+        auto newEntity = g_world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
+        auto* newT = g_world.getComponentArchetype<ecs::TransformComponent>(newEntity);
+        auto* newM = g_world.getComponentArchetype<ecs::MeshComponent>(newEntity);
+
+        if (newT && newM) {
+            newT->position = t->position + glm::vec3(1, 0, 0);
+            newT->rotation = t->rotation;
+            newT->scale = t->scale;
+            newM->color = m->color;
+            newM->visible = m->visible;
+            newM->meshID = m->meshID;
+
+            logMessage("Duplicated entity " + std::to_string(g_selected) + " -> " + std::to_string(newEntity.id), 0);
+        }
+    }
+}
+
+// ============================================================================
+// Entity Creation (using archetype storage)
+// ============================================================================
+ecs::Entity createCube(const glm::vec3& pos, const glm::vec3& scale, const glm::vec3& color) {
+    // Create entity with Transform + Mesh only (NameComponent causes issues)
+    auto e = g_world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
+    if (!e.isValid()) return e;
+
+    // Use getComponentArchetype for archetype-stored components
+    auto* t = g_world.getComponentArchetype<ecs::TransformComponent>(e);
+    auto* m = g_world.getComponentArchetype<ecs::MeshComponent>(e);
+
+    if (t) { t->position = pos; t->scale = scale; t->rotation = glm::quat(1, 0, 0, 0); }
+    if (m) { m->visible = true; m->meshID = 0; m->color = color; }
+
+    return e;
+}
+
+ecs::Entity createSphere(const glm::vec3& pos, float radius, const glm::vec3& color) {
+    auto e = g_world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
+    if (!e.isValid()) return e;
+
+    auto* t = g_world.getComponentArchetype<ecs::TransformComponent>(e);
+    auto* m = g_world.getComponentArchetype<ecs::MeshComponent>(e);
+
+    if (t) { t->position = pos; t->scale = glm::vec3(radius); t->rotation = glm::quat(1, 0, 0, 0); }
+    if (m) { m->visible = true; m->color = color; m->meshID = 0; }
+
+    return e;
+}
+
+ecs::Entity createPlane(const glm::vec3& pos, const glm::vec2& size, const glm::vec3& color) {
+    auto e = g_world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
+    if (!e.isValid()) return e;
+
+    auto* t = g_world.getComponentArchetype<ecs::TransformComponent>(e);
+    auto* m = g_world.getComponentArchetype<ecs::MeshComponent>(e);
+
+    if (t) { t->position = pos; t->scale = glm::vec3(size.x, 0.01f, size.y); t->rotation = glm::quat(1, 0, 0, 0); }
+    if (m) { m->visible = true; m->color = color; m->meshID = 0; }
+
+    return e;
+}
+
+ecs::Entity createLight(const glm::vec3& pos, const glm::vec3& color, float intensity) {
+    auto e = g_world.createEntityWithComponents<ecs::TransformComponent>();
+    if (!e.isValid()) return e;
+
+    auto* t = g_world.getComponentArchetype<ecs::TransformComponent>(e);
+
+    if (t) { t->position = pos; t->scale = glm::vec3(0.2f); t->rotation = glm::quat(1, 0, 0, 0); }
+
+    // TODO: Add LightComponent when available
+    (void)color; (void)intensity;  // Suppress unused warnings
+
+    return e;
+}
+
+ecs::Entity createCamera(const glm::vec3& pos, const glm::vec3& target) {
+    auto e = g_world.createEntityWithComponents<ecs::TransformComponent>();
+    if (!e.isValid()) return e;
+
+    auto* t = g_world.getComponentArchetype<ecs::TransformComponent>(e);
+
+    if (t) { t->position = pos; t->scale = glm::vec3(1); t->rotation = glm::quat(1, 0, 0, 0); }
+
+    // TODO: Add CameraComponent when available
+    (void)target;  // Suppress unused warnings
+
+    return e;
+}
+
+// ============================================================================
+// Scene Serialization (Simple JSON-like format)
+// ============================================================================
+#include <fstream>
+#include <sstream>
+
+static std::string g_currentSceneFile;
+
+bool saveScene(const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "ERROR: Could not open file for writing: " << filename << "\n";
+        return false;
     }
 
-    // Set OpenGL version and profile
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);  // For macOS compatibility
-    glfwWindowHint(GLFW_RESIZABLE, GL_TRUE);
+    file << "{\n";
+    file << "  \"version\": \"1.0\",\n";
+    file << "  \"entities\": [\n";
+
+    bool first = true;
+    g_world.forEach<ecs::TransformComponent, ecs::NameComponent>(
+        [&](ecs::EntityID id, ecs::TransformComponent& t, ecs::NameComponent& n) {
+            if (!first) file << ",\n";
+            first = false;
+
+            file << "    {\n";
+            file << "      \"name\": \"" << n.name << "\",\n";
+            file << "      \"position\": [" << t.position.x << ", " << t.position.y << ", " << t.position.z << "],\n";
+            file << "      \"rotation\": [" << t.rotation.x << ", " << t.rotation.y << ", " << t.rotation.z << ", " << t.rotation.w << "],\n";
+            file << "      \"scale\": [" << t.scale.x << ", " << t.scale.y << ", " << t.scale.z << "]\n";
+            file << "    }";
+        });
+
+    file << "\n  ]\n";
+    file << "}\n";
+
+    file.close();
+    g_currentSceneFile = filename;
+    std::cout << "Scene saved to: " << filename << "\n";
+    return true;
+}
+
+bool loadScene(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "ERROR: Could not open file for reading: " << filename << "\n";
+        return false;
+    }
+
+    // Clear current scene
+    g_world.shutdown();
+    g_world.init();
+
+    // Simple parsing (production would use proper JSON library)
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string content = buffer.str();
+    file.close();
+
+    // Parse entities (simplified - just looking for position patterns)
+    size_t pos = 0;
+    int entityCount = 0;
+
+    while ((pos = content.find("\"position\":", pos)) != std::string::npos) {
+        size_t start = content.find("[", pos);
+        size_t end = content.find("]", start);
+        if (start != std::string::npos && end != std::string::npos) {
+            std::string posStr = content.substr(start + 1, end - start - 1);
+            float x, y, z;
+            if (sscanf(posStr.c_str(), "%f, %f, %f", &x, &y, &z) == 3) {
+                createCube(glm::vec3(x, y, z), glm::vec3(1), glm::vec3(0.8f, 0.8f, 0.8f));
+                entityCount++;
+            }
+        }
+        pos = end;
+    }
+
+    g_currentSceneFile = filename;
+    std::cout << "Loaded " << entityCount << " entities from: " << filename << "\n";
+    return true;
+}
+
+// ============================================================================
+// About Dialog
+// ============================================================================
+static bool g_showAbout = false;
+
+void showAboutDialog() {
+    if (!g_showAbout) return;
+
+    ImGui::OpenPopup("About RTT Engine");
+    if (ImGui::BeginPopupModal("About RTT Engine", &g_showAbout, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1), "RTT Engine Editor");
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(200, 0));
+        ImGui::Text("Version: 1.0.0");
+        ImGui::Text("Built: %s %s", __DATE__, __TIME__);
+        ImGui::Dummy(ImVec2(0, 10));
+        ImGui::TextWrapped("A professional 3D game engine editor with:");
+        ImGui::BulletText("ECS Architecture");
+        ImGui::BulletText("Real-time rendering");
+        ImGui::BulletText("Physics simulation");
+        ImGui::BulletText("Animation system");
+        ImGui::BulletText("Motion matching");
+        ImGui::Dummy(ImVec2(0, 15));
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Built with Dear ImGui, OpenGL, and GLFW");
+        ImGui::Dummy(ImVec2(0, 15));
+
+        if (ImGui::Button("OK", ImVec2(120, 0))) {
+            g_showAbout = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SetItemDefaultFocus();
+        ImGui::EndPopup();
+    }
+}
+
+// ============================================================================
+// Render Scene to FBO
+// ============================================================================
+void renderScene() {
+    PROFILE_GPU_SCOPE("Render Scene");
     
-    // Try to create window with different hints if first attempt fails
-    GLFWwindow *window = glfwCreateWindow(1280, 720, "3D Engine - Skinned Model", nullptr, nullptr);
+    // 🔵 2. Render scene INTO framebuffer (your viewport)
+    g_viewportFB.bind();
+
+    // Set viewport to match FBO size
+    glViewport(0, 0, g_viewportFB.width, g_viewportFB.height);
+
+    // Enable proper state
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+
+    // Clear
+    glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Set renderer viewport and camera matrices
+    g_renderer.SetViewport(0, 0, g_viewportFB.width, g_viewportFB.height);
     
-    if (!window) {
-        std::cerr << "Window creation failed with default hints, trying alternative...\n";
-        glfwWindowHint(GLFW_SAMPLES, 4);  // Try with MSAA
-        window = glfwCreateWindow(1280, 720, "3D Engine - Skinned Model", nullptr, nullptr);
+    glm::mat4 view = glm::lookAt(g_camera->Position, g_camera->Target, glm::vec3(0,1,0));
+    glm::mat4 proj = glm::perspective(glm::radians(60.0f), 
+                                       (float)g_viewportFB.width / g_viewportFB.height, 
+                                       0.1f, 1000.0f);
+    g_renderer.SetCameraMatrices(view, proj);
+
+    // Render all ECS entities through RenderSystem
+    g_renderSystem.render();
+
+    // TEST: Draw a simple colored quad to verify FBO works
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_DEPTH_TEST);
+    glUseProgram(0);
+    glBindVertexArray(0);
+    
+    // Draw a red rectangle in top-left corner of viewport
+    glBegin(GL_QUADS);
+    glColor3f(1.0f, 0.0f, 0.0f);
+    glVertex2f(-0.8f, 0.5f);
+    glVertex2f(-0.5f, 0.5f);
+    glVertex2f(-0.5f, 0.8f);
+    glVertex2f(-0.8f, 0.8f);
+    glEnd();
+
+    // 🔴 3. Restore default framebuffer
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+}
+
+// ============================================================================
+// UI Helper Functions
+// ============================================================================
+void renderTransformSection(ecs::TransformComponent* t) {
+    if (!t) return;
+    
+    if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushID("Transform");
+        
+        ImGui::SeparatorText("Position");
+        glm::vec3 p = t->position;
+        if (ImGui::DragFloat3("##Position", &p.x, 0.1f, -10000, 10000)) {
+            t->position = p;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset##Pos", ImVec2(60, 0))) {
+            t->position = glm::vec3(0);
+        }
+        
+        ImGui::SeparatorText("Rotation");
+        glm::vec3 r = glm::degrees(glm::eulerAngles(t->rotation));
+        if (ImGui::DragFloat3("##Rotation", &r.x, 1.0f, -180, 180)) {
+            t->setEulerAngles(glm::radians(r));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset##Rot", ImVec2(60, 0))) {
+            t->rotation = glm::quat(1, 0, 0, 0);
+        }
+        
+        ImGui::SeparatorText("Scale");
+        glm::vec3 s = t->scale;
+        if (ImGui::DragFloat3("##Scale", &s.x, 0.01f, 0.01f, 1000)) {
+            t->scale = s;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset##Scale", ImVec2(60, 0))) {
+            t->scale = glm::vec3(1);
+        }
+        
+        ImGui::PopID();
+    }
+}
+
+void renderMeshSection(ecs::MeshComponent* m) {
+    if (!m) return;
+    
+    if (ImGui::CollapsingHeader("Mesh", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushID("Mesh");
+        
+        ImGui::SeparatorText("Appearance");
+        glm::vec3 c = m->color;
+        if (ImGui::ColorEdit3("Albedo", &c.x, ImGuiColorEditFlags_Float)) {
+            m->color = c;
+        }
+        ImGui::Checkbox("Visible", &m->visible);
+        
+        ImGui::PopID();
+    }
+}
+
+// ============================================================================
+// Font Loading Helper (using stb_truetype - no freetype dependency)
+// ============================================================================
+
+static bool loadIconFont(ImGuiIO& io) {
+    // Open log file for debugging
+    FILE* logFile = fopen("font_load.log", "w");
+    if (logFile) {
+        fprintf(logFile, "=== Font Loading Log ===\n");
+        fflush(logFile);
     }
     
+    // Common Nerd Font and monospace font locations
+    const char* fontPaths[] = {
+        // User's local fonts (highest priority - your system has these!)
+        "/home/run-time-terror/.local/share/fonts/FiraCodeNerdFont-Regular.ttf",
+        "/home/run-time-terror/.local/share/fonts/FiraCodeNerdFontMono-Regular.ttf",
+        // Generic user font directories
+        "/home/run-time-terror/.local/share/fonts/JetBrainsMonoNerdFont-Regular.ttf",
+        // Nerd Fonts (priority - these have icons)
+        "/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/truetype/JetBrainsMonoNL-Regular.ttf",
+        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/opentype/jetbrains-mono/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/jetbrains-mono/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/truetype/firacode/FiraCodeNerdFont-Regular.ttf",
+        "/usr/share/fonts/TTF/FiraCodeNerdFont-Regular.ttf",
+        "/usr/share/fonts/truetype/NerdFonts/JetBrainsMonoNerdFont-Regular.ttf",
+        // Ubuntu Mono (available on this system)
+        "/usr/share/fonts/truetype/ubuntu/UbuntuMono-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/UbuntuMono[wght].ttf",
+        // Common monospace fonts (no icons but better than default)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoMono-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+        nullptr
+    };
+    
+    ImFontConfig fontConfig;
+    fontConfig.MergeMode = false;
+    fontConfig.PixelSnapH = true;
+    
+    // Load main font with icon range
+    ImVector<ImWchar> ranges;
+    ImFontGlyphRangesBuilder builder;
+    
+    // Add default ranges plus FontAwesome icons
+    builder.AddText("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;':\",./<>?");
+    builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+    
+    // Add FontAwesome icon range
+    ImWchar iconRange[] = { ICON_MIN_FA, ICON_MAX_FA, 0 };
+    builder.AddRanges(iconRange);
+    
+    builder.BuildRanges(&ranges);
+    
+    for (int i = 0; fontPaths[i] != nullptr; i++) {
+        struct stat buffer;
+        if (stat(fontPaths[i], &buffer) == 0) {
+            std::cout << "Loading font: " << fontPaths[i] << "\n";
+            if (logFile) {
+                fprintf(logFile, "SUCCESS: Loaded font: %s\n", fontPaths[i]);
+                fflush(logFile);
+            }
+            io.Fonts->AddFontFromFileTTF(fontPaths[i], 16.0f, &fontConfig, ranges.Data);
+            
+            // Check if it's a Nerd Font (supports icons)
+            bool hasIcons = (strstr(fontPaths[i], "Nerd") != nullptr || 
+                           strstr(fontPaths[i], "nerd") != nullptr);
+            if (hasIcons) {
+                std::cout << "Icon font loaded successfully!\n";
+                if (logFile) {
+                    fprintf(logFile, "This font supports icons (Nerd Font detected)\n");
+                    fflush(logFile);
+                }
+            } else {
+                std::cout << "Note: This font doesn't support icons.\n";
+                if (logFile) {
+                    fprintf(logFile, "Note: This font does not support icons\n");
+                    fflush(logFile);
+                }
+            }
+            if (logFile) fclose(logFile);
+            return true;
+        } else {
+            if (logFile) {
+                fprintf(logFile, "NOT FOUND: %s\n", fontPaths[i]);
+                fflush(logFile);
+            }
+        }
+    }
+    
+    std::cout << "No custom font found, using default ImGui font.\n";
+    std::cout << "For better fonts and icons, install a Nerd Font:\n";
+    std::cout << "  sudo apt install fonts-font-awesome fonts-jetbrains-mono\n";
+    std::cout << "  OR download from: https://www.nerdfonts.com/font-downloads\n";
+    
+    if (logFile) {
+        fprintf(logFile, "FAILURE: No fonts found, using default\n");
+        fclose(logFile);
+    }
+    return false;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+int main() {
+    std::cout << "=== RTT Engine Editor ===\n";
+
+    // Initialize GLFW
+    if (!glfwInit()) {
+        std::cerr << "ERROR: Failed to initialize GLFW\n";
+        return -1;
+    }
+    
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(1920, 1080, "RTT Engine Editor", nullptr, nullptr);
     if (!window) {
-        std::cerr << "GLFW Window creation failed!\n";
-        std::cerr << "Possible causes:\n";
-        std::cerr << "  - No display available (running headless)\n";
-        std::cerr << "  - OpenGL 3.3 not supported\n";
-        std::cerr << "  - Graphics drivers not installed\n";
-        std::cerr << "\nTry:\n";
-        std::cerr << "  - Running on a system with a display\n";
-        std::cerr << "  - Installing proper graphics drivers\n";
-        std::cerr << "  - Using software OpenGL: export LIBGL_ALWAYS_SOFTWARE=1\n";
+        std::cerr << "ERROR: Failed to create GLFW window\n";
+        glfwTerminate();
+        return -1;
+    }
+    
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(0);  // Disable vsync for max FPS
+
+    // Initialize GLAD
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cerr << "ERROR: Failed to initialize GLAD\n";
+        glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
     }
 
-    std::cout << "\n=== 3D ENGINE - ANIMATION STATE MACHINE ===\n";
-    std::cout << "Controls:\n";
-    std::cout << "  Mouse - Orbit camera (disabled in fixed mode)\n";
-    std::cout << "  Scroll - Zoom in/out\n";
-    std::cout << "  W/S - Walk forward/backward\n";
-    std::cout << "  A/D - Strafe left/right\n";
-    std::cout << "  Q/E - Camera pivot up/down\n";
-    std::cout << "  R - Reset camera\n";
-    std::cout << "  C - Toggle camera mode (orbit/fixed)\n";
-    std::cout << "  SPACE - Jump\n";
-    std::cout << "  LEFT SHIFT - Sprint (run faster)\n";
-    std::cout << "  LEFT CTRL - Crouch (hold while moving)\n";
-    std::cout << "  F - Toggle wireframe/solid\n";
-    std::cout << "  B - Toggle bone debug (cycle modes)\n";
-    std::cout << "  G - Print foot IK status\n";
-    std::cout << "  H - Print animation state\n";
-    std::cout << "  ESC - Exit\n";
-    std::cout << "========================================\n\n";
-    
-    glfwMakeContextCurrent(window);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-    glfwSetCursorPosCallback(window, mouse_callback);
-    glfwSetScrollCallback(window, scroll_callback);
-    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    std::cout << "OpenGL: " << glGetString(GL_VERSION) << "\n";
 
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        std::cerr << "GLAD failed\n"; glfwTerminate(); return -1;
+    // Initialize GPU Profiler
+    std::cout << "Initializing GPU Profiler...\n";
+    if (!AdvancedGPUProfiler::getInstance().initialize()) {
+        std::cerr << "WARNING: GPU Profiler initialization failed\n";
     }
 
-    std::cout << "GLFW Window created successfully!\n";
-    std::cout << "OpenGL Version: " << glGetString(GL_VERSION) << "\n";
-    std::cout << "GLSL Version: " << glGetString(GL_SHADING_LANGUAGE_VERSION) << "\n";
-    std::cout << "GLAD initialized successfully!\n";
-    std::cout.flush();
+    // Initialize resources
+    initShader();
+    initCube();
+    g_viewportFB.init(1280, 720);
 
-    // Run camera test assertions
-    runCameraTests();
+    // Initialize ImGui
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = "engine_ui.ini";
 
-    glEnable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);  // Start in SOLID mode (not wireframe)
-
-    // Skybox - DISABLED for world terrain rendering
-    // Using clear color + fog for atmosphere instead
-    std::cout << "Skybox disabled - using procedural fog for atmosphere\n";
-    // setupSkybox();  // Disabled
-    // skyboxTexture = 0;  // Disabled
-
-    // Load model
-    std::cout << "Loading model...\n";
-    Model* character = new Model("assets/bot.fbx");
-    const Skeleton& skeleton = character->GetSkeleton();
-    std::cout << "Skeleton bones: " << skeleton.bones.size() << "\n";
-
-    // Calculate model scale
-    glm::vec3 size = character->GetSize();
-    float modelScale = 10.0f / size.y;
-    std::cout << "Model scale: " << modelScale << " (~10 units tall)\n";
-    std::cout << "Meshes: " << character->GetMeshCount() << "\n";
-
-    std::cout << "\n=== LOADING ANIMATIONS ===\n";
+    // Enable proper menu and window behavior
+    io.ConfigWindowsMoveFromTitleBarOnly = true;
     
-    Assimp::Importer importer;
+    // Fix resize duplication - ensure proper alpha blending
+    io.ConfigWindowsResizeFromEdges = true;
     
-    // Load all animations
-    Animation* idleAnim = nullptr;
-    Animation* walkAnim = nullptr;
-    Animation* runAnim = nullptr;
-    Animation* jumpAnim = nullptr;
-    Animation* fallAnim = nullptr;
-    Animation* crouchAnim = nullptr;
-    Animation* crouchWalkAnim = nullptr;
+    // Load icon font
+    loadIconFont(io);
 
-    // ============================================================
-    // LOADING SCREEN
-    // ============================================================
-    std::cout << "\n";
-    std::cout << "========================================\n";
-    std::cout << "  LOADING...\n";
-    std::cout << "========================================\n";
+    // Setup ImGui style
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.FrameRounding = 4.0f;
+    style.GrabRounding = 4.0f;
+    style.WindowRounding = 4.0f;
+    style.TabRounding = 4.0f;
+    style.ScrollbarRounding = 4.0f;
+    style.WindowBorderSize = 1.0f;
+    style.FrameBorderSize = 0.0f;
+    style.TabBorderSize = 0.0f;
+    style.WindowPadding = ImVec2(4, 4);
+    style.FramePadding = ImVec2(6, 3);
+    style.ItemSpacing = ImVec2(6, 4);
     
-    int loadingStep = 0;
-    int totalSteps = 10;  // Total loading steps
+    // Setup ImGui colors (Unreal-inspired dark theme)
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_WindowBg] = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);  // Fully opaque
+    colors[ImGuiCol_Header] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
+    colors[ImGuiCol_Tab] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
+    colors[ImGuiCol_TabActive] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
+    colors[ImGuiCol_MenuBarBg] = ImVec4(0.12f, 0.12f, 0.12f, 1.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.60f, 0.40f, 0.0f, 1.00f);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.60f, 0.40f, 0.0f, 1.00f);
+    colors[ImGuiCol_TextSelectedBg] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
+    colors[ImGuiCol_ResizeGrip] = ImVec4(0.50f, 0.50f, 0.50f, 0.5f);  // Semi-transparent grip
+    colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.60f, 0.60f, 0.60f, 0.7f);
+    colors[ImGuiCol_ResizeGripActive] = ImVec4(0.70f, 0.70f, 0.70f, 0.9f);
+
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 450");
+
+    // Initialize camera and ECS
+    g_camera = new flyCamera(glm::vec3(0, 5, 10), glm::vec3(0, 0, 0), -90, 0, 10);
+    g_world.init();
+    g_world.addSystem<ecs::PhysicsSystem>().setGravity(glm::vec3(0, -9.81f, 0));
+
+    // Initialize Renderer and Render System
+    std::cout << "Initializing Renderer...\n";
+    g_renderer.Initialize();
+    std::cout << "Renderer initialized\n";
+    g_renderSystem.setRenderer(&g_renderer);
+    g_renderSystem.setWorld(&g_world);  // Set world pointer for iteration
+    std::cout << "RenderSystem configured\n";
     
-    auto showProgress = [&]() {
-        loadingStep++;
-        int percent = (loadingStep * 100) / totalSteps;
-        std::cout << "  [" << percent << "%] ";
-        std::cout.flush();
-    };
-
-    // Helper lambda to load animation
-    auto loadAnim = [&](const std::string& path, const std::string& name) -> Animation* {
-        const aiScene* scene = importer.ReadFile(path, aiProcess_Triangulate | aiProcess_FlipUVs);
-        if (scene && scene->HasAnimations()) {
-            Animation* anim = new Animation(AssimpAnimationLoader::LoadAnimationWithPoseCorrection(scene, scene->mAnimations[0]));
-            return anim;
-        }
-        return nullptr;
-    };
-
-    std::cout << "  Loading animations...\n";
+    // Create a simple test model from VAO (cube)
+    g_currentModel = Model::CreateFromVAO(g_cubeVAO, 36);
+    std::cout << "Test model created from VAO (VAO=" << g_cubeVAO << ")\n";
+    g_renderSystem.setModel(g_currentModel);
     
-    // Load animations
-    idleAnim = loadAnim("assets/Idle.fbx", "Idle");    showProgress(); std::cout << "Idle\n";
-    walkAnim = loadAnim("assets/Walking.fbx", "Walk");  showProgress(); std::cout << "Walk\n";
-    runAnim = loadAnim("assets/Run.fbx", "Run");        showProgress(); std::cout << "Run\n";
-    jumpAnim = loadAnim("assets/Jump.fbx", "Jump");     showProgress(); std::cout << "Jump\n";
-    fallAnim = loadAnim("assets/fall.fbx", "Fall");     showProgress(); std::cout << "Fall\n";
-    crouchAnim = loadAnim("assets/Crouching.fbx", "Crouch"); showProgress(); std::cout << "Crouch\n";
-    crouchWalkAnim = loadAnim("assets/chrouchWalk.fbx", "CrouchWalk"); showProgress(); std::cout << "CrouchWalk\n";
-
-    // Load grass model
-    showProgress(); std::cout << "Grass...\n";
-    Model* grassModel = nullptr;
-    try {
-        grassModel = new Model("assets/grass/grass.fbx");
-        if (!grassModel || grassModel->GetMeshCount() == 0) {
-            if (grassModel) delete grassModel;
-            grassModel = nullptr;
-        }
-    } catch (...) {
-        if (grassModel) delete grassModel;
-        grassModel = nullptr;
-    }
-
-    // Create animator
-    showProgress(); std::cout << "Animator...\n";
-    Animator* animator = new Animator(&skeleton);
-
-    // Motion Matching System
-    showProgress(); std::cout << "Motion Matching...\n";
-    MotionMatcher* matcher = new MotionMatcher();
-    matcher->Initialize(&skeleton, animator);
+    // Set shader program for rendering
+    g_renderSystem.setDefaultShaderProgram(g_shaderProg);
+    std::cout << "Shader program set (" << g_shaderProg << ")\n";
     
-    // Configure motion matching
-    MotionMatchingConfig mmConfig;
-    mmConfig.maxSearchResults = 10;
-    mmConfig.searchRadius = 2.0f;
-    mmConfig.useTrajectoryMatching = true;
-    mmConfig.blendDuration = 0.1f;
-    mmConfig.footPlantThreshold = 0.05f;
-    mmConfig.footPlantHeightThreshold = 0.1f;
-    mmConfig.enableFootLocking = true;
-    mmConfig.trajectoryDuration = 0.5f;
-    mmConfig.trajectoryPoints = 5;
-    matcher->SetConfig(mmConfig);
-    
-    // Load animations into motion database
-    std::cout << "\n=== LOADING ANIMATIONS INTO MOTION DATABASE ===\n";
-    if (idleAnim) matcher->LoadAnimation("Idle", std::shared_ptr<Animation>(idleAnim, [](Animation*){}));
-    if (walkAnim) matcher->LoadAnimation("Walk", std::shared_ptr<Animation>(walkAnim, [](Animation*){}));
-    if (runAnim) matcher->LoadAnimation("Run", std::shared_ptr<Animation>(runAnim, [](Animation*){}));
-    if (jumpAnim) matcher->LoadAnimation("Jump", std::shared_ptr<Animation>(jumpAnim, [](Animation*){}));
-    if (crouchAnim) matcher->LoadAnimation("Crouch", std::shared_ptr<Animation>(crouchAnim, [](Animation*){}));
-    if (crouchWalkAnim) matcher->LoadAnimation("CrouchWalk", std::shared_ptr<Animation>(crouchWalkAnim, [](Animation*){}));
-    
-    std::cout << "\nMotion Matching Database Stats:\n";
-    std::cout << matcher->GetDatabaseStats() << "\n";
-    
-    // Build KD-Tree for fast search (after all animations loaded)
-    std::cout << "\nBuilding KD-Tree for fast search...\n";
-    matcher->BuildSearchIndex();
+    // Add render system to world (use our global instance)
+    g_world.addSystem(&g_renderSystem);
+    std::cout << "RenderSystem added to world\n";
 
-    // FIX: Your FBX animations have WRONG duration (29-499 seconds instead of 1-2 seconds)
-    // This happens when Blender/Maya exports entire timeline instead of just the cycle
-    // We'll truncate the duration to the actual animation cycle length
-    auto fixAnimationDuration = [](Animation* anim, float expectedDuration, const std::string& name) {
-        if (anim && anim->duration > 5.0f) {  // Only fix if way too long
-            // The actual animation cycle is the first N frames
-            // Truncate duration to expected length (this makes it loop correctly)
-            anim->duration = expectedDuration;
-            std::cout << "  [FIX] " << name << ": " << anim->name
-                      << " duration " << (anim->duration > 100 ? "TRUNCATED" : "set")
-                      << " (" << anim->duration << "s)\n";
-        }
-    };
+    // Create initial scene (AFTER render system is added)
+    std::cout << "Creating test cubes...\n";
+    createCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(0.8f, 0.2f, 0.2f));
+    std::cout << "Created cube 1\n";
+    createCube(glm::vec3(2, 2, 0), glm::vec3(0.5f), glm::vec3(0.2f, 0.8f, 0.2f));
+    std::cout << "Created cube 2\n";
+    createCube(glm::vec3(-2, 3, 0), glm::vec3(0.7f), glm::vec3(0.2f, 0.2f, 0.8f));
+    std::cout << "Created cube 3\n";
+    std::cout << "Total entities: " << g_world.getEntityCount() << "\n";
 
-    std::cout << "\n=== FIXING ANIMATION DURATIONS (FBX Export Issue) ===\n";
-    fixAnimationDuration(idleAnim, 2.5f, "Idle");
-    fixAnimationDuration(walkAnim, 1.2f, "Walk");
-    fixAnimationDuration(runAnim, 0.9f, "Run");
-    fixAnimationDuration(jumpAnim, 1.1f, "Jump");
-    fixAnimationDuration(fallAnim, 1.0f, "Fall");
-    fixAnimationDuration(crouchAnim, 0.6f, "Crouch");
-    fixAnimationDuration(crouchWalkAnim, 1.0f, "CrouchWalk");
-    std::cout << "Note: Re-export FBX with only animation cycle selected\n";
-
-    // ENABLE root motion - the animation drives the movement
-    // We'll extract root motion and apply it in the camera-relative direction
-    animator->SetLockRootPosition(false);
-    std::cout << "\nRoot motion ENABLED - will extract and apply camera-relative\n";
-    std::cout << "Motion Matching ACTIVE - continuous pose searching\n";
-
-    // Debug: print animation info (AFTER animator created)
-    auto printAnimInfo = [](Animation* anim, const std::string& name) {
-        if (anim) {
-            float frames = anim->duration * 30.0f;  // Assume 30fps
-            std::cout << "  " << name << ": duration=" << anim->duration
-                      << "s (" << (int)frames << " frames @30fps)"
-                      << ", ticks/sec=" << anim->ticksPerSecond
-                      << ", bones=" << anim->boneAnimations.size() << "\n";
-            
-            // Check if animation length is appropriate
-            if (name == "Walk" && (frames < 20 || frames > 60)) {
-                std::cout << "    ⚠️  WARNING: Walk should be 30-45 frames (1-1.5s @30fps)\n";
-            }
-            if (name == "Run" && (frames < 15 || frames > 50)) {
-                std::cout << "    ⚠️  WARNING: Run should be 24-36 frames (0.8-1.2s @30fps)\n";
-            }
-            if (name == "Jump" && (frames < 20 || frames > 60)) {
-                std::cout << "    ⚠️  WARNING: Jump should be 30-45 frames (1-1.5s @30fps)\n";
-            }
-            if (name == "Idle" && (frames < 40 || frames > 120)) {
-                std::cout << "    ⚠️  WARNING: Idle should be 60-90 frames (2-3s @30fps)\n";
-            }
-        } else {
-            std::cout << "  " << name << ": NOT LOADED\n";
-        }
-    };
-    
-    std::cout << "\n=== ANIMATION INFO ===\n";
-    std::cout << "Expected lengths @30fps:\n";
-    std::cout << "  Idle: 60-90 frames (2-3s) - loops IN PLACE\n";
-    std::cout << "  Walk: 30-45 frames (1-1.5s) - loops IN PLACE\n";
-    std::cout << "  Run: 24-36 frames (0.8-1.2s) - loops IN PLACE\n";
-    std::cout << "  Jump: 30-45 frames (1-1.5s) - ONE-SHOT with root motion\n";
-    std::cout << "\nActual animations:\n";
-    printAnimInfo(idleAnim, "Idle");
-    printAnimInfo(walkAnim, "Walk");
-    printAnimInfo(runAnim, "Run");
-    printAnimInfo(jumpAnim, "Jump");
-    printAnimInfo(fallAnim, "Fall");
-    printAnimInfo(crouchAnim, "Crouch");
-    printAnimInfo(crouchWalkAnim, "CrouchWalk");
-    
-    std::cout << "\n=== ROOT MOTION STATUS ===\n";
-    std::cout << "Root position locked: " << (animator->IsRootPositionLocked() ? "YES (code drives movement)" : "NO (root motion DRIVES movement)") << "\n";
-    std::cout << "\n=== TROUBLESHOOTING ===\n";
-    std::cout << "If character slides/stuck in pose:\n";
-    std::cout << "  1. Animations too short? Should be 30-45 frames for walk\n";
-    std::cout << "  2. Root motion wrong? Try: animator->SetLockRootPosition(true)\n";
-    std::cout << "  3. Movement multiplier wrong? Adjust in code (currently 0.25f)\n";
-
-    std::cout << "\nAnimation State Machine initialized!\n";
-    std::cout << "Registered states: " 
-              << (idleAnim ? "IDLE " : "")
-              << (walkAnim ? "WALK " : "")
-              << (runAnim ? "RUN " : "")
-              << (jumpAnim ? "JUMP " : "")
-              << (fallAnim ? "FALL " : "")
-              << (crouchAnim ? "CROUCH " : "")
-              << (crouchWalkAnim ? "CROUCH_WALK " : "")
-              << "\n";
-
-    // ============================================================
-    // SETUP FLOOR AND FOOT IK
-    // ============================================================
-    std::cout << "\n=== SETTING UP PHYSICS FLOOR & FOOT IK ===\n";
-
-    // Floor height (where feet should plant) - will be updated dynamically in main loop
-    float floorHeight = 0.0f;
-
-    // Setup foot IK if animation is loaded
-    if (animator) {
-        // Find foot bone indices from skeleton
-        int leftFoot = skeleton.GetBoneIndex("leftfoot");
-        int rightFoot = skeleton.GetBoneIndex("rightfoot");
-        int leftToe = skeleton.GetBoneIndex("lefttoebase");
-        int rightToe = skeleton.GetBoneIndex("righttoebase");
-
-        std::cout << "Foot bones: left=" << leftFoot << " right=" << rightFoot
-                  << " | leftToe=" << leftToe << " rightToe=" << rightToe << "\n";
-
-        // Configure foot IK - floor height will be updated dynamically in main loop
-        Animator::FootIKSettings ikSettings;
-        ikSettings.enabled = true;
-        ikSettings.floorHeight = floorHeight;  // Updated dynamically in main loop
-        ikSettings.ikStrength = 1.0f;
-        ikSettings.footLockBlend = 0.9f;
-        ikSettings.maxIKDistance = 0.2f;
-        ikSettings.leftFootBone = leftFoot;
-        ikSettings.rightFootBone = rightFoot;
-        ikSettings.leftToeBone = leftToe;
-        ikSettings.rightToeBone = rightToe;
-
-        animator->SetFootIKSettings(ikSettings);
-        std::cout << "Foot IK configured and enabled (floor Y will update dynamically)!\n";
-    }
-    
-    // Create floor physics body (invisible collider)
-    std::shared_ptr<RigidBody> floorBody = std::make_shared<RigidBody>(
-        glm::vec3(0.0f, floorHeight, 0.0f),
-        glm::vec3(200.0f, 1.0f, 200.0f),
-        0.0f,  // infinite mass
-        true   // static
-    );
-    floorBody->colliderType = ColliderType::BOX;
-    floorBody->friction = 0.9f;
-    floorBody->restitution = 0.0f;
-    floorBody->albedo = glm::vec3(0.25f, 0.25f, 0.3f);  // Dark blue-gray
-
-    std::cout << "Floor physics body created at y=" << floorHeight << "\n";
-    
-    // Create visible debug floor plane (for visualization)
-    GLuint debugFloorVAO = 0, debugFloorVBO = 0, debugFloorEBO = 0;
-    {
-        float floorSize = 400.0f;
-        int floorRes = 20;
-        
-        std::vector<float> vertices;
-        std::vector<unsigned int> indices;
-        
-        for (int z = 0; z <= floorRes; z++) {
-            for (int x = 0; x <= floorRes; x++) {
-                float vx = (float)x / floorRes * floorSize - floorSize / 2.0f;
-                float vz = (float)z / floorRes * floorSize - floorSize / 2.0f;
-                vertices.push_back(vx);
-                vertices.push_back(floorHeight);  // At floor height
-                vertices.push_back(vz);
-            }
-        }
-        
-        for (int z = 0; z < floorRes; z++) {
-            for (int x = 0; x < floorRes; x++) {
-                int topLeft = z * (floorRes + 1) + x;
-                int topRight = topLeft + 1;
-                int bottomLeft = (z + 1) * (floorRes + 1) + x;
-                int bottomRight = bottomLeft + 1;
-                
-                indices.push_back(topLeft);
-                indices.push_back(bottomLeft);
-                indices.push_back(topRight);
-                indices.push_back(topRight);
-                indices.push_back(bottomLeft);
-                indices.push_back(bottomRight);
-            }
-        }
-        
-        glGenVertexArrays(1, &debugFloorVAO);
-        glGenBuffers(1, &debugFloorVBO);
-        glGenBuffers(1, &debugFloorEBO);
-        
-        glBindVertexArray(debugFloorVAO);
-        glBindBuffer(GL_ARRAY_BUFFER, debugFloorVBO);
-        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, debugFloorEBO);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
-        
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-        glEnableVertexAttribArray(0);
-        
-        glBindVertexArray(0);
-        
-        std::cout << "Debug floor plane created (visible wireframe grid)\n";
-    }
-    
-    std::cout << "========================================\n\n";
-
-    // ============================================================
-    // OPEN WORLD TERRAIN SYSTEM
-    // ============================================================
-    std::cout << "\n=== INITIALIZING OPEN WORLD TERRAIN ===\n";
-    
-    Terrain::TerrainConfig terrainConfig;
-    terrainConfig.chunkSize = 100.0f;
-    terrainConfig.chunkResolution = 64;
-    terrainConfig.viewDistance = 8;  // Load 4 chunks in each direction
-    terrainConfig.lodDistance = 50.0f;
-    terrainConfig.heightmapSize = 1024;
-    terrainConfig.heightScale = 80.0f;  // Max terrain height
-    
-    Terrain* terrain = new Terrain(terrainConfig);
-    terrain->initialize();
-    
-    // Vegetation system
-    VegetationSystem::VegetationConfig vegConfig;
-    vegConfig.treeDensity = 0.03f;        // More trees
-    vegConfig.grassDensity = 0.8f;         // Dense grass
-    vegConfig.rockDensity = 0.02f;         // More rocks
-    vegConfig.minTreeHeight = 4.0f;
-    vegConfig.maxTreeHeight = 12.0f;
-    vegConfig.maxTreesPerChunk = 80;
-    vegConfig.maxRocksPerChunk = 50;
-    
-    VegetationSystem* vegetation = new VegetationSystem(vegConfig);
-    
-    // World object manager (for importing actual 3D models)
-    WorldObjectManager* worldObjects = new WorldObjectManager();
-    // Try to load from assets/world_objects/ (will use fallbacks if not found)
-    worldObjects->initialize("assets/World_objects/");
-    
-    std::cout << "\n=== WORLD OBJECT MANAGER ===\n";
-    std::cout << "Loaded object types: " << worldObjects->getObjectCount() << " instances\n";
-    std::cout << "To add trees/rocks: Place FBX models in assets/world_objects/\n";
-    std::cout << "==============================\n\n";
-    
-    // Water level
-    float waterLevel = 5.0f;
-
-    // Terrain shader (used in render loop)
-    Shader* terrainShader = nullptr;
-    Shader* waterShader = nullptr;
-    // Shader* treeShader = nullptr;    // Not currently used
-    // Shader* grassShader = nullptr;   // Not currently used
-    // GLuint terrainVAO = 0;           // Not currently used
-    
-    std::cout << "========================================\n\n";
-
-    // ============================================================
-    // CHARACTER MOVEMENT STATE
-    // ============================================================
-    glm::vec3 characterPos(0.0f, 0.0f, 0.0f);  // Character world position
-    
-    // Place character on terrain
-    if (terrain) {
-        float terrainHeight = terrain->getHeightAt(characterPos.x, characterPos.z);
-        // Validate terrain height (prevent NaN)
-        if (std::isfinite(terrainHeight)) {
-            characterPos.y = terrainHeight;
-            std::cout << "[Character] Spawned at terrain height: " << terrainHeight << "\n";
-        } else {
-            characterPos.y = 0.0f;
-            std::cout << "[Character] Spawned at Y=0 (invalid terrain height)\n";
-        }
-    } else {
-        characterPos.y = 0.0f;
-        std::cout << "[Character] Spawned at Y=0 (no terrain)\n";
-    }
-    
-    glm::vec3 characterVelocity(0.0f);
-    glm::vec3 prevCharacterPos(0.0f, 0.0f, 0.0f);  // For velocity calculation
-    float rotationAngle = 0.0f;   // Character rotation (degrees)
-
-    // Create skinned shader
-    SkinnedShader skinnedShader;
-
-    // Create fresh VAOs for skinned mesh
-    std::vector<GLuint> freshVAOs;
-    std::vector<GLsizei> freshCounts;
-    std::cout << "Creating skinned mesh VAOs...\n";
-    for (size_t i = 0; i < character->GetMeshCount(); i++) {
-        Mesh& mesh = character->GetMesh(i);
-        GLuint vao, vbo, ebo;
-        glGenVertexArrays(1, &vao);
-        glGenBuffers(1, &vbo);
-        glGenBuffers(1, &ebo);
-
-        glBindVertexArray(vao);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, mesh.vertices.size() * sizeof(Vertex), mesh.vertices.data(), GL_STATIC_DRAW);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, mesh.indices.size() * sizeof(unsigned int), mesh.indices.data(), GL_STATIC_DRAW);
-
-        // Position (location 0)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Position));
-        glEnableVertexAttribArray(0);
-        // Normal (location 1)
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Normal));
-        glEnableVertexAttribArray(1);
-        // TexCoords (location 2)
-        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, TexCoords));
-        glEnableVertexAttribArray(2);
-        // BoneIDs (location 5) - INTEGER!
-        glVertexAttribIPointer(5, 4, GL_INT, sizeof(Vertex), (void*)offsetof(Vertex, BoneIDs));
-        glEnableVertexAttribArray(5);
-        // Weights (location 6)
-        glVertexAttribPointer(6, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, Weights));
-        glEnableVertexAttribArray(6);
-
-        glBindVertexArray(0);
-
-        freshVAOs.push_back(vao);
-        freshCounts.push_back(mesh.indices.size());
-        
-        // Debug: print sample vertex bone data
-        if (i == 0 && !mesh.vertices.empty()) {
-            Vertex& v = mesh.vertices[0];
-            std::cout << "  Mesh[" << i << "]: " << mesh.vertices.size() << " vertices\n";
-            std::cout << "    Sample vertex: boneIDs=(" << v.BoneIDs.x << "," << v.BoneIDs.y << "," << v.BoneIDs.z << "," << v.BoneIDs.w << ")"
-                      << " weights=(" << v.Weights.x << "," << v.Weights.y << "," << v.Weights.z << "," << v.Weights.w << ")\n";
-        }
-    }
-    std::cout << "Skinned mesh VAOs created\n";
+    std::cout << "Ready!\n";
+    std::cout << "Controls: Right-click+drag to look, WASD to move\n";
 
     // Main loop
-    float lastTime = (float)glfwGetTime();
-    bool running = true;
-    int debugMode = 0;  // 0=normal, 1=bone debug
-    
-    // FPS counter variables
-    int frameCount = 0;
-    float fpsTimer = 0.0f;
+    float lastTime = 0;
+    float fpsTimer = 0;
+    int frames = 0;
 
-    // Loading complete
-    showProgress();
-    std::cout << "\n";
-    std::cout << "========================================\n";
-    std::cout << "  LOADING COMPLETE!\n";
-    std::cout << "========================================\n\n";
-
-    std::cout << "\n=== READY ===\n\n";
-    std::cout << "Camera position: (" << camera.Position.x << ", " << camera.Position.y << ", " << camera.Position.z << ")\n";
-    std::cout << "Character position: (0, 0, 0)\n";
-    std::cout << "AAA QUALITY CAMERA: Maximum smoothing | Zero lag follow\n";
-    std::cout << "Zoom: scroll wheel (10-50 units cinematic range)\n";
-    std::cout << "Press F to toggle wireframe/solid\n";
-    std::cout << "Press B for bone debug visualization\n";
-    std::cout << "Press H to print camera debug\n";
-    std::cout << "Press ESC to exit\n\n";
-    std::cout << "=== MAIN LOOP STARTED ===\n";
-    std::cout.flush();
-
-    while (running && !glfwWindowShouldClose(window)) {
-        float now = (float)glfwGetTime();
-        float dt = std::min(now - lastTime, 0.1f);  // Cap dt to prevent huge jumps
+    while (!glfwWindowShouldClose(window)) {
+        // Start GPU frame
+        BEGIN_GPU_FRAME();
+        
+        // Calculate delta time
+        float now = glfwGetTime();
+        float dt = now - lastTime;
         lastTime = now;
 
-        // FPS counter (print every 5 seconds for minimal spam)
-        frameCount++;
+        // FPS counter
+        frames++;
         fpsTimer += dt;
-        if (fpsTimer >= 5.0f) {
-            std::cout << "[FPS] " << frameCount << " (" << (1000.0f * fpsTimer / frameCount) << "ms/frame)\n";
-            std::cout.flush();
-            frameCount = 0;
-            fpsTimer = 0.0f;
+        if (fpsTimer >= 1.0f) {
+            g_fps = static_cast<float>(frames);
+            frames = 0;
+            fpsTimer = 0;
         }
 
-        glfwPollEvents();
-        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) running = false;
+        // Update ECS
+        g_world.update(dt);
 
-        // ============================================================
-        // CAMERA CONTROLS (Mouse orbit + Q/E only)
-        // ============================================================
-        float moveSpeed = 10.0f * dt;
+        // Handle mouse input for viewport camera
+        double mx, my;
+        glfwGetCursorPos(window, &mx, &my);
         
-        // Q/E for camera up/down only
-        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
-            cameraPivot.y -= moveSpeed;
+        if (g_isViewing && !io.WantCaptureMouse) {
+            float dx = static_cast<float>(mx - g_lastMousePos.x);
+            float dy = static_cast<float>(my - g_lastMousePos.y);
+            g_camera->ProcessMouseMovement(dx * 0.3f, dy * 0.3f);
         }
-        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
-            cameraPivot.y += moveSpeed;
-        }
-        if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
-            cameraPivot = glm::vec3(0, 2, 0);
-            cameraDistance = 10.0f;
-            camera.Yaw = -90;
-            camera.Pitch = 0;
-        }
+        g_lastMousePos = glm::vec2(static_cast<float>(mx), static_cast<float>(my));
 
-        // Toggle fixed camera mode (C key)
-        static bool lastC = false;
-        if (glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS && !lastC) {
-            cameraFixedMode = !cameraFixedMode;
-            std::cout << ">>> Camera Mode: " << (cameraFixedMode ? "FIXED (stable)" : "ORBIT") << "\n";
-            if (cameraFixedMode) {
-                // Reset to behind character
-                camera.Yaw = -90;
-                camera.Pitch = 0;
+        // Handle keyboard shortcuts
+        if (!io.WantCaptureKeyboard) {
+            // Gizmo tools
+            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) g_gizmoType = GizmoType::Translate;
+            if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) g_gizmoType = GizmoType::Rotate;
+            if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) g_gizmoType = GizmoType::Scale;
+            if (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS) {
+                g_spaceType = (g_spaceType == SpaceType::World) ? SpaceType::Local : SpaceType::World;
             }
-        }
-        lastC = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
-
-        // NOTE: Camera update moved to AFTER character position is finalized
-        // This ensures camera follows the actual character position, not the previous frame's position
-
-        // ============================================================
-        // CHARACTER MOVEMENT INPUT (WASD triggers animation, root motion drives movement)
-        // ============================================================
-        CharacterInput charInput;
-
-        // Movement input (WASD) - this triggers animation direction, NOT direct movement
-        glm::vec2 moveDir(0.0f);
-
-        // WASD input
-        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) moveDir.y = 1.0f;
-        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) moveDir.y = -1.0f;
-        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) moveDir.x = 1.0f;
-        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) moveDir.x = -1.0f;
-
-        // Normalize direction (prevent faster diagonal movement)
-        if (glm::length(moveDir) > 1.0f) {
-            moveDir = glm::normalize(moveDir);
-        }
-
-        charInput.moveDirection = moveDir;
-        charInput.moveMagnitude = glm::length(moveDir);
-
-        // Action inputs
-        charInput.crouch = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS);
-        charInput.sprint = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS);
-
-        // Calculate movement direction in world space (relative to camera)
-        // This is used for character rotation and root motion direction
-        glm::vec3 moveDirection(0.0f);
-
-        if (charInput.moveMagnitude > 0.1f) {
-            // Get camera forward and right vectors (flattened to XZ plane)
-            glm::vec3 camForward = glm::normalize(camera.Target - camera.Position);
-            camForward.y = 0.0f;
-            camForward = glm::normalize(camForward);
-
-            glm::vec3 camRight = glm::normalize(glm::cross(camForward, glm::vec3(0.0f, 1.0f, 0.0f)));
-
-            // Calculate movement direction
-            moveDirection = camForward * charInput.moveDirection.y + camRight * charInput.moveDirection.x;
-            moveDirection = glm::normalize(moveDirection);
-
-            // Smooth rotation - interpolate current angle toward target angle
-            // SLOW rotation for realistic foot planting - character turns gradually
-            float targetAngle = atan2(moveDirection.x, moveDirection.z) * 180.0f / 3.14159f;
-            float rotationSpeed = 180.0f * dt;  // degrees per second (slow, natural turning)
             
-            // Handle angle wrapping (-180 to 180)
-            float angleDiff = targetAngle - rotationAngle;
-            while (angleDiff > 180.0f) angleDiff -= 360.0f;
-            while (angleDiff < -180.0f) angleDiff += 360.0f;
+            // Entity operations (with Ctrl modifier)
+            bool ctrlPressed = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                               glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
             
-            // Deadzone: Don't rotate if angle difference is very small (prevents jitter)
-            if (std::abs(angleDiff) > 1.0f) {
-                // Clamp the change to rotation speed
-                if (std::abs(angleDiff) > rotationSpeed) {
-                    rotationAngle += std::copysign(rotationSpeed, angleDiff);
-                } else {
-                    rotationAngle = targetAngle;
+            if (ctrlPressed) {
+                if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+                    duplicateSelectedEntity();
+                    // Simple debounce
+                    static float lastDupTime = 0;
+                    if (glfwGetTime() - lastDupTime > 0.2f) {
+                        lastDupTime = glfwGetTime();
+                    }
+                }
+            }
+            
+            // Delete key
+            if (glfwGetKey(window, GLFW_KEY_DELETE) == GLFW_PRESS) {
+                static float lastDelTime = 0;
+                if (glfwGetTime() - lastDelTime > 0.2f) {
+                    deleteSelectedEntity();
+                    lastDelTime = glfwGetTime();
+                }
+            }
+            
+            // Console toggle
+            if (glfwGetKey(window, GLFW_KEY_BACKSLASH) == GLFW_PRESS) {
+                static float lastToggle = 0;
+                if (glfwGetTime() - lastToggle > 0.2f) {
+                    g_showConsole = !g_showConsole;
+                    lastToggle = glfwGetTime();
                 }
             }
         }
 
-        // Jump input - triggers animation state, not direct position change
-        static bool lastJump = false;
-        bool jumpKeyPressed = (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS);
-        charInput.jump = jumpKeyPressed && !lastJump;  // Edge detected: just pressed
-        lastJump = jumpKeyPressed;
-
-        // Grounded check based on terrain height
-        float terrainHeight = terrain ? terrain->getHeightAt(characterPos.x, characterPos.z) : 0.0f;
-        bool wasGrounded = (characterPos.y <= terrainHeight + 0.01f);
-        charInput.grounded = wasGrounded;  // FSM needs ORIGINAL grounded state for jump check
-
-        // Jump handling - set vertical velocity
-        static float jumpVelocity = 0.0f;
-        if (charInput.jump && wasGrounded) {
-            jumpVelocity = 5.0f;  // Initial jump impulse
-            charInput.verticalVelocity = jumpVelocity;
-            // Don't set grounded=false here - FSM needs to see grounded=true for jump trigger
-            // grounded will be set false NEXT frame after FSM processes
-        } else if (!wasGrounded) {
-            jumpVelocity -= 12.0f * dt;  // Gravity
-            charInput.verticalVelocity = jumpVelocity;
-            charInput.grounded = false;  // Now set grounded false for physics
-
-            if (jumpVelocity <= 0.0f && characterPos.y <= terrainHeight + 0.01f) {
-                charInput.grounded = true;
-                jumpVelocity = 0.0f;
-            }
+        // Render 3D scene to FBO
+        {
+            PROFILE_GPU_SCOPE("Render Scene");
+            renderScene();
         }
 
-        // Apply gravity to character position (animation provides initial jump impulse)
-        if (!charInput.grounded) {
-            characterPos.y += jumpVelocity * dt;
-            // Clamp to terrain height
-            if (characterPos.y < terrainHeight) {
-                characterPos.y = terrainHeight;
-                charInput.grounded = true;
-                jumpVelocity = 0.0f;
-            }
-        } else {
-            // Snap to terrain when grounded
-            characterPos.y = terrainHeight;
-        }
+        // End GPU frame
+        END_GPU_FRAME();
 
-        // Toggle wireframe
-        static bool lastF = false;
-        if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS && !lastF) {
-            static bool wireframe = true;
-            wireframe = !wireframe;
-            glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
-            std::cout << ">>> Wireframe: " << (wireframe ? "ON" : "OFF") << "\n";
-        }
-        lastF = glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS;
+        // Setup ImGui frame
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
 
-        // Toggle bone debug view (cycle through 3 modes)
-        static bool lastB = false;
-        if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS && !lastB) {
-            debugMode = (debugMode + 1) % 3;
-            if (debugMode == 0) std::cout << ">>> Bone debug: OFF\n";
-            else if (debugMode == 1) std::cout << ">>> Bone debug: ON (color=boneID)\n";
-            else std::cout << ">>> Bone debug: ON (color=weights RGB)\n";
-        }
-        lastB = glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS;
-
-        // Toggle foot IK debug
-        static bool lastG = false;
-        if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS && !lastG && animator) {
-            std::cout << "\n=== FOOT IK STATUS ===\n";
-            std::cout << "Enabled: " << (animator->footIKSettings.enabled ? "YES" : "NO") << "\n";
-            std::cout << "Floor height: " << animator->footIKSettings.floorHeight << "\n";
-            std::cout << "Character grounded: " << (animator->IsCharacterGrounded() ? "YES" : "NO") << "\n";
-            std::cout << "Left foot planted: " << (animator->IsFootPlanted(animator->footIKSettings.leftFootBone) ? "YES" : "NO") << "\n";
-            std::cout << "Right foot planted: " << (animator->IsFootPlanted(animator->footIKSettings.rightFootBone) ? "YES" : "NO") << "\n";
-            std::cout << "Character Y position: " << characterPos.y << "\n";
-            animator->DebugDrawFootIK();
-        }
-        lastG = glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS;
+        // Get window dimensions
+        int windowW, windowH;
+        glfwGetWindowSize(window, &windowW, &windowH);
         
-        // Print MOTION MATCHING debug
-        static bool lastH = false;
-        if (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS && !lastH) {
-            std::cout << "\n=== MOTION MATCHING DEBUG ===\n";
-            matcher->PrintDebugInfo();
-            std::cout << "[CAMERA] Pos=(" << camera.Position.x << ", " << camera.Position.y << ", " << camera.Position.z << ")\n";
-            std::cout << "[CHARACTER] Pos=(" << characterPos.x << ", " << characterPos.y << ", " << characterPos.z << ")\n";
-            std::cout << "[DISTANCE] Camera-to-character=" << glm::length(camera.Position - characterPos) << " units\n";
-        }
-        lastH = glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS;
+        // Panel dimensions
+        const float menuBarHeight = 25.0f;
+        const float toolbarHeight = 36.0f;
+        const float sidePanelWidth = 280.0f;
+        const float bottomPanelHeight = 250.0f;
+        const float consoleHeight = 180.0f;
+        const float statusBarHeight = 24.0f;
+        
+        // Use smaller of console or bottom panel height for tabbed panel
+        const float tabbedBottomHeight = consoleHeight;
 
-        // ============================================================
-        // UPDATE MOTION MATCHING (Replaces FSM update)
-        // ============================================================
-        if (matcher) {
-            // Build character state for motion matching
-            CharacterState charState;
-            charState.position = characterPos;
-            charState.velocity = characterVelocity;
-            charState.rotation = glm::radians(rotationAngle);
-            charState.moveDirection = moveDir;
-            charState.grounded = charInput.grounded;
-            charState.crouching = charInput.crouch;
-            charState.jumping = charInput.jump;
-            
-            // Update motion matching - searches database, blends poses, applies foot IK
-            matcher->Update(dt, charState);
-
-            // CRITICAL: Update animator to calculate bone matrices!
-            if (animator) {
-                animator->Update(dt);
-            }
-
-            // Motion matching debug only on 'H' key press (see line ~1140)
-        }
-
-        // Build model matrix with character position and rotation
-        glm::mat4 modelMat = glm::translate(glm::mat4(1.0f), characterPos);
-        modelMat *= glm::rotate(glm::mat4(1.0f), glm::radians(rotationAngle), glm::vec3(0.0f, 1.0f, 0.0f));
-        modelMat *= glm::scale(glm::mat4(1.0f), glm::vec3(modelScale));
-
-        // Extract root motion from animation and apply in camera-relative direction
-        // Root motion DRIVES the movement, not the keyboard input
-        glm::vec3 rootMotionDelta(0.0f);  // Track how much we moved this frame
-
-        if (animator) {
-            glm::vec3 rootMotion = animator->ConsumeRootMotion();
-            float motionMagnitude = glm::length(rootMotion);
-
-            // Apply root motion for movement
-            if (charInput.moveMagnitude > 0.01f && moveDirection != glm::vec3(0.0f)) {
-                float movementMultiplier = 0.25f;
-                rootMotionDelta = moveDirection * motionMagnitude * movementMultiplier;
-                characterPos += rootMotionDelta;
-            }
-
-            // Update foot IK floor height based on terrain (dynamic)
-            if (terrain && animator->footIKSettings.enabled) {
-                float terrainHeight = terrain->getHeightAt(characterPos.x, characterPos.z);
-                if (std::isfinite(terrainHeight)) {
-                    Animator::FootIKSettings ikSettings = animator->footIKSettings;
-                    ikSettings.floorHeight = terrainHeight;  // Update to match terrain
-                    animator->SetFootIKSettings(ikSettings);
+        // ========== MENU BAR ==========
+        if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("New Scene", "Ctrl+N")) {
+                    // Clear scene and create new one
+                    g_world.shutdown();
+                    g_world.init();
+                    g_selected = ecs::INVALID_ENTITY_ID;
+                    std::cout << "New scene created\n";
                 }
+                if (ImGui::MenuItem("Open Scene", "Ctrl+O")) {
+                    // For now, load a default scene file
+                    loadScene("scene.json");
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Save", "Ctrl+S")) {
+                    saveScene(g_currentSceneFile.empty() ? "scene.json" : g_currentSceneFile);
+                }
+                if (ImGui::MenuItem("Save As", "Ctrl+Shift+S")) {
+                    saveScene("scene.json");
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Exit", "Alt+F4")) {
+                    glfwSetWindowShouldClose(window, true);
+                }
+                ImGui::EndMenu();
             }
 
-            // Update foot IK (after position update)
-            bool isMoving = (charInput.moveMagnitude > 0.1f);
-            animator->UpdateFootIK(dt, modelMat, isMoving);
-        }
-        
-        // CRITICAL: Calculate character velocity for motion matching!
-        // Velocity = position delta / time (with dt safety check)
-        if (dt > 0.0001f) {
-            characterVelocity = (characterPos - prevCharacterPos) / dt;
-        } else {
-            characterVelocity = glm::vec3(0.0f);
-        }
-        prevCharacterPos = characterPos;  // Save for next frame
+            if (ImGui::BeginMenu("Edit")) {
+                if (ImGui::MenuItem("Undo", "Ctrl+Z")) {
+                    // TODO: Implement undo system
+                    std::cout << "Undo not yet implemented\n";
+                }
+                if (ImGui::MenuItem("Redo", "Ctrl+Y")) {
+                    // TODO: Implement redo system
+                    std::cout << "Redo not yet implemented\n";
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Preferences")) {
+                    // TODO: Implement preferences
+                    std::cout << "Preferences not yet implemented\n";
+                }
+                ImGui::EndMenu();
+            }
 
-        // ============================================================
-        // THIRD-PERSON CAMERA FOLLOW (AAA QUALITY - MAXIMUM SMOOTHING)
-        // ============================================================
-        // CRITICAL: This runs AFTER characterPos is updated with root motion
-        // This ensures camera follows the ACTUAL position, not last frame's position
-        if (cameraFollowEnabled) {
-            // AAA QUALITY - MAXIMUM SMOOTHING FOR PERFECT FOLLOW
-            // At 60fps with smooth=60.0f: ~63% interpolation per frame (essentially locked on)
-            // At 144fps with smooth=60.0f: ~30% interpolation per frame (still very tight)
-            // Frame-rate independent: dt scaling ensures consistent behavior
-            const float CAMERA_SMOOTH = 60.0f;      // MAXIMUM - camera locked to character
-            const float PIVOT_SMOOTH = 40.0f;       // MAXIMUM - pivot follows instantly
-            // const float ROTATION_SMOOTH = 50.0f; // Reserved for future rotation smoothing
+            if (ImGui::BeginMenu("GameObject")) {
+                if (ImGui::MenuItem("Cube")) {
+                    createCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(0.8f, 0.8f, 0.8f));
+                }
+                if (ImGui::MenuItem("Sphere")) {
+                    createSphere(glm::vec3(0, 1, 0), 0.5f, glm::vec3(0.2f, 0.8f, 0.2f));
+                }
+                if (ImGui::MenuItem("Plane")) {
+                    createPlane(glm::vec3(0, 0, 0), glm::vec2(10, 10), glm::vec3(0.5f, 0.5f, 0.5f));
+                }
+                if (ImGui::MenuItem("Light")) {
+                    createLight(glm::vec3(5, 10, 5), glm::vec3(1, 1, 0.9f), 1.0f);
+                }
+                if (ImGui::MenuItem("Camera")) {
+                    createCamera(glm::vec3(0, 5, 10), glm::vec3(0, 0, 0));
+                }
+                ImGui::EndMenu();
+            }
 
-            // Update pivot to follow character (maximum smoothing - no perceptible lag)
-            glm::vec3 targetPivot = characterPos + glm::vec3(0, 2.0f, 0);
+            if (ImGui::BeginMenu("Window")) {
+                ImGui::MenuItem("World Outliner", nullptr, true);
+                ImGui::MenuItem("Details", nullptr, true);
+                ImGui::MenuItem("Toolbox", nullptr, true);
+                ImGui::MenuItem("Viewport", nullptr, true);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Profiler")) {
+                    g_uiState.bottomPanelTab = 2;  // Switch to Profiler tab
+                }
+                ImGui::EndMenu();
+            }
+
+            if (ImGui::BeginMenu("Help")) {
+                if (ImGui::MenuItem("Documentation")) {
+                    std::cout << "Opening documentation...\n";
+                    // TODO: Open documentation URL
+                }
+                if (ImGui::MenuItem("About RTT Engine")) {
+                    g_showAbout = true;
+                }
+                ImGui::EndMenu();
+            }
+
+            // Performance stats on right side
+            ImGui::Separator();
+            ImGui::SameLine();
             
-            // Validate pivot position
-            if (std::isfinite(targetPivot.x) && std::isfinite(targetPivot.y) && std::isfinite(targetPivot.z)) {
-                float smoothFactor = glm::clamp(PIVOT_SMOOTH * dt, 0.0f, 1.0f);
-                cameraPivot = glm::mix(cameraPivot, targetPivot, smoothFactor);
+            char perfText[64];
+            snprintf(perfText, sizeof(perfText), "FPS: %.0f  |  Entities: %d", g_fps, g_world.getEntityCount());
+            float perfWidth = ImGui::CalcTextSize(perfText).x + 30;
+            ImGui::SetCursorPosX(ImGui::GetWindowWidth() - perfWidth - 150);
+            ImGui::TextColored(ImVec4(0.5f, 0.7f, 0.5f, 1), "%s", perfText);
+            
+            // GPU time if available
+            auto& profiler = AdvancedGPUProfiler::getInstance();
+            float gpuTime = profiler.getFrameTimeMs();
+            if (gpuTime > 0) {
+                ImGui::SameLine();
+                char gpuText[64];
+                snprintf(gpuText, sizeof(gpuText), "GPU: %.2f ms", gpuTime);
+                ImGui::TextColored(ImVec4(0.5f, 0.7f, 1.0f, 1), "%s", gpuText);
             }
 
-            if (cameraFixedMode) {
-                // FIXED MODE: Camera directly behind character (AAA quality)
-                glm::vec3 forward;
-                forward.x = sin(glm::radians(rotationAngle));
-                forward.z = cos(glm::radians(rotationAngle));
-                forward.y = 0.0f;
+            ImGui::EndMainMenuBar();
+        }
+
+        // ========== TOOLBAR ==========
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.08f, 1));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+        ImGui::BeginChild("Toolbar", ImVec2(static_cast<float>(windowW), toolbarHeight), 
+                         false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollbar);
+
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 3));
+
+        // Transform tools
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Transform:");
+        ImGui::SameLine();
+
+        const char* transformTools[] = {"Translate", "Rotate", "Scale"};
+        GizmoType transformTypes[] = {GizmoType::Translate, GizmoType::Rotate, GizmoType::Scale};
+        const char* transformTooltips[] = {"Translate Tool (W)", "Rotate Tool (E)", "Scale Tool (R)"};
+        
+        for (int i = 0; i < 3; i++) {
+            bool isActive = (g_gizmoType == transformTypes[i]);
+            ImGui::PushStyleColor(ImGuiCol_Button, isActive ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+            if (ImGui::Button(transformTools[i], ImVec2(75, 28))) {
+                g_gizmoType = transformTypes[i];
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", transformTooltips[i]);
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+        }
+
+        // Separator
+        ImGui::Dummy(ImVec2(15, 1));
+        ImGui::SameLine();
+        ImGui::Separator();
+        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(15, 1));
+        ImGui::SameLine();
+
+        // Space toggle
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Space:");
+        ImGui::SameLine();
+
+        const char* spaceText = (g_spaceType == SpaceType::World) ? "World" : "Local";
+        if (ImGui::Button(spaceText, ImVec2(70, 28))) {
+            g_spaceType = (g_spaceType == SpaceType::World) ? SpaceType::Local : SpaceType::World;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Transform Space (X)");
+        ImGui::SameLine();
+
+        // Separator
+        ImGui::Dummy(ImVec2(15, 1));
+        ImGui::SameLine();
+        ImGui::Separator();
+        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(15, 1));
+        ImGui::SameLine();
+
+        // View options
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "View:");
+        ImGui::SameLine();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, g_showGrid ? ImVec4(0.3f, 0.3f, 0.2f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+        if (ImGui::Button("Grid", ImVec2(50, 28))) g_showGrid = !g_showGrid;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Grid Display");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, g_showGizmo ? ImVec4(0.3f, 0.3f, 0.2f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+        if (ImGui::Button("Gizmo", ImVec2(55, 28))) g_showGizmo = !g_showGizmo;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Gizmo Display");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+
+        // Separator
+        ImGui::Dummy(ImVec2(15, 1));
+        ImGui::SameLine();
+        ImGui::Separator();
+        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(15, 1));
+        ImGui::SameLine();
+
+        // Play controls
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Play:");
+        ImGui::SameLine();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, g_isPlaying ? ImVec4(0.1f, 0.3f, 0.1f, 1) : ImVec4(0.2f, 0.5f, 0.2f, 1));
+        if (ImGui::Button(g_isPlaying ? "PLAYING" : "PLAY", ImVec2(70, 28))) {
+            if (!g_isPlaying) {
+                // Enter play mode
+                g_isPlaying = true;
+                g_wasPlaying = false;
+                std::cout << "=== PLAY MODE ===\n";
+                // TODO: Save current state before entering play mode
+            }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Enter Play Mode");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, g_isPlaying ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.3f, 0.3f, 0.3f, 1));
+        ImGui::BeginDisabled(!g_isPlaying);
+        if (ImGui::Button("PAUSE", ImVec2(70, 28))) {
+            g_wasPlaying = g_isPlaying;
+            g_isPlaying = !g_wasPlaying;
+            std::cout << (g_wasPlaying ? "=== PAUSED ===\n" : "=== RESUMED ===\n");
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pause/Resume Game");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, g_isPlaying ? ImVec4(0.5f, 0.1f, 0.1f, 1) : ImVec4(0.3f, 0.3f, 0.3f, 1));
+        ImGui::BeginDisabled(!g_isPlaying && !g_wasPlaying);
+        if (ImGui::Button("STOP", ImVec2(60, 28))) {
+            if (g_isPlaying || g_wasPlaying) {
+                g_isPlaying = false;
+                g_wasPlaying = false;
+                std::cout << "=== STOP (Exited Play Mode) ===\n";
+                // TODO: Restore state from before play mode
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Exit Play Mode");
+        ImGui::PopStyleColor();
+
+        ImGui::PopStyleVar(2);
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+
+        // ========== LEFT PANEL (Outliner / Details - Tabbed) ==========
+        ImGui::SetNextWindowPos(ImVec2(0, menuBarHeight + toolbarHeight));
+        ImGui::SetNextWindowSize(ImVec2(sidePanelWidth,
+            static_cast<float>(windowH) - menuBarHeight - toolbarHeight - tabbedBottomHeight));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.25f, 0.25f, 0.25f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, 1));
+        ImGui::Begin("Scene", nullptr,
+            ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+        // Tab buttons
+        ImGui::PushStyleColor(ImGuiCol_Button, g_uiState.leftPanelTab == 0 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+        if (ImGui::Button("Outliner", ImVec2(sidePanelWidth/2 - 5, 28))) g_uiState.leftPanelTab = 0;
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, g_uiState.leftPanelTab == 1 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+        if (ImGui::Button("Details", ImVec2(sidePanelWidth/2 - 5, 28))) g_uiState.leftPanelTab = 1;
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (g_uiState.leftPanelTab == 0) {
+            // ========== WORLD OUTLINER ==========
+            // Search box
+            ImGui::PushItemWidth(-1);
+            ImGui::InputTextWithHint("##Search", "Search entities...", g_uiState.searchBuffer,
+                                    sizeof(g_uiState.searchBuffer));
+            ImGui::PopItemWidth();
+            ImGui::Separator();
+            ImGui::Spacing();
+            
+            int entityCount = 0;
+        g_world.forEach<ecs::TransformComponent, ecs::MeshComponent>(
+            [&](ecs::EntityID id, ecs::TransformComponent&, ecs::MeshComponent& m) {
+                bool isSelected = (g_selected == id);
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    isSelected ? ImVec4(1.0f, 0.8f, 0.2f, 1) : ImVec4(0.85f, 0.85f, 0.85f, 1));
+
+                char label[64];
+                snprintf(label, sizeof(label), "Entity %d", id);
+
+                // Right-click context menu
+                if (ImGui::Selectable(label, isSelected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                    g_selected = id;
+                    if (ImGui::IsMouseDoubleClicked(0)) {
+                        // Double-click: focus on entity (TODO: move camera)
+                        logMessage("Focus on: " + std::string(label));
+                    }
+                }
                 
-                // Prevent NaN from normalizing zero vector
-                if (glm::length(forward) > 0.0001f) {
-                    forward = glm::normalize(forward);
-                } else {
-                    forward = glm::vec3(0.0f, 0.0f, 1.0f);  // Default forward
+                // Context menu on right-click
+                if (ImGui::BeginPopupContextItem()) {
+                    g_selected = id;
+                    if (ImGui::MenuItem("Duplicate", "Ctrl+D")) {
+                        duplicateSelectedEntity();
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Delete", "Delete")) {
+                        deleteSelectedEntity();
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Rename")) {
+                        // TODO: Open rename dialog
+                    }
+                    ImGui::EndPopup();
+                }
+                
+                ImGui::PopStyleColor();
+                entityCount++;
+            });
+
+        // Global context menu (right-click in empty space)
+        if (ImGui::BeginPopupContextWindow("OutlinerContext")) {
+            if (ImGui::MenuItem("Create Cube")) {
+                createCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(0.8f, 0.8f, 0.8f));
+            }
+            if (ImGui::MenuItem("Create Sphere")) {
+                createSphere(glm::vec3(0, 1, 0), 0.5f, glm::vec3(0.2f, 0.8f, 0.2f));
+            }
+            if (ImGui::MenuItem("Create Plane")) {
+                createPlane(glm::vec3(0, 0, 0), glm::vec2(10, 10), glm::vec3(0.5f, 0.5f, 0.5f));
+            }
+            if (ImGui::MenuItem("Create Light")) {
+                createLight(glm::vec3(5, 10, 5), glm::vec3(1, 1, 0.9f), 1.0f);
+            }
+            if (ImGui::MenuItem("Create Camera")) {
+                createCamera(glm::vec3(0, 5, 10), glm::vec3(0, 0, 0));
+            }
+            ImGui::EndPopup();
+        }
+
+        if (entityCount == 0) {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "No entities in scene");
+            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1), "Right-click to create one");
+        }
+
+        } else {
+            // ========== DETAILS ==========
+            if (g_selected != ecs::INVALID_ENTITY_ID) {
+                // Get components safely
+                ecs::Entity selectedEntity{g_selected};
+
+                // Check if entity still exists before accessing
+                bool entityStillExists = false;
+                ecs::TransformComponent* t = nullptr;
+                ecs::MeshComponent* m = nullptr;
+
+                // Try to get components (they may not exist or entity may be destroyed)
+                if (selectedEntity.isValid()) {
+                    t = g_world.getComponentArchetype<ecs::TransformComponent>(selectedEntity);
+                    m = g_world.getComponentArchetype<ecs::MeshComponent>(selectedEntity);
+                    entityStillExists = (t || m);
                 }
 
-                glm::vec3 targetCamPos = characterPos - forward * cameraDistance + glm::vec3(0, cameraHeight, 0);
+                ImGui::Separator();
+                ImGui::Spacing();
 
-                // Validate target position (prevent NaN)
-                if (std::isfinite(targetCamPos.x) && std::isfinite(targetCamPos.y) && std::isfinite(targetCamPos.z)) {
-                    // MAXIMUM smoothing - camera essentially locked to character
-                    float smoothFactor = glm::clamp(CAMERA_SMOOTH * dt, 0.0f, 1.0f);
-                    camera.Position = glm::mix(camera.Position, targetCamPos, smoothFactor);
-                    camera.Target = cameraPivot;
+                // Transform component
+                if (t && entityStillExists) renderTransformSection(t);
+
+                // Mesh component
+                if (m && entityStillExists) renderMeshSection(m);
+
+            } else {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "No entity selected");
+                ImGui::Dummy(ImVec2(0, 20));
+                ImGui::TextWrapped("Select an entity from the Outliner to view and edit its properties.");
+            }
+        }
+
+        ImGui::PopStyleColor(2);
+        ImGui::End();
+
+        // ========== BOTTOM PANEL (Content / Console / Debug - Tabbed) ==========
+        ImGui::SetNextWindowPos(ImVec2(0, static_cast<float>(windowH) - tabbedBottomHeight));
+        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(windowW), tabbedBottomHeight));
+        ImGui::Begin("Toolbox", nullptr,
+            ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoBringToFrontOnFocus);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, 1));
+
+        // Tab buttons
+        ImGui::PushStyleColor(ImGuiCol_Button, g_uiState.bottomPanelTab == 0 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+        if (ImGui::Button("Content", ImVec2(90, 28))) g_uiState.bottomPanelTab = 0;
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, g_uiState.bottomPanelTab == 1 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+        if (ImGui::Button("Console", ImVec2(90, 28))) g_uiState.bottomPanelTab = 1;
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, g_uiState.bottomPanelTab == 2 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+        if (ImGui::Button("Profiler", ImVec2(90, 28))) g_uiState.bottomPanelTab = 2;
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (g_uiState.bottomPanelTab == 0) {
+            // ========== CONTENT BROWSER ==========
+
+        // Path bar
+        ImGui::PushItemWidth(300);
+        ImGui::InputText("##Path", g_uiState.pathBuffer, sizeof(g_uiState.pathBuffer));
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+
+        if (ImGui::Button("Refresh", ImVec2(75, 0))) {
+            std::cout << "Refreshing asset browser: " << g_uiState.pathBuffer << "\n";
+            // Asset refresh would scan the directory
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Import", ImVec2(75, 0))) {
+            std::cout << "Import asset dialog (not implemented)\n";
+            // TODO: Open file dialog for asset import
+        }
+
+        ImGui::Separator();
+
+        // Asset grid
+        ImGui::BeginChild("Assets", ImVec2(0, 0), true);
+
+        // Calculate grid layout
+        float iconSize = 70.0f;
+        float availWidth = ImGui::GetContentRegionAvail().x;
+        int itemsPerRow = std::max(1, static_cast<int>(availWidth / (iconSize + 15)));
+
+        // Meshes section
+        ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1), "MESHES");
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, 8));
+
+        const char* meshes[] = {"Cube", "Sphere", "Plane", "Cylinder", "Cone", "Torus"};
+        for (int i = 0; i < 6; i++) {
+            ImGui::PushID(i);
+            
+            // Asset box
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 1));
+            ImGui::Button("##Asset", ImVec2(iconSize, iconSize));
+            ImGui::PopStyleColor();
+            
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Click to select %s", meshes[i]);
+            }
+            
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s", meshes[i]);
+            ImGui::SameLine();
+
+            if ((i + 1) % itemsPerRow != 0 && i < 5) {
+                ImGui::SameLine();
+            }
+            ImGui::PopID();
+        }
+
+        ImGui::Dummy(ImVec2(0, 15));
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, 10));
+
+        // Materials section
+        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.4f, 1), "MATERIALS");
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, 8));
+
+        const char* materials[] = {"M_Default", "M_Metal", "M_Wood", "M_Stone", "M_Glass"};
+        for (int i = 0; i < 5; i++) {
+            ImGui::PushID(i + 100);
+            
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 1));
+            ImGui::Button("##Mat", ImVec2(iconSize, iconSize));
+            ImGui::PopStyleColor();
+            
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s", materials[i]);
+            ImGui::SameLine();
+
+            if ((i + 1) % itemsPerRow != 0 && i < 4) {
+                ImGui::SameLine();
+            }
+            ImGui::PopID();
+        }
+
+        ImGui::EndChild();
+
+        } else if (g_uiState.bottomPanelTab == 1) {
+            // ========== CONSOLE ==========
+            // Console toolbar
+            if (ImGui::Button("Clear", ImVec2(60, 0))) {
+                g_consoleMessages.clear();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Collapse All", ImVec2(80, 0))) {
+                // TODO: Collapse log groups
+            }
+            ImGui::SameLine();
+            ImGui::Button("##Sep1", ImVec2(1, 20));
+            ImGui::SameLine();
+
+            // Filter buttons
+            const char* filterNames[] = {"All", "Info", "Warning", "Error"};
+            for (int i = -1; i < 3; i++) {
+                ImGui::PushStyleColor(ImGuiCol_Button, g_consoleFilter == i ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+                if (ImGui::Button(filterNames[i + 1], ImVec2(60, 0))) {
+                    g_consoleFilter = i;
+                }
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+            }
+
+            ImGui::Separator();
+
+            // Message list
+            ImGui::BeginChild("ConsoleMessages", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+
+            int msgCount = 0;
+            for (const auto& msg : g_consoleMessages) {
+                if (g_consoleFilter != -1 && msg.level != g_consoleFilter) continue;
+
+                ImVec4 color;
+                const char* prefix;
+                if (msg.level == 2) { color = ImVec4(1.0f, 0.3f, 0.3f, 1); prefix = "[ERROR]"; }
+                else if (msg.level == 1) { color = ImVec4(1.0f, 0.8f, 0.0f, 1); prefix = "[WARN]"; }
+                else { color = ImVec4(0.7f, 0.7f, 0.7f, 1); prefix = "[INFO]"; }
+
+                ImGui::TextColored(color, "%s %s", prefix, msg.text.c_str());
+                msgCount++;
+            }
+
+            if (msgCount == 0) {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "No messages");
+            }
+
+            // Auto-scroll to bottom
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+                ImGui::SetScrollHereY(1.0f);
+            }
+
+            ImGui::EndChild();
+
+        } else if (g_uiState.bottomPanelTab == 2) {
+            // ========== PROFILER PANEL ==========
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1), "PROFILER");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // Engine stats
+            ImGui::Text("FPS: %.1f", g_fps);
+            ImGui::Text("Frame Time: %.2f ms", 1000.0f / (g_fps > 0 ? g_fps : 60));
+            ImGui::Text("Entity Count: %d", g_world.getEntityCount());
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // Camera info
+            ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1), "CAMERA");
+            ImGui::Text("Position: (%.2f, %.2f, %.2f)",
+                g_camera->Position.x, g_camera->Position.y, g_camera->Position.z);
+            ImGui::Text("Target: (%.2f, %.2f, %.2f)",
+                g_camera->Target.x, g_camera->Target.y, g_camera->Target.z);
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // Selected entity info
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1), "SELECTION");
+            if (g_selected != ecs::INVALID_ENTITY_ID) {
+                ImGui::Text("Selected Entity ID: %d", g_selected);
+                auto* t = g_world.getComponentArchetype<ecs::TransformComponent>(ecs::Entity{g_selected});
+                if (t) {
+                    ImGui::Text("Position: (%.2f, %.2f, %.2f)", t->position.x, t->position.y, t->position.z);
                 }
             } else {
-                // ORBIT MODE: Camera rotates around character (AAA quality)
-                float yawRad = glm::radians(camera.Yaw);
-                float pitchRad = glm::radians(camera.Pitch);
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "No entity selected");
+            }
+            ImGui::Separator();
+            ImGui::Spacing();
 
-                glm::vec3 camOffset;
-                camOffset.x = cos(pitchRad) * sin(yawRad) * cameraDistance;
-                camOffset.y = sin(pitchRad) * cameraDistance + cameraHeight;
-                camOffset.z = cos(pitchRad) * cos(yawRad) * cameraDistance;
+            // Memory info
+            ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1), "MEMORY");
+            auto* drawData = ImGui::GetDrawData();
+            if (drawData) {
+                ImGui::Text("ImGui Draw Lists: %d", drawData->CmdListsCount);
+            } else {
+                ImGui::Text("ImGui Draw Lists: N/A");
+            }
+            // TODO: Add more memory stats when memory manager is integrated
 
-                glm::vec3 targetCamPos = cameraPivot + camOffset;
+        }
 
-                // Validate target position
-                if (std::isfinite(targetCamPos.x) && std::isfinite(targetCamPos.y) && std::isfinite(targetCamPos.z)) {
-                    // MAXIMUM smoothing - camera locked to orbit position
-                    float smoothFactor = glm::clamp(CAMERA_SMOOTH * dt, 0.0f, 1.0f);
-                    camera.Position = glm::mix(camera.Position, targetCamPos, smoothFactor);
-                    camera.Target = cameraPivot;
-                }
+        ImGui::PopStyleColor();
+        ImGui::End();
+
+        // ========== VIEWPORT (Center - Maximizes remaining space) ==========
+        float vpX = sidePanelWidth;
+        float vpY = menuBarHeight + toolbarHeight;
+        float vpW = static_cast<float>(windowW) - sidePanelWidth;
+        float vpH = static_cast<float>(windowH) - menuBarHeight - toolbarHeight - tabbedBottomHeight;
+
+        ImGui::SetNextWindowPos(ImVec2(vpX, vpY));
+        ImGui::SetNextWindowSize(ImVec2(vpW, vpH));
+        ImGui::Begin("Viewport", nullptr,
+            ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+        ImVec2 contentSize = ImGui::GetContentRegionAvail();
+        if (contentSize.x > 0 && contentSize.y > 0) {
+            int w = static_cast<int>(contentSize.x);
+            int h = static_cast<int>(contentSize.y);
+            
+            // Resize FBO if needed
+            if (w != g_viewportFB.width || h != g_viewportFB.height) {
+                g_viewportFB.resize(w, h);
+            }
+
+            // Display FBO texture
+            ImGui::Image((void*)(intptr_t)g_viewportFB.colorTex, 
+                        ImVec2(static_cast<float>(w), static_cast<float>(h)),
+                        ImVec2(0, 1), ImVec2(1, 0));
+
+            // Viewport interaction (right-click to look)
+            ImVec2 viewportMin = ImGui::GetCursorScreenPos();
+            ImVec2 viewportMax = ImVec2(viewportMin.x + w, viewportMin.y + h);
+            ImVec2 mousePos = ImGui::GetMousePos();
+            
+            bool mouseInViewport = (mousePos.x >= viewportMin.x && mousePos.x < viewportMax.x &&
+                                   mousePos.y >= viewportMin.y && mousePos.y < viewportMax.y);
+
+            if (mouseInViewport && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                g_isViewing = true;
+            }
+            if (ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+                g_isViewing = false;
+            }
+            
+            if (g_isViewing) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_None);
             }
         }
 
-        // Clear with sky-blue color for open world (no skybox)
-        glClearColor(0.5f, 0.7f, 0.9f, 1.0f);  // Light blue sky color
+        ImGui::End();
+
+        // Show About dialog if requested
+        showAboutDialog();
+
+        // ========== STATUS BAR (Bottom of screen) ==========
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.08f, 0.08f, 1));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(0, 0));
+        ImGui::SetNextWindowPos(ImVec2(0, static_cast<float>(windowH) - statusBarHeight));
+        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(windowW), statusBarHeight));
+        ImGui::Begin("StatusBar", nullptr,
+            ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+        // Left side: Scene info
+        int totalEntities = 0;
+        g_world.forEach<ecs::TransformComponent>([&](ecs::EntityID, ecs::TransformComponent&) {
+            totalEntities++;
+        });
+
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Entities: %d  |  Selected: %s",
+            totalEntities,
+            g_selected != ecs::INVALID_ENTITY_ID ? "Yes" : "No");
+        ImGui::SameLine();
+
+        // Center: Play mode indicator
+        if (g_isPlaying) {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 1.0f, 0.2f, 1));
+            ImGui::Text("\xef\x81\x8b  PLAYING");
+            ImGui::PopStyleColor();
+        } else if (g_wasPlaying) {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.0f, 1));
+            ImGui::Text("\xef\x81\x8c  PAUSED");
+            ImGui::PopStyleColor();
+        }
+
+        // Right side: FPS and memory
+        char statusText[128];
+        snprintf(statusText, sizeof(statusText), "FPS: %.0f  |  Frame: %.2fms",
+            g_fps, 1000.0f / (g_fps > 0 ? g_fps : 60));
+
+        float textWidth = ImGui::CalcTextSize(statusText).x + 20;
+        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - textWidth);
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "%s", statusText);
+
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor();
+
+        // Final ImGui render
+        ImGui::Render();
+        
+        // Clear and render ImGui draw data
+        int displayW, displayH;
+        glfwGetFramebufferSize(window, &displayW, &displayH);
+        glViewport(0, 0, displayW, displayH);
+        glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        glm::mat4 projection = glm::perspective(glm::radians(45.0f), 1280.f/720.f, 0.1f, 1000.f);
-        glm::mat4 view = camera.GetViewMatrix();
-
-        // Skybox disabled - rendering world terrain directly
-        // drawSkybox(view, projection, skyboxTexture);  // Disabled
-
-        // ============================================================
-        // RENDER TERRAIN (open world)
-        // ============================================================
-        if (terrain) {
-            // Update terrain streaming based on camera position
-            terrain->update(camera.Position, dt);
-            
-            // Generate vegetation for newly loaded chunks
-            static bool vegetationGenerated = false;
-            if (!vegetationGenerated && terrain) {
-                // Generate vegetation with proper terrain heights
-                int chunksToGenerate = 1;  // Generate for chunks around camera
-                for (int cx = -chunksToGenerate; cx <= chunksToGenerate; cx++) {
-                    for (int cy = -chunksToGenerate; cy <= chunksToGenerate; cy++) {
-                        // Create heightmap by sampling terrain at multiple points
-                        std::vector<float> chunkHeights(1024);
-                        float worldStartX = cx * 100.0f;
-                        float worldStartZ = cy * 100.0f;
-                        
-                        // Sample terrain at 32x32 grid for this chunk
-                        for (int hz = 0; hz < 32; hz++) {
-                            for (int hx = 0; hx < 32; hx++) {
-                                float sampleX = worldStartX + (hx / 32.0f) * 100.0f;
-                                float sampleZ = worldStartZ + (hz / 32.0f) * 100.0f;
-                                float height = terrain->getHeightAt(sampleX, sampleZ);
-                                chunkHeights[hz * 32 + hx] = height;
-                            }
-                        }
-                        
-                        vegetation->generateForChunk(cx, cy, 100.0f, chunkHeights, 32);
-                        
-                        std::cout << "[Vegetation] Chunk (" << cx << "," << cy << "): "
-                                  << vegetation->getTrees().size() << " trees, "
-                                  << vegetation->getRocks().size() << " rocks\n";
-                    }
-                }
-                vegetationGenerated = true;
-            }
-            
-            // Create terrain shader if needed
-            if (!terrainShader) {
-                terrainShader = new Shader("world/terrainVS.glsl", "world/terrainFS.glsl");
-            }
-            
-            // Render all active terrain chunks
-            terrainShader->use();
-            terrainShader->setMat4("projection", projection);
-            terrainShader->setMat4("view", view);
-            terrainShader->setMat4("model", glm::mat4(1.0f));
-            terrainShader->setVec3("terrainColor", glm::vec3(0.2f, 0.5f, 0.2f));
-            terrainShader->setFloat("waterLevel", waterLevel);
-            terrainShader->setVec3("cameraPos", camera.Position);  // For fog
-
-            // Render terrain with frustum culling (Priority 1 optimization)
-            terrain->render(camera.Position, 45.0f, 1280.0f/720.0f, 0.1f, 1000.0f);
-
-            // Render grass on terrain (if grass model loaded)
-            if (grassModel) {
-                // Would render grass instances here
-                // For now, grass is handled by vegetation system
-            }
-        }
-
-        // ============================================================
-        // RENDER DEBUG FLOOR (visible wireframe grid at floor height)
-        // ============================================================
-        {
-            static Shader* debugFloorShader = nullptr;
-            if (!debugFloorShader) {
-                debugFloorShader = new Shader("shaderSystem/VS.glsl", "shaderSystem/FS.glsl");
-            }
-            
-            // Render debug floor as wireframe
-            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-            debugFloorShader->use();
-            debugFloorShader->setMat4("projection", projection);
-            debugFloorShader->setMat4("view", view);
-            debugFloorShader->setMat4("model", glm::mat4(1.0f));
-            debugFloorShader->setVec3("color", glm::vec3(0.0f, 1.0f, 0.0f));  // Green grid
-            
-            glBindVertexArray(debugFloorVAO);
-            glDrawElements(GL_TRIANGLES, 20 * 20 * 6, GL_UNSIGNED_INT, 0);
-            glBindVertexArray(0);
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-        }
-
-        // ============================================================
-        // RENDER WATER PLANE
-        // ============================================================
-        {
-            static GLuint waterVAO = 0;
-            static GLuint waterVBO = 0;
-            static GLuint waterEBO = 0;
-            
-            if (waterVAO == 0) {
-                // Create large water plane
-                float waterSize = 2000.0f;
-                int waterRes = 50;
-                
-                std::vector<float> vertices;
-                std::vector<unsigned int> indices;
-                
-                // Generate vertices
-                for (int z = 0; z <= waterRes; z++) {
-                    for (int x = 0; x <= waterRes; x++) {
-                        float vx = (float)x / waterRes * waterSize - waterSize / 2.0f;
-                        float vz = (float)z / waterRes * waterSize - waterSize / 2.0f;
-                        vertices.push_back(vx);
-                        vertices.push_back(waterLevel);
-                        vertices.push_back(vz);
-                        vertices.push_back(vx * 0.1f);  // UV
-                        vertices.push_back(vz * 0.1f);
-                    }
-                }
-                
-                // Generate indices
-                for (int z = 0; z < waterRes; z++) {
-                    for (int x = 0; x < waterRes; x++) {
-                        int topLeft = z * (waterRes + 1) + x;
-                        int topRight = topLeft + 1;
-                        int bottomLeft = (z + 1) * (waterRes + 1) + x;
-                        int bottomRight = bottomLeft + 1;
-                        
-                        indices.push_back(topLeft);
-                        indices.push_back(bottomLeft);
-                        indices.push_back(topRight);
-                        indices.push_back(topRight);
-                        indices.push_back(bottomLeft);
-                        indices.push_back(bottomRight);
-                    }
-                }
-                
-                glGenVertexArrays(1, &waterVAO);
-                glGenBuffers(1, &waterVBO);
-                glGenBuffers(1, &waterEBO);
-                
-                glBindVertexArray(waterVAO);
-                glBindBuffer(GL_ARRAY_BUFFER, waterVBO);
-                glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, waterEBO);
-                glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
-                
-                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-                glEnableVertexAttribArray(0);
-                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
-                glEnableVertexAttribArray(1);
-                
-                glBindVertexArray(0);
-            }
-            
-            // Render water AFTER terrain with proper blending
-            if (!waterShader) {
-                waterShader = new Shader("world/waterVS.glsl", "world/waterFS.glsl");
-            }
-            
-            int waterRes = 50;  // Must match creation
-            
-            waterShader->use();
-            waterShader->setMat4("projection", projection);
-            waterShader->setMat4("view", view);
-            waterShader->setMat4("model", glm::mat4(1.0f));
-            waterShader->setVec3("cameraPos", camera.Position);
-            waterShader->setFloat("time", (float)glfwGetTime());
-            waterShader->setVec3("waterColor", glm::vec3(0.0f, 0.35f, 0.55f));
-            waterShader->setFloat("waterLevel", waterLevel);
-            
-            // Enable blending for transparent water
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            
-            // Disable depth write (but keep depth test) so water blends correctly
-            glDepthMask(GL_FALSE);
-            
-            glBindVertexArray(waterVAO);
-            glDrawElements(GL_TRIANGLES, (waterRes * waterRes * 6), GL_UNSIGNED_INT, 0);
-            glBindVertexArray(0);
-            
-            // Restore depth write
-            glDepthMask(GL_TRUE);
-            glDisable(GL_BLEND);
-        }
-        
-        // ============================================================
-        // RENDER VEGETATION AND WORLD OBJECTS
-        // ============================================================
-        if (vegetation && terrain) {
-            // Update world objects (cull distant ones)
-            if (worldObjects) {
-                worldObjects->update(camera.Position, dt);
-            }
-            
-            // Place trees from vegetation system (if not already placed)
-            static bool treesPlaced = false;
-            if (!treesPlaced && worldObjects) {
-                const auto& trees = vegetation->getTrees();
-                for (const auto& tree : trees) {
-                    // Random tree type
-                    WorldObjectType treeType = WorldObjectType::TREE_PINE;
-                    int randType = rand() % 3;
-                    if (randType == 1) treeType = WorldObjectType::TREE_OAK;
-                    else if (randType == 2) treeType = WorldObjectType::TREE_BIRCH;
-                    
-                    worldObjects->placeObject(treeType, tree.position, tree.height * 0.3f, 
-                                             0.0f, glm::vec3(1.0f));
-                }
-                treesPlaced = true;
-                std::cout << "[World] Placed " << vegetation->getTrees().size() 
-                          << " trees using imported models\n";
-            }
-            
-            // Place rocks from vegetation system with physics
-            static bool rocksPlaced = false;
-            if (!rocksPlaced && worldObjects) {
-                const auto& rocks = vegetation->getRocks();
-                std::cout << "[World] Found " << rocks.size() << " rocks to place\n";
-                for (const auto& rock : rocks) {
-                    // Random rock type
-                    WorldObjectType rockType = WorldObjectType::ROCK_BOULDER;
-                    int randType = rand() % 3;
-                    if (randType == 1) rockType = WorldObjectType::ROCK_STONE;
-                    else if (randType == 2) rockType = WorldObjectType::ROCK_CLIFF;
-
-                    // Get terrain height at rock position (physics - raycast to ground)
-                    float terrainHeight = terrain->getHeightAt(rock.position.x, rock.position.z);
-                    
-                    // Place rock ON terrain (not floating)
-                    glm::vec3 placePos = rock.position;
-                    placePos.y = terrainHeight + rock.scale.y * 0.5f;  // Half scale so it sits ON ground
-                    
-                    worldObjects->placeObject(rockType, placePos-5.5f,
-                                             rock.scale.x, rock.rotation);
-                }
-                rocksPlaced = true;
-                std::cout << "[World] Placed " << vegetation->getRocks().size()
-                          << " rocks using imported models (with physics)\n";
-            }
-
-            // Render all world objects (trees, rocks, etc.)
-            if (worldObjects) {
-                worldObjects->render(view, projection, camera.Position);
-            }
-        }
-
-        // ============================================================
-        // RENDER FLOOR (fallback if no terrain)
-        // ============================================================
-        {
-            static GLuint floorVAO = 0;
-            static GLuint floorVBO = 0;
-            
-            if (floorVAO == 0) {
-                float floorSize = 100.0f;
-                float floorVertices[] = {
-                    // Positions          // Normals         // TexCoords
-                    -floorSize, floorHeight, -floorSize,  0.0f, 1.0f, 0.0f,  0.0f, 0.0f,
-                     floorSize, floorHeight, -floorSize,  0.0f, 1.0f, 0.0f,  1.0f, 0.0f,
-                     floorSize, floorHeight,  floorSize,  0.0f, 1.0f, 0.0f,  1.0f, 1.0f,
-                    -floorSize, floorHeight,  floorSize,  0.0f, 1.0f, 0.0f,  0.0f, 1.0f
-                };
-                
-                glGenVertexArrays(1, &floorVAO);
-                glGenBuffers(1, &floorVBO);
-                glBindVertexArray(floorVAO);
-                glBindBuffer(GL_ARRAY_BUFFER, floorVBO);
-                glBufferData(GL_ARRAY_BUFFER, sizeof(floorVertices), floorVertices, GL_STATIC_DRAW);
-                
-                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-                glEnableVertexAttribArray(0);
-                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-                glEnableVertexAttribArray(1);
-                glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-                glEnableVertexAttribArray(2);
-                glBindVertexArray(0);
-            }
-            
-            // Render floor
-            static Shader* floorShader = nullptr;
-            if (!floorShader) {
-                floorShader = new Shader(
-                    "shaderSystem/floorVS.glsl",
-                    "shaderSystem/floorFS.glsl"
-                );
-            }
-            
-            floorShader->use();
-            floorShader->setMat4("projection", projection);
-            floorShader->setMat4("view", view);
-            floorShader->setMat4("model", glm::mat4(1.0f));
-            floorShader->setVec3("cameraPos", camera.Position);
-            floorShader->setVec3("floorColor", glm::vec3(0.2f, 0.2f, 0.25f));
-            floorShader->setFloat("floorHeight", floorHeight);
-            floorShader->setFloat("gridSpacing", 1.0f);
-            floorShader->setInt("showGrid", 1);
-            
-            glBindVertexArray(floorVAO);
-            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-            glBindVertexArray(0);
-        }
-
-        // Draw model with skinned shader
-        skinnedShader.use();
-        skinnedShader.setMat4("projection", projection);
-        skinnedShader.setMat4("view", view);
-        skinnedShader.setMat4("model", modelMat);
-        skinnedShader.setVec3("lightPos", glm::vec3(10.0f, 10.0f, 10.0f));
-        skinnedShader.setVec3("viewPos", camera.Position);
-        skinnedShader.setVec3("color", glm::vec3(0.8f, 0.6f, 0.4f));  // Skin tone
-        skinnedShader.setInt("uDebugMode", debugMode);
-        
-        // Upload bone matrices - MUST happen after shader.use()
-        if (animator) {
-            const auto& finalBones = animator->GetFinalBoneMatrices();
-
-            static GLuint boneTexID = 0;
-            static int prevBoneCount = 0;
-            int boneCount = (int)finalBones.size();
-            
-            if (boneTexID == 0) {
-                glGenTextures(1, &boneTexID);
-            }
-
-            int width = boneCount * 4;
-            std::vector<glm::vec4> pixels(width);
-            for (size_t i = 0; i < finalBones.size(); i++) {
-                pixels[i*4+0] = finalBones[i][0];
-                pixels[i*4+1] = finalBones[i][1];
-                pixels[i*4+2] = finalBones[i][2];
-                pixels[i*4+3] = finalBones[i][3];
-            }
-
-            glActiveTexture(GL_TEXTURE10);
-            glBindTexture(GL_TEXTURE_2D, boneTexID);
-            
-            // Re-allocate texture if bone count changed
-            if (boneCount != prevBoneCount) {
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, 1, 0, GL_RGBA, GL_FLOAT, pixels.data());
-                prevBoneCount = boneCount;
-                std::cout << "[BoneTex] Allocated texture: " << boneCount << " bones\n";
-            } else {
-                // Update existing texture
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, 1, GL_RGBA, GL_FLOAT, pixels.data());
-            }
-
-            // Set bone texture uniform
-            skinnedShader.setInt("boneTex", 10);
-            skinnedShader.setInt("uPaletteSize", boneCount);
-        }
-
-        // Draw skinned meshes
-        for (size_t i = 0; i < freshVAOs.size(); i++) {
-            glBindVertexArray(freshVAOs[i]);
-            glDrawElements(GL_TRIANGLES, freshCounts[i], GL_UNSIGNED_INT, 0);
-        }
-        glBindVertexArray(0);
-
+        // Swap buffers and poll events
         glfwSwapBuffers(window);
+        glfwPollEvents();
     }
 
     // Cleanup
-    delete character;
-    if (animator) delete animator;
-    if (walkAnim) delete walkAnim;
-    if (grassModel) delete grassModel;
-    if (terrain) delete terrain;
-    if (vegetation) delete vegetation;
-    if (worldObjects) delete worldObjects;
-    glfwTerminate();
+    std::cout << "Shutting down...\n";
+
+    // Shutdown GPU profiler
+    AdvancedGPUProfiler::getInstance().shutdown();
+    std::cout << "GPU Profiler shutdown complete\n";
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
+    g_world.shutdown();
     
-    std::cout << "\nClosed.\n";
+    cleanupCube();
+    g_viewportFB.cleanup();
+    glDeleteProgram(g_shaderProg);
+    
+    if (g_camera) {
+        delete g_camera;
+        g_camera = nullptr;
+    }
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
+
+    std::cout << "Goodbye!\n";
     return 0;
 }

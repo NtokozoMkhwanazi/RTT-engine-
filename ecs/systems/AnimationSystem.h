@@ -1,297 +1,258 @@
 #pragma once
 
+/**
+ * Integrated Animation System - Uses engine's Animator
+ * 
+ * This system syncs ECS AnimatorComponent with engine Animator
+ * and uses engine's bone sampling, blending, and GPU skinning.
+ */
+
 #include "../ECS.h"
 #include "../components/Components.h"
+#include "../../animationSystem/Animator.h"
+#include "../../animationSystem/Animation.h"
 #include <glm/glm.hpp>
 #include <vector>
-
-// Forward declarations from animation system
-class Animator;
-class AnimationStateMachine;
-class HybridMMFSM;
+#include <unordered_map>
 
 namespace ecs {
 
 /**
- * Animation System - Updates animator components
+ * Animation System - Integrates ECS with engine Animator
  */
 class AnimationSystem : public TypedSystem<AnimatorComponent, SkeletonComponent> {
 public:
     AnimationSystem() = default;
-    
-    /**
-     * Set external animator manager (optional)
-     */
-    void setAnimator(Animator* animator) {
-        m_animator = animator;
-    }
-    
-    /**
-     * Set animation state machine
-     */
-    void setFSM(AnimationStateMachine* fsm) {
-        m_fsm = fsm;
-    }
-    
-    /**
-     * Set hybrid MM+FSM system
-     */
-    void setHybrid(HybridMMFSM* hybrid) {
-        m_hybrid = hybrid;
-    }
-    
+    ~AnimationSystem() = default;
+
     void init() override {
         m_filter = SystemFilter::require<AnimatorComponent, SkeletonComponent>();
     }
-    
+
     void update(float deltaTime) override {
+        if (!m_entityManager || !m_componentManager) return;
+
         forEach(*m_entityManager, *m_componentManager,
-            [this, deltaTime](EntityID entityID, AnimatorComponent& animator, 
-                              SkeletonComponent& skeleton) {
-                updateAnimator(animator, skeleton, deltaTime);
+            [this, deltaTime](EntityID entityID, AnimatorComponent& animator, SkeletonComponent& skeleton) {
+                updateAnimator(entityID, animator, skeleton, deltaTime);
             });
     }
-    
+
     /**
      * Update a single animator
      */
-    void updateAnimator(AnimatorComponent& animator, SkeletonComponent& skeleton, 
-                        float deltaTime) {
-        if (!animator.isPlaying) return;
+    void updateAnimator(EntityID entityID, AnimatorComponent& animator, SkeletonComponent& skeleton, float deltaTime) {
+        // Get or create engine Animator for this entity
+        auto it = m_animators.find(entityID);
+        if (it == m_animators.end()) {
+            // Create new engine Animator
+            createAnimator(entityID, animator, skeleton);
+            it = m_animators.find(entityID);
+        }
+
+        if (it != m_animators.end() && it->second) {
+            auto& engineAnimator = it->second;
+
+            // Sync state from ECS component to engine animator
+            syncToEngine(animator, *engineAnimator);
+
+            // Update engine animator (samples bones, applies blending, foot IK, etc.)
+            engineAnimator->Update(deltaTime);
+
+            // Sync bone matrices back to ECS skeleton
+            syncFromEngine(*engineAnimator, skeleton);
+        }
+    }
+
+    /**
+     * Create engine Animator for an entity
+     */
+    void createAnimator(EntityID entityID, AnimatorComponent& animator, SkeletonComponent& skeleton) {
+        // Create engine skeleton from ECS skeleton
+        auto engineSkeleton = createEngineSkeleton(skeleton);
         
-        // Update animation time
-        animator.currentTime += deltaTime * animator.playbackSpeed;
-        
-        // Handle looping
-        // Note: Animation duration would come from animation data
-        // For now, we just keep incrementing
-        
-        // Update blending
-        if (animator.isBlending) {
-            animator.blendTime += deltaTime;
-            if (animator.blendTime >= animator.blendDuration) {
-                animator.isBlending = false;
-                animator.blendWeight = 1.0f;
-                animator.previousAnimation = -1;
-            } else {
-                animator.blendWeight = animator.blendTime / animator.blendDuration;
+        // Create engine animator
+        auto engineAnimator = std::make_unique<Animator>(engineSkeleton.get());
+
+        // Add animations to engine animator
+        for (Animation* anim : animator.animations) {
+            if (anim) {
+                engineAnimator->Play(anim);
             }
         }
-        
-        // Update bone transforms (simplified)
-        // In production, this would sample animation curves
-        updateBoneTransforms(animator, skeleton);
+
+        m_animators[entityID] = std::move(engineAnimator);
+        m_skeletons[entityID] = std::move(engineSkeleton);
     }
-    
+
     /**
-     * Update bone transforms from animation
+     * Create engine Skeleton from ECS SkeletonComponent
      */
-    void updateBoneTransforms(const AnimatorComponent& animator, 
-                              SkeletonComponent& skeleton) {
-        // This is a placeholder - actual implementation would:
-        // 1. Sample animation curves at currentTime
-        // 2. Blend between animations if blending
-        // 3. Apply root motion if enabled
-        // 4. Calculate final bone matrices
+    std::unique_ptr<Skeleton> createEngineSkeleton(SkeletonComponent& skeleton) {
+        auto engineSkeleton = std::make_unique<Skeleton>();
         
-        // For now, just ensure bone matrices are identity
-        for (auto& bone : skeleton.bones) {
-            bone.localTransform = glm::mat4(1.0f);
-            bone.worldTransform = glm::mat4(1.0f);
+        // Copy bone count
+        engineSkeleton->bones.resize(skeleton.bones.size());
+        engineSkeleton->rootBoneIndex = skeleton.rootBoneIndex;
+
+        // Copy bone data
+        for (size_t i = 0; i < skeleton.bones.size(); i++) {
+            auto& ecsBone = skeleton.bones[i];
+            auto& engineBone = engineSkeleton->bones[i];
+
+            engineBone.id = static_cast<int>(i);
+            engineBone.bindTransform = ecsBone.inverseBindMatrix;
+            engineBone.offset = glm::inverse(ecsBone.inverseBindMatrix);
+            
+            // Store ECS bone pointer for sync back
+            m_boneMap[reinterpret_cast<uintptr_t>(&engineBone)] = &ecsBone;
+        }
+
+        return engineSkeleton;
+    }
+
+    /**
+     * Sync ECS AnimatorComponent to engine Animator
+     */
+    void syncToEngine(AnimatorComponent& animator, Animator& engineAnimator) {
+        // Sync playback state
+        if (engineAnimator.GetCurrentTime() != animator.currentTime) {
+            engineAnimator.SetCurrentTime(animator.currentTime);
+        }
+
+        // Handle play/pause
+        if (animator.isPlaying && engineAnimator.GetCurrentTime() == engineAnimator.GetCurrentTime()) {
+            // Already playing
+        }
+
+        // Handle animation changes
+        if (animator.currentAnimation >= 0 && 
+            animator.currentAnimation < static_cast<int>(animator.animations.size())) {
+            
+            Animation* currentAnim = animator.animations[animator.currentAnimation];
+            if (currentAnim) {
+                // Would need to check if this is already playing
+                // For now, assume ECS state is authoritative
+            }
         }
     }
-    
+
+    /**
+     * Sync bone matrices from engine Animator to ECS SkeletonComponent
+     */
+    void syncFromEngine(Animator& engineAnimator, SkeletonComponent& skeleton) {
+        // Get final bone matrices from engine animator
+        const auto& finalMatrices = engineAnimator.GetFinalBoneMatrices();
+        
+        // Copy to ECS skeleton
+        size_t count = std::min(finalMatrices.size(), skeleton.bones.size());
+        for (size_t i = 0; i < count; i++) {
+            skeleton.bones[i].worldTransform = finalMatrices[i];
+        }
+    }
+
     /**
      * Play an animation on an entity
      */
     void playAnimation(Entity entity, int animationIndex, bool loop = true) {
-        auto* animator = getComponent<AnimatorComponent>(entity.id);
+        auto* animator = m_componentManager->getComponent<AnimatorComponent>(entity.id);
         if (animator) {
             animator->play(animationIndex, loop);
         }
-    }
-    
-    /**
-     * Crossfade to a new animation
-     */
-    void crossfade(Entity entity, int animationIndex, float duration = 0.2f) {
-        auto* animator = getComponent<AnimatorComponent>(entity.id);
-        if (animator) {
-            animator->blendDuration = duration;
-            animator->play(animationIndex);
+
+        // Also update engine animator if it exists
+        auto it = m_animators.find(entity.id);
+        if (it != m_animators.end() && it->second) {
+            if (animationIndex >= 0 && animationIndex < static_cast<int>(animator->animations.size())) {
+                it->second->Play(animator->animations[animationIndex]);
+            }
         }
     }
-    
+
     /**
-     * Stop animation
+     * Stop animation on an entity
      */
     void stopAnimation(Entity entity) {
-        auto* animator = getComponent<AnimatorComponent>(entity.id);
+        auto* animator = m_componentManager->getComponent<AnimatorComponent>(entity.id);
         if (animator) {
             animator->stop();
         }
     }
-    
+
+    /**
+     * Blend to a new animation
+     */
+    void blendToAnimation(Entity entity, int animationIndex, float blendDuration, bool loop = true) {
+        auto* animator = m_componentManager->getComponent<AnimatorComponent>(entity.id);
+        if (animator) {
+            animator->previousAnimation = animator->currentAnimation;
+            animator->currentAnimation = animationIndex;
+            animator->isBlending = true;
+            animator->blendTime = 0.0f;
+            animator->blendDuration = blendDuration;
+            animator->loop = loop;
+        }
+
+        // Also update engine animator
+        auto it = m_animators.find(entity.id);
+        if (it != m_animators.end() && it->second) {
+            if (animationIndex >= 0 && animationIndex < static_cast<int>(animator->animations.size())) {
+                it->second->BlendTo(animator->animations[animationIndex], blendDuration);
+            }
+        }
+    }
+
+    /**
+     * Add animation to entity
+     */
+    void addAnimation(Entity entity, Animation* anim) {
+        auto* animator = m_componentManager->getComponent<AnimatorComponent>(entity.id);
+        if (animator && anim) {
+            animator->addAnimation(anim);
+        }
+
+        // Also add to engine animator
+        auto it = m_animators.find(entity.id);
+        if (it != m_animators.end() && it->second) {
+            it->second->Play(anim);
+        }
+    }
+
     /**
      * Set animation playback speed
      */
     void setPlaybackSpeed(Entity entity, float speed) {
-        auto* animator = getComponent<AnimatorComponent>(entity.id);
+        auto* animator = m_componentManager->getComponent<AnimatorComponent>(entity.id);
         if (animator) {
             animator->playbackSpeed = speed;
         }
     }
-    
+
     /**
-     * Enable/disable root motion
+     * Get current animation time
      */
-    void setRootMotionEnabled(Entity entity, bool enabled) {
-        auto* animator = getComponent<AnimatorComponent>(entity.id);
-        if (animator) {
-            animator->useRootMotion = enabled;
-        }
+    float getAnimationTime(Entity entity) const {
+        auto* animator = m_componentManager->getComponent<AnimatorComponent>(entity.id);
+        return animator ? animator->currentTime : 0.0f;
     }
-    
+
     /**
-     * Get root motion delta
+     * Check if animation is playing
      */
-    glm::vec3 getRootMotionDelta(Entity entity) {
-        auto* animator = getComponent<AnimatorComponent>(entity.id);
-        if (animator) {
-            return animator->rootMotionDelta;
-        }
-        return glm::vec3(0.0f);
+    bool isPlaying(Entity entity) const {
+        auto* animator = m_componentManager->getComponent<AnimatorComponent>(entity.id);
+        return animator ? animator->isPlaying : false;
     }
-    
-    const char* getName() const override { return "AnimationSystem"; }
+
+    const char* getName() const override { return "AnimationSystem (Integrated)"; }
 
 private:
-    Animator* m_animator = nullptr;
-    AnimationStateMachine* m_fsm = nullptr;
-    HybridMMFSM* m_hybrid = nullptr;
-};
-
-/**
- * Animation State System - Manages animation state machine
- */
-class AnimationStateSystem : public TypedSystem<AnimatorComponent, AnimationStateComponent> {
-public:
-    AnimationStateSystem() = default;
+    // Map from ECS entity ID to engine Animator
+    std::unordered_map<EntityID, std::unique_ptr<Animator>> m_animators;
+    std::unordered_map<EntityID, std::unique_ptr<Skeleton>> m_skeletons;
     
-    void init() override {
-        m_filter = SystemFilter::require<AnimatorComponent, AnimationStateComponent>();
-    }
-    
-    void update(float deltaTime) override {
-        forEach(*m_entityManager, *m_componentManager,
-            [this, deltaTime](EntityID entityID, AnimatorComponent& animator, 
-                              AnimationStateComponent& state) {
-                updateState(animator, state, deltaTime);
-            });
-    }
-    
-    /**
-     * Update animation state based on parameters
-     */
-    void updateState(AnimatorComponent& animator, AnimationStateComponent& state,
-                     float deltaTime) {
-        state.stateTime += deltaTime;
-        
-        // Update grounded state
-        state.isIdle = (state.moveSpeed < 0.1f);
-        state.isWalking = (state.moveSpeed >= 0.1f && state.moveSpeed < 0.5f);
-        state.isRunning = (state.moveSpeed >= 0.5f);
-        state.isJumping = (!state.isGrounded && state.verticalVelocity > 0.1f);
-        state.isFalling = (!state.isGrounded && state.verticalVelocity < -0.1f);
-        
-        // State transitions would happen here based on FSM rules
-        // For now, just update animator parameters
-    }
-    
-    /**
-     * Set movement speed parameter
-     */
-    void setMoveSpeed(Entity entity, float speed) {
-        auto* state = getComponent<AnimationStateComponent>(entity.id);
-        if (state) {
-            state->moveSpeed = speed;
-        }
-    }
-    
-    /**
-     * Set vertical velocity parameter
-     */
-    void setVerticalVelocity(Entity entity, float velocity) {
-        auto* state = getComponent<AnimationStateComponent>(entity.id);
-        if (state) {
-            state->verticalVelocity = velocity;
-        }
-    }
-    
-    /**
-     * Set grounded state
-     */
-    void setGrounded(Entity entity, bool grounded) {
-        auto* state = getComponent<AnimationStateComponent>(entity.id);
-        if (state) {
-            state->isGrounded = grounded;
-        }
-    }
-    
-    /**
-     * Trigger attack animation
-     */
-    void triggerAttack(Entity entity) {
-        auto* state = getComponent<AnimationStateComponent>(entity.id);
-        if (state) {
-            state->isAttacking = true;
-        }
-    }
-    
-    const char* getName() const override { return "AnimationStateSystem"; }
-};
-
-/**
- * Motion Matching System - Advanced animation selection
- */
-class MotionMatchingSystem : public TypedSystem<AnimatorComponent, AnimationStateComponent, TransformComponent> {
-public:
-    MotionMatchingSystem() = default;
-    
-    void setHybrid(HybridMMFSM* hybrid) {
-        m_hybrid = hybrid;
-    }
-    
-    void init() override {
-        m_filter = SystemFilter::require<AnimatorComponent, AnimationStateComponent, TransformComponent>();
-    }
-    
-    void update(float deltaTime) override {
-        if (!m_hybrid) return;
-        
-        forEach(*m_entityManager, *m_componentManager,
-            [this, deltaTime](EntityID entityID, AnimatorComponent& animator, 
-                              AnimationStateComponent& state, TransformComponent& transform) {
-                updateMotionMatching(entityID, animator, state, transform, deltaTime);
-            });
-    }
-    
-    void updateMotionMatching(EntityID entityID, AnimatorComponent& animator,
-                              AnimationStateComponent& state, TransformComponent& transform,
-                              float deltaTime) {
-        // Motion matching would:
-        // 1. Extract current pose features
-        // 2. Search database for best matching clip
-        // 3. Sample and blend animation
-        // 4. Extract and apply root motion
-        
-        // This is integrated with the existing HybridMMFSM system
-    }
-    
-    const char* getName() const override { return "MotionMatchingSystem"; }
-
-private:
-    HybridMMFSM* m_hybrid = nullptr;
+    // Map from engine bone address to ECS bone (for direct sync)
+    std::unordered_map<uintptr_t, Bone*> m_boneMap;
 };
 
 } // namespace ecs

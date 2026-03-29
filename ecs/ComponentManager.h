@@ -13,65 +13,34 @@ namespace ecs {
 
 /**
  * Component Manager - Manages all component arrays
+ * Uses a simple type-erasure approach with void pointers
  */
 class ComponentManager {
 private:
-    /**
-     * Type-erased wrapper for component arrays (must be defined first)
-     */
-    struct ComponentArrayWrapperBase {
-        virtual ~ComponentArrayWrapperBase() = default;
+    // Type-erased interface for component arrays
+    class IComponentArray {
+    public:
+        virtual ~IComponentArray() = default;
         virtual void remove(EntityID entityID) = 0;
         virtual bool hasComponent(EntityID entityID) const = 0;
     };
 
     template<typename T>
-    struct ComponentArrayWrapper : ComponentArrayWrapperBase {
+    class ComponentArrayHolder : public IComponentArray {
+    public:
         ComponentArray<T> array;
 
-        template<typename... Args>
-        T& insert(EntityID entityID, EntityID index, Args&&... args) {
-            return array.insert(entityID, index, std::forward<Args>(args)...);
+        void remove(EntityID entityID) override {
+            array.remove(entityID);
         }
 
-        T* get(EntityID entityID) { return array.get(entityID); }
-        const T* get(EntityID entityID) const { return array.get(entityID); }
-
-        void remove(EntityID entityID) override { array.remove(entityID); }
         bool hasComponent(EntityID entityID) const override {
             return array.hasComponent(entityID);
         }
-
-        // Iteration support
-        T* begin() { return array.begin(); }
-        T* end() { return array.end(); }
-        const T* begin() const { return array.begin(); }
-        const T* end() const { return array.end(); }
-
-        size_t size() const { return array.size(); }
-
-        T& getByIndex(EntityID index) { return array.get(index); }
-        const T& getByIndex(EntityID index) const { return array.get(index); }
-        EntityID getEntityByIndex(EntityID index) const { return array.getEntity(index); }
     };
 
 public:
     ComponentManager() = default;
-
-    /**
-     * Register a component type
-     */
-    template<typename T>
-    void registerComponentType() {
-        ComponentTypeID typeID = getComponentTypeID<T>();
-
-        if (m_componentArrays.find(typeID) != m_componentArrays.end()) {
-            return;  // Already registered
-        }
-
-        m_componentArrays[typeID] = std::make_unique<ComponentArrayWrapper<T>>();
-        m_componentNames[typeID] = typeid(T).name();
-    }
 
     /**
      * Add a component to an entity
@@ -80,12 +49,18 @@ public:
     T& addComponent(EntityID entityID, Args&&... args) {
         ComponentTypeID typeID = getComponentTypeID<T>();
 
-        if (m_componentArrays.find(typeID) == m_componentArrays.end()) {
-            registerComponentType<T>();
+        // Get or create the component array for this type
+        auto it = m_componentArrays.find(typeID);
+        if (it == m_componentArrays.end()) {
+            // Create new array for this component type
+            auto holder = std::make_unique<ComponentArrayHolder<T>>();
+            m_componentArrays[typeID] = std::move(holder);
+            it = m_componentArrays.find(typeID);
         }
 
-        auto* array = static_cast<ComponentArrayWrapper<T>*>(m_componentArrays[typeID].get());
-        return array->insert(entityID, entityID, std::forward<Args>(args)...);
+        // Cast to the correct type and insert
+        auto* holder = static_cast<ComponentArrayHolder<T>*>(it->second.get());
+        return holder->array.insert(entityID, std::forward<Args>(args)...);
     }
 
     /**
@@ -95,12 +70,13 @@ public:
     void removeComponent(EntityID entityID) {
         ComponentTypeID typeID = getComponentTypeID<T>();
 
-        if (m_componentArrays.find(typeID) == m_componentArrays.end()) {
+        auto it = m_componentArrays.find(typeID);
+        if (it == m_componentArrays.end()) {
             return;  // Component type not registered
         }
 
-        auto* array = static_cast<ComponentArrayWrapper<T>*>(m_componentArrays[typeID].get());
-        array->remove(entityID);
+        auto* holder = static_cast<ComponentArrayHolder<T>*>(it->second.get());
+        holder->array.remove(entityID);
     }
 
     /**
@@ -110,12 +86,13 @@ public:
     T* getComponent(EntityID entityID) {
         ComponentTypeID typeID = getComponentTypeID<T>();
 
-        if (m_componentArrays.find(typeID) == m_componentArrays.end()) {
+        auto it = m_componentArrays.find(typeID);
+        if (it == m_componentArrays.end()) {
             return nullptr;
         }
 
-        auto* array = static_cast<ComponentArrayWrapper<T>*>(m_componentArrays[typeID].get());
-        return array->get(entityID);
+        auto* holder = static_cast<ComponentArrayHolder<T>*>(it->second.get());
+        return holder->array.get(entityID);
     }
 
     template<typename T>
@@ -127,8 +104,8 @@ public:
             return nullptr;
         }
 
-        const auto* array = static_cast<const ComponentArrayWrapper<T>*>(it->second.get());
-        return array->get(entityID);
+        const auto* holder = static_cast<const ComponentArrayHolder<T>*>(it->second.get());
+        return holder->array.get(entityID);
     }
 
     /**
@@ -143,33 +120,37 @@ public:
             return false;
         }
 
-        const auto* array = static_cast<const ComponentArrayWrapper<T>*>(it->second.get());
-        return array->hasComponent(entityID);
+        const auto* holder = static_cast<const ComponentArrayHolder<T>*>(it->second.get());
+        return holder->array.hasComponent(entityID);
     }
 
     /**
-     * Get component array for iteration (type-erased)
+     * Get component array for iteration
      */
     template<typename T>
-    ComponentArrayWrapper<T>* getComponentArray() {
+    ComponentArray<T>* getComponentArray() {
         ComponentTypeID typeID = getComponentTypeID<T>();
 
-        if (m_componentArrays.find(typeID) == m_componentArrays.end()) {
+        auto it = m_componentArrays.find(typeID);
+        if (it == m_componentArrays.end()) {
             return nullptr;
         }
 
-        return static_cast<ComponentArrayWrapper<T>*>(m_componentArrays[typeID].get());
+        auto* holder = static_cast<ComponentArrayHolder<T>*>(it->second.get());
+        return &holder->array;
     }
 
-    /**
-     * Get the name of a component type
-     */
-    const char* getComponentTypeName(ComponentTypeID typeID) const {
-        auto it = m_componentNames.find(typeID);
-        if (it == m_componentNames.end()) {
-            return "Unknown";
+    template<typename T>
+    const ComponentArray<T>* getComponentArray() const {
+        ComponentTypeID typeID = getComponentTypeID<T>();
+
+        auto it = m_componentArrays.find(typeID);
+        if (it == m_componentArrays.end()) {
+            return nullptr;
         }
-        return it->second.c_str();
+
+        const auto* holder = static_cast<const ComponentArrayHolder<T>*>(it->second.get());
+        return &holder->array;
     }
 
     /**
@@ -178,15 +159,14 @@ public:
     std::vector<ComponentTypeID> getRegisteredTypeIDs() const {
         std::vector<ComponentTypeID> ids;
         ids.reserve(m_componentArrays.size());
-        for (const auto& [id, _] : m_componentArrays) {
-            ids.push_back(id);
+        for (const auto& pair : m_componentArrays) {
+            ids.push_back(pair.first);
         }
         return ids;
     }
 
 private:
-    std::unordered_map<ComponentTypeID, std::unique_ptr<ComponentArrayWrapperBase>> m_componentArrays;
-    std::unordered_map<ComponentTypeID, std::string> m_componentNames;
+    std::unordered_map<ComponentTypeID, std::unique_ptr<IComponentArray>> m_componentArrays;
 };
 
 } // namespace ecs

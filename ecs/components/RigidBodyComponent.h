@@ -3,6 +3,9 @@
 #include "../ECS.h"
 #include <glm/glm.hpp>
 
+// Include engine's ColliderType
+#include "../../physicsSystem/RigidBody.h"
+
 namespace ecs {
 
 /**
@@ -50,13 +53,21 @@ struct RigidBodyComponent : public Component {
     glm::vec3 angularVelocity{0.0f};
     glm::vec3 force{0.0f};
     glm::vec3 torque{0.0f};
-    
+
     // State flags
     bool isKinematic = false;
     bool isStatic = false;
     bool useGravity = true;
     bool isGrounded = false;
-    
+    bool useCCD = false;  // Continuous Collision Detection
+
+    // Advanced physics properties (for fluid dynamics, etc.)
+    float buoyancyFactor = 0.0f;
+    float density = 1000.0f;  // kg/m³
+    float staticFriction = 0.5f;
+    float dynamicFriction = 0.3f;
+    float rollingResistance = 0.01f;
+
     // Inverse properties (calculated)
     float invMass = 1.0f;
     glm::mat3 invInertiaTensor{1.0f};
@@ -171,24 +182,31 @@ struct RigidBodyComponent : public Component {
 
 /**
  * Character Controller Component - Special kinematic body for player
+ * Integrates with engine's CharacterController
  */
 struct CharacterControllerComponent : public Component {
     float height = 1.8f;
     float radius = 0.4f;
     float stepHeight = 0.5f;
     float slopeLimit = 45.0f;
-    
+
     // Movement
     glm::vec3 velocity{0.0f};
     glm::vec3 inputDirection{0.0f};
+    glm::vec3 rootMotion{0.0f};  // Root motion delta from animation
+    
+    // State
     bool isGrounded = false;
     bool canJump = true;
-    
-    // Jump settings
-    float jumpForce = 5.0f;
-    float moveSpeed = 5.0f;
+    bool wantsJump = false;      // Jump requested (consumed by system)
+    bool isCrouching = false;
+    bool isSprinting = false;
+
+    // Settings
+    float jumpForce = 6.5f;
+    float moveSpeed = 6.0f;
     float sprintMultiplier = 1.5f;
-    
+
     CharacterControllerComponent() = default;
 };
 

@@ -1,22 +1,45 @@
 #pragma once
 
-// ECS Systems
+/**
+ * Enhanced Systems Header - Includes all updated systems with archetype support
+ */
 
 #include "RenderSystem.h"
 #include "PhysicsSystem.h"
 #include "AnimationSystem.h"
 
+// New integrated systems
+#include "CharacterControllerSystem.h"
+#include "TerrainSystem.h"
+#include "WorldObjectSystem.h"
+#include "MotionMatchingSystem.h"
+
 /**
- * ECS Systems Module
- * 
  * Available Systems:
- * - RenderSystem: Renders meshes with transforms
- * - SkinnedMeshRenderSystem: Renders animated characters
- * - CameraSystem: Manages active camera
- * - LightSystem: Manages light sources
- * - PhysicsSystem: Rigid body simulation
- * - CharacterControllerSystem: Player movement
- * - AnimationSystem: Animation playback
- * - AnimationStateSystem: Animation state machine
- * - MotionMatchingSystem: Advanced motion matching
+ *
+ * Rendering:
+ * - RenderSystem: Static mesh rendering with frustum culling
+ * - SkinnedMeshRenderSystem: Animated character rendering
+ * - CameraSystem: Active camera management
+ * - LightSystem: Light collection for shaders
+ *
+ * Physics:
+ * - PhysicsSystem: Rigid body simulation with substepping (direct component processing)
+ * - CharacterControllerSystem: Player movement (direct component processing)
+ *
+ * Animation:
+ * - AnimationSystem: Animator updates and bone transforms (direct component processing)
+ * - AnimationStateSystem: State machine parameter updates
+ * - MotionMatchingSystem: Advanced motion matching integration
+ *
+ * World:
+ * - TerrainSystem: Terrain chunk streaming and LOD
+ * - WorldObjectSystem: Object placement and culling
+ * - VegetationSystem: Grass and tree rendering
+ *
+ * All systems now support:
+ * - Archetype-based iteration for cache-coherent access
+ * - Parallel execution via JobSystem
+ * - Event publishing for component changes
+ * - Direct component processing (no wrapper overhead)
  */

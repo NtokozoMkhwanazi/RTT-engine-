@@ -10,10 +10,19 @@
 #include "LightComponent.h"
 #include "TagComponent.h"
 
+// Terrain and World
+#include "TerrainComponent.h"
+#include "WorldObjectComponent.h"
+
+// Animation
+#include "MotionMatchingComponent.h"
+
 /**
  * ECS Components Module
- * 
+ *
  * Available Components:
+ * 
+ * Core:
  * - TransformComponent: Position, rotation, scale
  * - MeshComponent: Static mesh rendering
  * - SkinnedMeshComponent: Animated mesh rendering
@@ -33,4 +42,15 @@
  * - ChildrenComponent: Entity children
  * - LifetimeComponent: Auto-destruct timer
  * - ActiveComponent: Enable/disable
+ * 
+ * Terrain & World:
+ * - TerrainComponent: Terrain root settings
+ * - TerrainChunkComponent: Terrain chunk data
+ * - WorldObjectComponent: World object (trees, rocks, etc.)
+ * - VegetationComponent: Vegetation-specific properties
+ * - GrassComponent: Grass patch properties
+ * 
+ * Animation:
+ * - MotionMatchingComponent: Motion matching state
+ * - MotionDatabaseComponent: Motion database reference
  */

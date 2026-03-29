@@ -1,12 +1,11 @@
 # RTT Engine - 3D Game Engine
+
 ![GitHub stars](https://img.shields.io/github/stars/NtokozoMkhwanazi/RTT-engine-?style=social)
 ![GitHub forks](https://img.shields.io/github/forks/NtokozoMkhwanazi/RTT-engine-?style=social)
 ![GitHub issues](https://img.shields.io/github/issues/NtokozoMkhwanazi/RTT-engine-)
 ![GitHub license](https://img.shields.io/github/license/NtokozoMkhwanazi/RTT-engine-)
 ![C++](https://img.shields.io/badge/C++17-ISO-blue)
 ![OpenGL](https://img.shields.io/badge/OpenGL-4.5-orange)
-![Build](https://img.shields.io/github/actions/workflow/status/NtokozoMkhwanazi/RTT-engine-/build.yml?branch=main)
-![Downloads](https://img.shields.io/github/downloads/NtokozoMkhwanazi/RTT-engine-/total)
 
 **simple lightweight** 3D game engine project with  **systems programming patterns and engineering principles** in mind, built for **scalability and high-performance** using the **power and speed** of the C++ Language. openGL graphics API for relative ease of use compared to Vulkan. Dear imgui UI/UX editor for its seemless integration with th C++ language and backend API openGL . This project contains comprehensive documentation, clear Codebase structure and pdf containing a few of the advanced algorithms used in this project. This project is **actively under-development and maintained**
 

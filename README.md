@@ -89,7 +89,7 @@ make clean && make
 | **Ctrl+D** | Duplicate selected entity |
 | **Delete** | Delete selected entity |
 
-### Expected Display (see issue ) 
+### Expected Display (debug purposes for viewport specifically ) 
 The viewport shows:
 - **Red cube** at (0, 1, 0)
 - **Green cube** at (2, 2, 0)

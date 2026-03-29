@@ -24,7 +24,7 @@ SIMPLE lightweight 3d game engine project with  **systems programming patterns a
 - **Motion Matching** - Advanced character locomotion with trajectory prediction
 
 ### Editor
-- **Unreal Engine-style UI (I lIKE UNREAL-ENGINE :))** - Dark theme, tabbed panels, maximized viewport 
+- **Unreal Engine-style UI (I LIKE UNREAL-ENGINE :))** - Dark theme, tabbed panels, maximized viewport 
 - **Live Statistics** - FPS, GPU time, entity count in menu bar
 - **GPU Profiler** - Hierarchical profiling with timestamp queries
 - **Entity Inspector** - Transform, mesh, component editing
@@ -85,7 +85,7 @@ make clean && make
 | **Ctrl+D** | Duplicate selected entity |
 | **Delete** | Delete selected entity |
 
-### Expected Display
+### Expected Display (see issue ) 
 The viewport shows:
 - **Red cube** at (0, 1, 0)
 - **Green cube** at (2, 2, 0)

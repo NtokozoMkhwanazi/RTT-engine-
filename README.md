@@ -45,28 +45,8 @@
 
 ## 📁 Project Structure
 
-```
-3D GAME ENGINE/
-├── ecs/                    # Entity-Component-System framework
-├── renderer/               # OpenGL rendering, GPU profiler
-├── animationSystem/        # Animation, motion matching, IK
-├── physicsSystem/          # Collision detection, physics simulation
-├── modelSystem/            # Model loading, mesh management
-├── boneSystem/             # Skeleton, bone animation
-├── cameraSystem/           # Camera controllers
-├── world/                  # Terrain, world objects
-├── memory/                 # Memory management, asset manager
-├── meshSystem/             # Mesh optimization, LOD
-├── lighting/               # Lighting system
-├── shaderSystem/           # Shader management
-├── playerSystem/           # Character controller
-├── motionMatching/         # Motion matching algorithms
-├── demo/                   # Demo recording/playback
-├── tests/                  # Unit tests
-├── docs/                   # Documentation
-├── assets/                 # Game assets
-└── external/               # Third-party libraries (ImGui, etc.)
-```
+<img width="2562" height="824" alt="mermaid-diagram(3)" src="https://github.com/user-attachments/assets/2f263e15-845b-4ffc-83ae-1deebe050329" />
+
 
 ## 🚀 Quick Start
 

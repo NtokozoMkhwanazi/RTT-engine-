@@ -129,7 +129,4 @@ Links to related docs.
 3. **Archive resolved issues** - Move to docs/archive/ or delete
 4. **Create missing docs** - physics/, lighting/, shaderSystem/
 
----
 
-**Status:** 🔄 Documentation reorganization in progress
-**Last Updated:** March 27, 2025

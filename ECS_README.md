@@ -2,7 +2,7 @@
 
 ## Overview
 
-This ECS (Entity Component System) framework has been enhanced with production-ready features found in modern game engines like Unity DOTS and Unreal Engine.
+This ECS (Entity Component System) framework has been a bit tweaked to almost resemble the ones found in modern game engines like Unity DOTS and Unreal Engine be it at a much-smaller scale.
 
 ## New Features
 

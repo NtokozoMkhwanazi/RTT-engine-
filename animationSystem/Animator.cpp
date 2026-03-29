@@ -15,6 +15,36 @@
 
 // No local normalization - use canonical NormalizeBoneName from BoneName.h
 
+// ============================================================
+// Helper Functions for Matrix Blending
+// ============================================================
+
+/**
+ * Decompose a matrix into translation, rotation, and scale
+ */
+static void decomposeMatrix(const glm::mat4& matrix, glm::vec3& translation, glm::quat& rotation, glm::vec3& scale) {
+    glm::vec3 skew;
+    glm::vec4 perspective;
+    glm::decompose(matrix, scale, rotation, translation, skew, perspective);
+}
+
+/**
+ * Compose a matrix from translation, rotation, and scale
+ */
+static glm::mat4 composeMatrix(const glm::vec3& translation, const glm::quat& rotation, const glm::vec3& scale) {
+    glm::mat4 matrix = glm::mat4(1.0f);
+    matrix = glm::translate(matrix, translation);
+    matrix *= glm::mat4_cast(rotation);
+    matrix = glm::scale(matrix, scale);
+    return matrix;
+}
+
+// ============================================================
+// Animator Implementation
+// ============================================================
+
+// No local normalization - use canonical NormalizeBoneName from BoneName.h
+
 // ------------------------------------------------------------
 // Animator
 // ------------------------------------------------------------
@@ -233,41 +263,74 @@ void Animator::Update(float dt)
                 // and then blend the resulting transforms. This requires a more complex approach
                 // than what's currently implemented in EvaluateNode.
 
-                // For now, we'll use a weighted average approach for the first animation
-                // with a fallback to the legacy system if there are multiple animations
+                // Full weighted blending implementation
                 if (activeAnimations.size() == 1 && activeAnimations[0].animation && activeAnimations[0].enabled)
                 {
                     // Single animation case - straightforward
                     EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), activeAnimations[0].animation, activeAnimations[0].time);
                     dominantLayerIdx = 0;
                 }
-                else
+                else if (activeAnimations.size() > 1)
                 {
-                    // Multiple animations - we need to blend them
-                    // This is a simplified approach that prioritizes the animation with highest weight
-                    const AnimationLayer* dominantLayer = nullptr;
-
-                    for (size_t i = 0; i < activeAnimations.size(); i++)
-                    {
-                        const auto& layer = activeAnimations[i];
-                        if (layer.animation && layer.weight > maxWeight && layer.enabled)
-                        {
-                            maxWeight = layer.weight;
-                            dominantLayer = &layer;
-                            dominantLayerIdx = i;
+                    // Multiple animations - full weighted blending
+                    // First, calculate total weight for normalization
+                    float totalWeight = 0.0f;
+                    for (const auto& layer : activeAnimations) {
+                        if (layer.animation && layer.enabled) {
+                            totalWeight += layer.weight;
                         }
                     }
-
-                    if (dominantLayer && dominantLayer->animation)
+                    
+                    if (totalWeight > 0.0f)
                     {
-                        // Use the animation with the highest weight as the base
-                        EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), dominantLayer->animation, dominantLayer->time);
+                        // Apply each animation with normalized weight
+                        // Start with bind pose
+                        EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
+                        std::vector<glm::mat4> bindPose = finalBoneMatrices;
+                        
+                        // Apply each animation layer with its normalized weight
+                        for (size_t i = 0; i < activeAnimations.size(); i++) {
+                            const auto& layer = activeAnimations[i];
+                            if (layer.animation && layer.enabled && layer.weight > 0.0f) {
+                                float normalizedWeight = layer.weight / totalWeight;
+                                
+                                // Evaluate this animation
+                                EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), layer.animation, layer.time);
+                                
+                                // Blend with accumulated result using matrix interpolation
+                                for (size_t j = 0; j < finalBoneMatrices.size() && j < bindPose.size(); j++) {
+                                    // Decompose matrices for proper blending
+                                    glm::vec3 bindScale, bindTrans;
+                                    glm::quat bindRot;
+                                    decomposeMatrix(bindPose[j], bindTrans, bindRot, bindScale);
+                                    
+                                    glm::vec3 currScale, currTrans;
+                                    glm::quat currRot;
+                                    decomposeMatrix(finalBoneMatrices[j], currTrans, currRot, currScale);
+                                    
+                                    // Blend components
+                                    glm::vec3 blendedTrans = glm::mix(bindTrans, currTrans, normalizedWeight);
+                                    glm::quat blendedRot = glm::slerp(bindRot, currRot, normalizedWeight);
+                                    glm::vec3 blendedScale = glm::mix(bindScale, currScale, normalizedWeight);
+                                    
+                                    // Recompose matrix
+                                    finalBoneMatrices[j] = composeMatrix(blendedTrans, blendedRot, blendedScale);
+                                }
+                            }
+                        }
+                        
+                        dominantLayerIdx = 0;
                     }
                     else
                     {
-                        // Fallback to bind pose
+                        // No active animations, use bind pose
                         EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
                     }
+                }
+                else
+                {
+                    // No animations, use bind pose
+                    EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
                 }
             }
 

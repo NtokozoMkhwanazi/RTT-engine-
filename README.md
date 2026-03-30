@@ -7,7 +7,7 @@
 ![C++](https://img.shields.io/badge/C++17-ISO-blue)
 ![OpenGL](https://img.shields.io/badge/OpenGL-4.5-orange)
 
-**Advanced lightweight** 3D game engine project built for **scalability and high-performance** using the **power and speed** of the C++ Language. openGL graphics API for relative ease of use compared to Vulkan. Dear imgui UI/UX editor for its seemless integration with th C++ language and backend API openGL . This project contains comprehensive documentation and a clear codebase structure. This project is **actively under-development and maintained**. This is a project that encourages learn by building, meant for curious minds.  
+**Advanced lightweight** 3D game engine project built for **scalability and high-performance systems** for animation systems , 3D software simulation systems and real-time rendering using the **power and speed** of the C++ Language. openGL graphics API for relative ease of use compared to Vulkan. Dear imgui UI/UX editor for its seemless integration with th C++ language and backend API openGL . This project contains comprehensive documentation and a clear codebase structure. This project is **actively under-development and maintained**. This is a project that encourages learn by building, meant for curious minds.  
 
 ## 📊 Architecture diagrams (ECS Overview)
 

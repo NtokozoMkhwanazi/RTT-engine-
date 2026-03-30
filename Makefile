@@ -215,12 +215,28 @@ world_test: $(OBJS)
 	$(CXX) $(CXXFLAGS) $(OBJS) world_test.cpp -o $(BIN_DIR)/world_test $(LIBS) $(LDFLAGS)
 	@echo "Run with: ./bin/world_test"
 
+# Viewport debug test application (standalone - no engine objects needed)
+viewport-test:
+	@echo "\n========================================"
+	@echo "  Building Viewport Debug Test"
+	@echo "========================================\n"
+	$(CXX) $(CXXFLAGS) $(INCLUDES) viewport_test.cpp src/glad.c -o $(BIN_DIR)/viewport_test $(LIBS)
+	@echo "Run with: ./bin/viewport_test"
+
+# Viewport debug test with ECS and Renderer (comprehensive debugging)
+viewport-debug-test: $(OBJS)
+	@echo "\n========================================"
+	@echo "  Building Viewport Debug Test (Full)"
+	@echo "========================================\n"
+	$(CXX) $(CXXFLAGS) $(INCLUDES) viewport_debug_test.cpp $(filter-out build/test.o,$(OBJS)) -o $(BIN_DIR)/viewport_debug_test $(LIBS)
+	@echo "Run with: ./bin/viewport_debug_test"
+
 # Build all test applications
-all-tests: physics_test animation_test world_test
+all-tests: physics_test animation_test world_test viewport-test
 
 # Clean test applications
 clean-test-apps:
-	rm -f $(BIN_DIR)/physics_test $(BIN_DIR)/animation_test $(BIN_DIR)/world_test
+	rm -f $(BIN_DIR)/physics_test $(BIN_DIR)/animation_test $(BIN_DIR)/world_test $(BIN_DIR)/viewport_test
 
 # ============================================================
 #  Unit Tests

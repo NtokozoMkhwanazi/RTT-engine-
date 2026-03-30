@@ -134,49 +134,97 @@ static Framebuffer g_viewportFB;
 static GLuint g_shaderProg = 0;
 
 static void initShader() {
+    // Optimized shader with UBO support and explicit layout locations
     const char* vs = R"(
-#version 330 core
+#version 430 core
+
+// Vertex attributes
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
-uniform mat4 model, view, projection;
-out vec3 FragPos, Normal;
+
+// Instance matrix (per-instance data)
+layout(location=7) in mat4 instanceMatrix;
+
+// UBO for camera matrices - binding point 0
+layout(std140, binding = 0) uniform CameraBlock {
+    mat4 view;
+    mat4 projection;
+    mat4 viewProjection;
+    vec4 viewPos;
+    vec4 lightPos;
+} camera;
+
+// Explicit uniform locations for per-object data
+layout(location = 0) uniform vec3 color;
+
+out vec3 FragPos;
+out vec3 Normal;
+
 void main() {
-    FragPos = vec3(model * vec4(aPos, 1.0));
-    Normal = mat3(transpose(inverse(model))) * aNormal;
-    gl_Position = projection * view * vec4(FragPos, 1.0);
+    // Use instance matrix for instanced rendering
+    mat4 finalModel = instanceMatrix;
+    
+    // Transform position
+    vec4 worldPos = finalModel * vec4(aPos, 1.0);
+    FragPos = vec3(worldPos);
+    Normal = mat3(transpose(inverse(finalModel))) * aNormal;
+    
+    // Use UBO for view/projection
+    gl_Position = camera.projection * camera.view * worldPos;
 }
 )";
     const char* fs = R"(
-#version 330 core
-in vec3 FragPos, Normal;
-uniform vec3 color, lightPos, viewPos;
+#version 430 core
+
+// Fragment inputs
+in vec3 FragPos;
+in vec3 Normal;
+
+// UBO for camera/light - binding point 0
+layout(std140, binding = 0) uniform CameraBlock {
+    mat4 view;
+    mat4 projection;
+    mat4 viewProjection;
+    vec4 viewPos;
+    vec4 lightPos;
+} camera;
+
+// Explicit uniform locations
+layout(location = 0) uniform vec3 color;
+
+// Fragment output
 out vec4 FragColor;
+
 void main() {
+    // Lighting calculations
     vec3 ambient = 0.2 * vec3(1.0);
+    
     vec3 norm = normalize(Normal);
-    vec3 lightDir = normalize(lightPos - FragPos);
+    vec3 lightDir = normalize(camera.lightPos.xyz - FragPos);
     float diff = max(dot(norm, lightDir), 0.0);
     vec3 diffuse = diff * vec3(1.0);
-    vec3 viewDir = normalize(viewPos - FragPos);
+    
+    vec3 viewDir = normalize(camera.viewPos.xyz - FragPos);
     vec3 reflectDir = reflect(-lightDir, norm);
     float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
     vec3 specular = 0.3 * spec * vec3(1.0);
+    
     FragColor = vec4((ambient + diffuse + specular) * color, 1.0);
 }
 )";
     GLuint vsObj = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vsObj, 1, &vs, nullptr);
     glCompileShader(vsObj);
-    
+
     GLuint fsObj = glCreateShader(GL_FRAGMENT_SHADER);
     glShaderSource(fsObj, 1, &fs, nullptr);
     glCompileShader(fsObj);
-    
+
     g_shaderProg = glCreateProgram();
     glAttachShader(g_shaderProg, vsObj);
     glAttachShader(g_shaderProg, fsObj);
     glLinkProgram(g_shaderProg);
-    
+
     glDeleteShader(vsObj);
     glDeleteShader(fsObj);
 }
@@ -286,6 +334,12 @@ static UIState g_uiState;
 static bool g_isPlaying = false;
 static bool g_wasPlaying = false;
 static float g_gameSpeed = 1.0f;
+
+// Debug configuration
+struct DebugConfig {
+    bool verbose = true;
+};
+static DebugConfig g_debugConfig;
 
 // Console/Log system
 struct LogMessage {
@@ -540,9 +594,26 @@ void showAboutDialog() {
 // ============================================================================
 // Render Scene to FBO
 // ============================================================================
+static int g_frameCount = 0;
+static float g_lastRenderTime = 0;
+
 void renderScene() {
     PROFILE_GPU_SCOPE("Render Scene");
     
+    g_frameCount++;
+    float currentTime = glfwGetTime();
+    
+    // Print debug info every 60 frames
+    if (g_frameCount % 60 == 0 && g_debugConfig.verbose) {
+        float dt = currentTime - g_lastRenderTime;
+        if (dt > 0) {
+            std::cout << "[DEBUG] Frame " << g_frameCount 
+                      << " | Entities: " << g_world.getEntityCount()
+                      << " | FPS: " << (1.0f/dt) << "\n";
+        }
+        g_lastRenderTime = currentTime;
+    }
+
     // 🔵 2. Render scene INTO framebuffer (your viewport)
     g_viewportFB.bind();
 
@@ -560,29 +631,115 @@ void renderScene() {
 
     // Set renderer viewport and camera matrices
     g_renderer.SetViewport(0, 0, g_viewportFB.width, g_viewportFB.height);
-    
+
     glm::mat4 view = glm::lookAt(g_camera->Position, g_camera->Target, glm::vec3(0,1,0));
-    glm::mat4 proj = glm::perspective(glm::radians(60.0f), 
-                                       (float)g_viewportFB.width / g_viewportFB.height, 
+    glm::mat4 proj = glm::perspective(glm::radians(60.0f),
+                                       (float)g_viewportFB.width / g_viewportFB.height,
                                        0.1f, 1000.0f);
     g_renderer.SetCameraMatrices(view, proj);
+    g_renderer.SetLightParameters(glm::vec3(5.0f, 5.0f, 5.0f), g_camera->Position);
 
-    // Render all ECS entities through RenderSystem
+    // Render all ECS entities through RenderSystem (uses SubmitBatches internally)
     g_renderSystem.render();
 
-    // TEST: Draw a simple colored quad to verify FBO works
+    // === ECS RENDERING ===
+    // Use the ECS RenderSystem instead of direct rendering
+    static bool g_useDirectRendering = false;  // Set to true to use direct rendering fallback
+    static int g_debugPrintCounter = 0;
+    
+    if (g_useDirectRendering) {
+        g_debugPrintCounter++;
+        
+        // Clear any previous errors
+        while (glGetError() != GL_NO_ERROR);
+        
+        if (g_debugPrintCounter <= 3) {
+            std::cout << "[DIRECT_RENDER] Drawing cubes directly! (frame " << g_frameCount << ")" << std::endl;
+            std::cout << "[DIRECT_RENDER] Shader: " << g_shaderProg << ", VAO: " << g_cubeVAO << std::endl;
+            std::cout << "[DIRECT_RENDER] FBO bound: " << g_viewportFB.fbo << ", Size: " 
+                      << g_viewportFB.width << "x" << g_viewportFB.height << std::endl;
+        }
+        
+        // Render cubes directly using the same approach as viewport_debug_test
+        glUseProgram(g_shaderProg);
+        glBindVertexArray(g_cubeVAO);
+        
+        // Set view/projection uniforms
+        GLint viewLoc = glGetUniformLocation(g_shaderProg, "view");
+        GLint projLoc = glGetUniformLocation(g_shaderProg, "projection");
+        GLint modelLoc = glGetUniformLocation(g_shaderProg, "model");
+        GLint colorLoc = glGetUniformLocation(g_shaderProg, "color");
+        GLint lightPosLoc = glGetUniformLocation(g_shaderProg, "lightPos");
+        GLint viewPosLoc = glGetUniformLocation(g_shaderProg, "viewPos");
+        
+        if (g_debugPrintCounter <= 3) {
+            std::cout << "[DIRECT_RENDER] Uniform locations: view=" << viewLoc 
+                      << " proj=" << projLoc << " model=" << modelLoc 
+                      << " color=" << colorLoc << " light=" << lightPosLoc 
+                      << " viewPos=" << viewPosLoc << std::endl;
+        }
+        
+        // Set uniforms while shader is bound
+        glUniformMatrix4fv(viewLoc, 1, GL_FALSE, &view[0][0]);
+        glUniformMatrix4fv(projLoc, 1, GL_FALSE, &proj[0][0]);
+        glUniform3f(lightPosLoc, 5.0f, 5.0f, 5.0f);
+        glUniform3f(viewPosLoc, g_camera->Position.x, g_camera->Position.y, g_camera->Position.z);
+        
+        // Draw 3 cubes at different positions with different colors
+        struct CubeData {
+            glm::vec3 pos;
+            glm::vec3 color;
+            glm::vec3 scale;
+        };
+        
+        CubeData cubes[] = {
+            {{0.0f, 1.0f, 0.0f}, {1.0f, 0.2f, 0.2f}, {1.0f, 1.0f, 1.0f}},    // Red
+            {{2.0f, 2.0f, 0.0f}, {0.2f, 1.0f, 0.2f}, {0.5f, 0.5f, 0.5f}},    // Green
+            {{-2.0f, 3.0f, 0.0f}, {0.2f, 0.2f, 1.0f}, {0.7f, 0.7f, 0.7f}}    // Blue
+        };
+        
+        for (int i = 0; i < 3; i++) {
+            glm::mat4 model = glm::translate(glm::mat4(1.0f), cubes[i].pos);
+            model = glm::scale(model, cubes[i].scale);
+            glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+            glUniform3f(colorLoc, cubes[i].color.r, cubes[i].color.g, cubes[i].color.b);
+            
+            if (g_debugPrintCounter <= 3) {
+                std::cout << "[DIRECT_RENDER] Drawing cube " << i << " at (" 
+                          << cubes[i].pos.x << "," << cubes[i].pos.y << "," << cubes[i].pos.z << ")" << std::endl;
+            }
+            
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+            
+            // Check error after each draw
+            GLenum drawErr = glGetError();
+            if (drawErr != GL_NO_ERROR && g_debugPrintCounter <= 3) {
+                std::cerr << "[DIRECT_RENDER] Error after drawing cube " << i << ": " << drawErr << std::endl;
+            }
+        }
+        
+        glUseProgram(0);
+        glBindVertexArray(0);
+    }
+    else {
+        // Render all ECS entities through RenderSystem
+        g_renderSystem.render();
+    }
+
+    // DEBUG: Draw a visible test quad to verify FBO is working
+    // This helps distinguish between "FBO broken" vs "scene not rendering"
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
     glUseProgram(0);
     glBindVertexArray(0);
-    
-    // Draw a red rectangle in top-left corner of viewport
+
+    // Draw a small green rectangle in bottom-right corner as FBO activity indicator
     glBegin(GL_QUADS);
-    glColor3f(1.0f, 0.0f, 0.0f);
-    glVertex2f(-0.8f, 0.5f);
-    glVertex2f(-0.5f, 0.5f);
-    glVertex2f(-0.5f, 0.8f);
-    glVertex2f(-0.8f, 0.8f);
+    glColor3f(0.0f, 1.0f, 0.0f);  // Green = FBO is working
+    glVertex2f(0.9f, -0.95f);
+    glVertex2f(0.98f, -0.95f);
+    glVertex2f(0.98f, -0.85f);
+    glVertex2f(0.9f, -0.85f);
     glEnd();
 
     // 🔴 3. Restore default framebuffer
@@ -636,17 +793,26 @@ void renderTransformSection(ecs::TransformComponent* t) {
 
 void renderMeshSection(ecs::MeshComponent* m) {
     if (!m) return;
-    
+
     if (ImGui::CollapsingHeader("Mesh", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushID("Mesh");
-        
+
         ImGui::SeparatorText("Appearance");
         glm::vec3 c = m->color;
         if (ImGui::ColorEdit3("Albedo", &c.x, ImGuiColorEditFlags_Float)) {
-            m->color = c;
+            m->color = c;  // Real-time color change!
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset", ImVec2(60, 0))) {
+            m->color = glm::vec3(0.8f);
+        }
+        
         ImGui::Checkbox("Visible", &m->visible);
         
+        ImGui::SeparatorText("Material");
+        ImGui::SliderFloat("Metallic", &m->metallic, 0.0f, 1.0f);
+        ImGui::SliderFloat("Roughness", &m->roughness, 0.0f, 1.0f);
+
         ImGui::PopID();
     }
 }
@@ -872,33 +1038,57 @@ int main() {
     // Initialize Renderer and Render System
     std::cout << "Initializing Renderer...\n";
     g_renderer.Initialize();
-    std::cout << "Renderer initialized\n";
+    std::cout << "Renderer initialized with UBO and optimizations\n";
     g_renderSystem.setRenderer(&g_renderer);
     g_renderSystem.setWorld(&g_world);  // Set world pointer for iteration
     std::cout << "RenderSystem configured\n";
-    
+
     // Create a simple test model from VAO (cube)
     g_currentModel = Model::CreateFromVAO(g_cubeVAO, 36);
     std::cout << "Test model created from VAO (VAO=" << g_cubeVAO << ")\n";
     g_renderSystem.setModel(g_currentModel);
-    
+
     // Set shader program for rendering
     g_renderSystem.setDefaultShaderProgram(g_shaderProg);
-    std::cout << "Shader program set (" << g_shaderProg << ")\n";
-    
+    std::cout << "Shader program set (" << g_shaderProg << ") with UBO support\n";
+
     // Add render system to world (use our global instance)
     g_world.addSystem(&g_renderSystem);
     std::cout << "RenderSystem added to world\n";
 
     // Create initial scene (AFTER render system is added)
     std::cout << "Creating test cubes...\n";
-    createCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(0.8f, 0.2f, 0.2f));
-    std::cout << "Created cube 1\n";
-    createCube(glm::vec3(2, 2, 0), glm::vec3(0.5f), glm::vec3(0.2f, 0.8f, 0.2f));
-    std::cout << "Created cube 2\n";
-    createCube(glm::vec3(-2, 3, 0), glm::vec3(0.7f), glm::vec3(0.2f, 0.2f, 0.8f));
-    std::cout << "Created cube 3\n";
+    auto cube1 = createCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(0.8f, 0.2f, 0.2f));
+    std::cout << "Created cube 1 (entity: " << cube1.id << ")\n";
+    auto cube2 = createCube(glm::vec3(2, 2, 0), glm::vec3(0.5f), glm::vec3(0.2f, 0.8f, 0.2f));
+    std::cout << "Created cube 2 (entity: " << cube2.id << ")\n";
+    auto cube3 = createCube(glm::vec3(-2, 3, 0), glm::vec3(0.7f), glm::vec3(0.2f, 0.2f, 0.8f));
+    std::cout << "Created cube 3 (entity: " << cube3.id << ")\n";
     std::cout << "Total entities: " << g_world.getEntityCount() << "\n";
+    
+    // Debug: Verify components were added
+    std::cout << "\n=== Verifying Entity Components ===\n";
+    for (auto& cube : {cube1, cube2, cube3}) {
+        if (cube.isValid()) {
+            auto* t = g_world.getComponentArchetype<ecs::TransformComponent>(cube);
+            auto* m = g_world.getComponentArchetype<ecs::MeshComponent>(cube);
+            std::cout << "Entity " << cube.id << ": ";
+            if (t) {
+                std::cout << "Transform@(" << t->position.x << "," << t->position.y << "," << t->position.z << ") ";
+            } else {
+                std::cout << "NO_TRANSFORM ";
+            }
+            if (m) {
+                std::cout << "Mesh[visible=" << m->visible << ", meshID=" << m->meshID << "]";
+            } else {
+                std::cout << "NO_MESH";
+            }
+            std::cout << "\n";
+        } else {
+            std::cout << "Entity INVALID\n";
+        }
+    }
+    std::cout << "====================================\n\n";
 
     std::cout << "Ready!\n";
     std::cout << "Controls: Right-click+drag to look, WASD to move\n";
@@ -1126,13 +1316,37 @@ int main() {
         // ========== TOOLBAR ==========
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.08f, 1));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
-        ImGui::BeginChild("Toolbar", ImVec2(static_cast<float>(windowW), toolbarHeight), 
+        ImGui::BeginChild("Toolbar", ImVec2(static_cast<float>(windowW), toolbarHeight),
                          false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoScrollbar);
 
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 3));
 
+        // Entity creation buttons
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.3f, 0.4f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.4f, 0.5f, 1));
+        
+        if (ImGui::Button(ICON_FA_CUBE " Cube", ImVec2(75, 26))) {
+            createCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(1.0f, 0.2f, 0.2f));
+            logMessage("Created Cube");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_CUBE " Sphere", ImVec2(75, 26))) {
+            createSphere(glm::vec3(0, 1, 0), 0.5f, glm::vec3(0.2f, 1.0f, 0.2f));
+            logMessage("Created Sphere");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_CUBE " Plane", ImVec2(75, 26))) {
+            createPlane(glm::vec3(0, 0, 0), glm::vec2(10, 10), glm::vec3(0.5f, 0.5f, 0.5f));
+            logMessage("Created Plane");
+        }
+        ImGui::SameLine();
+        ImGui::Separator();
+        ImGui::SameLine();
+        
+        ImGui::PopStyleColor(2);
+
         // Transform tools
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Transform:");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Tools:");
         ImGui::SameLine();
 
         const char* transformTools[] = {"Translate", "Rotate", "Scale"};
@@ -1645,6 +1859,51 @@ int main() {
             
             if (g_isViewing) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+            }
+            
+            // Viewport context menu (right-click in empty space)
+            if (mouseInViewport && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                g_isViewing = true;
+            }
+            if (ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+                g_isViewing = false;
+            }
+            
+            // Context menu on right-click in viewport
+            if (mouseInViewport && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                ImGui::OpenPopup("ViewportContext");
+            }
+            
+            if (ImGui::BeginPopup("ViewportContext")) {
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1), "Create Entity");
+                ImGui::Separator();
+                
+                if (ImGui::MenuItem(ICON_FA_CUBE " Create Cube")) {
+                    createCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(1.0f, 0.2f, 0.2f));
+                    logMessage("Created Cube from viewport menu");
+                }
+                if (ImGui::MenuItem(ICON_FA_CUBE " Create Sphere")) {
+                    createSphere(glm::vec3(0, 1, 0), 0.5f, glm::vec3(0.2f, 1.0f, 0.2f));
+                    logMessage("Created Sphere from viewport menu");
+                }
+                if (ImGui::MenuItem(ICON_FA_CUBE " Create Plane")) {
+                    createPlane(glm::vec3(0, 0, 0), glm::vec2(10, 10), glm::vec3(0.5f, 0.5f, 0.5f));
+                    logMessage("Created Plane from viewport menu");
+                }
+                if (ImGui::MenuItem(ICON_FA_CUBE " Create Light")) {
+                    createLight(glm::vec3(5, 10, 5), glm::vec3(1, 1, 0.9f), 1.0f);
+                    logMessage("Created Light from viewport menu");
+                }
+                
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear Scene")) {
+                    g_world.shutdown();
+                    g_world.init();
+                    g_selected = ecs::INVALID_ENTITY_ID;
+                    logMessage("Scene cleared");
+                }
+                
+                ImGui::EndPopup();
             }
         }
 

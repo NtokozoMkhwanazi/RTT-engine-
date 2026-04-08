@@ -17,6 +17,9 @@
 // Animation
 #include "MotionMatchingComponent.h"
 
+// Geospatial
+#include "GeospatialComponent.h"
+
 /**
  * ECS Components Module
  *

@@ -7,10 +7,24 @@
 namespace ecs {
 
 /**
+ * Mesh type enumeration for procedural meshes
+ */
+enum class MeshType : int {
+    Cube = 0,
+    Sphere = 1,
+    Plane = 2,
+    Cylinder = 3,
+    Cone = 4,
+    Torus = 5,
+    Custom = 100  // Loaded from file
+};
+
+/**
  * Mesh Component - Reference to a mesh asset
  */
 struct MeshComponent : public Component {
     int meshID = -1;              // Reference to loaded mesh
+    MeshType meshType = MeshType::Cube;  // Type of procedural mesh
     bool visible = true;
     bool castShadow = true;
     bool receiveShadow = true;

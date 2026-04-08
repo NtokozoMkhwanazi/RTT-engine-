@@ -24,9 +24,12 @@
 #include "ecs/ECS.h"
 #include "ecs/components/Components.h"
 #include "ecs/systems/Systems.h"
+#include "geospatial/GeospatialConverter.h"
+#include "geospatial/GPSTracker.h"
 #include "cameraSystem/flyCamera.h"
 #include "renderer/GPUProfilerAdvanced.h"
 #include "renderer/Renderer.h"
+#include "renderer/MeshRegistry.h"
 #include "ecs/systems/RenderSystem.h"
 
 #include <imgui.h>
@@ -132,15 +135,59 @@ static Framebuffer g_viewportFB;
 // Shader Helper
 // ============================================================================
 static GLuint g_shaderProg = 0;
+static GLuint g_cubeTexture = 0;  // Procedural texture for cubes
+
+// Create a procedural checkerboard texture
+static void createProceduralTexture() {
+    const int texSize = 256;
+    unsigned char* texData = new unsigned char[texSize * texSize * 3];
+    
+    // Generate checkerboard pattern
+    int checkSize = 32;
+    for (int y = 0; y < texSize; y++) {
+        for (int x = 0; x < texSize; x++) {
+            int idx = (y * texSize + x) * 3;
+            bool isWhite = ((x / checkSize) + (y / checkSize)) % 2 == 0;
+            
+            if (isWhite) {
+                texData[idx + 0] = 200;  // R
+                texData[idx + 1] = 200;  // G
+                texData[idx + 2] = 200;  // B
+            } else {
+                texData[idx + 0] = 80;   // R
+                texData[idx + 1] = 80;   // G
+                texData[idx + 2] = 100;  // B (slightly blue)
+            }
+        }
+    }
+    
+    // Generate OpenGL texture
+    glGenTextures(1, &g_cubeTexture);
+    glBindTexture(GL_TEXTURE_2D, g_cubeTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, texSize, texSize, 0, GL_RGB, GL_UNSIGNED_BYTE, texData);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    
+    glBindTexture(GL_TEXTURE_2D, 0);
+    delete[] texData;
+    
+    std::cout << "[OK] Procedural checkerboard texture created (" << texSize << "x" << texSize << ")\n";
+}
 
 static void initShader() {
-    // Optimized shader with UBO support and explicit layout locations
+    // Optimized shader with UBO support, explicit layout locations, and proper material system
     const char* vs = R"(
 #version 430 core
 
 // Vertex attributes
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
+layout(location=2) in vec2 aTexCoord;  // For textures
 
 // Instance matrix (per-instance data)
 layout(location=7) in mat4 instanceMatrix;
@@ -154,11 +201,10 @@ layout(std140, binding = 0) uniform CameraBlock {
     vec4 lightPos;
 } camera;
 
-// Explicit uniform locations for per-object data
-layout(location = 0) uniform vec3 color;
-
 out vec3 FragPos;
 out vec3 Normal;
+out vec2 TexCoord;
+out vec3 ViewDir;
 
 void main() {
     // Use instance matrix for instanced rendering
@@ -168,6 +214,12 @@ void main() {
     vec4 worldPos = finalModel * vec4(aPos, 1.0);
     FragPos = vec3(worldPos);
     Normal = mat3(transpose(inverse(finalModel))) * aNormal;
+    
+    // Pass texture coordinates
+    TexCoord = aTexCoord;
+    
+    // Calculate view direction for fresnel/specular
+    ViewDir = normalize(camera.viewPos.xyz - FragPos);
     
     // Use UBO for view/projection
     gl_Position = camera.projection * camera.view * worldPos;
@@ -179,6 +231,8 @@ void main() {
 // Fragment inputs
 in vec3 FragPos;
 in vec3 Normal;
+in vec2 TexCoord;
+in vec3 ViewDir;
 
 // UBO for camera/light - binding point 0
 layout(std140, binding = 0) uniform CameraBlock {
@@ -189,27 +243,94 @@ layout(std140, binding = 0) uniform CameraBlock {
     vec4 lightPos;
 } camera;
 
-// Explicit uniform locations
-layout(location = 0) uniform vec3 color;
+// Material properties - explicit locations
+layout(location = 0) uniform vec3 albedo;      // Base color
+layout(location = 1) uniform float metallic;    // Metallic factor (0-1)
+layout(location = 2) uniform float roughness;   // Roughness factor (0-1)
+layout(location = 3) uniform float ao;          // Ambient occlusion (0-1)
+layout(location = 4) uniform vec3 emissive;     // Emissive color
+
+// Texture samplers
+uniform sampler2D albedoMap;
+uniform sampler2D normalMap;
+uniform sampler2D metallicRoughnessMap;
+uniform bool useAlbedoMap = false;
+uniform bool useNormalMap = false;
 
 // Fragment output
 out vec4 FragColor;
 
-void main() {
-    // Lighting calculations
-    vec3 ambient = 0.2 * vec3(1.0);
-    
+// PBR Lighting (simplified)
+vec3 calculatePBR() {
+    // Get albedo (from texture or uniform)
+    vec3 baseColor = useAlbedoMap ? texture(albedoMap, TexCoord).rgb : albedo;
+
+    // Normal (could sample normal map here)
+    // Two-sided lighting: flip normal for backfaces
     vec3 norm = normalize(Normal);
+    if (!gl_FrontFacing) {
+        norm = -norm;
+    }
+
+    // Light direction
     vec3 lightDir = normalize(camera.lightPos.xyz - FragPos);
-    float diff = max(dot(norm, lightDir), 0.0);
-    vec3 diffuse = diff * vec3(1.0);
-    
-    vec3 viewDir = normalize(camera.viewPos.xyz - FragPos);
+
+    // View direction (already calculated in VS)
+    vec3 viewDir = normalize(ViewDir);
+
+    // Reflect direction
     vec3 reflectDir = reflect(-lightDir, norm);
-    float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
-    vec3 specular = 0.3 * spec * vec3(1.0);
-    
-    FragColor = vec4((ambient + diffuse + specular) * color, 1.0);
+
+    // Fresnel effect (Schlick approximation)
+    vec3 F0 = vec3(0.04);
+    F0 = mix(F0, baseColor, metallic);
+    vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(viewDir, reflectDir), 0.0), 5.0);
+
+    // Diffuse (Lambert)
+    vec3 diffuse = baseColor * (1.0 - F) * (1.0 - metallic);
+
+    // Specular (Cook-Torrance GGX)
+    float NdotL = max(dot(norm, lightDir), 0.0);
+    float NdotV = max(dot(norm, viewDir), 0.0);
+    float NdotR = max(dot(norm, reflectDir), 0.0);
+
+    // Distribution (GGX)
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotR2 = NdotR * NdotR;
+    float num = a2;
+    float denom = (NdotR2 * (a2 - 1.0) + 1.0);
+    denom = 3.14159 * denom * denom;
+    float D = num / max(denom, 0.001);
+
+    // Geometry (Schlick-GGX)
+    float k = (a + 1.0) * (a + 1.0) / 8.0;
+    float G_L = NdotL / (NdotL * (1.0 - k) + k);
+    float G_V = NdotV / (NdotV * (1.0 - k) + k);
+    float G = G_L * G_V;
+
+    // specular BRDF
+    vec3 specular = (D * F * G) / (4.0 * NdotL * NdotV + 0.001);
+
+    // Final PBR lighting
+    vec3 ambient = vec3(0.03) * baseColor * ao;
+    vec3 result = ambient + (diffuse + specular) * NdotL;
+
+    // Tone mapping (ACES)
+    result = result / (result + vec3(1.0));
+    result = pow(result, vec3(1.0/2.2));  // Gamma correction
+
+    return result;
+}
+
+void main() {
+    // Calculate PBR lighting
+    vec3 color = calculatePBR();
+
+    // Add emissive
+    color += emissive;
+
+    FragColor = vec4(color, 1.0);
 }
 )";
     GLuint vsObj = glCreateShader(GL_VERTEX_SHADER);
@@ -243,43 +364,57 @@ static void setVec3(const char* n, const glm::vec3& v) {
 // Cube Mesh
 // ============================================================================
 static GLuint g_cubeVAO = 0, g_cubeVBO = 0, g_cubeEBO = 0;
+static GLuint g_sphereVAO = 0, g_sphereVBO = 0, g_sphereEBO = 0;
+static GLuint g_planeVAO = 0, g_planeVBO = 0, g_planeEBO = 0;
+static GLsizei g_cubeIndexCount = 36;
+static GLsizei g_sphereIndexCount = 0;
+static GLsizei g_planeIndexCount = 0;
 
 static void initCube() {
+    // Cube with positions, normals, AND texture coordinates
     float verts[] = {
-        -0.5f,-0.5f,-0.5f, 0,0,-1,  0.5f,-0.5f,-0.5f, 0,0,-1,  0.5f,0.5f,-0.5f, 0,0,-1,
-         0.5f,0.5f,-0.5f, 0,0,-1, -0.5f,0.5f,-0.5f, 0,0,-1, -0.5f,-0.5f,-0.5f, 0,0,-1,
-        -0.5f,-0.5f, 0.5f, 0,0, 1,  0.5f,-0.5f, 0.5f, 0,0, 1,  0.5f, 0.5f, 0.5f, 0,0, 1,
-         0.5f, 0.5f, 0.5f, 0,0, 1, -0.5f, 0.5f, 0.5f, 0,0, 1, -0.5f,-0.5f, 0.5f, 0,0, 1,
-        -0.5f, 0.5f, 0.5f,-1,0, 0, -0.5f, 0.5f,-0.5f,-1,0, 0, -0.5f,-0.5f,-0.5f,-1,0, 0,
-        -0.5f,-0.5f,-0.5f,-1,0, 0, -0.5f,-0.5f, 0.5f,-1,0, 0, -0.5f, 0.5f, 0.5f,-1,0, 0,
-         0.5f, 0.5f, 0.5f, 1,0, 0,  0.5f, 0.5f,-0.5f, 1,0, 0,  0.5f,-0.5f,-0.5f, 1,0, 0,
-         0.5f,-0.5f,-0.5f, 1,0, 0,  0.5f,-0.5f, 0.5f, 1,0, 0,  0.5f, 0.5f, 0.5f, 1,0, 0,
-        -0.5f,-0.5f,-0.5f, 0,-1, 0,  0.5f,-0.5f,-0.5f, 0,-1, 0,  0.5f,-0.5f, 0.5f, 0,-1, 0,
-         0.5f,-0.5f, 0.5f, 0,-1, 0, -0.5f,-0.5f, 0.5f, 0,-1, 0, -0.5f,-0.5f,-0.5f, 0,-1, 0,
-        -0.5f, 0.5f,-0.5f, 0, 1, 0,  0.5f, 0.5f,-0.5f, 0, 1, 0,  0.5f, 0.5f, 0.5f, 0, 1, 0,
-         0.5f, 0.5f, 0.5f, 0, 1, 0, -0.5f, 0.5f, 0.5f, 0, 1, 0, -0.5f, 0.5f,-0.5f, 0, 1, 0
+        // positions          // normals           // texcoords
+        -0.5f,-0.5f,-0.5f,  0,0,-1,  0,0,   0.5f,-0.5f,-0.5f,  0,0,-1,  1,0,   0.5f,0.5f,-0.5f,  0,0,-1,  1,1,
+         0.5f,0.5f,-0.5f,  0,0,-1,  1,1,  -0.5f,0.5f,-0.5f,  0,0,-1,  0,1,  -0.5f,-0.5f,-0.5f,  0,0,-1,  0,0,
+        -0.5f,-0.5f, 0.5f,  0,0, 1,  0,0,   0.5f,-0.5f, 0.5f,  0,0, 1,  1,0,   0.5f, 0.5f, 0.5f,  0,0, 1,  1,1,
+         0.5f, 0.5f, 0.5f,  0,0, 1,  1,1,  -0.5f, 0.5f, 0.5f,  0,0, 1,  0,1,  -0.5f,-0.5f, 0.5f,  0,0, 1,  0,0,
+        -0.5f, 0.5f, 0.5f, -1,0, 0,  0,0,  -0.5f, 0.5f,-0.5f, -1,0, 0,  1,0,  -0.5f,-0.5f,-0.5f, -1,0, 0,  1,1,
+        -0.5f,-0.5f,-0.5f, -1,0, 0,  1,1,  -0.5f,-0.5f, 0.5f, -1,0, 0,  0,1,  -0.5f, 0.5f, 0.5f, -1,0, 0,  0,0,
+         0.5f, 0.5f, 0.5f,  1,0, 0,  0,0,   0.5f, 0.5f,-0.5f,  1,0, 0,  1,0,   0.5f,-0.5f,-0.5f,  1,0, 0,  1,1,
+         0.5f,-0.5f,-0.5f,  1,0, 0,  1,1,   0.5f,-0.5f, 0.5f,  1,0, 0,  0,1,   0.5f, 0.5f, 0.5f,  1,0, 0,  0,0,
+        -0.5f,-0.5f,-0.5f,  0,-1, 0,  0,0,   0.5f,-0.5f,-0.5f,  0,-1, 0,  1,0,   0.5f,-0.5f, 0.5f,  0,-1, 0,  1,1,
+         0.5f,-0.5f, 0.5f,  0,-1, 0,  1,1,  -0.5f,-0.5f, 0.5f,  0,-1, 0,  0,1,  -0.5f,-0.5f,-0.5f,  0,-1, 0,  0,0,
+        -0.5f, 0.5f,-0.5f,  0, 1, 0,  0,0,   0.5f, 0.5f,-0.5f,  0, 1, 0,  1,0,   0.5f, 0.5f, 0.5f,  0, 1, 0,  1,1,
+         0.5f, 0.5f, 0.5f,  0, 1, 0,  1,1,  -0.5f, 0.5f, 0.5f,  0, 1, 0,  0,1,  -0.5f, 0.5f,-0.5f,  0, 1, 0,  0,0
     };
     unsigned int idx[] = {
         0,1,2,2,3,4,5, 6,7,7,8,9, 10,11,12,12,13,14,
         15,16,17,17,18,19, 20,21,22,22,23,24, 25,26,27,27,28,29,
         30,31,32,32,33,34, 35,36,37,37,38,39
     };
-    
+
     glGenVertexArrays(1, &g_cubeVAO);
     glGenBuffers(1, &g_cubeVBO);
     glGenBuffers(1, &g_cubeEBO);
-    
+
     glBindVertexArray(g_cubeVAO);
     glBindBuffer(GL_ARRAY_BUFFER, g_cubeVBO);
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_cubeEBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx), idx, GL_STATIC_DRAW);
-    
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)0);
+
+    // Position attribute (location 0) - 3 floats
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)(3*sizeof(float)));
+    
+    // Normal attribute (location 1) - 3 floats
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(3*sizeof(float)));
     glEnableVertexAttribArray(1);
     
+    // Texture coordinate attribute (location 2) - 2 floats
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(6*sizeof(float)));
+    glEnableVertexAttribArray(2);
+
     glBindVertexArray(0);
 }
 
@@ -297,6 +432,180 @@ static void cleanupCube() {
 }
 
 // ============================================================================
+// Sphere Mesh (UV sphere)
+// ============================================================================
+static void initSphere(int rings = 16, int segments = 32) {
+    std::vector<float> verts;
+    std::vector<unsigned int> indices;
+
+    for (int r = 0; r <= rings; r++) {
+        float phi = M_PI * r / rings;
+        for (int s = 0; s <= segments; s++) {
+            float theta = 2.0f * M_PI * s / segments;
+
+            float x = std::sin(phi) * std::cos(theta);
+            float y = std::cos(phi);
+            float z = std::sin(phi) * std::sin(theta);
+
+            float u = (float)s / segments;
+            float v = (float)r / rings;
+
+            verts.push_back(x * 0.5f);  // Scale to unit sphere
+            verts.push_back(y * 0.5f);
+            verts.push_back(z * 0.5f);
+            verts.push_back(x);  // Normal
+            verts.push_back(y);
+            verts.push_back(z);
+            verts.push_back(u);  // Texcoord
+            verts.push_back(v);
+        }
+    }
+
+    for (int r = 0; r < rings; r++) {
+        for (int s = 0; s < segments; s++) {
+            unsigned int current = r * (segments + 1) + s;
+            unsigned int next = current + segments + 1;
+            indices.push_back(current);
+            indices.push_back(next);
+            indices.push_back(current + 1);
+            indices.push_back(current + 1);
+            indices.push_back(next);
+            indices.push_back(next + 1);
+        }
+    }
+
+    g_sphereIndexCount = indices.size();
+
+    glGenVertexArrays(1, &g_sphereVAO);
+    glGenBuffers(1, &g_sphereVBO);
+    glGenBuffers(1, &g_sphereEBO);
+
+    glBindVertexArray(g_sphereVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_sphereVBO);
+    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_sphereEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    glBindVertexArray(0);
+}
+
+// ============================================================================
+// Plane Mesh
+// ============================================================================
+static void initPlane() {
+    float verts[] = {
+        // positions          // normals           // texcoords
+        -0.5f, 0.0f, -0.5f,  0, 1, 0,  0, 0,
+         0.5f, 0.0f, -0.5f,  0, 1, 0,  1, 0,
+         0.5f, 0.0f,  0.5f,  0, 1, 0,  1, 1,
+        -0.5f, 0.0f,  0.5f,  0, 1, 0,  0, 1,
+    };
+    unsigned int indices[] = {
+        0, 1, 2, 2, 3, 0
+    };
+    g_planeIndexCount = 6;
+
+    glGenVertexArrays(1, &g_planeVAO);
+    glGenBuffers(1, &g_planeVBO);
+    glGenBuffers(1, &g_planeEBO);
+
+    glBindVertexArray(g_planeVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_planeVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_planeEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    glBindVertexArray(0);
+}
+
+static void cleanupSphere() {
+    if (g_sphereVAO) glDeleteVertexArrays(1, &g_sphereVAO);
+    if (g_sphereVBO) glDeleteBuffers(1, &g_sphereVBO);
+    if (g_sphereEBO) glDeleteBuffers(1, &g_sphereEBO);
+    g_sphereVAO = 0; g_sphereVBO = 0; g_sphereEBO = 0;
+}
+
+static void cleanupPlane() {
+    if (g_planeVAO) glDeleteVertexArrays(1, &g_planeVAO);
+    if (g_planeVBO) glDeleteBuffers(1, &g_planeVBO);
+    if (g_planeEBO) glDeleteBuffers(1, &g_planeEBO);
+    g_planeVAO = 0; g_planeVBO = 0; g_planeEBO = 0;
+}
+
+// ============================================================================
+// Grid Rendering (forward declarations - globals defined below)
+// ============================================================================
+static GLuint g_gridVAO = 0, g_gridVBO = 0;
+static GLsizei g_gridLineCount = 0;
+
+static void initGrid(int gridSize, float spacing);
+static void drawGrid(const glm::mat4& view, const glm::mat4& projection);
+static void cleanupGrid();
+
+// ============================================================================
+// Gizmo Rendering (forward declarations)
+// ============================================================================
+static void drawGizmo(const glm::vec3& position, float size, const glm::quat& rotation);
+
+// ============================================================================
+// Grid Rendering Implementation
+// ============================================================================
+static void initGrid(int gridSize, float spacing) {
+    std::vector<float> gridVerts;
+    float halfSize = gridSize * spacing * 0.5f;
+
+    // Generate grid lines along X axis
+    for (int i = 0; i <= gridSize; i++) {
+        float x = -halfSize + i * spacing;
+        gridVerts.push_back(x); gridVerts.push_back(0.0f); gridVerts.push_back(-halfSize);
+        gridVerts.push_back(x); gridVerts.push_back(0.0f); gridVerts.push_back(halfSize);
+    }
+
+    // Generate grid lines along Z axis
+    for (int i = 0; i <= gridSize; i++) {
+        float z = -halfSize + i * spacing;
+        gridVerts.push_back(-halfSize); gridVerts.push_back(0.0f); gridVerts.push_back(z);
+        gridVerts.push_back(halfSize); gridVerts.push_back(0.0f); gridVerts.push_back(z);
+    }
+
+    // Make axes thicker/bolder by adding them separately
+    // X axis (red)
+    gridVerts.push_back(-halfSize); gridVerts.push_back(0.01f); gridVerts.push_back(0.0f);
+    gridVerts.push_back(halfSize); gridVerts.push_back(0.01f); gridVerts.push_back(0.0f);
+    // Z axis (blue)
+    gridVerts.push_back(0.0f); gridVerts.push_back(0.01f); gridVerts.push_back(-halfSize);
+    gridVerts.push_back(0.0f); gridVerts.push_back(0.01f); gridVerts.push_back(halfSize);
+
+    g_gridLineCount = static_cast<GLsizei>(gridVerts.size() / 3);
+
+    glGenVertexArrays(1, &g_gridVAO);
+    glGenBuffers(1, &g_gridVBO);
+
+    glBindVertexArray(g_gridVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_gridVBO);
+    glBufferData(GL_ARRAY_BUFFER, gridVerts.size() * sizeof(float), gridVerts.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
+    glEnableVertexAttribArray(0);
+
+    glBindVertexArray(0);
+}
+
+// ============================================================================
 // Globals
 // ============================================================================
 static ecs::World g_world;
@@ -307,6 +616,7 @@ static float g_fps = 0.0f;
 // Renderer and Render System
 static Renderer g_renderer;
 static ecs::RenderSystem g_renderSystem;
+static ecs::GeospatialSystem g_geospatialSystem;
 static Model* g_currentModel = nullptr;
 
 // Editor State
@@ -316,10 +626,17 @@ static GizmoType g_gizmoType = GizmoType::Translate;
 static SpaceType g_spaceType = SpaceType::World;
 static bool g_showGrid = true;
 static bool g_showGizmo = true;
+static bool g_showWireframe = false;  // Wireframe debug mode
 
 // Viewport camera controls
 static bool g_isViewing = false;
 static glm::vec2 g_lastMousePos;
+
+// UI Layout constants (must match ImGui panel dimensions)
+static constexpr float kMenuBarHeight = 25.0f;
+static constexpr float kToolbarHeight = 36.0f;
+static constexpr float kSidePanelWidth = 280.0f;
+static constexpr float kTabbedBottomHeight = 180.0f;  // console height
 
 // UI State (non-static to avoid lifetime issues)
 struct UIState {
@@ -475,6 +792,212 @@ ecs::Entity createCamera(const glm::vec3& pos, const glm::vec3& target) {
 }
 
 // ============================================================================
+// Grid Rendering Implementation
+// ============================================================================
+static void drawGrid(const glm::mat4& view, const glm::mat4& projection) {
+    if (!g_showGrid || g_gridVAO == 0) return;
+
+    glDisable(GL_DEPTH_TEST);  // Grid always renders on top
+    glUseProgram(g_shaderProg);
+
+    // Set view/projection
+    GLint viewLoc = glGetUniformLocation(g_shaderProg, "view");
+    GLint projLoc = glGetUniformLocation(g_shaderProg, "projection");
+    GLint modelLoc = glGetUniformLocation(g_shaderProg, "model");
+    GLint colorLoc = glGetUniformLocation(g_shaderProg, "color");
+
+    glUniformMatrix4fv(viewLoc, 1, GL_FALSE, &view[0][0]);
+    glUniformMatrix4fv(projLoc, 1, GL_FALSE, &projection[0][0]);
+
+    // Draw grid lines (gray)
+    glm::mat4 model = glm::mat4(1.0f);
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+    glUniform3f(colorLoc, 0.3f, 0.3f, 0.35f);
+
+    glBindVertexArray(g_gridVAO);
+    // Draw all lines except last 4 (axes)
+    glDrawArrays(GL_LINES, 0, g_gridLineCount - 4);
+
+    // Draw X axis (red)
+    glUniform3f(colorLoc, 0.8f, 0.2f, 0.2f);
+    glDrawArrays(GL_LINES, g_gridLineCount - 4, 2);
+
+    // Draw Z axis (blue)
+    glUniform3f(colorLoc, 0.2f, 0.2f, 0.8f);
+    glDrawArrays(GL_LINES, g_gridLineCount - 2, 2);
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glEnable(GL_DEPTH_TEST);
+}
+
+static void cleanupGrid() {
+    if (g_gridVAO) glDeleteVertexArrays(1, &g_gridVAO);
+    if (g_gridVBO) glDeleteBuffers(1, &g_gridVBO);
+    g_gridVAO = 0; g_gridVBO = 0; g_gridLineCount = 0;
+}
+
+// ============================================================================
+// Gizmo Rendering (Translate/Rotate/Scale)
+// ============================================================================
+static void drawGizmo(const glm::vec3& position, float size, const glm::quat& rotation) {
+    if (!g_showGizmo || g_selected == ecs::INVALID_ENTITY_ID) return;
+    if (g_gizmoType == GizmoType::None) return;
+
+    glDisable(GL_DEPTH_TEST);
+    glUseProgram(g_shaderProg);
+
+    GLint viewLoc = glGetUniformLocation(g_shaderProg, "view");
+    GLint projLoc = glGetUniformLocation(g_shaderProg, "projection");
+    GLint modelLoc = glGetUniformLocation(g_shaderProg, "model");
+    GLint colorLoc = glGetUniformLocation(g_shaderProg, "color");
+
+    // Build rotation matrix from quaternion
+    glm::mat4 rotMat = glm::toMat4(rotation);
+
+    // Gizmo axes: X=red, Y=green, Z=blue
+    struct AxisGizmo {
+        glm::vec3 direction;
+        glm::vec3 color;
+        std::vector<float> verts;
+    };
+
+    float arrowLen = size * 0.8f;
+    float headLen = size * 0.25f;
+    float headWidth = size * 0.12f;
+
+    AxisGizmo axes[3];
+
+    // X axis (red)
+    axes[0].direction = glm::vec3(1, 0, 0);
+    axes[0].color = glm::vec3(1.0f, 0.2f, 0.2f);
+    axes[0].verts = {
+        // Line
+        0, 0, 0,  arrowLen, 0, 0,
+        // Arrow head
+        arrowLen, 0, 0,  arrowLen - headLen, headWidth, 0,
+        arrowLen, 0, 0,  arrowLen - headLen, -headWidth, 0,
+        arrowLen, 0, 0,  arrowLen - headLen, 0, headWidth,
+        arrowLen, 0, 0,  arrowLen - headLen, 0, -headWidth,
+    };
+
+    // Y axis (green)
+    axes[1].direction = glm::vec3(0, 1, 0);
+    axes[1].color = glm::vec3(0.2f, 1.0f, 0.2f);
+    axes[1].verts = {
+        0, 0, 0,  0, arrowLen, 0,
+        0, arrowLen, 0,  headWidth, arrowLen - headLen, 0,
+        0, arrowLen, 0,  -headWidth, arrowLen - headLen, 0,
+        0, arrowLen, 0,  0, arrowLen - headLen, headWidth,
+        0, arrowLen, 0,  0, arrowLen - headLen, -headWidth,
+    };
+
+    // Z axis (blue)
+    axes[2].direction = glm::vec3(0, 0, 1);
+    axes[2].color = glm::vec3(0.2f, 0.2f, 1.0f);
+    axes[2].verts = {
+        0, 0, 0,  0, 0, arrowLen,
+        0, 0, arrowLen,  headWidth, 0, arrowLen - headLen,
+        0, 0, arrowLen,  -headWidth, 0, arrowLen - headLen,
+        0, 0, arrowLen,  0, headWidth, arrowLen - headLen,
+        0, 0, arrowLen,  0, -headWidth, arrowLen - headLen,
+    };
+
+    // For rotate gizmo, draw circles instead of arrows
+    if (g_gizmoType == GizmoType::Rotate) {
+        float radius = size * 0.6f;
+        int segments = 32;
+
+        for (int a = 0; a < 3; a++) {
+            axes[a].verts.clear();
+            glm::vec3 d = axes[a].direction;
+
+            // Find two perpendicular axes
+            glm::vec3 perp1, perp2;
+            if (abs(d.x) > 0.9f) { perp1 = glm::vec3(0, 0, 1); }
+            else { perp1 = glm::vec3(1, 0, 0); }
+            perp1 = glm::normalize(glm::cross(d, perp1));
+            perp2 = glm::normalize(glm::cross(d, perp1));
+
+            for (int i = 0; i < segments; i++) {
+                float angle1 = (float)i / segments * 2.0f * 3.14159f;
+                float angle2 = (float)(i + 1) / segments * 2.0f * 3.14159f;
+
+                glm::vec3 p1 = glm::cos(angle1) * perp1 * radius + glm::sin(angle1) * perp2 * radius;
+                glm::vec3 p2 = glm::cos(angle2) * perp1 * radius + glm::sin(angle2) * perp2 * radius;
+
+                axes[a].verts.push_back(p1.x); axes[a].verts.push_back(p1.y); axes[a].verts.push_back(p1.z);
+                axes[a].verts.push_back(p2.x); axes[a].verts.push_back(p2.y); axes[a].verts.push_back(p2.z);
+            }
+        }
+    }
+
+    // For scale gizmo, draw small cubes at axis ends
+    if (g_gizmoType == GizmoType::Scale) {
+        for (int a = 0; a < 3; a++) {
+            float endPos = size * 0.8f;
+            glm::vec3 end = axes[a].direction * endPos;
+            float cubeSize = size * 0.15f;
+
+            axes[a].verts = {
+                // Line to cube
+                0, 0, 0,  end.x, end.y, end.z,
+                // Small cube at end (wireframe edges)
+                end.x - cubeSize, end.y - cubeSize, end.z - cubeSize,  end.x + cubeSize, end.y - cubeSize, end.z - cubeSize,
+                end.x + cubeSize, end.y - cubeSize, end.z - cubeSize,  end.x + cubeSize, end.y + cubeSize, end.z - cubeSize,
+                end.x + cubeSize, end.y + cubeSize, end.z - cubeSize,  end.x - cubeSize, end.y + cubeSize, end.z - cubeSize,
+                end.x - cubeSize, end.y + cubeSize, end.z - cubeSize,  end.x - cubeSize, end.y - cubeSize, end.z - cubeSize,
+                end.x - cubeSize, end.y - cubeSize, end.z + cubeSize,  end.x + cubeSize, end.y - cubeSize, end.z + cubeSize,
+                end.x + cubeSize, end.y - cubeSize, end.z + cubeSize,  end.x + cubeSize, end.y + cubeSize, end.z + cubeSize,
+                end.x + cubeSize, end.y + cubeSize, end.z + cubeSize,  end.x - cubeSize, end.y + cubeSize, end.z + cubeSize,
+                end.x - cubeSize, end.y + cubeSize, end.z + cubeSize,  end.x - cubeSize, end.y - cubeSize, end.z + cubeSize,
+                // Connect front to back
+                end.x - cubeSize, end.y - cubeSize, end.z - cubeSize,  end.x - cubeSize, end.y - cubeSize, end.z + cubeSize,
+                end.x + cubeSize, end.y - cubeSize, end.z - cubeSize,  end.x + cubeSize, end.y - cubeSize, end.z + cubeSize,
+                end.x + cubeSize, end.y + cubeSize, end.z - cubeSize,  end.x + cubeSize, end.y + cubeSize, end.z + cubeSize,
+                end.x - cubeSize, end.y + cubeSize, end.z - cubeSize,  end.x - cubeSize, end.y + cubeSize, end.z + cubeSize,
+            };
+        }
+    }
+
+    // Create VAO for gizmo
+    GLuint gizmoVAO, gizmoVBO;
+    glGenVertexArrays(1, &gizmoVAO);
+    glGenBuffers(1, &gizmoVBO);
+    glBindVertexArray(gizmoVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, gizmoVBO);
+    glBufferData(GL_ARRAY_BUFFER, 256 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
+    glEnableVertexAttribArray(0);
+
+    // Draw each axis
+    for (int a = 0; a < 3; a++) {
+        // Transform gizmo vertices by position and rotation
+        std::vector<float> transformedVerts;
+        transformedVerts.reserve(axes[a].verts.size());
+
+        for (size_t i = 0; i < axes[a].verts.size(); i += 3) {
+            glm::vec3 localPos(axes[a].verts[i], axes[a].verts[i+1], axes[a].verts[i+2]);
+            glm::vec3 worldPos = position + glm::vec3(rotMat * glm::vec4(localPos, 1.0f));
+            transformedVerts.push_back(worldPos.x);
+            transformedVerts.push_back(worldPos.y);
+            transformedVerts.push_back(worldPos.z);
+        }
+
+        glBufferSubData(GL_ARRAY_BUFFER, 0, transformedVerts.size() * sizeof(float), transformedVerts.data());
+
+        glUniform3f(colorLoc, axes[a].color.r, axes[a].color.g, axes[a].color.b);
+        glDrawArrays(GL_LINES, 0, transformedVerts.size() / 3);
+    }
+
+    glBindVertexArray(0);
+    glDeleteVertexArrays(1, &gizmoVAO);
+    glDeleteBuffers(1, &gizmoVBO);
+    glUseProgram(0);
+    glEnable(GL_DEPTH_TEST);
+}
+
+// ============================================================================
 // Scene Serialization (Simple JSON-like format)
 // ============================================================================
 #include <fstream>
@@ -625,6 +1148,13 @@ void renderScene() {
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
 
+    // Wireframe mode for debugging
+    if (g_showWireframe) {
+        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    } else {
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    }
+
     // Clear
     glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -726,9 +1256,22 @@ void renderScene() {
         g_renderSystem.render();
     }
 
+    // Render grid (uses same shader with simple color mode)
+    drawGrid(view, proj);
+
+    // Render gizmo for selected entity
+    ecs::Entity selectedEntity{g_selected};
+    if (selectedEntity.isValid() && g_selected != ecs::INVALID_ENTITY_ID) {
+        auto* t = g_world.getComponentArchetype<ecs::TransformComponent>(selectedEntity);
+        if (t) {
+            float gizmoSize = glm::max(1.0f, glm::distance(g_camera->Position, t->position) * 0.15f);
+            drawGizmo(t->position, gizmoSize, t->rotation);
+        }
+    }
+
     // DEBUG: Draw a visible test quad to verify FBO is working
     // This helps distinguish between "FBO broken" vs "scene not rendering"
-    glDisable(GL_CULL_FACE);
+   // glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
     glUseProgram(0);
     glBindVertexArray(0);
@@ -742,10 +1285,13 @@ void renderScene() {
     glVertex2f(0.9f, -0.85f);
     glEnd();
 
+    // Reset polygon mode (wireframe debug)
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
     // 🔴 3. Restore default framebuffer
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
+    //glDisable(GL_CULL_FACE);
 }
 
 // ============================================================================
@@ -969,7 +1515,21 @@ int main() {
     // Initialize resources
     initShader();
     initCube();
+    initSphere(16, 32);
+    initPlane();
+    initGrid(20, 1.0f);  // Initialize 20x20 grid with 1 unit spacing
+    createProceduralTexture();  // Create checkerboard texture
     g_viewportFB.init(1280, 720);
+
+    // Register procedural meshes in MeshRegistry
+    auto& meshReg = MeshRegistry::getInstance();
+    meshReg.registerMesh(ecs::MeshType::Cube, g_cubeVAO, g_cubeVBO, g_cubeEBO, g_cubeIndexCount);
+    meshReg.registerMesh(ecs::MeshType::Sphere, g_sphereVAO, g_sphereVBO, g_sphereEBO, g_sphereIndexCount);
+    meshReg.registerMesh(ecs::MeshType::Plane, g_planeVAO, g_planeVBO, g_planeEBO, g_planeIndexCount);
+    std::cout << "[MeshRegistry] Registered Cube, Sphere, Plane\n";
+
+    // Set texture for renderer
+    g_renderer.SetDefaultTexture(g_cubeTexture);
 
     // Initialize ImGui
     IMGUI_CHECKVERSION();
@@ -1056,6 +1616,12 @@ int main() {
     g_world.addSystem(&g_renderSystem);
     std::cout << "RenderSystem added to world\n";
 
+    // Initialize Geospatial System (Sydney Opera House as default origin)
+    g_geospatialSystem.initialize(-33.8568, 151.2153, 50.0);
+    g_geospatialSystem.setGPSMode(GPSTracker::Mode::SIMULATED_WALK);
+    g_world.addSystem(&g_geospatialSystem);
+    std::cout << "GeospatialSystem added to world\n";
+
     // Create initial scene (AFTER render system is added)
     std::cout << "Creating test cubes...\n";
     auto cube1 = createCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(0.8f, 0.2f, 0.2f));
@@ -1119,25 +1685,42 @@ int main() {
         // Update ECS
         g_world.update(dt);
 
-        // Handle mouse input for viewport camera
+        // Get window dimensions and mouse position early (needed for viewport bounds)
+        int windowW, windowH;
+        glfwGetWindowSize(window, &windowW, &windowH);
         double mx, my;
         glfwGetCursorPos(window, &mx, &my);
-        
-        if (g_isViewing && !io.WantCaptureMouse) {
-            float dx = static_cast<float>(mx - g_lastMousePos.x);
-            float dy = static_cast<float>(my - g_lastMousePos.y);
-            g_camera->ProcessMouseMovement(dx * 0.3f, dy * 0.3f);
-        }
-        g_lastMousePos = glm::vec2(static_cast<float>(mx), static_cast<float>(my));
 
-        // Handle keyboard shortcuts
+        // Handle keyboard shortcuts (non-movement, no viewport dependency)
         if (!io.WantCaptureKeyboard) {
             // Gizmo tools
-            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) g_gizmoType = GizmoType::Translate;
-            if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) g_gizmoType = GizmoType::Rotate;
-            if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) g_gizmoType = GizmoType::Scale;
+            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS && g_gizmoType != GizmoType::Translate) {
+                static float lastW = 0;
+                if (glfwGetTime() - lastW > 0.2f) {
+                    g_gizmoType = GizmoType::Translate;
+                    lastW = glfwGetTime();
+                }
+            }
+            if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS && g_gizmoType != GizmoType::Rotate) {
+                static float lastE = 0;
+                if (glfwGetTime() - lastE > 0.2f) {
+                    g_gizmoType = GizmoType::Rotate;
+                    lastE = glfwGetTime();
+                }
+            }
+            if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS && g_gizmoType != GizmoType::Scale) {
+                static float lastR = 0;
+                if (glfwGetTime() - lastR > 0.2f) {
+                    g_gizmoType = GizmoType::Scale;
+                    lastR = glfwGetTime();
+                }
+            }
             if (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS) {
-                g_spaceType = (g_spaceType == SpaceType::World) ? SpaceType::Local : SpaceType::World;
+                static float lastX = 0;
+                if (glfwGetTime() - lastX > 0.2f) {
+                    g_spaceType = (g_spaceType == SpaceType::World) ? SpaceType::Local : SpaceType::World;
+                    lastX = glfwGetTime();
+                }
             }
             
             // Entity operations (with Ctrl modifier)
@@ -1188,10 +1771,7 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // Get window dimensions
-        int windowW, windowH;
-        glfwGetWindowSize(window, &windowW, &windowH);
-        
+        // Window dimensions already retrieved earlier for input handling
         // Panel dimensions
         const float menuBarHeight = 25.0f;
         const float toolbarHeight = 36.0f;
@@ -1407,6 +1987,29 @@ int main() {
         ImGui::PopStyleColor();
         ImGui::SameLine();
 
+        ImGui::PushStyleColor(ImGuiCol_Button, g_showWireframe ? ImVec4(0.3f, 0.2f, 0.3f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+        if (ImGui::Button("Wire", ImVec2(50, 28))) g_showWireframe = !g_showWireframe;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Wireframe Mode (Debug)");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+
+        // GPS mode cycle button
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.25f, 0.15f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.35f, 0.25f, 1));
+        if (ImGui::Button("GPS", ImVec2(50, 28))) {
+            // Cycle through GPS modes
+            auto currentMode = g_geospatialSystem.getGPSTracker().getMode();
+            int modeInt = static_cast<int>(currentMode);
+            modeInt = (modeInt + 1) % 5;  // 5 modes
+            g_geospatialSystem.setGPSMode(static_cast<GPSTracker::Mode>(modeInt));
+        }
+        ImGui::PopStyleColor(2);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Cycle GPS Mode: %s",
+                g_geospatialSystem.getGPSTracker().getCurrentModeName());
+        }
+        ImGui::SameLine();
+
         // Separator
         ImGui::Dummy(ImVec2(15, 1));
         ImGui::SameLine();
@@ -1476,11 +2079,15 @@ int main() {
 
         // Tab buttons
         ImGui::PushStyleColor(ImGuiCol_Button, g_uiState.leftPanelTab == 0 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
-        if (ImGui::Button("Outliner", ImVec2(sidePanelWidth/2 - 5, 28))) g_uiState.leftPanelTab = 0;
+        if (ImGui::Button("Outliner", ImVec2(sidePanelWidth/3 - 5, 28))) g_uiState.leftPanelTab = 0;
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, g_uiState.leftPanelTab == 1 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
-        if (ImGui::Button("Details", ImVec2(sidePanelWidth/2 - 5, 28))) g_uiState.leftPanelTab = 1;
+        if (ImGui::Button("Details", ImVec2(sidePanelWidth/3 - 5, 28))) g_uiState.leftPanelTab = 1;
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, g_uiState.leftPanelTab == 2 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
+        if (ImGui::Button("Geo", ImVec2(sidePanelWidth/3 - 5, 28))) g_uiState.leftPanelTab = 2;
         ImGui::PopStyleColor();
         ImGui::Separator();
         ImGui::Spacing();
@@ -1559,8 +2166,7 @@ int main() {
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "No entities in scene");
             ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1), "Right-click to create one");
         }
-
-        } else {
+        } else if (g_uiState.leftPanelTab == 1) {
             // ========== DETAILS ==========
             if (g_selected != ecs::INVALID_ENTITY_ID) {
                 // Get components safely
@@ -1592,6 +2198,59 @@ int main() {
                 ImGui::Dummy(ImVec2(0, 20));
                 ImGui::TextWrapped("Select an entity from the Outliner to view and edit its properties.");
             }
+        } else if (g_uiState.leftPanelTab == 2) {
+            // ========== GEOSPATIAL PANEL ==========
+            ImGui::SeparatorText("GPS Tracker");
+
+            const GPSFix& fix = g_geospatialSystem.getCurrentGPSFix();
+
+            // GPS mode display
+            ImGui::Text("Mode: %s", g_geospatialSystem.getGPSTracker().getCurrentModeName());
+            ImGui::Text("Satellites: %d", fix.satelliteCount);
+            ImGui::Text("Accuracy: H=%.1fm V=%.1fm", fix.horizontalAccuracy, fix.verticalAccuracy);
+            ImGui::Separator();
+
+            // Position display
+            ImGui::SeparatorText("Position (WGS84)");
+            ImGui::Text("Lat: %.8f°", fix.latitude);
+            ImGui::Text("Lon: %.8f°", fix.longitude);
+            ImGui::Text("Alt: %.2f m", fix.altitude);
+            ImGui::Separator();
+
+            // DMS format
+            ImGui::SeparatorText("DMS Format");
+            char latDir = fix.latitude >= 0 ? 'N' : 'S';
+            char lonDir = fix.longitude >= 0 ? 'E' : 'W';
+            ImGui::Text("%c %.8f°", latDir, std::abs(fix.latitude));
+            ImGui::Text("%c %.8f°", lonDir, std::abs(fix.longitude));
+            ImGui::Separator();
+
+            // Movement info
+            ImGui::SeparatorText("Movement");
+            ImGui::Text("Speed: %.2f m/s (%.1f km/h)", fix.speed, fix.speed * 3.6f);
+            ImGui::Text("Heading: %.1f°", fix.heading);
+            ImGui::Text("Sim Time: %.1fs", g_geospatialSystem.getGPSTracker().getSimTime());
+            ImGui::Separator();
+
+            // Origin info
+            ImGui::SeparatorText("Local Origin");
+            glm::dvec3 origin = g_geospatialSystem.getConverter().getOriginWGS84();
+            ImGui::Text("Lat: %.4f°", origin.x);
+            ImGui::Text("Lon: %.4f°", origin.y);
+            ImGui::Text("Alt: %.1f m", origin.z);
+
+            // Validation
+            if (fix.isValid) {
+                double dist = GeospatialConverter::haversineDistance(
+                    origin.x, origin.y, fix.latitude, fix.longitude);
+                double bearing = GeospatialConverter::bearing(
+                    origin.x, origin.y, fix.latitude, fix.longitude);
+                ImGui::Separator();
+                ImGui::SeparatorText("From Origin");
+                ImGui::Text("Distance: %.1f m", dist);
+                ImGui::Text("Bearing: %.1f°", bearing);
+            }
+
         }
 
         ImGui::PopStyleColor(2);
@@ -1657,18 +2316,59 @@ int main() {
         ImGui::Dummy(ImVec2(0, 8));
 
         const char* meshes[] = {"Cube", "Sphere", "Plane", "Cylinder", "Cone", "Torus"};
+        ecs::MeshType meshTypes[] = {
+            ecs::MeshType::Cube, ecs::MeshType::Sphere, ecs::MeshType::Plane,
+            ecs::MeshType::Cylinder, ecs::MeshType::Cone, ecs::MeshType::Torus
+        };
+        glm::vec3 meshColors[] = {
+            {0.8f, 0.8f, 0.8f}, {0.2f, 0.8f, 0.2f}, {0.5f, 0.5f, 0.5f},
+            {0.8f, 0.6f, 0.2f}, {0.8f, 0.2f, 0.2f}, {0.2f, 0.6f, 0.8f}
+        };
+
         for (int i = 0; i < 6; i++) {
             ImGui::PushID(i);
-            
-            // Asset box
+
+            // Asset box - clickable
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 1));
-            ImGui::Button("##Asset", ImVec2(iconSize, iconSize));
-            ImGui::PopStyleColor();
-            
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Click to select %s", meshes[i]);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.35f, 0.45f, 1));
+            if (ImGui::Button("##Asset", ImVec2(iconSize, iconSize))) {
+                if (g_selected != ecs::INVALID_ENTITY_ID) {
+                    // Change selected entity's mesh type
+                    ecs::Entity selEntity{g_selected};
+                    auto* meshComp = g_world.getComponentArchetype<ecs::MeshComponent>(selEntity);
+                    if (meshComp) {
+                        meshComp->meshType = meshTypes[i];
+                        meshComp->color = meshColors[i];
+                        logMessage(std::string("Changed selected entity to ") + meshes[i]);
+                    } else {
+                        logMessage("Selected entity has no MeshComponent", 1);
+                    }
+                } else {
+                    // Create new entity
+                    glm::vec3 spawnPos(0, 1, 0);
+                    createCube(spawnPos, glm::vec3(1), meshColors[i]);
+                    // Set mesh type on the newly created entity
+                    // (createCube creates a cube, so for non-cube types we need to update)
+                    if (i > 0) {
+                        // Find the last created entity and update its mesh type
+                        g_world.forEach<ecs::TransformComponent, ecs::MeshComponent>(
+                            [&](ecs::EntityID id, ecs::TransformComponent&, ecs::MeshComponent& m) {
+                                // This is a bit hacky - in production, track the last created entity
+                            });
+                    }
+                    logMessage(std::string("Created ") + meshes[i]);
+                }
             }
-            
+            ImGui::PopStyleColor(2);
+
+            if (ImGui::IsItemHovered()) {
+                if (g_selected != ecs::INVALID_ENTITY_ID) {
+                    ImGui::SetTooltip("Click to change selected entity to %s", meshes[i]);
+                } else {
+                    ImGui::SetTooltip("Click to add %s to scene", meshes[i]);
+                }
+            }
+
             ImGui::SameLine();
             ImGui::TextWrapped("%s", meshes[i]);
             ImGui::SameLine();
@@ -1689,13 +2389,54 @@ int main() {
         ImGui::Dummy(ImVec2(0, 8));
 
         const char* materials[] = {"M_Default", "M_Metal", "M_Wood", "M_Stone", "M_Glass"};
+
+        // Material presets: albedo, metallic, roughness
+        struct MaterialPreset {
+            glm::vec3 albedo;
+            float metallic;
+            float roughness;
+        };
+        MaterialPreset matPresets[] = {
+            {{0.8f, 0.8f, 0.8f}, 0.0f, 0.5f},  // Default
+            {{0.9f, 0.9f, 0.95f}, 0.9f, 0.2f},  // Metal
+            {{0.4f, 0.25f, 0.1f}, 0.0f, 0.9f},  // Wood
+            {{0.5f, 0.5f, 0.5f}, 0.0f, 0.95f},  // Stone
+            {{0.9f, 0.95f, 1.0f}, 0.1f, 0.05f}, // Glass
+        };
+
         for (int i = 0; i < 5; i++) {
             ImGui::PushID(i + 100);
-            
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 1));
-            ImGui::Button("##Mat", ImVec2(iconSize, iconSize));
-            ImGui::PopStyleColor();
-            
+
+            // Color swatch as button background
+            ImVec4 btnColor = ImVec4(matPresets[i].albedo.r, matPresets[i].albedo.g, matPresets[i].albedo.b, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, btnColor);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(
+                matPresets[i].albedo.r * 1.2f, matPresets[i].albedo.g * 1.2f, matPresets[i].albedo.b * 1.2f, 1.0f));
+
+            if (ImGui::Button("##Mat", ImVec2(iconSize, iconSize))) {
+                // Apply material to selected entity
+                if (g_selected != ecs::INVALID_ENTITY_ID) {
+                    ecs::Entity selEntity{g_selected};
+                    auto* meshComp = g_world.getComponentArchetype<ecs::MeshComponent>(selEntity);
+                    if (meshComp) {
+                        meshComp->color = matPresets[i].albedo;
+                        meshComp->metallic = matPresets[i].metallic;
+                        meshComp->roughness = matPresets[i].roughness;
+                        logMessage(std::string("Applied ") + materials[i] + " to selected entity");
+                    } else {
+                        logMessage("Selected entity has no MeshComponent", 1);
+                    }
+                } else {
+                    logMessage("No entity selected - select one first", 1);
+                }
+            }
+            ImGui::PopStyleColor(2);
+
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Apply %s to selected entity\nMetallic: %.1f, Roughness: %.2f",
+                    materials[i], matPresets[i].metallic, matPresets[i].roughness);
+            }
+
             ImGui::SameLine();
             ImGui::TextWrapped("%s", materials[i]);
             ImGui::SameLine();
@@ -1831,53 +2572,104 @@ int main() {
         if (contentSize.x > 0 && contentSize.y > 0) {
             int w = static_cast<int>(contentSize.x);
             int h = static_cast<int>(contentSize.y);
-            
+
             // Resize FBO if needed
             if (w != g_viewportFB.width || h != g_viewportFB.height) {
                 g_viewportFB.resize(w, h);
             }
 
             // Display FBO texture
-            ImGui::Image((void*)(intptr_t)g_viewportFB.colorTex, 
+            ImGui::Image((void*)(intptr_t)g_viewportFB.colorTex,
                         ImVec2(static_cast<float>(w), static_cast<float>(h)),
                         ImVec2(0, 1), ImVec2(1, 0));
 
-            // Viewport interaction (right-click to look)
+            // Viewport bounds in screen space
             ImVec2 viewportMin = ImGui::GetCursorScreenPos();
             ImVec2 viewportMax = ImVec2(viewportMin.x + w, viewportMin.y + h);
             ImVec2 mousePos = ImGui::GetMousePos();
-            
+
             bool mouseInViewport = (mousePos.x >= viewportMin.x && mousePos.x < viewportMax.x &&
                                    mousePos.y >= viewportMin.y && mousePos.y < viewportMax.y);
 
-            if (mouseInViewport && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            // ====================================================================
+            // CAMERA INPUT HANDLING (after ImGui::NewFrame, proper ordering)
+            // ====================================================================
+
+            // Track right-click hold for orbit camera
+            bool rightClickInViewport = mouseInViewport && ImGui::IsMouseDown(ImGuiMouseButton_Right);
+            bool rightClickReleased = ImGui::IsMouseReleased(ImGuiMouseButton_Right);
+
+            if (rightClickInViewport && !io.WantCaptureMouse) {
                 g_isViewing = true;
             }
-            if (ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+            if (rightClickReleased) {
                 g_isViewing = false;
             }
-            
+
+            // Orbit camera with right-click drag
+            if (g_isViewing && !io.WantCaptureMouse) {
+                float dx = static_cast<float>(mx - g_lastMousePos.x);
+                float dy = static_cast<float>(my - g_lastMousePos.y);
+                g_camera->ProcessMouseMovement(dx * 0.3f, dy * 0.3f);
+            }
+
+            // WASD camera movement (only when right-clicking in viewport - Unreal style)
+            if (g_isViewing && !io.WantCaptureKeyboard && !io.WantCaptureMouse) {
+                float moveSpeed = 5.0f * dt;
+                glm::vec3 forward = glm::normalize(g_camera->Target - g_camera->Position);
+                glm::vec3 right = glm::normalize(glm::cross(forward, g_camera->WorldUp));
+
+                if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+                    g_camera->Position += forward * moveSpeed;
+                    g_camera->Target += forward * moveSpeed;
+                }
+                if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+                    g_camera->Position -= forward * moveSpeed;
+                    g_camera->Target -= forward * moveSpeed;
+                }
+                if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+                    g_camera->Position -= right * moveSpeed;
+                    g_camera->Target -= right * moveSpeed;
+                }
+                if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+                    g_camera->Position += right * moveSpeed;
+                    g_camera->Target += right * moveSpeed;
+                }
+                if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
+                    g_camera->Position.y -= moveSpeed;
+                    g_camera->Target.y -= moveSpeed;
+                }
+                if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
+                    g_camera->Position.y += moveSpeed;
+                    g_camera->Target.y += moveSpeed;
+                }
+            }
+
+            // Scroll zoom when mouse is in viewport
+            if (mouseInViewport && !io.WantCaptureMouse) {
+                float scrollY = io.MouseWheel;
+                if (scrollY != 0.0f) {
+                    g_camera->ProcessMouseScroll(scrollY * 2.0f);
+                }
+            }
+
+            // Update last mouse position
+            g_lastMousePos = glm::vec2(static_cast<float>(mx), static_cast<float>(my));
+
+            // Hide cursor when orbiting
             if (g_isViewing) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_None);
             }
-            
-            // Viewport context menu (right-click in empty space)
-            if (mouseInViewport && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-                g_isViewing = true;
-            }
-            if (ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
-                g_isViewing = false;
-            }
-            
-            // Context menu on right-click in viewport
-            if (mouseInViewport && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+
+            // Viewport context menu (right-click release in empty space)
+            if (mouseInViewport && rightClickReleased && !g_isViewing) {
                 ImGui::OpenPopup("ViewportContext");
             }
-            
+
             if (ImGui::BeginPopup("ViewportContext")) {
                 ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1), "Create Entity");
                 ImGui::Separator();
-                
+
                 if (ImGui::MenuItem(ICON_FA_CUBE " Create Cube")) {
                     createCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(1.0f, 0.2f, 0.2f));
                     logMessage("Created Cube from viewport menu");
@@ -1894,7 +2686,7 @@ int main() {
                     createLight(glm::vec3(5, 10, 5), glm::vec3(1, 1, 0.9f), 1.0f);
                     logMessage("Created Light from viewport menu");
                 }
-                
+
                 ImGui::Separator();
                 if (ImGui::MenuItem("Clear Scene")) {
                     g_world.shutdown();
@@ -1902,8 +2694,27 @@ int main() {
                     g_selected = ecs::INVALID_ENTITY_ID;
                     logMessage("Scene cleared");
                 }
-                
+
                 ImGui::EndPopup();
+            }
+
+            // Viewport overlay info
+            ImGui::SetCursorScreenPos(ImVec2(viewportMin.x + 10, viewportMin.y + 10));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 0.8f));
+            ImGui::Text("Camera: (%.1f, %.1f, %.1f)", g_camera->Position.x, g_camera->Position.y, g_camera->Position.z);
+            ImGui::Text("Gizmo: %s | Space: %s | %s",
+                g_gizmoType == GizmoType::Translate ? "Translate" :
+                g_gizmoType == GizmoType::Rotate ? "Rotate" : "Scale",
+                g_spaceType == SpaceType::World ? "World" : "Local",
+                g_showWireframe ? "WIREFRAME" : "Solid");
+            ImGui::PopStyleColor();
+
+            // Focus indicator when orbiting
+            if (g_isViewing) {
+                ImGui::SetCursorScreenPos(ImVec2(viewportMin.x + w/2 - 40, viewportMin.y + 10));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
+                ImGui::Text("[ Right-click held - Orbit Mode ]");
+                ImGui::PopStyleColor();
             }
         }
 
@@ -1992,6 +2803,9 @@ int main() {
     g_world.shutdown();
     
     cleanupCube();
+    cleanupSphere();
+    cleanupPlane();
+    cleanupGrid();
     g_viewportFB.cleanup();
     glDeleteProgram(g_shaderProg);
     

@@ -10,6 +10,7 @@
 #include "../ECS.h"
 #include "../components/Components.h"
 #include "../../renderer/Renderer.h"
+#include "../../renderer/MeshRegistry.h"
 #include "../../modelSystem/Model.h"
 #include <glm/glm.hpp>
 #include <vector>
@@ -89,19 +90,23 @@ public:
         }
 
         m_visibleCount = 0;
+        int entitiesAdded = 0;
 
         // Use world's forEach which properly uses archetypes
         if (m_world) {
             m_world->forEach<TransformComponent, MeshComponent>(
-                [this](EntityID entityID, TransformComponent& transform, MeshComponent& mesh) {
-                    renderEntity(entityID, transform, mesh);
+                [this, &entitiesAdded](EntityID entityID, TransformComponent& transform, MeshComponent& mesh) {
+                    if (mesh.visible) {
+                        renderEntity(entityID, transform, mesh);
+                        entitiesAdded++;
+                    }
                 }
             );
         }
-        
-        // Submit batches to GPU via engine Renderer
-        if (m_renderer) {
-            m_renderer->Render();
+
+        // Submit batches to GPU via engine Renderer (with sorting and optimizations)
+        if (entitiesAdded > 0 && m_renderer) {
+            m_renderer->SubmitBatches();  // Uses sorted, optimized rendering
         }
     }
 
@@ -109,33 +114,32 @@ public:
      * Render a single entity
      */
     void renderEntity(EntityID entityID, TransformComponent& transform, MeshComponent& mesh) {
-        if (!mesh.visible || !m_renderer || !m_model) return;
+        if (!mesh.visible || !m_renderer) return;
 
         m_visibleCount++;
 
         // Calculate model matrix
         glm::mat4 model = transform.getModelMatrix();
+        std::vector<glm::mat4> transforms = {model};
 
-        // Check if model has debug VAO (programmatic mesh)
-        if (m_model->getDebugVAO() != 0 && m_model->getDebugIndexCount() > 0) {
-            // Use debug VAO directly
-            std::vector<glm::mat4> transforms = {model};
+        // Try procedural mesh registry first (by meshType)
+        const MeshEntry* meshEntry = MeshRegistry::getInstance().getMesh(mesh.meshType);
+        if (meshEntry && meshEntry->VAO != 0 && meshEntry->indexCount > 0) {
             m_renderer->AddRenderable(
-                m_model->getDebugVAO(),
+                meshEntry->VAO,
                 0,  // VBO not needed (in VAO)
                 0,  // EBO not needed (in VAO)
-                m_model->getDebugIndexCount(),
+                meshEntry->indexCount,
                 GL_TRIANGLES,
                 m_defaultShaderProgram,
                 transforms
             );
+            return;
         }
-        // Otherwise use mesh from model
-        else if (mesh.meshID >= 0 && mesh.meshID < static_cast<int>(m_model->GetMeshCount())) {
-            Mesh& meshData = m_model->GetMesh(mesh.meshID);
 
-            // Add to renderer batch
-            std::vector<glm::mat4> transforms = {model};
+        // Fall back to model-based mesh
+        if (m_model && mesh.meshID >= 0 && mesh.meshID < static_cast<int>(m_model->GetMeshCount())) {
+            Mesh& meshData = m_model->GetMesh(mesh.meshID);
 
             m_renderer->AddRenderable(
                 meshData.VAO,

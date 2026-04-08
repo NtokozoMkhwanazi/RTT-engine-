@@ -13,6 +13,7 @@
 #include "TerrainSystem.h"
 #include "WorldObjectSystem.h"
 #include "MotionMatchingSystem.h"
+#include "GeospatialSystem.h"
 
 /**
  * Available Systems:

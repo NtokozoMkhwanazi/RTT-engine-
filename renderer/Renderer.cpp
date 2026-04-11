@@ -284,6 +284,12 @@ void Renderer::Render() {
     
     // Bind camera UBO once - all shaders will use it
     glBindBufferBase(GL_UNIFORM_BUFFER, CAMERA_UBO_BINDING, cameraUBO);
+    
+    // Bind default texture to texture unit 0
+    if (defaultTexture != 0) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, defaultTexture);
+    }
 
     // Render batches in sorted order
     GLuint lastShader = 0;
@@ -310,15 +316,56 @@ void Renderer::Render() {
             BindCameraUBO(batch.shaderProgram);
         }
         
+        // Set material uniforms for this batch (per-batch, not per-shader)
+        GLint albedoLoc = glGetUniformLocation(batch.shaderProgram, "albedo");
+        GLint metallicLoc = glGetUniformLocation(batch.shaderProgram, "metallic");
+        GLint roughnessLoc = glGetUniformLocation(batch.shaderProgram, "roughness");
+        GLint aoLoc = glGetUniformLocation(batch.shaderProgram, "ao");
+        GLint emissiveLoc = glGetUniformLocation(batch.shaderProgram, "emissive");
+        GLint useAlbedoMapLoc = glGetUniformLocation(batch.shaderProgram, "useAlbedoMap");
+
+        if (albedoLoc != -1) glUniform3f(albedoLoc, batch.albedo.r, batch.albedo.g, batch.albedo.b);
+        if (metallicLoc != -1) glUniform1f(metallicLoc, batch.metallic);
+        if (roughnessLoc != -1) glUniform1f(roughnessLoc, batch.roughness);
+        if (aoLoc != -1) glUniform1f(aoLoc, batch.ao);
+        if (emissiveLoc != -1) glUniform3f(emissiveLoc, batch.emissive.r, batch.emissive.g, batch.emissive.b);
+
+        // Enable texture sampling ONLY if the batch explicitly has a texture ID
+        // (defaultTexture is just a fallback, don't force it on all batches)
+        if (useAlbedoMapLoc != -1) {
+            bool hasTexture = (batch.textureID != 0);
+            glUniform1i(useAlbedoMapLoc, hasTexture ? 1 : 0);
+
+            // Bind the batch texture if it has one
+            if (hasTexture) {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, batch.textureID);
+            }
+        }
+        
         if (batch.vertexArrayObject != lastVAO) {
             glBindVertexArray(batch.vertexArrayObject);
             lastVAO = batch.vertexArrayObject;
         }
-        
+
+        // Use indexed or non-indexed drawing based on elementBuffer
+        bool useIndexed = (batch.elementBuffer != 0);
+        if (useIndexed) {
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.elementBuffer);
+        }
+
         if (batch.instanceCount > 0) {
-            glDrawArraysInstanced(batch.primitiveType, 0, batch.vertexCount, batch.instanceCount);
+            if (useIndexed) {
+                glDrawElementsInstanced(batch.primitiveType, batch.vertexCount, GL_UNSIGNED_INT, 0, batch.instanceCount);
+            } else {
+                glDrawArraysInstanced(batch.primitiveType, 0, batch.vertexCount, batch.instanceCount);
+            }
         } else {
-            glDrawArrays(batch.primitiveType, 0, batch.vertexCount);
+            if (useIndexed) {
+                glDrawElements(batch.primitiveType, batch.vertexCount, GL_UNSIGNED_INT, 0);
+            } else {
+                glDrawArrays(batch.primitiveType, 0, batch.vertexCount);
+            }
         }
     }
 

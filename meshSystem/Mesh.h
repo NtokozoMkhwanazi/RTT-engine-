@@ -295,7 +295,12 @@ public:
     // Flags
     void SetFlag(MeshFlags flag, bool enabled);
     bool HasFlag(MeshFlags flag) const { return (flags & flag) != MeshFlags::None; }
-    
+
+    // Get OpenGL buffer IDs
+    unsigned int GetVAO() const { return VAO; }
+    unsigned int GetVBO() const { return VBO; }
+    unsigned int GetEBO() const { return EBO; }
+
     // Memory management
     void Clear();
     size_t GetMemoryUsage() const;

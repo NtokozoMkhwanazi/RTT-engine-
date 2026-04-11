@@ -101,6 +101,12 @@ void renderScene() {
 
     // Bind viewport framebuffer
     g_editor.viewportFB.bind();
+    
+    // Safety check: ensure framebuffer has valid dimensions
+    if (g_editor.viewportFB.width <= 0 || g_editor.viewportFB.height <= 0) {
+        g_editor.viewportFB.unbind();
+        return;
+    }
 
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
@@ -119,11 +125,26 @@ void renderScene() {
     g_editor.renderer.SetViewport(0, 0, g_editor.viewportFB.width, g_editor.viewportFB.height);
 
     glm::mat4 view = glm::lookAt(g_editor.camera->Position, g_editor.camera->Target, glm::vec3(0,1,0));
+
+    // Safety check: prevent division by zero in aspect ratio
+    float aspectRatio = (g_editor.viewportFB.height > 0) ?
+                        (float)g_editor.viewportFB.width / g_editor.viewportFB.height : 1.0f;
     glm::mat4 proj = glm::perspective(glm::radians(60.0f),
-                                       (float)g_editor.viewportFB.width / g_editor.viewportFB.height,
+                                       aspectRatio,
                                        0.1f, 1000.0f);
     g_editor.renderer.SetCameraMatrices(view, proj);
     g_editor.renderer.SetLightParameters(glm::vec3(5.0f, 5.0f, 5.0f), g_editor.camera->Position);
+
+    // Debug: Print rendering info (once every 60 frames)
+    static int debugFrameCount = 0;
+    if (debugFrameCount++ % 120 == 0 && g_editor.debugConfig.verbose) {
+        std::cout << "[RENDER] Viewport: " << g_editor.viewportFB.width << "x" << g_editor.viewportFB.height
+                  << " | Entities: " << g_editor.world.getEntityCount()
+                  << " | Camera: (" << g_editor.camera->Position.x << ", "
+                  << g_editor.camera->Position.y << ", "
+                  << g_editor.camera->Position.z << ")"
+                  << " | Shader: " << ShaderManager::GetMainShaderProgram() << "\n";
+    }
 
     // Render all ECS entities through RenderSystem
     g_editor.renderSystem.render();
@@ -186,31 +207,145 @@ void handleInput(GLFWwindow* window, float dt, ImGuiIO& io) {
             }
         }
 
-        // Entity operations
+        // Modifier keys
         bool ctrlPressed = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
                            glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
+        bool shiftPressed = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                            glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
 
+        // ========== FILE SHORTCUTS ==========
+        // Ctrl+N: New Scene
+        if (ctrlPressed && glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS) {
+            static float lastTime = 0;
+            if (glfwGetTime() - lastTime > 0.3f) {
+                g_editor.world.shutdown();
+                g_editor.world.init();
+                g_editor.selectedEntity = ecs::INVALID_ENTITY_ID;
+                EditorConsole::Log("New scene created (Ctrl+N)");
+                lastTime = glfwGetTime();
+            }
+        }
+        
+        // Ctrl+O: Open Scene
+        if (ctrlPressed && glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS) {
+            static float lastTime = 0;
+            if (glfwGetTime() - lastTime > 0.3f) {
+                if (SceneManager::LoadScene("scene.json", g_editor.world)) {
+                    EditorConsole::Log("Scene opened (Ctrl+O)");
+                } else {
+                    EditorConsole::Log("Failed to open scene", 2);
+                }
+                lastTime = glfwGetTime();
+            }
+        }
+        
+        // Ctrl+S: Save Scene
+        if (ctrlPressed && !shiftPressed && glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+            static float lastTime = 0;
+            if (glfwGetTime() - lastTime > 0.3f) {
+                std::string file = "scene.json";
+                if (SceneManager::SaveScene(file, g_editor.world)) {
+                    EditorConsole::Log("Scene saved (Ctrl+S)");
+                } else {
+                    EditorConsole::Log("Failed to save scene", 2);
+                }
+                lastTime = glfwGetTime();
+            }
+        }
+        
+        // Ctrl+Shift+S: Save As
+        if (ctrlPressed && shiftPressed && glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+            static float lastTime = 0;
+            if (glfwGetTime() - lastTime > 0.3f) {
+                if (SceneManager::SaveScene("scene_autosave.json", g_editor.world)) {
+                    EditorConsole::Log("Scene saved as (Ctrl+Shift+S)");
+                } else {
+                    EditorConsole::Log("Failed to save scene", 2);
+                }
+                lastTime = glfwGetTime();
+            }
+        }
+
+        // ========== EDIT SHORTCUTS ==========
+        // Ctrl+D: Duplicate Entity
         if (ctrlPressed && glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
-            EntityManager::DuplicateEntity(g_editor.selectedEntity);
             static float lastDupTime = 0;
-            if (glfwGetTime() - lastDupTime > 0.2f) {
+            if (glfwGetTime() - lastDupTime > 0.3f) {
+                if (g_editor.selectedEntity != ecs::INVALID_ENTITY_ID) {
+                    EntityManager::DuplicateEntity(g_editor.selectedEntity);
+                    EditorConsole::Log("Entity duplicated (Ctrl+D)");
+                }
                 lastDupTime = glfwGetTime();
             }
         }
-
-        if (glfwGetKey(window, GLFW_KEY_DELETE) == GLFW_PRESS) {
-            static float lastDelTime = 0;
-            if (glfwGetTime() - lastDelTime > 0.2f) {
-                EntityManager::DeleteEntity(g_editor.selectedEntity);
-                lastDelTime = glfwGetTime();
+        
+        // Ctrl+Z: Undo (placeholder)
+        if (ctrlPressed && glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS) {
+            static float lastTime = 0;
+            if (glfwGetTime() - lastTime > 0.3f) {
+                EditorConsole::Log("Undo not yet implemented", 1);
+                lastTime = glfwGetTime();
+            }
+        }
+        
+        // Ctrl+Y: Redo (placeholder)
+        if (ctrlPressed && glfwGetKey(window, GLFW_KEY_Y) == GLFW_PRESS) {
+            static float lastTime = 0;
+            if (glfwGetTime() - lastTime > 0.3f) {
+                EditorConsole::Log("Redo not yet implemented", 1);
+                lastTime = glfwGetTime();
             }
         }
 
-        if (glfwGetKey(window, GLFW_KEY_BACKSLASH) == GLFW_PRESS) {
+        // ========== VIEW SHORTCUTS ==========
+        // Escape: Deselect
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+            static float lastTime = 0;
+            if (glfwGetTime() - lastTime > 0.3f) {
+                g_editor.selectedEntity = ecs::INVALID_ENTITY_ID;
+                lastTime = glfwGetTime();
+            }
+        }
+        
+        // ` (backtick): Toggle console
+        if (glfwGetKey(window, GLFW_KEY_GRAVE_ACCENT) == GLFW_PRESS) {
             static float lastToggle = 0;
-            if (glfwGetTime() - lastToggle > 0.2f) {
-                // Toggle console (handled in UI)
+            if (glfwGetTime() - lastToggle > 0.3f) {
+                g_editor.uiState.showConsole = !g_editor.uiState.showConsole;
                 lastToggle = glfwGetTime();
+            }
+        }
+        
+        // F1: Toggle profiler
+        if (glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS) {
+            static float lastTime = 0;
+            if (glfwGetTime() - lastTime > 0.3f) {
+                g_editor.uiState.showProfiler = !g_editor.uiState.showProfiler;
+                lastTime = glfwGetTime();
+            }
+        }
+
+        // Delete: Delete entity
+        if (glfwGetKey(window, GLFW_KEY_DELETE) == GLFW_PRESS) {
+            static float lastDelTime = 0;
+            if (glfwGetTime() - lastDelTime > 0.3f) {
+                if (g_editor.selectedEntity != ecs::INVALID_ENTITY_ID) {
+                    EntityManager::DeleteEntity(g_editor.selectedEntity);
+                    g_editor.selectedEntity = ecs::INVALID_ENTITY_ID;
+                    EditorConsole::Log("Entity deleted");
+                }
+                lastDelTime = glfwGetTime();
+            }
+        }
+        
+        // F2: Focus on selected (placeholder)
+        if (glfwGetKey(window, GLFW_KEY_F2) == GLFW_PRESS) {
+            static float lastTime = 0;
+            if (glfwGetTime() - lastTime > 0.3f) {
+                if (g_editor.selectedEntity != ecs::INVALID_ENTITY_ID) {
+                    EditorConsole::Log("Focus on selected entity (F2)");
+                }
+                lastTime = glfwGetTime();
             }
         }
     }
@@ -219,10 +354,12 @@ void handleInput(GLFWwindow* window, float dt, ImGuiIO& io) {
 void handleCameraInput(GLFWwindow* window, float dt, ImGuiIO& io,
                        double mx, double my, bool mouseInViewport) {
     // Track right-click hold for orbit camera
+    // IMPORTANT: Ignore WantCaptureMouse when right-clicking in viewport
+    // This allows camera orbit even when ImGui has focus
     bool rightClickInViewport = mouseInViewport && ImGui::IsMouseDown(ImGuiMouseButton_Right);
     bool rightClickReleased = ImGui::IsMouseReleased(ImGuiMouseButton_Right);
 
-    if (rightClickInViewport && !io.WantCaptureMouse) {
+    if (rightClickInViewport) {
         g_editor.isViewing = true;
     }
     if (rightClickReleased) {
@@ -230,45 +367,61 @@ void handleCameraInput(GLFWwindow* window, float dt, ImGuiIO& io,
     }
 
     // Orbit camera with right-click drag
-    if (g_editor.isViewing && !io.WantCaptureMouse) {
-        float dx = static_cast<float>(mx - g_editor.lastMousePos.x);
-        float dy = static_cast<float>(my - g_editor.lastMousePos.y);
-        g_editor.camera->ProcessMouseMovement(dx * 0.3f, dy * 0.3f);
+    // Don't check WantCaptureMouse - we want camera control in viewport regardless
+    if (g_editor.isViewing) {
+        g_editor.camera->ProcessMouseMovementAbsolute(static_cast<float>(mx), static_cast<float>(my));
     }
 
-    // WASD camera movement
-    if (g_editor.isViewing && !io.WantCaptureKeyboard && !io.WantCaptureMouse) {
-        float moveSpeed = 5.0f * dt;
-        glm::vec3 forward = glm::normalize(g_editor.camera->Target - g_editor.camera->Position);
-        glm::vec3 right = glm::normalize(glm::cross(forward, g_editor.camera->WorldUp));
+    // WASD camera movement (always when in viewing mode, not just when dragging)
+    // Don't check WantCaptureKeyboard - we want camera control in viewport regardless
+    float moveSpeed = 5.0f * dt;
+    glm::vec3 direction = g_editor.camera->Target - g_editor.camera->Position;
 
-        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
-            g_editor.camera->Position += forward * moveSpeed;
-            g_editor.camera->Target += forward * moveSpeed;
-        }
-        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-            g_editor.camera->Position -= forward * moveSpeed;
-            g_editor.camera->Target -= forward * moveSpeed;
-        }
-        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
-            g_editor.camera->Position -= right * moveSpeed;
-            g_editor.camera->Target -= right * moveSpeed;
-        }
-        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
-            g_editor.camera->Position += right * moveSpeed;
-            g_editor.camera->Target += right * moveSpeed;
-        }
-        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
-            g_editor.camera->Position.y -= moveSpeed;
-            g_editor.camera->Target.y -= moveSpeed;
-        }
-        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
-            g_editor.camera->Position.y += moveSpeed;
-            g_editor.camera->Target.y += moveSpeed;
-        }
+    // Prevent NaN when camera position equals target position
+    if (glm::length(direction) < 0.001f) {
+        direction = glm::vec3(0, 0, -1); // Default forward
     }
 
-    // Scroll zoom
+    glm::vec3 forward = glm::normalize(direction);
+    
+    // Calculate right vector - check for parallel vectors (cross product = 0)
+    glm::vec3 right = glm::cross(forward, g_editor.camera->WorldUp);
+    if (glm::length(right) < 0.001f) {
+        // Forward is parallel (or nearly parallel) to WorldUp
+        // Use a fallback: cross with X axis instead
+        right = glm::normalize(glm::cross(forward, glm::vec3(1, 0, 0)));
+    } else {
+        right = glm::normalize(right);
+    }
+    
+    glm::vec3 up = glm::cross(right, forward);
+
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+        g_editor.camera->Position += forward * moveSpeed;
+        g_editor.camera->Target += forward * moveSpeed;
+    }
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+        g_editor.camera->Position -= forward * moveSpeed;
+        g_editor.camera->Target -= forward * moveSpeed;
+    }
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+        g_editor.camera->Position -= right * moveSpeed;
+        g_editor.camera->Target -= right * moveSpeed;
+    }
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+        g_editor.camera->Position += right * moveSpeed;
+        g_editor.camera->Target += right * moveSpeed;
+    }
+    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
+        g_editor.camera->Position -= up * moveSpeed;
+        g_editor.camera->Target -= up * moveSpeed;
+    }
+    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
+        g_editor.camera->Position += up * moveSpeed;
+        g_editor.camera->Target += up * moveSpeed;
+    }
+
+    // Scroll zoom (when mouse is in viewport)
     if (mouseInViewport && !io.WantCaptureMouse) {
         float scrollY = io.MouseWheel;
         if (scrollY != 0.0f) {
@@ -416,10 +569,24 @@ int main() {
         double mx, my;
         glfwGetCursorPos(window, &mx, &my);
 
-        // Handle keyboard shortcuts
+        // Calculate viewport bounds for camera input
+        const float sidePanelWidth = 280.0f;
+        const float menuBarHeight = 25.0f;
+        const float toolbarHeight = 36.0f;
+        const float tabbedBottomHeight = 180.0f;
+        const float statusBarHeight = 24.0f;
+
+        bool mouseInViewport = (mx >= sidePanelWidth && mx < windowW &&
+                                my >= menuBarHeight + toolbarHeight &&
+                                my < windowH - tabbedBottomHeight - statusBarHeight);
+
+        // Handle keyboard shortcuts (BEFORE rendering)
         handleInput(window, dt, io);
 
-        // Render 3D scene to FBO
+        // Handle camera input (BEFORE rendering so changes take effect this frame)
+        handleCameraInput(window, dt, io, mx, my, mouseInViewport);
+
+        // Render 3D scene to FBO (uses updated camera position)
         {
             PROFILE_GPU_SCOPE("Render Scene");
             renderScene();
@@ -433,38 +600,53 @@ int main() {
         ImGui::NewFrame();
 
         // ========== RENDER UI PANELS ==========
-        
-        // Menu bar
+
+        // Menu bar (always visible)
         UI::RenderMenuBar(g_editor.showAbout, g_editor.world, g_editor.selectedEntity,
                          g_editor.isPlaying, g_editor.wasPlaying,
                          SceneManager::GetCurrentSceneFile(), g_editor.shouldClose);
 
-        // Left panel (Outliner/Details/Geo)
+        // Toolbar (always visible)
+        UI::RenderToolbar(g_editor.gizmoType, g_editor.spaceType, g_editor.showGrid,
+                         g_editor.showGizmo, g_editor.showWireframe, g_editor.world,
+                         g_editor.selectedEntity);
+
+        // Left panel (Outliner/Details/Geo) - always render, position handled by ImGui
         UI::RenderLeftPanel(g_editor.uiState.leftPanelTab, g_editor.world,
                            g_editor.selectedEntity, g_editor.uiState.searchBuffer);
 
-        // Bottom panel (Content/Console/Profiler)
+        // Bottom panel (Toolbox) - always render
         UI::RenderBottomPanel(g_editor.uiState.bottomPanelTab, g_editor.world,
                              g_editor.selectedEntity, g_editor.fps, g_editor.camera);
 
-        // Viewport
-        bool mouseInViewport = (mx >= g_editor.uiState.leftPanelTab * 280.0f && 
-                                mx < windowW && my >= 61.0f && 
-                                my < windowH - 180.0f);
+        // Viewport - always render (core panel)
         UI::RenderViewport(g_editor.selectedEntity, g_editor.camera, g_editor.isViewing,
                           g_editor.lastMousePos, g_editor.viewportFB.colorTex,
                           windowW, windowH, g_editor.gizmoType, g_editor.spaceType,
                           g_editor.showWireframe, g_editor.showGrid, g_editor.showGizmo,
                           window, io);
 
-        // Handle camera input after viewport is rendered
-        handleCameraInput(window, dt, io, mx, my, mouseInViewport);
+        // Optional panels (conditional visibility)
+        if (g_editor.uiState.showGameMode) {
+            UI::RenderGameModeControls(g_editor.isPlaying, g_editor.wasPlaying, g_editor.gameSpeed, g_editor.world);
+        }
 
-        // Status bar
+        if (g_editor.uiState.showConsole) {
+            UI::RenderConsolePanel(g_editor.world);
+        }
+
+        if (g_editor.uiState.showContentBrowser) {
+            UI::RenderContentBrowser(g_editor.world);
+        }
+
+        // Preferences dialog (conditional)
+        UI::RenderPreferencesDialog(g_editor.uiState.showPreferences, g_editor);
+
+        // Status bar (always visible)
         UI::RenderStatusBar(g_editor.world, g_editor.selectedEntity, g_editor.fps,
                            g_editor.isPlaying, g_editor.wasPlaying, windowW);
 
-        // About dialog
+        // About dialog (conditional)
         UI::RenderAboutDialog(g_editor.showAbout);
 
         // Final ImGui render

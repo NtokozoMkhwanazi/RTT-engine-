@@ -87,7 +87,8 @@ void InitEditor() {
     g_editor.renderer.SetDefaultTexture(MeshBuilder::GetProceduralTexture());
     
     // Initialize camera and ECS
-    g_editor.camera = new flyCamera(glm::vec3(0, 5, 10), glm::vec3(0, 0, 0), -90, 0, 10);
+    // Camera at (0,5,10) looking at origin with -20 degree pitch (looking down at objects)
+    g_editor.camera = new flyCamera(glm::vec3(0, 5, 10), glm::vec3(0, 0, 0), -90, -20, 10);
     g_editor.world.init();
     g_editor.world.addSystem<ecs::PhysicsSystem>().setGravity(glm::vec3(0, -9.81f, 0));
     

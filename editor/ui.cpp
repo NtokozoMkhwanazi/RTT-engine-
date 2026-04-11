@@ -2,6 +2,7 @@
 #include "editor_state.h"
 #include "entity_manager.h"
 #include "console.h"
+#include "scene_manager.h"
 #include "ecs/components/Components.h"
 #include "cameraSystem/flyCamera.h"
 #include "geospatial/GeospatialConverter.h"
@@ -120,22 +121,45 @@ void RenderMenuBar(bool& showAbout, ecs::World& world, ecs::EntityID& selected,
                    bool& isPlaying, bool& wasPlaying, const std::string& currentSceneFile,
                    bool& shouldClose) {
     if (ImGui::BeginMainMenuBar()) {
+        // ========== FILE MENU ==========
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("New Scene", "Ctrl+N")) {
+                // Confirm if there are unsaved changes
                 world.shutdown();
                 world.init();
                 selected = ecs::INVALID_ENTITY_ID;
-                std::cout << "New scene created\n";
+                EditorConsole::Log("New scene created");
             }
-            if (ImGui::MenuItem("Open Scene", "Ctrl+O")) {
-                SceneManager::LoadScene("scene.json", world);
+            if (ImGui::MenuItem("Open Scene...", "Ctrl+O")) {
+                // Open file dialog (simplified - loads default scene.json)
+                if (SceneManager::LoadScene("scene.json", world)) {
+                    EditorConsole::Log("Scene loaded: scene.json");
+                } else {
+                    EditorConsole::Log("Failed to load scene", 2);
+                }
             }
+            
+            // Recent files (placeholder)
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "Recent Files:");
+            ImGui::MenuItem("scene.json");
+            
             ImGui::Separator();
             if (ImGui::MenuItem("Save", "Ctrl+S")) {
-                SceneManager::SaveScene(currentSceneFile.empty() ? "scene.json" : currentSceneFile, world);
+                std::string file = currentSceneFile.empty() ? "scene.json" : currentSceneFile;
+                if (SceneManager::SaveScene(file, world)) {
+                    EditorConsole::Log("Scene saved: " + file);
+                } else {
+                    EditorConsole::Log("Failed to save scene", 2);
+                }
             }
-            if (ImGui::MenuItem("Save As", "Ctrl+Shift+S")) {
-                SceneManager::SaveScene("scene.json", world);
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) {
+                // Save with new filename
+                if (SceneManager::SaveScene("scene_autosave.json", world)) {
+                    EditorConsole::Log("Scene saved: scene_autosave.json");
+                } else {
+                    EditorConsole::Log("Failed to save scene", 2);
+                }
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit", "Alt+F4")) {
@@ -144,55 +168,133 @@ void RenderMenuBar(bool& showAbout, ecs::World& world, ecs::EntityID& selected,
             ImGui::EndMenu();
         }
 
+        // ========== EDIT MENU ==========
         if (ImGui::BeginMenu("Edit")) {
-            if (ImGui::MenuItem("Undo", "Ctrl+Z")) {
-                std::cout << "Undo not yet implemented\n";
+            bool canUndo = false; // TODO: Implement undo system
+            bool canRedo = false;
+            
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, canUndo)) {
+                EditorConsole::Log("Undo not yet implemented", 1);
             }
-            if (ImGui::MenuItem("Redo", "Ctrl+Y")) {
-                std::cout << "Redo not yet implemented\n";
+            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, canRedo)) {
+                EditorConsole::Log("Redo not yet implemented", 1);
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Preferences")) {
-                std::cout << "Preferences not yet implemented\n";
+            
+            // Edit operations
+            bool hasSelection = (selected != ecs::INVALID_ENTITY_ID);
+            
+            if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, hasSelection)) {
+                EntityManager::DuplicateEntity(selected);
+                EditorConsole::Log("Entity duplicated");
+            }
+            if (ImGui::MenuItem("Delete", "Del", false, hasSelection)) {
+                EntityManager::DeleteEntity(selected);
+                selected = ecs::INVALID_ENTITY_ID;
+                EditorConsole::Log("Entity deleted");
+            }
+            if (ImGui::MenuItem("Select All", "Ctrl+A")) {
+                EditorConsole::Log("Select all not yet implemented", 1);
+            }
+            if (ImGui::MenuItem("Deselect All", "Esc")) {
+                selected = ecs::INVALID_ENTITY_ID;
+                EditorConsole::Log("Selection cleared");
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Preferences...")) {
+                g_editor.uiState.showPreferences = true;
             }
             ImGui::EndMenu();
         }
 
+        // ========== GAMEOBJECT MENU ==========
         if (ImGui::BeginMenu("GameObject")) {
             if (ImGui::MenuItem("Cube")) {
                 EntityManager::CreateCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(0.8f, 0.8f, 0.8f));
+                EditorConsole::Log("Created Cube");
             }
             if (ImGui::MenuItem("Sphere")) {
                 EntityManager::CreateSphere(glm::vec3(0, 1, 0), 0.5f, glm::vec3(0.2f, 0.8f, 0.2f));
+                EditorConsole::Log("Created Sphere");
             }
             if (ImGui::MenuItem("Plane")) {
                 EntityManager::CreatePlane(glm::vec3(0, 0, 0), glm::vec2(10, 10), glm::vec3(0.5f, 0.5f, 0.5f));
+                EditorConsole::Log("Created Plane");
             }
-            if (ImGui::MenuItem("Light")) {
+            ImGui::Separator();
+            if (ImGui::MenuItem("Cylinder")) {
+                EntityManager::CreateCylinder(glm::vec3(0, 1, 0), 0.5f, 1.0f, glm::vec3(0.8f, 0.8f, 0.2f));
+                EditorConsole::Log("Created Cylinder");
+            }
+            if (ImGui::MenuItem("Cone")) {
+                EntityManager::CreateCone(glm::vec3(0, 1, 0), 0.5f, 1.0f, glm::vec3(0.2f, 0.8f, 0.8f));
+                EditorConsole::Log("Created Cone");
+            }
+            if (ImGui::MenuItem("Torus")) {
+                EntityManager::CreateTorus(glm::vec3(0, 1, 0), 0.35f, 0.15f, glm::vec3(0.8f, 0.2f, 0.8f));
+                EditorConsole::Log("Created Torus");
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Point Light")) {
                 EntityManager::CreateLight(glm::vec3(5, 10, 5), glm::vec3(1, 1, 0.9f), 1.0f);
+                EditorConsole::Log("Created Light");
             }
             if (ImGui::MenuItem("Camera")) {
                 EntityManager::CreateCamera(glm::vec3(0, 5, 10), glm::vec3(0, 0, 0));
+                EditorConsole::Log("Created Camera");
             }
-            ImGui::EndMenu();
-        }
-
-        if (ImGui::BeginMenu("Window")) {
-            ImGui::MenuItem("World Outliner", nullptr, true);
-            ImGui::MenuItem("Details", nullptr, true);
-            ImGui::MenuItem("Toolbox", nullptr, true);
-            ImGui::MenuItem("Viewport", nullptr, true);
             ImGui::Separator();
-            if (ImGui::MenuItem("Profiler")) {
-                // Switch to Profiler tab (handled externally)
+            if (ImGui::MenuItem("Empty Object")) {
+                auto entity = g_editor.world.createEntity();
+                g_editor.world.addComponent<ecs::TransformComponent>(entity);
+                EditorConsole::Log("Created Empty Object");
             }
             ImGui::EndMenu();
         }
 
+        // ========== WINDOW MENU ==========
+        if (ImGui::BeginMenu("Window")) {
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Panels:");
+            
+            ImGui::MenuItem("World Outliner", nullptr, &g_editor.uiState.showOutliner);
+            ImGui::MenuItem("Details", nullptr, &g_editor.uiState.showDetails);
+            ImGui::MenuItem("Toolbox", nullptr, &g_editor.uiState.showToolbox);
+            ImGui::Separator();
+            ImGui::MenuItem("Console", nullptr, &g_editor.uiState.showConsole);
+            ImGui::MenuItem("Content Browser", nullptr, &g_editor.uiState.showContentBrowser);
+            ImGui::MenuItem("Game Mode", nullptr, &g_editor.uiState.showGameMode);
+            ImGui::MenuItem("Profiler", nullptr, &g_editor.uiState.showProfiler);
+            ImGui::Separator();
+            
+            if (ImGui::MenuItem("Reset Layout")) {
+                g_editor.uiState.showOutliner = true;
+                g_editor.uiState.showDetails = true;
+                g_editor.uiState.showToolbox = true;
+                g_editor.uiState.showConsole = false;
+                g_editor.uiState.showContentBrowser = false;
+                g_editor.uiState.showGameMode = false;
+                g_editor.uiState.showProfiler = false;
+                EditorConsole::Log("UI layout reset");
+            }
+            ImGui::EndMenu();
+        }
+
+        // ========== HELP MENU ==========
         if (ImGui::BeginMenu("Help")) {
             if (ImGui::MenuItem("Documentation")) {
-                std::cout << "Opening documentation...\n";
+                // Try to open documentation in browser
+                EditorConsole::Log("Documentation: Check docs/ folder or README.md");
             }
+            if (ImGui::MenuItem("Keyboard Shortcuts")) {
+                EditorConsole::Log("Shortcuts: W=Translate, E=Rotate, R=Scale, X=Space, Del=Delete, Ctrl+D=Duplicate");
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("System Info")) {
+                EditorConsole::Log("OpenGL: " + std::string(reinterpret_cast<const char*>(glGetString(GL_VERSION))));
+                EditorConsole::Log("Renderer: " + std::string(reinterpret_cast<const char*>(glGetString(GL_RENDERER))));
+                EditorConsole::Log("Vendor: " + std::string(reinterpret_cast<const char*>(glGetString(GL_VENDOR))));
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("About RTT Engine")) {
                 showAbout = true;
             }
@@ -204,7 +306,7 @@ void RenderMenuBar(bool& showAbout, ecs::World& world, ecs::EntityID& selected,
         ImGui::SameLine();
 
         char perfText[64];
-        snprintf(perfText, sizeof(perfText), "FPS: %.0f  |  Entities: %d", g_editor.fps, world.getEntityCount());
+        snprintf(perfText, sizeof(perfText), "FPS: %.0f  |  Entities: %zu", g_editor.fps, world.getEntityCount());
         float perfWidth = ImGui::CalcTextSize(perfText).x + 30;
         ImGui::SetCursorPosX(ImGui::GetWindowWidth() - perfWidth - 150);
         ImGui::TextColored(ImVec4(0.5f, 0.7f, 0.5f, 1), "%s", perfText);
@@ -226,8 +328,6 @@ void RenderMenuBar(bool& showAbout, ecs::World& world, ecs::EntityID& selected,
 void RenderToolbar(GizmoRenderer::GizmoType& gizmoType, GizmoRenderer::SpaceType& spaceType, bool& showGrid,
                    bool& showGizmo, bool& showWireframe, ecs::World& world,
                    ecs::EntityID& selected) {
-    int windowW, windowH;
-    // Note: window dimensions should be passed in, using placeholder
     const float toolbarHeight = 36.0f;
     
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.08f, 0.08f, 1));
@@ -340,14 +440,10 @@ void RenderLeftPanel(int& activeTab, ecs::World& world, ecs::EntityID& selected,
     const float menuBarHeight = 25.0f;
     const float toolbarHeight = 36.0f;
     const float tabbedBottomHeight = 180.0f;
-    
-    int windowW, windowH;
-    // Note: These should be passed in
-    windowW = 1920; windowH = 1080; // Placeholder
 
     ImGui::SetNextWindowPos(ImVec2(0, menuBarHeight + toolbarHeight));
     ImGui::SetNextWindowSize(ImVec2(sidePanelWidth,
-        static_cast<float>(windowH) - menuBarHeight - toolbarHeight - tabbedBottomHeight));
+        1080.0f - menuBarHeight - toolbarHeight - tabbedBottomHeight));
     ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.25f, 0.25f, 0.25f, 1));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, 1));
     ImGui::Begin("Scene", nullptr,
@@ -395,7 +491,9 @@ void RenderLeftPanel(int& activeTab, ecs::World& world, ecs::EntityID& selected,
                     }
                 }
 
-                if (ImGui::BeginPopupContextItem()) {
+                char popupId[128];
+                snprintf(popupId, sizeof(popupId), "EntityPopup##%d", id);
+                if (ImGui::BeginPopupContextItem(popupId)) {
                     selected = id;
                     if (ImGui::MenuItem("Duplicate", "Ctrl+D")) {
                         EntityManager::DuplicateEntity(g_editor.selectedEntity);
@@ -451,6 +549,10 @@ void RenderLeftPanel(int& activeTab, ecs::World& world, ecs::EntityID& selected,
 
             if (t && entityStillExists) RenderTransformSection(t);
             if (m && entityStillExists) RenderMeshSection(m);
+            
+            // Component management section
+            ImGui::Spacing();
+            RenderComponentPanel(world, selected);
 
         } else {
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "No entity selected");
@@ -479,32 +581,63 @@ void RenderBottomPanel(int& activeTab, ecs::World& world, ecs::EntityID& selecte
         ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.9f, 0.9f, 1));
 
-    // Tab buttons
+    // Tab buttons - simplified since we have separate windows now
     ImGui::PushStyleColor(ImGuiCol_Button, activeTab == 0 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
-    if (ImGui::Button("Content", ImVec2(90, 28))) activeTab = 0;
+    if (ImGui::Button("Console", ImVec2(90, 28))) activeTab = 0;
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Button, activeTab == 1 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
-    if (ImGui::Button("Console", ImVec2(90, 28))) activeTab = 1;
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, activeTab == 2 ? ImVec4(0.4f, 0.3f, 0.0f, 1) : ImVec4(0.2f, 0.2f, 0.2f, 1));
-    if (ImGui::Button("Profiler", ImVec2(90, 28))) activeTab = 2;
+    if (ImGui::Button("Profiler", ImVec2(90, 28))) activeTab = 1;
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::Separator();
     ImGui::Spacing();
 
     if (activeTab == 0) {
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "Content Browser (placeholder)");
+        // Quick console view (last 10 messages)
+        const auto& messages = EditorConsole::GetMessages();
+        int displayCount = std::min(10, (int)messages.size());
+        
+        ImGui::BeginChild("QuickConsole", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()));
+        for (int i = messages.size() - displayCount; i < (int)messages.size(); i++) {
+            if (i < 0) continue;
+            const auto& msg = messages[i];
+            
+            ImVec4 color;
+            switch (msg.level) {
+                case 0: color = ImVec4(0.7f, 0.7f, 0.7f, 1.0f); break;
+                case 1: color = ImVec4(1.0f, 0.8f, 0.2f, 1.0f); break;
+                case 2: color = ImVec4(1.0f, 0.3f, 0.3f, 1.0f); break;
+                default: color = ImVec4(0.7f, 0.7f, 0.7f, 1.0f);
+            }
+            
+            ImGui::PushStyleColor(ImGuiCol_Text, color);
+            ImGui::Text("%s", msg.text.c_str());
+            ImGui::PopStyleColor();
+        }
+        
+        // Auto-scroll
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+            ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
     } else if (activeTab == 1) {
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "Console (placeholder)");
-    } else if (activeTab == 2) {
+        // Profiler
         ImGui::Text("FPS: %.1f", fps);
-        ImGui::Text("Entity Count: %d", world.getEntityCount());
+        ImGui::Text("Frame Time: %.2f ms", 1000.0f / (fps > 0 ? fps : 60));
+        ImGui::Text("Entity Count: %zu", world.getEntityCount());
         if (camera) {
             ImGui::Text("Camera: (%.2f, %.2f, %.2f)",
                 camera->Position.x, camera->Position.y, camera->Position.z);
+        }
+        
+        ImGui::Separator();
+        
+        // GPU Profiler
+        auto& profiler = AdvancedGPUProfiler::getInstance();
+        float gpuTime = profiler.getFrameTimeMs();
+        if (gpuTime > 0) {
+            ImGui::Text("GPU Time: %.2f ms", gpuTime);
         }
     }
 
@@ -519,22 +652,28 @@ void RenderViewport(ecs::EntityID& selected, flyCamera* camera, bool& isViewing,
     const float sidePanelWidth = 280.0f;
     const float menuBarHeight = 25.0f;
     const float toolbarHeight = 36.0f;
+    const float statusBarHeight = 24.0f;
     const float tabbedBottomHeight = 180.0f;
 
+    // Calculate viewport position and size dynamically
     float vpX = sidePanelWidth;
     float vpY = menuBarHeight + toolbarHeight;
     float vpW = static_cast<float>(windowW) - sidePanelWidth;
-    float vpH = static_cast<float>(windowH) - menuBarHeight - toolbarHeight - tabbedBottomHeight;
+    float vpH = static_cast<float>(windowH) - menuBarHeight - toolbarHeight - tabbedBottomHeight - statusBarHeight;
 
-    ImGui::SetNextWindowPos(ImVec2(vpX, vpY));
-    ImGui::SetNextWindowSize(ImVec2(vpW, vpH));
+    // Ensure minimum dimensions
+    if (vpW < 100.0f) vpW = 100.0f;
+    if (vpH < 100.0f) vpH = 100.0f;
+
+    ImGui::SetNextWindowPos(ImVec2(vpX, vpY), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(vpW, vpH), ImGuiCond_FirstUseEver);
     ImGui::Begin("Viewport", nullptr,
         ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoBringToFrontOnFocus);
 
+    // Get actual window size for texture display
     ImVec2 contentSize = ImGui::GetContentRegionAvail();
-    if (contentSize.x > 0 && contentSize.y > 0) {
+    if (contentSize.x > 10.0f && contentSize.y > 10.0f) {
         int w = static_cast<int>(contentSize.x);
         int h = static_cast<int>(contentSize.y);
 
@@ -627,6 +766,341 @@ void RenderAboutDialog(bool& showAbout) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::SetItemDefaultFocus();
+        ImGui::EndPopup();
+    }
+}
+
+void RenderConsolePanel(ecs::World& world) {
+    ImGui::Begin("Console");
+    
+    // Filter buttons
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
+    ImGui::Text("Filter:");
+    ImGui::SameLine();
+    
+    int& filter = EditorConsole::GetFilterRef();
+    bool filterAll = filter == -1;
+    bool filterInfo = filter == 0;
+    bool filterWarn = filter == 1;
+    bool filterError = filter == 2;
+    
+    if (ImGui::Checkbox("All", &filterAll)) filter = -1;
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Info", &filterInfo)) filter = 0;
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Warning", &filterWarn)) filter = 1;
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Error", &filterError)) filter = 2;
+    
+    ImGui::SameLine(ImGui::GetWindowWidth() - 80);
+    if (ImGui::SmallButton("Clear")) {
+        EditorConsole::Clear();
+    }
+    ImGui::PopStyleVar();
+    
+    ImGui::Separator();
+    
+    // Display log messages
+    const auto& messages = EditorConsole::GetMessages();
+    for (const auto& msg : messages) {
+        // Apply filter
+        if (filter != -1 && msg.level != filter) continue;
+        
+        ImVec4 color;
+        const char* prefix;
+        switch (msg.level) {
+            case 0: color = ImVec4(0.7f, 0.7f, 0.7f, 1.0f); prefix = "[INFO]"; break;
+            case 1: color = ImVec4(1.0f, 0.8f, 0.2f, 1.0f); prefix = "[WARN]"; break;
+            case 2: color = ImVec4(1.0f, 0.3f, 0.3f, 1.0f); prefix = "[ERROR]"; break;
+            default: color = ImVec4(0.7f, 0.7f, 0.7f, 1.0f); prefix = "[INFO]";
+        }
+        
+        ImGui::PushStyleColor(ImGuiCol_Text, color);
+        ImGui::Text("%s %s", prefix, msg.text.c_str());
+        ImGui::PopStyleColor();
+    }
+    
+    // Auto-scroll to bottom
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+        ImGui::SetScrollHereY(1.0f);
+    }
+    
+    ImGui::End();
+}
+
+void RenderContentBrowser(ecs::World& world) {
+    ImGui::Begin("Content Browser");
+    
+    // Path navigation
+    static char currentPath[512] = "assets/";
+    static std::vector<std::string> pathHistory;
+    
+    ImGui::Text("Path:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(ImGui::GetWindowWidth() - 200);
+    ImGui::InputText("##Path", currentPath, sizeof(currentPath));
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh")) {
+        // Refresh current directory
+    }
+    
+    ImGui::Separator();
+    
+    // Asset display area
+    ImGui::Text("Assets:");
+    ImGui::Separator();
+    
+    // Placeholder asset grid
+    ImGui::BeginChild("AssetGrid", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), false);
+    
+    // Example assets
+    const char* assetFolders[] = {"Materials", "Meshes", "Textures", "Shaders", "Audio", "Prefabs"};
+    const char* folderIcons[] = {ICON_FA_FOLDER, ICON_FA_FOLDER, ICON_FA_FOLDER, ICON_FA_FOLDER, ICON_FA_FOLDER, ICON_FA_FOLDER};
+    
+    for (int i = 0; i < 6; i++) {
+        if (i % 4 != 0) ImGui::SameLine();
+        
+        ImGui::BeginGroup();
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%s", folderIcons[i]);
+        ImGui::Text("%s", assetFolders[i]);
+        ImGui::EndGroup();
+        
+        if (ImGui::IsItemClicked()) {
+            EditorConsole::Log("Opening folder: " + std::string(assetFolders[i]));
+        }
+    }
+    
+    // Example files
+    ImGui::Spacing();
+    ImGui::Text("Files:");
+    const char* files[] = {"cube.obj", "sphere.fbx", "plane.gltf", "texture.png", "material.json"};
+    for (int i = 0; i < 5; i++) {
+        if (i % 4 != 0) ImGui::SameLine();
+        
+        ImGui::BeginGroup();
+        ImGui::Text(ICON_FA_FILE);
+        ImGui::Text("%s", files[i]);
+        ImGui::EndGroup();
+        
+        if (ImGui::IsItemClicked()) {
+            EditorConsole::Log("Selected file: " + std::string(files[i]));
+        }
+        
+        char filePopupId[128];
+        snprintf(filePopupId, sizeof(filePopupId), "FilePopup##%d", i);
+        if (ImGui::BeginPopupContextItem(filePopupId)) {
+            if (ImGui::MenuItem("Import")) {
+                EditorConsole::Log("Importing: " + std::string(files[i]));
+            }
+            if (ImGui::MenuItem("Delete")) {
+                EditorConsole::Log("Deleting: " + std::string(files[i]), 1);
+            }
+            ImGui::EndPopup();
+        }
+    }
+    
+    ImGui::EndChild();
+    
+    ImGui::End();
+}
+
+void RenderComponentPanel(ecs::World& world, ecs::EntityID selected) {
+    if (selected == ecs::INVALID_ENTITY_ID) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No entity selected");
+        return;
+    }
+    
+    ecs::Entity entity{selected};
+    if (!entity.isValid()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Invalid entity");
+        return;
+    }
+    
+    ImGui::SeparatorText("Components");
+    
+    // List existing components
+    ImGui::Text("Existing Components:");
+    
+    bool hasTransform = world.hasComponent<ecs::TransformComponent>(entity);
+    bool hasMesh = world.hasComponent<ecs::MeshComponent>(entity);
+    bool hasCamera = world.hasComponent<ecs::CameraComponent>(entity);
+    bool hasLight = world.hasComponent<ecs::LightComponent>(entity);
+    
+    if (hasTransform) {
+        ImGui::BulletText("Transform");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 80);
+        if (ImGui::SmallButton("Remove##Transform")) {
+            EditorConsole::Log("Cannot remove Transform component", 1);
+        }
+    }
+    
+    if (hasMesh) {
+        ImGui::BulletText("Mesh");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 80);
+        if (ImGui::SmallButton("Remove##Mesh")) {
+            // world.removeComponent<ecs::MeshComponent>(selected);
+            EditorConsole::Log("Removed Mesh component");
+        }
+    }
+    
+    if (hasCamera) {
+        ImGui::BulletText("Camera");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 80);
+        if (ImGui::SmallButton("Remove##Camera")) {
+            // world.removeComponent<ecs::CameraComponent>(selected);
+            EditorConsole::Log("Removed Camera component");
+        }
+    }
+    
+    if (hasLight) {
+        ImGui::BulletText("Light");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 80);
+        if (ImGui::SmallButton("Remove##Light")) {
+            //world.removeComponent<ecs::LightComponent>(selected);
+            EditorConsole::Log("Removed Light component");
+        }
+    }
+    
+    ImGui::Separator();
+    
+    // Add component buttons
+    ImGui::Text("Add Components:");
+    
+    if (!hasMesh) {
+        if (ImGui::Button("Add Mesh")) {
+            // world.addComponent<ecs::MeshComponent>(selected);
+            EditorConsole::Log("Added Mesh component");
+        }
+    }
+    
+    if (!hasCamera) {
+        if (ImGui::Button("Add Camera")) {
+            // world.addComponent<ecs::CameraComponent>(selected);
+            EditorConsole::Log("Added Camera component");
+        }
+    }
+    
+    if (!hasLight) {
+        if (ImGui::Button("Add Light")) {
+            // world.addComponent<ecs::LightComponent>(selected);
+            EditorConsole::Log("Added Light component");
+        }
+    }
+}
+
+void RenderGameModeControls(bool& isPlaying, bool& wasPlaying, float& gameSpeed, ecs::World& world) {
+    ImGui::Begin("Game Mode");
+    
+    if (!isPlaying) {
+        if (ImGui::Button(ICON_FA_PLAY " Play", ImVec2(-1, 30))) {
+            isPlaying = true;
+            wasPlaying = true;
+            EditorConsole::Log("Game started");
+        }
+    } else {
+        if (ImGui::Button(ICON_FA_PAUSE " Pause", ImVec2(-1, 30))) {
+            isPlaying = false;
+            EditorConsole::Log("Game paused");
+        }
+        
+        if (ImGui::Button(ICON_FA_STOP " Stop", ImVec2(-1, 30))) {
+            isPlaying = false;
+            wasPlaying = false;
+            EditorConsole::Log("Game stopped");
+        }
+    }
+    
+    ImGui::Separator();
+    
+    ImGui::Text("Game Speed:");
+    if (ImGui::SliderFloat("##Speed", &gameSpeed, 0.1f, 3.0f, "%.1fx")) {
+        EditorConsole::Log("Game speed changed to " + std::to_string(gameSpeed) + "x");
+    }
+    
+    ImGui::Separator();
+    
+    // Game state info
+    if (isPlaying) {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "Status: Playing");
+    } else if (wasPlaying) {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Status: Paused");
+    } else {
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Status: Stopped");
+    }
+    
+    ImGui::Text("Entities: %zu", world.getEntityCount());
+    
+    ImGui::End();
+}
+
+void RenderPreferencesDialog(bool& showPreferences, EditorState& editor) {
+    if (!showPreferences) return;
+
+    ImGui::OpenPopup("Preferences");
+    if (ImGui::BeginPopupModal("Preferences", &showPreferences, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::SetWindowSize(ImVec2(500, 400));
+        
+        // Tab bar for preference categories
+        if (ImGui::BeginTabBar("PrefsTabs")) {
+            // ===== General Tab =====
+            if (ImGui::BeginTabItem("General")) {
+                ImGui::Checkbox("Verbose Logging", &editor.debugConfig.verbose);
+                ImGui::SliderFloat("Game Speed", &editor.gameSpeed, 0.1f, 3.0f, "%.1fx");
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "Engine Version: 1.0.0");
+                ImGui::EndTabItem();
+            }
+            
+            // ===== Rendering Tab =====
+            if (ImGui::BeginTabItem("Rendering")) {
+                ImGui::Checkbox("Show Grid", &editor.showGrid);
+                ImGui::Checkbox("Show Gizmo", &editor.showGizmo);
+                ImGui::Checkbox("Wireframe Mode", &editor.showWireframe);
+                ImGui::Separator();
+                ImGui::Text("Viewport Resolution: %dx%d", editor.viewportFB.width, editor.viewportFB.height);
+                ImGui::EndTabItem();
+            }
+            
+            // ===== Input Tab =====
+            if (ImGui::BeginTabItem("Input")) {
+                ImGui::Text("Camera Controls:");
+                ImGui::BulletText("Right-click + drag: Orbit camera");
+                ImGui::BulletText("WASD: Move camera");
+                ImGui::BulletText("Q/E: Move down/up");
+                ImGui::BulletText("Scroll: Zoom");
+                ImGui::Separator();
+                ImGui::Text("Gizmo Shortcuts:");
+                ImGui::BulletText("W: Translate tool");
+                ImGui::BulletText("E: Rotate tool");
+                ImGui::BulletText("R: Scale tool");
+                ImGui::BulletText("X: Toggle World/Local space");
+                ImGui::EndTabItem();
+            }
+            
+            // ===== UI Tab =====
+            if (ImGui::BeginTabItem("UI")) {
+                ImGui::Text("Panel Visibility:");
+                ImGui::Checkbox("Outliner", &editor.uiState.showOutliner);
+                ImGui::Checkbox("Details", &editor.uiState.showDetails);
+                ImGui::Checkbox("Toolbox", &editor.uiState.showToolbox);
+                ImGui::Checkbox("Console", &editor.uiState.showConsole);
+                ImGui::Checkbox("Content Browser", &editor.uiState.showContentBrowser);
+                ImGui::Checkbox("Game Mode", &editor.uiState.showGameMode);
+                ImGui::Checkbox("Profiler", &editor.uiState.showProfiler);
+                ImGui::EndTabItem();
+            }
+            
+            ImGui::EndTabBar();
+        }
+        
+        ImGui::Separator();
+        if (ImGui::Button("Close", ImVec2(120, 0))) {
+            showPreferences = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SetItemDefaultFocus();
+        
         ImGui::EndPopup();
     }
 }

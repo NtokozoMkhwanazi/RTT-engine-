@@ -45,4 +45,8 @@ void SetFilter(int filter) {
     g_filter = filter;
 }
 
+int& GetFilterRef() {
+    return g_filter;
+}
+
 } // namespace EditorConsole

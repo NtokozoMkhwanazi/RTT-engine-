@@ -28,6 +28,9 @@ void Clear();
 int GetFilter();
 void SetFilter(int filter);
 
+// Get filter as reference for direct modification
+int& GetFilterRef();
+
 } // namespace EditorConsole
 
 #endif // EDITOR_CONSOLE_H

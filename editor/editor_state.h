@@ -41,6 +41,17 @@ struct EditorState {
         char pathBuffer[256] = "/Game/Assets";
         int leftPanelTab = 0;
         int bottomPanelTab = 0;
+        
+        // Panel visibility
+        bool showOutliner = true;
+        bool showDetails = true;
+        bool showToolbox = true;
+        bool showViewport = true;
+        bool showConsole = false;
+        bool showContentBrowser = false;
+        bool showGameMode = false;
+        bool showProfiler = false;
+        bool showPreferences = false;
     } uiState;
     
     // Game state

@@ -91,6 +91,13 @@ public:
         GLuint shaderProgram = 0;
         GLuint textureID = 0;
         
+        // Material properties for this batch
+        glm::vec3 albedo{1.0f};
+        float metallic{0.0f};
+        float roughness{0.5f};
+        float ao{1.0f};
+        glm::vec3 emissive{0.0f};
+        
         // For sorting - creates a sortable key
         uint64_t sortKey = 0;
         
@@ -187,6 +194,9 @@ public:
     // Get batch count for debugging
     size_t GetBatchCount() const { return batches.size(); }
     
+    // Set default texture ID
+    void SetDefaultTexture(GLuint textureID) { defaultTexture = textureID; }
+    
     // Make batches public for debug
     std::vector<RenderBatch> batches;
 
@@ -194,6 +204,9 @@ private:
     // UBO
     GLuint cameraUBO = 0;
     CameraUBO cameraData;
+    
+    // Default texture
+    GLuint defaultTexture = 0;
     
     // Viewport state
     int viewportX = 0, viewportY = 0;

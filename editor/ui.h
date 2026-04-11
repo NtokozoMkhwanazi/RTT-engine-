@@ -11,6 +11,7 @@
 // Forward declarations
 struct UIState;
 struct DebugConfig;
+struct EditorState;
 
 // Forward declare flyCamera
 class flyCamera;
@@ -21,9 +22,12 @@ class flyCamera;
 namespace UI {
 
 // Menu bar
-void RenderMenuBar(bool& showAbout, ecs::World& world, ecs::EntityID& selected, 
+void RenderMenuBar(bool& showAbout, ecs::World& world, ecs::EntityID& selected,
                    bool& isPlaying, bool& wasPlaying, const std::string& currentSceneFile,
                    bool& shouldClose);
+
+// Preferences dialog
+void RenderPreferencesDialog(bool& showPreferences, EditorState& editor);
 
 // Toolbar
 void RenderToolbar(GizmoRenderer::GizmoType& gizmoType, GizmoRenderer::SpaceType& spaceType, bool& showGrid, 
@@ -37,6 +41,18 @@ void RenderLeftPanel(int& activeTab, ecs::World& world, ecs::EntityID& selected,
 // Bottom panel (Content/Console/Profiler)
 void RenderBottomPanel(int& activeTab, ecs::World& world, ecs::EntityID& selected,
                        float fps, const class flyCamera* camera);
+
+// Console panel (standalone)
+void RenderConsolePanel(ecs::World& world);
+
+// Content Browser panel
+void RenderContentBrowser(ecs::World& world);
+
+// Component management panel
+void RenderComponentPanel(ecs::World& world, ecs::EntityID selected);
+
+// Game mode controls
+void RenderGameModeControls(bool& isPlaying, bool& wasPlaying, float& gameSpeed, ecs::World& world);
 
 // Viewport
 void RenderViewport(ecs::EntityID& selected, flyCamera* camera, bool& isViewing,

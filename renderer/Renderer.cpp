@@ -12,6 +12,23 @@
 #include <iostream>
 #include <cstring>
 
+// OpenGL 4.3+ constants not available in OpenGL 3.3 headers
+#ifndef GL_DRAW_INDIRECT_BUFFER
+#define GL_DRAW_INDIRECT_BUFFER 0x8F3F
+#endif
+#ifndef GL_MAP_PERSISTENT_BIT
+#define GL_MAP_PERSISTENT_BIT 0x0040
+#endif
+#ifndef GL_MAP_COHERENT_BIT
+#define GL_MAP_COHERENT_BIT 0x0080
+#endif
+
+// Function pointers for OpenGL 4.3+ features
+typedef void (APIENTRY *PFNGLBUFFERSTORAGEPROC)(GLenum target, GLsizeiptr size, const void *data, GLbitfield flags);
+typedef void (APIENTRY *PFNGLMULTIDRAWELEMENTSINDIRECTPROC)(GLenum mode, GLenum type, const void *indirect, GLsizei drawcount, GLsizei stride);
+static PFNGLBUFFERSTORAGEPROC glBufferStoragePtr = nullptr;
+static PFNGLMULTIDRAWELEMENTSINDIRECTPROC glMultiDrawElementsIndirectPtr = nullptr;
+
 // ============================================================================
 // Frustum Implementation
 // ============================================================================
@@ -91,26 +108,90 @@ bool Frustum::TestAABB(const glm::vec3& min, const glm::vec3& max) const {
 }
 
 // ============================================================================
-// Buffer Pool Implementation (Simplified - no persistent mapping)
+// Buffer Pool Implementation (Persistent Mapped Ring Buffer)
 // ============================================================================
 
 void Renderer::BufferPool::Initialize() {
-    // Pre-allocate some buffers for reuse
+    // Initialize legacy buffer slots
     numBuffers = 0;
     for (size_t i = 0; i < MAX_BUFFERS; i++) {
         inUse[i] = false;
         bufferSizes[i] = 0;
+        mappedPointers[i] = nullptr;
     }
-    
-    std::cout << "[Renderer] Buffer pool initialized\n";
+
+    // Check for OpenGL 4.4+ or GL_ARB_buffer_storage
+    ringBufferSupported = false;
+
+    const char* versionStr = (const char*)glGetString(GL_VERSION);
+    if (versionStr && std::strstr(versionStr, "4.4") != nullptr) {
+        ringBufferSupported = true;
+    }
+    const char* extensions = (const char*)glGetString(GL_EXTENSIONS);
+    if (extensions && std::strstr(extensions, "GL_ARB_buffer_storage") != nullptr) {
+        ringBufferSupported = true;
+    }
+
+    if (!ringBufferSupported) {
+        std::cout << "[Renderer] Persistent buffer storage not supported (requires OpenGL 4.4+ or GL_ARB_buffer_storage)\n";
+        std::cout << "[Renderer] Falling back to glBufferSubData\n";
+        return;
+    }
+
+    // Create persistent mapped ring buffer
+    glGenBuffers(1, &ringBuffer);
+    glBindBuffer(GL_ARRAY_BUFFER, ringBuffer);
+
+    // Use glBufferStorage with persistent mapping flags
+    // GL_MAP_PERSISTENT_BIT: mapping persists after unmap
+    // GL_MAP_COHERENT_BIT: GPU sees CPU writes immediately (no flush needed)
+    glBufferStoragePtr(GL_ARRAY_BUFFER, (GLsizeiptr)POOL_SIZE, nullptr,
+                       GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+
+    // Map once at init time
+    ringMappedPtr = glMapBufferRange(GL_ARRAY_BUFFER, 0, (GLsizeiptr)POOL_SIZE,
+                                      GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+
+    if (!ringMappedPtr) {
+        std::cout << "[Renderer] Failed to map persistent ring buffer\n";
+        ringBufferSupported = false;
+        glDeleteBuffers(1, &ringBuffer);
+        return;
+    }
+
+    ringBufferSize = POOL_SIZE;
+    ringOffset = 0;
+
+    syncHistory.reserve(MAX_FRAMES_IN_FLIGHT * 256);
+
+    std::cout << "[Renderer] Persistent mapped ring buffer initialized (64MB)\n";
 }
 
 void Renderer::BufferPool::Shutdown() {
+    // Clean up legacy buffers
     for (size_t i = 0; i < numBuffers; i++) {
         if (bufferIDs[i]) {
             glDeleteBuffers(1, &bufferIDs[i]);
         }
     }
+
+    // Clean up ring buffer
+    if (ringBuffer) {
+        if (ringMappedPtr) {
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+            ringMappedPtr = nullptr;
+        }
+        glDeleteBuffers(1, &ringBuffer);
+        ringBuffer = 0;
+    }
+
+    // Clean up sync objects
+    for (auto& sync : syncHistory) {
+        if (sync.fence) {
+            glDeleteSync((GLsync)sync.fence);
+        }
+    }
+    syncHistory.clear();
 }
 
 size_t Renderer::BufferPool::Allocate(size_t size, void** outMappedPtr) {
@@ -118,7 +199,7 @@ size_t Renderer::BufferPool::Allocate(size_t size, void** outMappedPtr) {
     for (size_t i = 0; i < numBuffers; i++) {
         if (!inUse[i] && bufferSizes[i] >= size) {
             inUse[i] = true;
-            *outMappedPtr = nullptr;  // Will use glBufferSubData
+            *outMappedPtr = mappedPointers[i];
             return i;
         }
     }
@@ -131,10 +212,23 @@ size_t Renderer::BufferPool::Allocate(size_t size, void** outMappedPtr) {
     
     size_t idx = numBuffers++;
     glGenBuffers(1, &bufferIDs[idx]);
+    glBindBuffer(GL_ARRAY_BUFFER, bufferIDs[idx]);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)size, nullptr, GL_DYNAMIC_DRAW);
+
+    // Try to persistently map this buffer too
+    if (ringBufferSupported && size < POOL_SIZE / 4) {
+        glBufferStoragePtr(GL_ARRAY_BUFFER, (GLsizeiptr)size, nullptr,
+                           GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+        mappedPointers[idx] = glMapBufferRange(GL_ARRAY_BUFFER, 0, (GLsizeiptr)size,
+                                                GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+    } else {
+        mappedPointers[idx] = nullptr;
+    }
+
     bufferSizes[idx] = size;
     inUse[idx] = true;
     
-    *outMappedPtr = nullptr;
+    *outMappedPtr = mappedPointers[idx];
     return idx;
 }
 
@@ -144,6 +238,88 @@ void Renderer::BufferPool::Free(size_t bufferIndex) {
     }
 }
 
+/**
+ * Allocate from persistent ring buffer.
+ * Returns offset into the ring buffer and a pointer to the mapped region.
+ * The caller can memcpy directly into the pointer - GPU sees changes immediately
+ * due to GL_MAP_COHERENT_BIT.
+ *
+ * Handles ring wrap-around and GPU sync to avoid overwriting data still in use.
+ */
+size_t Renderer::BufferPool::AllocateRing(size_t size, void** outMappedPtr) {
+    if (!ringBufferSupported) {
+        // Fallback: use legacy allocation
+        return Allocate(size, outMappedPtr);
+    }
+
+    // Align to 16 bytes for SIMD compatibility
+    size = (size + 15) & ~15;
+
+    // Check if we need to wrap around
+    if (ringOffset + size > ringBufferSize) {
+        // Insert GPU sync fence for current ring segment before wrapping
+        GLuint64 fence = (GLuint64)glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        syncHistory.push_back({fence, ringOffset, ringBufferSize - ringOffset});
+
+        ringOffset = 0;
+    }
+
+    // Wait on any sync objects that overlap with our new allocation
+    // (simple approach: wait on any pending fence - in production, track per-frame)
+    if (!syncHistory.empty()) {
+        // Only wait on the oldest fence that's been there long enough
+        auto& oldest = syncHistory.front();
+        if (oldest.fence) {
+            GLenum result = glClientWaitSync((GLsync)oldest.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000); // 1ms timeout
+            if (result == GL_CONDITION_SATISFIED || result == GL_ALREADY_SIGNALED) {
+                glDeleteSync((GLsync)oldest.fence);
+                oldest.fence = 0;
+            }
+        }
+        // Prune completed sync entries
+        syncHistory.erase(
+            std::remove_if(syncHistory.begin(), syncHistory.end(),
+                [](const SyncEntry& e) { return e.fence == 0; }),
+            syncHistory.end()
+        );
+    }
+
+    // Safety check: if ring is too full, flush and wait
+    if (ringOffset + size > ringBufferSize) {
+        glFinish(); // Force GPU to finish all pending work
+        ringOffset = 0;
+
+        // Clear all remaining sync objects
+        for (auto& sync : syncHistory) {
+            if (sync.fence) {
+                glDeleteSync((GLsync)sync.fence);
+                sync.fence = 0;
+            }
+        }
+        syncHistory.clear();
+    }
+
+    size_t offset = ringOffset;
+    *outMappedPtr = static_cast<char*>(ringMappedPtr) + offset;
+    ringOffset += size;
+
+    return offset;
+}
+
+void Renderer::BufferPool::ResetRing() {
+    // Reset ring buffer at start of each frame
+    // (only needed if not using persistent coherent mapping)
+    if (ringBufferSupported) {
+        // Insert fence at current position for next frame's sync
+        if (ringOffset > 0) {
+            GLuint64 fence = (GLuint64)glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            syncHistory.push_back({fence, 0, ringOffset});
+        }
+        ringOffset = 0;
+        currentFrame++;
+    }
+}
+    
 // ============================================================================
 // Renderer Implementation
 // ============================================================================
@@ -173,6 +349,9 @@ void Renderer::Initialize() {
     // Pre-allocate batch indices vector
     batchIndices.reserve(256);
     
+    // Initialize Multi-Draw Indirect
+    InitializeMDI();
+    
     std::cout << "[Renderer] Initialized with UBO and batch sorting\n";
 }
 
@@ -181,6 +360,20 @@ void Renderer::Shutdown() {
     
     if (cameraUBO) {
         glDeleteBuffers(1, &cameraUBO);
+    }
+    
+    if (mdiIndirectBuffer) {
+        if (mdiMappedCommands) {
+            glUnmapBuffer(GL_DRAW_INDIRECT_BUFFER);
+            mdiMappedCommands = nullptr;
+        }
+        glDeleteBuffers(1, &mdiIndirectBuffer);
+        mdiIndirectBuffer = 0;
+    }
+    
+    if (mdiVertexArray) {
+        glDeleteVertexArrays(1, &mdiVertexArray);
+        mdiVertexArray = 0;
     }
     
     batches.clear();
@@ -207,7 +400,8 @@ void Renderer::SetLightParameters(const glm::vec3& lightPos, const glm::vec3& vi
 }
 
 void Renderer::UpdateCameraUBO() {
-    // Update UBO once per frame
+    // Update UBO once per frame via glBufferSubData
+    // (UBOs are small enough that this is fast; the ring buffer is used for larger per-frame data)
     glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(CameraUBO), &cameraData);
 }
@@ -216,6 +410,8 @@ void Renderer::AddRenderable(GLuint VAO, GLuint VBO, GLuint EBO, GLsizei vertexC
                             GLenum primitiveType, GLuint shaderProgram,
                             const std::vector<glm::mat4>& transforms,
                             const glm::vec3& color,
+                            float metallic,
+                            float roughness,
                             const glm::vec3& bboxMin,
                             const glm::vec3& bboxMax) {
     // Frustum culling - skip if not visible
@@ -223,14 +419,14 @@ void Renderer::AddRenderable(GLuint VAO, GLuint VBO, GLuint EBO, GLsizei vertexC
         glm::vec3 center = (bboxMin + bboxMax) * 0.5f;
         glm::vec3 extent = (bboxMax - bboxMin) * 0.5f;
         float maxExtent = glm::length(extent);
-        
+
         glm::vec4 transformedCenter = transforms[0] * glm::vec4(center, 1.0f);
-        
+
         if (!frustum.TestSphere(glm::vec3(transformedCenter), maxExtent * 2.0f)) {
             return;  // Culled
         }
     }
-    
+
     RenderBatch batch;
     batch.vertexArrayObject = VAO;
     batch.vertexBuffer = VBO;
@@ -240,17 +436,20 @@ void Renderer::AddRenderable(GLuint VAO, GLuint VBO, GLuint EBO, GLsizei vertexC
     batch.shaderProgram = shaderProgram;
     batch.instanceCount = static_cast<GLsizei>(transforms.size());
     batch.textureID = 0;
+    batch.albedo = color;
+    batch.metallic = metallic;
+    batch.roughness = roughness;
     batch.bboxMin = bboxMin;
     batch.bboxMax = bboxMax;
-    
+
     // Compute sort key for efficient sorting
     batch.ComputeSortKey();
-    
+
     // Setup instance data
     if (!transforms.empty()) {
         SetupBatch(batch, transforms);
     }
-    
+
     batches.push_back(batch);
 }
 
@@ -268,6 +467,9 @@ void Renderer::SubmitBatches() {
                 return batches[a].sortKey < batches[b].sortKey;
             });
     }
+    
+    // Reset ring buffer for new frame (syncs GPU fences, wraps ring)
+    bufferPool.ResetRing();
     
     Render();
 }
@@ -291,80 +493,76 @@ void Renderer::Render() {
         glBindTexture(GL_TEXTURE_2D, defaultTexture);
     }
 
-    // Render batches in sorted order
-    GLuint lastShader = 0;
-    GLuint lastVAO = 0;
-    
-    const std::vector<size_t>* renderOrder = &batchIndices;
-    std::vector<size_t> fallbackOrder;
-    
-    if (batchIndices.empty() && !batches.empty()) {
-        fallbackOrder.resize(batches.size());
-        for (size_t i = 0; i < batches.size(); i++) fallbackOrder[i] = i;
-        renderOrder = &fallbackOrder;
-    }
-    
-    for (size_t idx : *renderOrder) {
-        const auto& batch = batches[idx];
+    if (useMultiDraw && !batches.empty()) {
+        // === MDI PATH: Group batches and issue multi-draw calls ===
+        ExecuteMultiDraw();
+    } else {
+        // === FALLBACK PATH: Individual draw calls per batch ===
+        GLuint lastShader = 0;
+        GLuint lastVAO = 0;
         
-        if (batch.vertexArrayObject == 0) continue;
+        const std::vector<size_t>* renderOrder = &batchIndices;
+        std::vector<size_t> fallbackOrder;
         
-        // Minimize state changes
-        if (batch.shaderProgram != lastShader) {
-            glUseProgram(batch.shaderProgram);
-            lastShader = batch.shaderProgram;
-            BindCameraUBO(batch.shaderProgram);
+        if (batchIndices.empty() && !batches.empty()) {
+            fallbackOrder.resize(batches.size());
+            for (size_t i = 0; i < batches.size(); i++) fallbackOrder[i] = i;
+            renderOrder = &fallbackOrder;
         }
         
-        // Set material uniforms for this batch (per-batch, not per-shader)
-        GLint albedoLoc = glGetUniformLocation(batch.shaderProgram, "albedo");
-        GLint metallicLoc = glGetUniformLocation(batch.shaderProgram, "metallic");
-        GLint roughnessLoc = glGetUniformLocation(batch.shaderProgram, "roughness");
-        GLint aoLoc = glGetUniformLocation(batch.shaderProgram, "ao");
-        GLint emissiveLoc = glGetUniformLocation(batch.shaderProgram, "emissive");
-        GLint useAlbedoMapLoc = glGetUniformLocation(batch.shaderProgram, "useAlbedoMap");
-
-        if (albedoLoc != -1) glUniform3f(albedoLoc, batch.albedo.r, batch.albedo.g, batch.albedo.b);
-        if (metallicLoc != -1) glUniform1f(metallicLoc, batch.metallic);
-        if (roughnessLoc != -1) glUniform1f(roughnessLoc, batch.roughness);
-        if (aoLoc != -1) glUniform1f(aoLoc, batch.ao);
-        if (emissiveLoc != -1) glUniform3f(emissiveLoc, batch.emissive.r, batch.emissive.g, batch.emissive.b);
-
-        // Enable texture sampling ONLY if the batch explicitly has a texture ID
-        // (defaultTexture is just a fallback, don't force it on all batches)
-        if (useAlbedoMapLoc != -1) {
-            bool hasTexture = (batch.textureID != 0);
-            glUniform1i(useAlbedoMapLoc, hasTexture ? 1 : 0);
-
-            // Bind the batch texture if it has one
-            if (hasTexture) {
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, batch.textureID);
+        for (size_t idx : *renderOrder) {
+            const auto& batch = batches[idx];
+            
+            if (batch.vertexArrayObject == 0) continue;
+            
+            // Minimize state changes
+            if (batch.shaderProgram != lastShader) {
+                glUseProgram(batch.shaderProgram);
+                lastShader = batch.shaderProgram;
+                BindCameraUBO(batch.shaderProgram);
             }
-        }
-        
-        if (batch.vertexArrayObject != lastVAO) {
-            glBindVertexArray(batch.vertexArrayObject);
-            lastVAO = batch.vertexArrayObject;
-        }
+            
+            // Set material uniforms using explicit layout locations from the shader
+            glUniform3f(0, batch.albedo.r, batch.albedo.g, batch.albedo.b);
+            glUniform1f(1, batch.metallic);
+            glUniform1f(2, batch.roughness);
+            glUniform1f(3, batch.ao);
+            glUniform3f(4, batch.emissive.r, batch.emissive.g, batch.emissive.b);
 
-        // Use indexed or non-indexed drawing based on elementBuffer
-        bool useIndexed = (batch.elementBuffer != 0);
-        if (useIndexed) {
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.elementBuffer);
-        }
+            GLint useAlbedoMapLoc = GetCachedUniformLocation(batch.shaderProgram, "useAlbedoMap");
 
-        if (batch.instanceCount > 0) {
-            if (useIndexed) {
-                glDrawElementsInstanced(batch.primitiveType, batch.vertexCount, GL_UNSIGNED_INT, 0, batch.instanceCount);
-            } else {
-                glDrawArraysInstanced(batch.primitiveType, 0, batch.vertexCount, batch.instanceCount);
+            if (useAlbedoMapLoc != -1) {
+                bool hasTexture = (batch.textureID != 0);
+                glUniform1i(useAlbedoMapLoc, hasTexture ? 1 : 0);
+
+                if (hasTexture) {
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, batch.textureID);
+                }
             }
-        } else {
+            
+            if (batch.vertexArrayObject != lastVAO) {
+                glBindVertexArray(batch.vertexArrayObject);
+                lastVAO = batch.vertexArrayObject;
+            }
+
+            bool useIndexed = (batch.elementBuffer != 0);
             if (useIndexed) {
-                glDrawElements(batch.primitiveType, batch.vertexCount, GL_UNSIGNED_INT, 0);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.elementBuffer);
+            }
+
+            if (batch.instanceCount > 0) {
+                if (useIndexed) {
+                    glDrawElementsInstanced(batch.primitiveType, batch.vertexCount, GL_UNSIGNED_INT, 0, batch.instanceCount);
+                } else {
+                    glDrawArraysInstanced(batch.primitiveType, 0, batch.vertexCount, batch.instanceCount);
+                }
             } else {
-                glDrawArrays(batch.primitiveType, 0, batch.vertexCount);
+                if (useIndexed) {
+                    glDrawElements(batch.primitiveType, batch.vertexCount, GL_UNSIGNED_INT, 0);
+                } else {
+                    glDrawArrays(batch.primitiveType, 0, batch.vertexCount);
+                }
             }
         }
     }
@@ -402,26 +600,256 @@ void Renderer::SetFaceCulling(bool enabled) {
 void Renderer::SetupBatch(RenderBatch& batch, const std::vector<glm::mat4>& transforms) {
     if (transforms.empty()) return;
     
-    // Create instance buffer
-    GLuint instanceBuffer;
-    glGenBuffers(1, &instanceBuffer);
-    glBindBuffer(GL_ARRAY_BUFFER, instanceBuffer);
-    glBufferData(GL_ARRAY_BUFFER, transforms.size() * sizeof(glm::mat4),
-                 transforms.data(), GL_DYNAMIC_DRAW);
-    
-    // Setup vertex attribute pointers for instance data (locations 7-10)
-    glBindVertexArray(batch.vertexArrayObject);
-    
-    for (int i = 0; i < 4; i++) {
-        glEnableVertexAttribArray(7 + i);
-        glVertexAttribPointer(7 + i, 4, GL_FLOAT, GL_FALSE, sizeof(glm::mat4),
-                             (void*)(sizeof(float) * 4 * i));
-        glVertexAttribDivisor(7 + i, 1);
+    size_t dataSize = transforms.size() * sizeof(glm::mat4);
+
+    if (bufferPool.ringBufferSupported) {
+        // === PERSISTENT RING BUFFER PATH (OpenGL 4.4+) ===
+        // Upload instance data directly into the persistent ring buffer
+        void* mappedPtr = nullptr;
+        bufferPool.AllocateRing(dataSize, &mappedPtr);
+        
+        // Copy transform data into the mapped ring buffer region
+        std::memcpy(mappedPtr, transforms.data(), dataSize);
+        
+        // Use the shared ring buffer as instance data source
+        GLuint instanceBuffer = bufferPool.ringBuffer;
+        batch.instanceBuffer = instanceBuffer;
+        batch.instanceDataOffset = reinterpret_cast<uintptr_t>(mappedPtr) - reinterpret_cast<uintptr_t>(bufferPool.ringMappedPtr);
+        
+        // Setup vertex attribute pointers for instance data (locations 7-10)
+        // Bind the ring buffer and set the offset for each matrix column
+        glBindVertexArray(batch.vertexArrayObject);
+        glBindBuffer(GL_ARRAY_BUFFER, instanceBuffer);
+        
+        for (int i = 0; i < 4; i++) {
+            glEnableVertexAttribArray(7 + i);
+            glVertexAttribPointer(7 + i, 4, GL_FLOAT, GL_FALSE, sizeof(glm::mat4),
+                                 (void*)(batch.instanceDataOffset + sizeof(float) * 4 * i));
+            glVertexAttribDivisor(7 + i, 1);
+        }
+        
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    } else {
+        // === FALLBACK: Legacy per-batch buffer ===
+        GLuint instanceBuffer;
+        glGenBuffers(1, &instanceBuffer);
+        glBindBuffer(GL_ARRAY_BUFFER, instanceBuffer);
+        glBufferData(GL_ARRAY_BUFFER, transforms.size() * sizeof(glm::mat4),
+                     transforms.data(), GL_DYNAMIC_DRAW);
+        
+        // Setup vertex attribute pointers for instance data (locations 7-10)
+        glBindVertexArray(batch.vertexArrayObject);
+        
+        for (int i = 0; i < 4; i++) {
+            glEnableVertexAttribArray(7 + i);
+            glVertexAttribPointer(7 + i, 4, GL_FLOAT, GL_FALSE, sizeof(glm::mat4),
+                                 (void*)(sizeof(float) * 4 * i));
+            glVertexAttribDivisor(7 + i, 1);
+        }
+        
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        
+        batch.instanceBuffer = instanceBuffer;
+        batch.instanceDataOffset = 0;
     }
+}
+
+// ============================================================================
+// Multi-Draw Indirect Implementation
+// ============================================================================
+
+void Renderer::InitializeMDI() {
+    // Check for GL_ARB_multi_draw_indirect or OpenGL 4.3+
+    mdiSupported = false;
+
+    const char* versionStr = (const char*)glGetString(GL_VERSION);
+    const char* extensions = (const char*)glGetString(GL_EXTENSIONS);
+
+    if (versionStr && std::strstr(versionStr, "4.") != nullptr) {
+        mdiSupported = true;
+    }
+
+    if (extensions && std::strstr(extensions, "GL_ARB_multi_draw_indirect") != nullptr) {
+        mdiSupported = true;
+    }
+
+    if (!mdiSupported) {
+        std::cout << "[Renderer] Multi-Draw Indirect not supported (requires OpenGL 4.3+ or GL_ARB_multi_draw_indirect)\n";
+        std::cout << "[Renderer] Falling back to glMultiDrawElements (OpenGL 1.4+)\n";
+        return;
+    }
+
+    // Load OpenGL 4.3+ function pointers
+    glBufferStoragePtr = (PFNGLBUFFERSTORAGEPROC)glfwGetProcAddress("glBufferStorage");
+    glMultiDrawElementsIndirectPtr = (PFNGLMULTIDRAWELEMENTSINDIRECTPROC)glfwGetProcAddress("glMultiDrawElementsIndirect");
+
+    if (!glBufferStoragePtr || !glMultiDrawElementsIndirectPtr) {
+        std::cout << "[Renderer] MDI functions not available via glfwGetProcAddress\n";
+        std::cout << "[Renderer] Falling back to glMultiDrawElements (OpenGL 1.4+)\n";
+        mdiSupported = false;
+        return;
+    }
+
+    // Create indirect command buffer with persistent mapping
+    glGenBuffers(1, &mdiIndirectBuffer);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, mdiIndirectBuffer);
     
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    // Allocate storage for indirect commands
+    size_t bufferSize = MAX_INDIRECT_COMMANDS * sizeof(DrawElementsIndirectCommand);
+    glBufferStoragePtr(GL_DRAW_INDIRECT_BUFFER, (GLsizeiptr)bufferSize, nullptr,
+                       GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
     
-    // Store buffer ID for cleanup (in production, use buffer pool)
-    batch.instanceBuffer = instanceBuffer;
+    // Map the buffer for persistent access
+    mdiMappedCommands = glMapBufferRange(GL_DRAW_INDIRECT_BUFFER, 0, (GLsizeiptr)bufferSize,
+                                          GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+    
+    if (!mdiMappedCommands) {
+        std::cout << "[Renderer] Failed to map indirect command buffer\n";
+        mdiSupported = false;
+        glDeleteBuffers(1, &mdiIndirectBuffer);
+        return;
+    }
+
+    // Create a dummy VAO for indirect draws
+    glGenVertexArrays(1, &mdiVertexArray);
+
+    std::cout << "[Renderer] Multi-Draw Indirect initialized (persistent mapped buffer, "
+              << MAX_INDIRECT_COMMANDS << " commands)\n";
+}
+
+void Renderer::ExecuteMultiDraw() {
+    if (batches.empty()) return;
+
+    const std::vector<size_t>* renderOrder = &batchIndices;
+    std::vector<size_t> fallbackOrder;
+    
+    if (batchIndices.empty()) {
+        fallbackOrder.resize(batches.size());
+        for (size_t i = 0; i < batches.size(); i++) fallbackOrder[i] = i;
+        renderOrder = &fallbackOrder;
+    }
+
+    // Group batches by shader+VAO for MDI (same shader+VAO = one multi-draw call)
+    struct MDIGroup {
+        GLuint shaderProgram;
+        GLuint VAO;
+        GLuint EBO;
+        GLsizei vertexCount;      // Same for all in group (same mesh)
+        GLenum primitiveType;
+        GLsizei instanceCount;    // Max instance count in group
+        std::vector<size_t> batchIndices;
+    };
+
+    // Build groups
+    std::vector<MDIGroup> groups;
+    groups.reserve(renderOrder->size());
+
+    for (size_t idx : *renderOrder) {
+        const auto& batch = batches[idx];
+        if (batch.vertexArrayObject == 0) continue;
+
+        bool useIndexed = (batch.elementBuffer != 0);
+        if (!useIndexed) continue;  // MDI path only handles indexed draws for now
+
+        // Find or create group for this shader+VAO combination
+        bool found = false;
+        for (auto& group : groups) {
+            if (group.shaderProgram == batch.shaderProgram &&
+                group.VAO == batch.vertexArrayObject &&
+                group.EBO == batch.elementBuffer) {
+                group.batchIndices.push_back(idx);
+                group.instanceCount = std::max(group.instanceCount, batch.instanceCount);
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            MDIGroup newGroup;
+            newGroup.shaderProgram = batch.shaderProgram;
+            newGroup.VAO = batch.vertexArrayObject;
+            newGroup.EBO = batch.elementBuffer;
+            newGroup.vertexCount = batch.vertexCount;
+            newGroup.primitiveType = batch.primitiveType;
+            newGroup.instanceCount = std::max((GLsizei)1, batch.instanceCount);
+            newGroup.batchIndices.push_back(idx);
+            groups.push_back(std::move(newGroup));
+        }
+    }
+
+    // Execute each group as a multi-draw call
+    for (const auto& group : groups) {
+        if (group.batchIndices.empty()) continue;
+
+        // Set shader and material state once per group
+        glUseProgram(group.shaderProgram);
+        BindCameraUBO(group.shaderProgram);
+        glBindVertexArray(group.VAO);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, group.EBO);
+
+        if (mdiSupported && useMultiDraw) {
+            // === PATH 1: Full Multi-Draw Indirect (OpenGL 4.3+) ===
+            
+            // Build indirect commands in persistent mapped buffer
+            auto* commands = static_cast<DrawElementsIndirectCommand*>(mdiMappedCommands);
+            size_t cmdCount = group.batchIndices.size();
+
+            if (cmdCount > MAX_INDIRECT_COMMANDS) {
+                cmdCount = MAX_INDIRECT_COMMANDS;  // Clamp to buffer size
+            }
+
+            for (size_t i = 0; i < cmdCount; ++i) {
+                size_t batchIdx = group.batchIndices[i];
+                const auto& batch = batches[batchIdx];
+                
+                commands[i].count = static_cast<GLuint>(batch.vertexCount);
+                commands[i].instanceCount = std::max((GLuint)batch.instanceCount, 1u);
+                commands[i].firstIndex = 0;  // Assumes EBO starts at 0
+                commands[i].baseVertex = 0;
+                commands[i].baseInstance = 0;
+            }
+
+            // Set material uniforms for first batch (shared shader state)
+            if (!group.batchIndices.empty()) {
+                const auto& firstBatch = batches[group.batchIndices[0]];
+                glUniform3f(0, firstBatch.albedo.r, firstBatch.albedo.g, firstBatch.albedo.b);
+                glUniform1f(1, firstBatch.metallic);
+                glUniform1f(2, firstBatch.roughness);
+                glUniform1f(3, firstBatch.ao);
+                glUniform3f(4, firstBatch.emissive.r, firstBatch.emissive.g, firstBatch.emissive.b);
+
+                GLint useAlbedoMapLoc = GetCachedUniformLocation(group.shaderProgram, "useAlbedoMap");
+                if (useAlbedoMapLoc != -1) {
+                    bool hasTexture = (firstBatch.textureID != 0);
+                    glUniform1i(useAlbedoMapLoc, hasTexture ? 1 : 0);
+                    if (hasTexture) {
+                        glActiveTexture(GL_TEXTURE0);
+                        glBindTexture(GL_TEXTURE_2D, firstBatch.textureID);
+                    }
+                }
+            }
+
+            // Single multi-draw call for all batches in this group
+            if (glMultiDrawElementsIndirectPtr) {
+                glMultiDrawElementsIndirectPtr(group.primitiveType, GL_UNSIGNED_INT,
+                                               nullptr, static_cast<GLsizei>(cmdCount), 0);
+            }
+        } else {
+            // === PATH 2: glMultiDrawElements fallback (OpenGL 1.4+) ===
+            
+            size_t cmdCount = group.batchIndices.size();
+            std::vector<GLsizei> counts(cmdCount);
+            std::vector<const void*> offsets(cmdCount);
+
+            for (size_t i = 0; i < cmdCount; ++i) {
+                counts[i] = static_cast<GLsizei>(batches[group.batchIndices[i]].vertexCount);
+                offsets[i] = nullptr;  // All use offset 0
+            }
+
+            glMultiDrawElements(group.primitiveType, counts.data(), GL_UNSIGNED_INT,
+                                offsets.data(), static_cast<GLsizei>(cmdCount));
+        }
+    }
 }

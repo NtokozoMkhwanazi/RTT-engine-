@@ -85,9 +85,10 @@ public:
      * Render all visible entities using archetype iteration
      */
     void render() override {
-        if (!m_model) {
-            return;
-        }
+        // Allow rendering without a model (procedural meshes work fine)
+        // if (!m_model) {
+        //     return;
+        // }
 
         m_visibleCount = 0;
         int entitiesAdded = 0;
@@ -106,7 +107,7 @@ public:
 
         // Submit batches to GPU via engine Renderer (with sorting and optimizations)
         if (entitiesAdded > 0 && m_renderer) {
-            m_renderer->SubmitBatches();  // Uses sorted, optimized rendering
+            m_renderer->SubmitBatches();
         }
     }
 
@@ -128,11 +129,14 @@ public:
             m_renderer->AddRenderable(
                 meshEntry->VAO,
                 0,  // VBO not needed (in VAO)
-                0,  // EBO not needed (in VAO)
+                meshEntry->EBO,  // EBO needed for indexed drawing
                 meshEntry->indexCount,
                 GL_TRIANGLES,
                 m_defaultShaderProgram,
-                transforms
+                transforms,
+                mesh.color,
+                mesh.metallic,
+                mesh.roughness
             );
             return;
         }
@@ -142,13 +146,16 @@ public:
             Mesh& meshData = m_model->GetMesh(mesh.meshID);
 
             m_renderer->AddRenderable(
-                meshData.VAO,
+                meshData.GetVAO(),
                 0,  // VBO not needed (in VAO)
-                0,  // EBO not needed (in VAO)
+                meshData.GetEBO(),  // EBO for indexed drawing
                 meshData.GetStatistics().indexCount,
                 GL_TRIANGLES,
                 m_defaultShaderProgram,
-                transforms
+                transforms,
+                mesh.color,
+                mesh.metallic,
+                mesh.roughness
             );
         }
     }

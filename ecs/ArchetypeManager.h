@@ -581,10 +581,20 @@ private:
     /**
      * Initialize components for a new entity
      */
+    template<typename T>
+    void initializeOneComponent(ArchetypeDataType* archetypeData, size_t chunkIndex, size_t indexInChunk) {
+        auto& chunks = archetypeData->getChunks();
+        if (chunkIndex >= chunks.size()) return;
+        auto& chunk = chunks[chunkIndex];
+        T* ptr = chunk.template getComponent<T>(indexInChunk);
+        if (ptr) new (ptr) T();
+    }
+
     template<typename... Components>
     void initializeComponents(EntityID entityID, size_t chunkIndex, size_t indexInChunk) {
-        // Components are default-initialized by the chunk
-        // This function can be used for custom initialization if needed
+        auto it = m_entityLocations.find(entityID);
+        if (it == m_entityLocations.end()) return;
+        (initializeOneComponent<Components>(it->second.archetypeData, chunkIndex, indexInChunk), ...);
     }
 
     /**

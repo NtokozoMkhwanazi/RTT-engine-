@@ -1,4 +1,5 @@
 #include "Physics.h"
+#include "GJK.h"
 #include <glm/gtx/norm.hpp>
 #include <glm/gtx/string_cast.hpp>
 #include <glm/gtx/intersect.hpp>
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <sstream>
 #include <iostream>
+#include <unordered_map>
 
 // -------------------- Helpers --------------------
 static inline std::string vecToStr(const glm::vec3 &v, int prec = 4) {
@@ -27,12 +29,12 @@ bool PhysicsWorld::raycastDown(
     bool hit = false;
     float closestY = -std::numeric_limits<float>::max();
 
-    for (auto& b : bodies)
+    for (const auto& b : bodies)
     {
-        if (!b || !b->isStatic) continue;
+        if (b.isStatic) continue;
 
-        glm::vec3 min = b->position - b->scale * 0.5f;
-        glm::vec3 max = b->position + b->scale * 0.5f;
+        glm::vec3 min = b.position - b.scale * 0.5f;
+        glm::vec3 max = b.position + b.scale * 0.5f;
 
         if (origin.x < min.x || origin.x > max.x ||
             origin.z < min.z || origin.z > max.z)
@@ -63,14 +65,15 @@ bool PhysicsWorld::raycast(
 {
     bool hit = false;
     float closestDist = std::numeric_limits<float>::max();
+    int hitIdx = -1;
 
-    for (auto& b : bodies)
+    for (int i = 0; i < static_cast<int>(bodies.size()); ++i)
     {
-        if (!b) continue;
+        const auto& b = bodies[i];
 
         // Simple AABB-ray intersection test
-        glm::vec3 min = b->position - b->scale * 0.5f;
-        glm::vec3 max = b->position + b->scale * 0.5f;
+        glm::vec3 min = b.position - b.scale * 0.5f;
+        glm::vec3 max = b.position + b.scale * 0.5f;
 
         // Find intersection with AABB
         float t1 = (min.x - origin.x) / direction.x;
@@ -102,137 +105,144 @@ bool PhysicsWorld::raycast(
                 else if (tmin == t5) hitNormal = glm::vec3(0, 0, -1);
                 else hitNormal = glm::vec3(0, 0, 1);
 
-                hitBody = b;
+                hitIdx = i;
                 hit = true;
             }
         }
     }
 
+    // Return as shared_ptr for API compatibility
+    if (hit && hitIdx >= 0) {
+        hitBody = std::make_shared<RigidBody>(bodies[hitIdx]);
+    }
+
     return hit;
 }
 
-void PhysicsWorld::removeBody(const std::shared_ptr<RigidBody>& body)
+std::vector<BodyHandle> PhysicsWorld::getBodiesInAABB(const glm::vec3& min, const glm::vec3& max) const
 {
-    bodies.erase(
-        std::remove_if(bodies.begin(), bodies.end(),
-            [&body](const std::shared_ptr<RigidBody>& b) { return b == body; }),
-        bodies.end());
-}
+    std::vector<BodyHandle> result;
 
-std::vector<std::shared_ptr<RigidBody>> PhysicsWorld::getBodiesInAABB(const glm::vec3& min, const glm::vec3& max) const
-{
-    std::vector<std::shared_ptr<RigidBody>> result;
-
-    for (const auto& body : bodies)
+    for (int i = 0; i < static_cast<int>(bodies.size()); ++i)
     {
-        if (!body) continue;
+        const auto& body = bodies[i];
 
-        glm::vec3 bodyMin = body->position - body->scale * 0.5f;
-        glm::vec3 bodyMax = body->position + body->scale * 0.5f;
+        glm::vec3 bodyMin = body.position - body.scale * 0.5f;
+        glm::vec3 bodyMax = body.position + body.scale * 0.5f;
 
         // Check if AABBs overlap
         if (bodyMin.x <= max.x && bodyMax.x >= min.x &&
             bodyMin.y <= max.y && bodyMax.y >= min.y &&
             bodyMin.z <= max.z && bodyMax.z >= min.z)
         {
-            result.push_back(body);
+            result.push_back(BodyHandle{i});
         }
     }
 
     return result;
 }
 
-std::shared_ptr<RigidBody> PhysicsWorld::getBodyAtPoint(const glm::vec3& point, float radius) const
+BodyHandle PhysicsWorld::getBodyAtPoint(const glm::vec3& point, float radius) const
 {
-    for (const auto& body : bodies)
+    for (int i = 0; i < static_cast<int>(bodies.size()); ++i)
     {
-        if (!body) continue;
+        const auto& body = bodies[i];
 
-        float dist = glm::distance(point, body->position);
+        float dist = glm::distance(point, body.position);
         if (dist <= radius)
         {
-            return body;
+            return BodyHandle{i};
         }
     }
 
-    return nullptr;
+    return BodyHandle{-1};
 }
 
-// -------------------- Shape building --------------------
-Sphere PhysicsWorld::buildSphereFromBody(const std::shared_ptr<RigidBody>& rb) const
+// -------------------- Shape building (index-based) --------------------
+Sphere PhysicsWorld::buildSphereFromIndex(int idx) const
 {
+    const RigidBody& rb = bodies[idx];
     Sphere sphere;
-    sphere.center = rb->position;
-    sphere.radius = (rb->scale.x + rb->scale.y + rb->scale.z) / 3.0f; // Average scale for radius
+    sphere.center = rb.position;
+    sphere.radius = (rb.scale.x + rb.scale.y + rb.scale.z) / 3.0f;
     return sphere;
 }
 
-Capsule PhysicsWorld::buildCapsuleFromBody(const std::shared_ptr<RigidBody>& rb) const
+Capsule PhysicsWorld::buildCapsuleFromIndex(int idx) const
 {
+    const RigidBody& rb = bodies[idx];
     Capsule capsule;
-    capsule.center = rb->position;
-    capsule.radius = rb->scale.x; // Assume x-scale is radius
-    capsule.height = rb->scale.y; // Assume y-scale is height
-    capsule.axis = glm::vec3(0.0f, 1.0f, 0.0f); // Default Y-axis orientation
+    capsule.center = rb.position;
+    capsule.radius = rb.scale.x;
+    capsule.height = rb.scale.y;
+    capsule.axis = glm::vec3(0.0f, 1.0f, 0.0f);
     return capsule;
 }
 
-// -------------------- Collision Detection --------------------
-CollisionResult PhysicsWorld::checkCollision(const std::shared_ptr<RigidBody>& a, const std::shared_ptr<RigidBody>& b) const
+// -------------------- Collision Detection (index-based) --------------------
+CollisionResult PhysicsWorld::checkCollision(int a, int b) const
 {
     CollisionResult result;
 
+    const RigidBody& bodyA = bodies[a];
+    const RigidBody& bodyB = bodies[b];
+
     // Determine collision based on collider types
-    if (a->colliderType == ColliderType::SPHERE && b->colliderType == ColliderType::SPHERE) {
-        Sphere sa = buildSphereFromBody(a);
-        Sphere sb = buildSphereFromBody(b);
+    if (bodyA.colliderType == ColliderType::SPHERE && bodyB.colliderType == ColliderType::SPHERE) {
+        Sphere sa = buildSphereFromIndex(a);
+        Sphere sb = buildSphereFromIndex(b);
         result = checkSphereVsSphere(sa, sb);
     }
-    else if (a->colliderType == ColliderType::BOX && b->colliderType == ColliderType::SPHERE) {
-        OBB box = buildOBBFromBody(a);
-        Sphere sph = buildSphereFromBody(b);
+    else if (bodyA.colliderType == ColliderType::BOX && bodyB.colliderType == ColliderType::SPHERE) {
+        OBB box = buildOBBFromIndex(a);
+        Sphere sph = buildSphereFromIndex(b);
         result = checkBoxVsSphere(box, sph);
     }
-    else if (a->colliderType == ColliderType::SPHERE && b->colliderType == ColliderType::BOX) {
-        Sphere sph = buildSphereFromBody(a);
-        OBB box = buildOBBFromBody(b);
+    else if (bodyA.colliderType == ColliderType::SPHERE && bodyB.colliderType == ColliderType::BOX) {
+        Sphere sph = buildSphereFromIndex(a);
+        OBB box = buildOBBFromIndex(b);
         result = checkBoxVsSphere(box, sph); // Same as above, just swapped
     }
-    else if (a->colliderType == ColliderType::BOX && b->colliderType == ColliderType::BOX) {
-        OBB boxA = buildOBBFromBody(a);
-        OBB boxB = buildOBBFromBody(b);
+    else if (bodyA.colliderType == ColliderType::BOX && bodyB.colliderType == ColliderType::BOX) {
+        OBB boxA = buildOBBFromIndex(a);
+        OBB boxB = buildOBBFromIndex(b);
         result = checkBoxVsBox(boxA, boxB);
     }
-    else if (a->colliderType == ColliderType::CAPSULE && b->colliderType == ColliderType::CAPSULE) {
-        Capsule capA = buildCapsuleFromBody(a);
-        Capsule capB = buildCapsuleFromBody(b);
+    else if (bodyA.colliderType == ColliderType::CAPSULE && bodyB.colliderType == ColliderType::CAPSULE) {
+        Capsule capA = buildCapsuleFromIndex(a);
+        Capsule capB = buildCapsuleFromIndex(b);
         result = checkCapsuleVsCapsule(capA, capB);
     }
-    else if (a->colliderType == ColliderType::CAPSULE && b->colliderType == ColliderType::SPHERE) {
-        Capsule cap = buildCapsuleFromBody(a);
-        Sphere sph = buildSphereFromBody(b);
+    else if (bodyA.colliderType == ColliderType::CAPSULE && bodyB.colliderType == ColliderType::SPHERE) {
+        Capsule cap = buildCapsuleFromIndex(a);
+        Sphere sph = buildSphereFromIndex(b);
         result = checkCapsuleVsSphere(cap, sph);
     }
-    else if (a->colliderType == ColliderType::SPHERE && b->colliderType == ColliderType::CAPSULE) {
-        Sphere sph = buildSphereFromBody(a);
-        Capsule cap = buildCapsuleFromBody(b);
+    else if (bodyA.colliderType == ColliderType::SPHERE && bodyB.colliderType == ColliderType::CAPSULE) {
+        Sphere sph = buildSphereFromIndex(a);
+        Capsule cap = buildCapsuleFromIndex(b);
         result = checkCapsuleVsSphere(cap, sph);
     }
-    else if (a->colliderType == ColliderType::CAPSULE && b->colliderType == ColliderType::BOX) {
-        Capsule cap = buildCapsuleFromBody(a);
-        OBB box = buildOBBFromBody(b);
+    else if (bodyA.colliderType == ColliderType::CAPSULE && bodyB.colliderType == ColliderType::BOX) {
+        Capsule cap = buildCapsuleFromIndex(a);
+        OBB box = buildOBBFromIndex(b);
         result = checkCapsuleVsBox(cap, box);
     }
-    else if (a->colliderType == ColliderType::BOX && b->colliderType == ColliderType::CAPSULE) {
-        OBB box = buildOBBFromBody(a);
-        Capsule cap = buildCapsuleFromBody(b);
+    else if (bodyA.colliderType == ColliderType::BOX && bodyB.colliderType == ColliderType::CAPSULE) {
+        OBB box = buildOBBFromIndex(a);
+        Capsule cap = buildCapsuleFromIndex(b);
         result = checkCapsuleVsBox(cap, box);
     }
     else {
-        // Default to OBB vs OBB for other combinations
-        OBB boxA = buildOBBFromBody(a);
-        OBB boxB = buildOBBFromBody(b);
-        result = checkBoxVsBox(boxA, boxB);
+        // MESH collider or unknown combination -> use GJK/EPA
+        if (bodyA.colliderType == ColliderType::MESH || bodyB.colliderType == ColliderType::MESH) {
+            result = checkGJKCollision(a, b);
+        } else {
+            // Default to OBB vs OBB for other combinations
+            OBB boxA = buildOBBFromIndex(a);
+            OBB boxB = buildOBBFromIndex(b);
+            result = checkBoxVsBox(boxA, boxB);
+        }
     }
 
     return result;
@@ -311,7 +321,126 @@ CollisionResult PhysicsWorld::checkBoxVsBox(const OBB& a, const OBB& b) const
         return result;
     }
 
-    return CollisionResult{}; // Return empty result if no collision
+    CollisionResult result;
+    return result;
+}
+
+// -------------------- GJK/EPA Collision for Mesh and Arbitrary Convex Shapes --------------------
+
+/**
+ * Extract vertices from a body for GJK support function.
+ * For BOX: generates 8 corner vertices.
+ * For SPHERE: generates approximating polyhedron vertices.
+ * For CAPSULE: generates cylinder+hemisphere vertices.
+ * For MESH: extracts mesh vertices (placeholder - needs mesh data).
+ */
+bool PhysicsWorld::extractMeshVertices(int bodyIdx, std::vector<glm::vec3>& outVertices, glm::mat4& outTransform) const {
+    if (bodyIdx < 0 || bodyIdx >= static_cast<int>(bodies.size())) return false;
+
+    const auto& b = bodies[bodyIdx];
+
+    // Build world transform from position and rotation
+    glm::mat4 rotation = glm::mat4_cast(b.rotation);
+    glm::mat4 translation = glm::translate(glm::mat4(1.0f), b.position);
+    outTransform = translation * rotation;
+
+    switch (b.colliderType) {
+        case ColliderType::BOX: {
+            // 8 corners of the box
+            glm::vec3 h = b.scale * 0.5f;
+            outVertices = {
+                {-h.x, -h.y, -h.z}, { h.x, -h.y, -h.z}, { h.x,  h.y, -h.z}, {-h.x,  h.y, -h.z},
+                {-h.x, -h.y,  h.z}, { h.x, -h.y,  h.z}, { h.x,  h.y,  h.z}, {-h.x,  h.y,  h.z}
+            };
+            return true;
+        }
+        case ColliderType::SPHERE: {
+            // Approximate sphere with icosahedron vertices (12 vertices)
+            float r = b.scale.x;
+            float t = (1.0f + std::sqrt(5.0f)) / 2.0f; // golden ratio
+            outVertices = {
+                {-r,  t*r, 0}, { r,  t*r, 0}, {-r, -t*r, 0}, { r, -t*r, 0},
+                {0, -r,  t*r}, {0,  r,  t*r}, {0, -r, -t*r}, {0,  r, -t*r},
+                { t*r, 0, -r}, { t*r, 0,  r}, {-t*r, 0, -r}, {-t*r, 0,  r}
+            };
+            // Normalize to sphere radius
+            for (auto& v : outVertices) {
+                v = glm::normalize(v) * r;
+            }
+            return true;
+        }
+        case ColliderType::CAPSULE: {
+            // Approximate capsule with vertices along cylinder + hemisphere
+            float radius = b.scale.x;
+            float height = b.scale.y * 0.5f;
+            int segments = 8;
+            for (int i = 0; i < segments; ++i) {
+                float angle = (2.0f * 3.14159f * i) / segments;
+                float cosA = std::cos(angle);
+                float sinA = std::sin(angle);
+                // Cylinder top
+                outVertices.push_back({radius * cosA, height, radius * sinA});
+                // Cylinder bottom
+                outVertices.push_back({radius * cosA, -height, radius * sinA});
+                // Top hemisphere
+                outVertices.push_back({radius * cosA * 0.707f, height + radius * 0.707f, radius * sinA * 0.707f});
+                // Bottom hemisphere
+                outVertices.push_back({radius * cosA * 0.707f, -height - radius * 0.707f, radius * sinA * 0.707f});
+            }
+            return true;
+        }
+        case ColliderType::MESH: {
+            // For MESH type, we'd need actual mesh vertex data
+            // Placeholder: use bounding box vertices
+            glm::vec3 h = b.scale * 0.5f;
+            outVertices = {
+                {-h.x, -h.y, -h.z}, { h.x, -h.y, -h.z}, { h.x,  h.y, -h.z}, {-h.x,  h.y, -h.z},
+                {-h.x, -h.y,  h.z}, { h.x, -h.y,  h.z}, { h.x,  h.y,  h.z}, {-h.x,  h.y,  h.z}
+            };
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+/**
+ * GJK/EPA collision detection between two bodies.
+ * Used for MESH colliders and as a unified collision path.
+ */
+CollisionResult PhysicsWorld::checkGJKCollision(int a, int b) const {
+    CollisionResult result;
+
+    std::vector<glm::vec3> verticesA, verticesB;
+    glm::mat4 transformA, transformB;
+
+    if (!extractMeshVertices(a, verticesA, transformA) ||
+        !extractMeshVertices(b, verticesB, transformB)) {
+        return result;
+    }
+
+    glm::vec3 contactNormal;
+    float penetrationDepth;
+    glm::vec3 contactPoint;
+
+    auto supportA = [&verticesA, &transformA](const glm::vec3& dir) {
+        return SupportPolyhedron(verticesA, transformA, dir);
+    };
+
+    auto supportB = [&verticesB, &transformB](const glm::vec3& dir) {
+        return SupportPolyhedron(verticesB, transformB, dir);
+    };
+
+    GJKResult gjkResult = GJK_DetectContact(supportA, supportB, contactNormal, penetrationDepth, contactPoint);
+
+    if (gjkResult.collided || penetrationDepth > 0.0f) {
+        result.collided = true;
+        result.normal = contactNormal;
+        result.penetration = penetrationDepth;
+        result.contactPoint = contactPoint;
+    }
+
+    return result;
 }
 
 CollisionResult PhysicsWorld::checkCapsuleVsCapsule(const Capsule& a, const Capsule& b) const
@@ -621,36 +750,49 @@ bool PhysicsWorld::sweptOBBvsOBB(const OBB& a0, const glm::vec3& moveA,
 }
 
 // -------------------- Build OBB --------------------
-OBB PhysicsWorld::buildOBBFromBody(const std::shared_ptr<RigidBody>& rb) const {
+OBB PhysicsWorld::buildOBBFromIndex(int idx) const {
+    const RigidBody& rb = bodies[idx];
     OBB obb;
-    obb.c = rb->position;
-    obb.half = rb->scale * 0.5f;
-    glm::mat3 rot = glm::mat3_cast(rb->rotation);
-    obb.axis[0] = glm::normalize(rot[0]);
-    obb.axis[1] = glm::normalize(rot[1]);
-    obb.axis[2] = glm::normalize(rot[2]);
+    obb.c = rb.position;
+    obb.half = rb.scale * 0.5f;
+    obb.axis[0] = glm::vec3(1.0f, 0.0f, 0.0f);
+    obb.axis[1] = glm::vec3(0.0f, 1.0f, 0.0f);
+    obb.axis[2] = glm::vec3(0.0f, 0.0f, 1.0f);
     return obb;
 }
 
 // -------------------- Ground check --------------------
-bool PhysicsWorld::isGrounded(std::shared_ptr<RigidBody>& body, float probeDistance) {
-    if (!body) return false;
-    glm::vec3 bottom = body->position - glm::vec3(0.0f, body->scale.y * 0.5f, 0.0f);
+bool PhysicsWorld::isGrounded(int bodyIdx, float probeDistance) {
+    const RigidBody& body = bodies[bodyIdx];
+    glm::vec3 bottom = body.position - glm::vec3(0.0f, body.scale.y * 0.5f, 0.0f);
     glm::vec3 probeEnd = bottom - glm::vec3(0.0f, probeDistance, 0.0f);
 
-    for (auto& other : bodies) {
-        if (!other || other == body || !other->isStatic) continue;
-        glm::vec3 otherMin = other->position - other->scale * 0.5f;
-        glm::vec3 otherMax = other->position + other->scale * 0.5f;
+    // Check against floor first
+    if (floor.enabled) {
+        float floorY = floor.position.y;
+        if (bottom.y >= floorY - probeDistance && bottom.y <= floorY + 0.05f) {
+            glm::vec3 localXZ = bottom - floor.position;
+            if (glm::abs(localXZ.x) <= floor.size.x && glm::abs(localXZ.z) <= floor.size.y) {
+                return true;
+            }
+        }
+    }
+
+    for (int i = 0; i < static_cast<int>(bodies.size()); ++i) {
+        if (i == bodyIdx) continue;
+        const auto& other = bodies[i];
+        if (!other.isStatic) continue;
+        glm::vec3 otherMin = other.position - other.scale * 0.5f;
+        glm::vec3 otherMax = other.position + other.scale * 0.5f;
         if (bottom.x < otherMax.x && bottom.x > otherMin.x &&
             bottom.z < otherMax.z && bottom.z > otherMin.z &&
             probeEnd.y <= otherMax.y && bottom.y >= otherMax.y)
             return true;
 
-       glm::vec3 bMin = body->position - body->scale * 0.5f;
-       glm::vec3 bMax = body->position + body->scale * 0.5f;
-       glm::vec3 oMin = other->position - other->scale * 0.5f;
-       glm::vec3 oMax = other->position + other->scale * 0.5f;
+       glm::vec3 bMin = body.position - body.scale * 0.5f;
+       glm::vec3 bMax = body.position + body.scale * 0.5f;
+       glm::vec3 oMin = other.position - other.scale * 0.5f;
+       glm::vec3 oMax = other.position + other.scale * 0.5f;
 
        bool xOverlap = (bMax.x > oMin.x) && (bMin.x < oMax.x);
        bool zOverlap = (bMax.z > oMin.z) && (bMin.z < oMax.z);
@@ -662,48 +804,330 @@ bool PhysicsWorld::isGrounded(std::shared_ptr<RigidBody>& body, float probeDista
     return false;
 }
 
-// -------------------- Add/Clear --------------------
-void PhysicsWorld::addBody(const std::shared_ptr<RigidBody>& body) { if (body) bodies.push_back(body); }
+// -------------------- Handle-based API (contiguous storage) --------------------
+BodyHandle PhysicsWorld::addBody(RigidBody body) {
+    bodies.push_back(std::move(body));
+    spatialGridDirty = true;
+    return BodyHandle{static_cast<int>(bodies.size() - 1)};
+}
+
+void PhysicsWorld::removeBody(BodyHandle handle) {
+    if (handle.isValid() && handle.index < static_cast<int>(bodies.size())) {
+        // Swap-remove changes index of moved body - grid must be rebuilt
+        bodies[handle.index] = std::move(bodies.back());
+        bodies.pop_back();
+        spatialGridDirty = true;
+    }
+}
+
+RigidBody* PhysicsWorld::getBody(BodyHandle handle) {
+    if (handle.isValid() && handle.index < static_cast<int>(bodies.size())) {
+        return &bodies[handle.index];
+    }
+    return nullptr;
+}
+
+const RigidBody* PhysicsWorld::getBody(BodyHandle handle) const {
+    if (handle.isValid() && handle.index < static_cast<int>(bodies.size())) {
+        return &bodies[handle.index];
+    }
+    return nullptr;
+}
+
 void PhysicsWorld::clear() { bodies.clear(); }
+
+// Legacy shared_ptr compatibility wrappers
+void PhysicsWorld::addBody(const std::shared_ptr<RigidBody>& body) {
+    if (body) {
+        bodies.push_back(std::move(*body));
+    }
+}
+
+void PhysicsWorld::removeBody(const std::shared_ptr<RigidBody>& body) {
+    if (!body) return;
+    for (int i = static_cast<int>(bodies.size()) - 1; i >= 0; --i) {
+        // Compare by position (since shared_ptr no longer points to same object)
+        if (bodies[i].position == body->position && 
+            bodies[i].colliderType == body->colliderType) {
+            bodies[i] = std::move(bodies.back());
+            bodies.pop_back();
+            return;
+        }
+    }
+}
 
 // -------------------- Adaptive substep --------------------
 int PhysicsWorld::computeAdaptiveSubsteps(float dt) const {
     float maxVel = 0.0f;
     float minSize = std::numeric_limits<float>::max();
-    for (auto& b : bodies) {
-        if (!b || b->isStatic) continue;
-        float vel = glm::length(b->velocity) * (1.0f + b->restitution);
+    for (const auto& b : bodies) {
+        if (b.isStatic) continue;
+        float vel = glm::length(b.velocity) * (1.0f + b.restitution);
         maxVel = std::max(maxVel, vel);
-        minSize = std::min({minSize, b->scale.x, b->scale.y, b->scale.z});
+        minSize = std::min({minSize, b.scale.x, b.scale.y, b.scale.z});
     }
     if (maxVel < 1e-6f) return 1;
     int substeps = std::ceil(maxVel * dt / (0.2f * minSize));
     return std::clamp(substeps, 1, 12);
 }
 
-// -------------------- Sweep-and-prune --------------------
-void PhysicsWorld::getPotentialPairs(std::vector<std::pair<int,int>>& outPairs) {
-    outPairs.clear();
-    if (bodies.empty()) return;
+// -------------------- 3D Spatial Hash Grid Broadphase --------------------
 
-    struct Interval { float minx, maxx; int idx; };
-    std::vector<Interval> intervals;
-    intervals.reserve(bodies.size());
+/**
+ * Rebuild the spatial hash grid from all bodies.
+ * Called when bodies are added/removed or when the grid is dirty.
+ */
+void PhysicsWorld::rebuildSpatialGrid() {
+    spatialGrid.clear();
+    spatialGridEntries.clear();
 
-    for (size_t i = 0; i < bodies.size(); ++i) {
-        auto& b = bodies[i];
-        if (!b) continue;
-        float minx = b->position.x - b->scale.x * 0.5f;
-        float maxx = b->position.x + b->scale.x * 0.5f;
-        intervals.push_back({minx, maxx, int(i)});
+    // Estimate cell size from average body scale if not set
+    if (spatialCellSize < 0.1f) {
+        float avgScale = 0.0f;
+        for (const auto& b : bodies) {
+            avgScale += (b.scale.x + b.scale.y + b.scale.z) / 3.0f;
+        }
+        spatialCellSize = bodies.empty() ? 2.0f : (avgScale / bodies.size()) * 1.5f;
     }
 
-    std::sort(intervals.begin(), intervals.end(), [](const Interval& a, const Interval& b){ return a.minx < b.minx; });
+    const float invCell = 1.0f / spatialCellSize;
 
-    for (size_t i = 0; i < intervals.size(); ++i) {
-        for (size_t j = i + 1; j < intervals.size(); ++j) {
-            if (intervals[j].minx > intervals[i].maxx) break;
-            outPairs.emplace_back(intervals[i].idx, intervals[j].idx);
+    for (int i = 0; i < static_cast<int>(bodies.size()); ++i) {
+        const auto& b = bodies[i];
+
+        // Compute AABB of body
+        float halfExtX = b.scale.x * 0.5f;
+        float halfExtY = b.scale.y * 0.5f;
+        float halfExtZ = b.scale.z * 0.5f;
+
+        // Determine which cells this body occupies
+        int minX = static_cast<int>(std::floor((b.position.x - halfExtX) * invCell));
+        int maxX = static_cast<int>(std::floor((b.position.x + halfExtX) * invCell));
+        int minY = static_cast<int>(std::floor((b.position.y - halfExtY) * invCell));
+        int maxY = static_cast<int>(std::floor((b.position.y + halfExtY) * invCell));
+        int minZ = static_cast<int>(std::floor((b.position.z - halfExtZ) * invCell));
+        int maxZ = static_cast<int>(std::floor((b.position.z + halfExtZ) * invCell));
+
+        for (int cx = minX; cx <= maxX; ++cx) {
+            for (int cy = minY; cy <= maxY; ++cy) {
+                for (int cz = minZ; cz <= maxZ; ++cz) {
+                    uint64_t hash = HashCell(cx, cy, cz);
+                    auto& cell = spatialGrid[hash];
+                    cell.bodyIndices.push_back(i);
+                    spatialGridEntries.emplace_back(hash, i);
+                }
+            }
+        }
+    }
+
+    spatialGridDirty = false;
+}
+
+/**
+ * Generate potential collision pairs using spatial hash grid.
+ * Bodies in the same cell or adjacent cells are potential pairs.
+ * Uses full 3D AABB overlap test to reduce false positives.
+ */
+void PhysicsWorld::getPotentialPairs(std::vector<std::pair<int,int>>& outPairs) {
+    outPairs.clear();
+    if (bodies.size() < 2) return;
+
+    // Rebuild grid if dirty
+    if (spatialGridDirty) {
+        rebuildSpatialGrid();
+    }
+
+    // Collect pairs from each cell, deduplicating with a sorted pair check
+    // To avoid duplicate pairs, only generate (minIdx, maxIdx) where minIdx < maxIdx
+    // and use a sorted set-like approach with a simple visited marker
+
+    // Use a flat visited array instead of set for performance
+    // We track which pairs we've already added using a sorted vector + binary search
+    // For small-to-medium scenes, a simple O(n^2) per cell with dedup is fine
+    // For large scenes, we use a bloom-like filter
+
+    // Simple approach: iterate each cell, generate pairs, sort and unique
+    std::vector<std::pair<int,int>> rawPairs;
+    rawPairs.reserve(bodies.size() * 4); // estimate
+
+    for (const auto& [cellHash, cell] : spatialGrid) {
+        const auto& indices = cell.bodyIndices;
+        for (size_t i = 0; i < indices.size(); ++i) {
+            for (size_t j = i + 1; j < indices.size(); ++j) {
+                int a = indices[i];
+                int b = indices[j];
+                if (a > b) { int tmp = a; a = b; b = tmp; }
+                rawPairs.emplace_back(a, b);
+            }
+        }
+    }
+
+    if (rawPairs.empty()) return;
+
+    // Sort and remove duplicates
+    std::sort(rawPairs.begin(), rawPairs.end());
+    rawPairs.erase(std::unique(rawPairs.begin(), rawPairs.end()), rawPairs.end());
+
+    // Filter with 3D AABB overlap test (fast rejection before narrow phase)
+    outPairs.reserve(rawPairs.size());
+    for (const auto& [a, b] : rawPairs) {
+        const auto& bodyA = bodies[a];
+        const auto& bodyB = bodies[b];
+
+        float ax = bodyA.scale.x * 0.5f, ay = bodyA.scale.y * 0.5f, az = bodyA.scale.z * 0.5f;
+        float bx = bodyB.scale.x * 0.5f, by = bodyB.scale.y * 0.5f, bz = bodyB.scale.z * 0.5f;
+
+        // 3D AABB overlap test
+        if (std::abs(bodyA.position.x - bodyB.position.x) > ax + bx) continue;
+        if (std::abs(bodyA.position.y - bodyB.position.y) > ay + by) continue;
+        if (std::abs(bodyA.position.z - bodyB.position.z) > az + bz) continue;
+
+        outPairs.emplace_back(a, b);
+    }
+}
+
+// -------------------- Island-Based Sleeping System --------------------
+
+int PhysicsWorld::findIsland(int i) {
+    // Path compression for fast lookups
+    while (islandRoot[i] != i) {
+        islandRoot[i] = islandRoot[islandRoot[i]];
+        i = islandRoot[i];
+    }
+    return i;
+}
+
+void PhysicsWorld::unionIslands(int i, int j) {
+    int rootI = findIsland(i);
+    int rootJ = findIsland(j);
+    if (rootI == rootJ) return;
+
+    // Union by rank
+    if (islandRank[rootI] < islandRank[rootJ]) {
+        islandRoot[rootI] = rootJ;
+    } else if (islandRank[rootI] > islandRank[rootJ]) {
+        islandRoot[rootJ] = rootI;
+    } else {
+        islandRoot[rootJ] = rootI;
+        islandRank[rootI]++;
+    }
+}
+
+void PhysicsWorld::wakeBody(int index) {
+    if (index < 0 || index >= static_cast<int>(bodies.size())) return;
+    auto& b = bodies[index];
+    if (!b.isSleeping) return;
+
+    b.isSleeping = false;
+    b.sleepTime = 0.0f;
+
+    // Wake entire island to prevent sleeping body from blocking active ones
+    if (b.sleepIslandIndex >= 0 && b.sleepIslandIndex < static_cast<int>(sleepIslands.size())) {
+        wakeIsland(b.sleepIslandIndex);
+    }
+}
+
+void PhysicsWorld::wakeIsland(int islandIndex) {
+    if (islandIndex < 0 || islandIndex >= static_cast<int>(sleepIslands.size())) return;
+    for (int bodyIdx : sleepIslands[islandIndex]) {
+        if (bodyIdx < static_cast<int>(bodies.size())) {
+            bodies[bodyIdx].isSleeping = false;
+            bodies[bodyIdx].sleepTime = 0.0f;
+        }
+    }
+}
+
+void PhysicsWorld::wakeAll() {
+    for (auto& b : bodies) {
+        b.isSleeping = false;
+        b.sleepTime = 0.0f;
+    }
+    sleepIslands.clear();
+}
+
+void PhysicsWorld::buildIslands(const std::vector<std::pair<int,int>>& pairs) {
+    int n = static_cast<int>(bodies.size());
+    if (n == 0) {
+        sleepIslands.clear();
+        return;
+    }
+
+    // Initialize union-find
+    islandRoot.resize(n);
+    islandRank.assign(n, 0);
+    for (int i = 0; i < n; ++i) {
+        islandRoot[i] = i;
+    }
+
+    // Union bodies that are in contact
+    for (const auto& [a, b] : pairs) {
+        unionIslands(a, b);
+    }
+
+    // Build island groups
+    sleepIslands.clear();
+    std::unordered_map<int, int> rootToIsland;
+
+    for (int i = 0; i < n; ++i) {
+        int root = findIsland(i);
+        auto it = rootToIsland.find(root);
+        if (it == rootToIsland.end()) {
+            int islandIdx = static_cast<int>(sleepIslands.size());
+            rootToIsland[root] = islandIdx;
+            sleepIslands.emplace_back();
+            sleepIslands.back().push_back(i);
+            bodies[i].sleepIslandIndex = islandIdx;
+        } else {
+            sleepIslands[it->second].push_back(i);
+            bodies[i].sleepIslandIndex = it->second;
+        }
+    }
+}
+
+void PhysicsWorld::updateSleeping(float subdt) {
+    // First, check for energy levels in each island
+    // If ANY body in an island is active (above threshold), wake the whole island
+
+    for (auto& island : sleepIslands) {
+        bool anyActive = false;
+
+        for (int bodyIdx : island) {
+            if (bodyIdx < 0 || bodyIdx >= static_cast<int>(bodies.size())) continue;
+            auto& b = bodies[bodyIdx];
+
+            if (b.isStatic || b.isPlayer || b.isModel) continue;
+
+            float linSpeed = glm::length2(b.velocity);
+            float angSpeed = glm::length2(b.angularVelocity);
+            float energy = linSpeed + angSpeed;
+
+            float threshold2 = sleepVelocityThreshold * sleepVelocityThreshold +
+                              sleepAngularVelocityThreshold * sleepAngularVelocityThreshold;
+
+            if (energy > threshold2 || b.forceAccumulator != glm::vec3(0.0f)) {
+                b.isSleeping = false;
+                b.sleepTime = 0.0f;
+                anyActive = true;
+            }
+        }
+
+        if (!anyActive) {
+            // All bodies below threshold - accumulate sleep time
+            for (int bodyIdx : island) {
+                if (bodyIdx < 0 || bodyIdx >= static_cast<int>(bodies.size())) continue;
+                auto& b = bodies[bodyIdx];
+
+                if (b.isStatic || b.isPlayer || b.isModel) continue;
+
+                if (!b.isSleeping) {
+                    b.sleepTime += subdt;
+                    if (b.sleepTime >= sleepTimeRequired) {
+                        b.isSleeping = true;
+                        b.velocity = glm::vec3(0.0f);
+                        b.angularVelocity = glm::vec3(0.0f);
+                    }
+                }
+            }
         }
     }
 }
@@ -737,31 +1161,31 @@ bool PhysicsWorld::isInFluid(const glm::vec3& point, FluidVolume& outFluid) cons
 }
 
 // Advanced collision response considering PBR material properties
-void PhysicsWorld::resolveContactAdvanced(std::shared_ptr<RigidBody>& a,
-                                         std::shared_ptr<RigidBody>& b,
+void PhysicsWorld::resolveContactAdvanced(int a, int b,
                                          const glm::vec3& normal,
                                          float penetration,
                                          const glm::vec3& contactPoint,
                                          float subdt)
 {
-    if (!a || !b) return;
+    RigidBody& bodyA = bodies[a];
+    RigidBody& bodyB = bodies[b];
 
-    bool aImmovable = a->isStatic || a->isModel;
-    bool bImmovable = b->isStatic || b->isModel;
+    bool aImmovable = bodyA.isStatic || bodyA.isModel;
+    bool bImmovable = bodyB.isStatic || bodyB.isModel;
 
-    float invMassA = aImmovable ? 0.0f : 1.0f / a->mass;
-    float invMassB = bImmovable ? 0.0f : 1.0f / b->mass;
+    float invMassA = aImmovable ? 0.0f : 1.0f / bodyA.mass;
+    float invMassB = bImmovable ? 0.0f : 1.0f / bodyB.mass;
     float totalInvMass = invMassA + invMassB;
 
     if (totalInvMass < 1e-6f) return; // both immovable, skip
 
     // --- Position correction (penetration resolution) ---
     glm::vec3 correction = normal * penetration / totalInvMass * 0.8f; // 80% factor for stability
-    if (!aImmovable) a->position -= correction * invMassA;
-    if (!bImmovable) b->position += correction * invMassB;
+    if (!aImmovable) bodyA.position -= correction * invMassA;
+    if (!bImmovable) bodyB.position += correction * invMassB;
 
     // --- Relative velocity along normal ---
-    glm::vec3 relVel = b->velocity - a->velocity;
+    glm::vec3 relVel = bodyB.velocity - bodyA.velocity;
     float velAlongNormal = glm::dot(relVel, normal);
 
     // Bodies separating? Skip impulse
@@ -769,20 +1193,20 @@ void PhysicsWorld::resolveContactAdvanced(std::shared_ptr<RigidBody>& a,
 
     // --- Restitution based on PBR properties ---
     // Using metallic property to influence bounciness (higher metallic = more bouncy)
-    float e = (a->restitution * a->metallic + b->restitution * b->metallic) * 0.5f;
+    float e = (bodyA.restitution * bodyA.metallic + bodyB.restitution * bodyB.metallic) * 0.5f;
     
     // If one body immovable and normal is mostly vertical, use material properties for bounce
     if ((aImmovable || bImmovable) && std::abs(normal.y) > 0.5f) {
         // Use roughness to dampen bounce (rougher surfaces = less bounce)
-        e = e * (1.0f - (a->roughness + b->roughness) * 0.5f);
+        e = e * (1.0f - (bodyA.roughness + bodyB.roughness) * 0.5f);
     }
 
     // --- Impulse ---
     float j = -(1.0f + e) * velAlongNormal / totalInvMass;
     glm::vec3 impulse = j * normal;
 
-    if (!aImmovable) a->velocity -= impulse * invMassA;
-    if (!bImmovable) b->velocity += impulse * invMassB;
+    if (!aImmovable) bodyA.velocity -= impulse * invMassA;
+    if (!bImmovable) bodyB.velocity += impulse * invMassB;
 
     // --- Friction based on PBR properties ---
     glm::vec3 tangent = relVel - glm::dot(relVel, normal) * normal;
@@ -791,26 +1215,26 @@ void PhysicsWorld::resolveContactAdvanced(std::shared_ptr<RigidBody>& a,
         float jt = -glm::dot(relVel, tangent) / totalInvMass;
         
         // Use both static and dynamic friction coefficients
-        float frictionCoeff = std::sqrt(a->staticFriction * b->staticFriction);
+        float frictionCoeff = std::sqrt(bodyA.staticFriction * bodyB.staticFriction);
         
         // Adjust friction based on roughness (rougher = more friction)
-        frictionCoeff *= (1.0f + (a->roughness + b->roughness) * 0.5f);
+        frictionCoeff *= (1.0f + (bodyA.roughness + bodyB.roughness) * 0.5f);
         
         float maxJt = j * frictionCoeff;
         jt = std::clamp(jt, -maxJt, maxJt);
         glm::vec3 frictionImpulse = jt * tangent;
 
-        if (!aImmovable) a->velocity -= frictionImpulse * invMassA;
-        if (!bImmovable) b->velocity += frictionImpulse * invMassB;
+        if (!aImmovable) bodyA.velocity -= frictionImpulse * invMassA;
+        if (!bImmovable) bodyB.velocity += frictionImpulse * invMassB;
     }
 
     // --- Clamp tiny velocities ---
-    if (!aImmovable && glm::length2(a->velocity) < 1e-6f) a->velocity = glm::vec3(0.0f);
-    if (!bImmovable && glm::length2(b->velocity) < 1e-6f) b->velocity = glm::vec3(0.0f);
+    if (!aImmovable && glm::length2(bodyA.velocity) < 1e-6f) bodyA.velocity = glm::vec3(0.0f);
+    if (!bImmovable && glm::length2(bodyB.velocity) < 1e-6f) bodyB.velocity = glm::vec3(0.0f);
 
     // --- Zero rotation ---
-    if (!aImmovable) a->angularVelocity = glm::vec3(0.0f);
-    if (!bImmovable) b->angularVelocity = glm::vec3(0.0f);
+    if (!aImmovable) bodyA.angularVelocity = glm::vec3(0.0f);
+    if (!bImmovable) bodyB.angularVelocity = glm::vec3(0.0f);
 }
 
 // -------------------- Physics step (rotation disabled, models optionally immovable) --------------------
@@ -825,67 +1249,111 @@ void PhysicsWorld::step(float dt)
 
         // --- integrate linear & angular motion ---
         for (auto& b : bodies) {
-            if (!b || b->isStatic) continue;
+            if (b.isStatic) continue;
+            if (b.isSleeping) continue;  // Skip sleeping bodies
 
             // Save previous transforms
-            b->prevPosition = b->position;
-            b->prevRotation = b->rotation;
+            b.prevPosition = b.position;
+            b.prevRotation = b.rotation;
 
             // -------- FLUID DYNAMICS --------
             // Check if body is in a fluid volume
             FluidVolume fluid;
-            if (isInFluid(b->position, fluid)) {
+            if (isInFluid(b.position, fluid)) {
                 // Calculate buoyancy force
-                glm::vec3 buoyancyForce = -gravity * b->buoyancyFactor * fluid.density * b->mass;
+                glm::vec3 buoyancyForce = -gravity * b.buoyancyFactor * fluid.density * b.mass;
                 
                 // Calculate drag force
-                glm::vec3 dragForce = -b->velocity * fluid.dragCoefficient * glm::length(b->velocity);
+                glm::vec3 dragForce = -b.velocity * fluid.dragCoefficient * glm::length(b.velocity);
                 
                 // Calculate flow force if fluid has flow
                 glm::vec3 flowForce = fluid.flowDirection * fluid.viscosity;
                 
                 // Apply fluid forces
-                if (!b->isModel) {
-                    b->applyForce(buoyancyForce);
-                    b->applyForce(dragForce);
-                    b->applyForce(flowForce);
+                if (!b.isModel) {
+                    b.applyForce(buoyancyForce);
+                    b.applyForce(dragForce);
+                    b.applyForce(flowForce);
                 }
             }
 
             // -------- LINEAR --------
-            if (!b->isModel) {
-                if (glm::length2(b->forceAccumulator) > 0.0f) {
-                    b->velocity += b->forceAccumulator * b->invMass() * subdt;
+            if (!b.isModel) {
+                if (glm::length2(b.forceAccumulator) > 0.0f) {
+                    b.velocity += b.forceAccumulator * b.invMass() * subdt;
                 }
-                b->velocity += gravity * subdt;
+                b.velocity += gravity * subdt;
             }
 
             // Apply damping
-            b->velocity *= b->linearDamping;
+            b.velocity *= b.linearDamping;
 
-            b->position += b->velocity * subdt;
+            b.position += b.velocity * subdt;
 
             // -------- ANGULAR (QUATERNION) --------
-            if (!b->isModel) {
+            if (!b.isModel) {
                 // Angular acceleration (world space)
-                glm::vec3 angAccel = b->inertiaLocalInv * b->torqueAccumulator;
+                glm::vec3 angAccel = b.inertiaLocalInv * b.torqueAccumulator;
 
-                b->angularVelocity += angAccel * subdt;
+                b.angularVelocity += angAccel * subdt;
 
                 // Apply angular damping
-                b->angularVelocity *= b->angularDamping;
+                b.angularVelocity *= b.angularDamping;
 
-                float angSpeed = glm::length(b->angularVelocity);
+                float angSpeed = glm::length(b.angularVelocity);
                 if (angSpeed > 1e-5f) {
-                    glm::vec3 axis = b->angularVelocity / angSpeed;
+                    glm::vec3 axis = b.angularVelocity / angSpeed;
                     glm::quat dq = glm::angleAxis(angSpeed * subdt, axis);
-                    b->rotation = glm::normalize(dq * b->rotation);
+                    b.rotation = glm::normalize(dq * b.rotation);
                 }
             }
 
             // Clear accumulators
-            b->forceAccumulator = glm::vec3(0.0f);
-            b->torqueAccumulator = glm::vec3(0.0f);
+            b.forceAccumulator = glm::vec3(0.0f);
+            b.torqueAccumulator = glm::vec3(0.0f);
+        }
+
+        // --- Floor collision resolution ---
+        if (floor.enabled) {
+            for (int i = 0; i < static_cast<int>(bodies.size()); ++i) {
+                auto& b = bodies[i];
+                if (b.isStatic) continue;
+
+                // Calculate bottom of body
+                float bottomY = b.position.y - b.scale.y * 0.5f;
+                float floorY = floor.position.y;
+
+                // Check if body is within floor bounds in XZ
+                glm::vec3 localXZ = b.position - floor.position;
+                bool withinBounds = (glm::abs(localXZ.x) <= floor.size.x + b.scale.x * 0.5f) &&
+                                    (glm::abs(localXZ.z) <= floor.size.y + b.scale.z * 0.5f);
+
+                if (withinBounds && bottomY <= floorY) {
+                    // Penetration depth
+                    float penetration = floorY - bottomY;
+
+                    // Position correction - push body out of floor
+                    b.position.y += penetration;
+
+                    // Velocity reflection with restitution
+                    if (b.velocity.y < 0.0f) {
+                        b.velocity.y = -b.velocity.y * floor.restitution;
+
+                        // If velocity is tiny, just zero it out (prevents micro-bouncing)
+                        if (std::abs(b.velocity.y) < 0.01f) {
+                            b.velocity.y = 0.0f;
+                        }
+                    }
+
+                    // Apply floor friction
+                    float friction = floor.friction;
+                    b.velocity.x *= (1.0f - friction * subdt);
+                    b.velocity.z *= (1.0f - friction * subdt);
+
+                    // Mark as on ground
+                    b.onGround = true;
+                }
+            }
         }
 
         // --- constraint solving ---
@@ -912,41 +1380,47 @@ void PhysicsWorld::step(float dt)
             int i = pr.first;
             int j = pr.second;
             if (i < 0 || j < 0 || i >= (int)bodies.size() || j >= (int)bodies.size()) continue;
-            auto& A = bodies[i];
-            auto& B = bodies[j];
-            if (!A || !B) continue;
+
+            // Wake both bodies if either is sleeping (collision reactivates them)
+            if (bodies[i].isSleeping) wakeBody(i);
+            if (bodies[j].isSleeping) wakeBody(j);
 
             // Use the new collision detection system
-            CollisionResult collision = checkCollision(A, B);
+            CollisionResult collision = checkCollision(i, j);
             if (collision.collided) {
                 // Use advanced collision response with PBR properties
-                resolveContactAdvanced(A, B, collision.normal, collision.penetration, 
+                resolveContactAdvanced(i, j, collision.normal, collision.penetration,
                                       collision.contactPoint, subdt);
             }
         }
 
+        // --- build contact islands and update sleeping ---
+        buildIslands(pairs);
+        updateSleeping(subdt);
+
         // --- ground snap & friction ---
-        for (auto& b : bodies) {
-            if (!b || b->isStatic) continue;
+        for (int i = 0; i < static_cast<int>(bodies.size()); ++i) {
+            auto& b = bodies[i];
+            if (b.isStatic) continue;
 
-            b->onGround = false;
+            b.onGround = false;
 
-            if (glm::length2(b->velocity) < 1e-6f)
-                b->velocity = glm::vec3(0.0f);
+            if (glm::length2(b.velocity) < 1e-6f)
+                b.velocity = glm::vec3(0.0f);
 
-            if (isGrounded(b, 1e-3f)) {
-                b->velocity.y = 0.0f;
-                b->onGround = true;
+            if (isGrounded(i, 1e-3f)) {
+                b.velocity.y = 0.0f;
+                b.onGround = true;
             }
 
-            if (b->onGround && !b->isModel) {
+            if (b.onGround && !b.isModel) {
                 // Use dynamic friction coefficient
-                float friction = b->dynamicFriction * 10.0f; // Scale for simulation
-                b->velocity.x -= b->velocity.x * friction * subdt;
-                b->velocity.z -= b->velocity.z * friction * subdt;
+                float friction = b.dynamicFriction * 10.0f; // Scale for simulation
+                b.velocity.x -= b.velocity.x * friction * subdt;
+                b.velocity.z -= b.velocity.z * friction * subdt;
 
-                if (glm::length2(glm::vec2(b->velocity.x, b->velocity.z)) < 1e-6f)
-                    b->velocity.x = b->velocity.z = 0.0f;
+                if (glm::length2(glm::vec2(b.velocity.x, b.velocity.z)) < 1e-6f)
+                    b.velocity.x = b.velocity.z = 0.0f;
             }
         }
     }

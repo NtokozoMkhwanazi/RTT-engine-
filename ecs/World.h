@@ -320,10 +320,10 @@ public:
     T& addSystem(Args&&... args) {
         static_assert(std::is_base_of_v<System, T>, "T must inherit from System");
 
-        auto system = std::make_unique<T>(std::forward<Args>(args)...);
+        auto system = std::make_shared<T>(std::forward<Args>(args)...);
         T* rawPtr = system.get();
 
-        m_systems.push_back(std::move(system));
+        m_systems.push_back(system);
 
         // Initialize the system if world is already initialized
         if (m_initialized) {
@@ -341,7 +341,28 @@ public:
         static_assert(std::is_base_of_v<System, T>, "T must inherit from System");
         if (!system) return;
         
-        m_systems.push_back(std::unique_ptr<T>(system));
+        m_systems.push_back(std::shared_ptr<T>(system));
+        
+        // Initialize the system if world is already initialized
+        if (m_initialized) {
+            system->init();
+        }
+    }
+    
+    /**
+     * Add a static/global system that won't be deleted on shutdown
+     * The system pointer must outlive the world
+     */
+    template<typename T>
+    void addStaticSystem(T* system) {
+        static_assert(std::is_base_of_v<System, T>, "T must inherit from System");
+        if (!system) return;
+        
+        struct StaticDeleter {
+            void operator()(T* ptr) { /* do nothing - static systems outlive world */ }
+        };
+        
+        m_systems.push_back(std::shared_ptr<T>(system, StaticDeleter()));
         
         // Initialize the system if world is already initialized
         if (m_initialized) {
@@ -658,7 +679,7 @@ private:
     // Core managers (legacy signature-based)
     EntityManager m_entityManager;
     ComponentManager m_componentManager;
-    std::vector<std::unique_ptr<System>> m_systems;
+    std::vector<std::shared_ptr<System>> m_systems;
     
     // Enhanced features
     ArchetypeManager<> m_archetypeManager;

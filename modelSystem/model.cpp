@@ -6,10 +6,13 @@
 #include "shaderSystem/load_texture_image.h"
 #include "boneSystem/BoneName.h"
 #include "renderer/DefaultTexture.h"
+#include "TextureCompression.h"
 
 #include <iostream>
+#include <fstream>
 #include <functional>
 #include <algorithm>
+#include <cstdio>
 
 #include <assimp/postprocess.h>
 #include <glm/gtc/matrix_transform.hpp>
@@ -190,6 +193,496 @@ Model* Model::CreateFromVAO(GLuint VAO, GLsizei indexCount)
 }
 
 // =====================================================
+// Async Model Loading
+// =====================================================
+Model::AsyncLoadHandle Model::LoadAsync(const std::string& path)
+{
+    AsyncLoadHandle handle;
+    handle.progress = 0.0f;
+    
+    auto dataPtr = std::make_shared<float>(0.0f);
+    
+    handle.future = std::async(std::launch::async, [path, dataPtr]() -> std::unique_ptr<AsyncModelData> {
+        auto result = LoadModelData(path, dataPtr.get());
+        return result;
+    });
+    
+    return handle;
+}
+
+std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, float* outProgress)
+{
+    auto data = std::make_unique<AsyncModelData>();
+    data->sourcePath = path;
+    
+    if (outProgress) *outProgress = 0.0f;
+
+    // Step 1: Assimp file parsing (heavy CPU work)
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(
+        path,
+        aiProcess_Triangulate |
+            aiProcess_GenSmoothNormals |
+            aiProcess_FlipUVs |
+            aiProcess_CalcTangentSpace |
+            aiProcess_LimitBoneWeights);
+
+    if (!scene || !scene->mRootNode) {
+        data->error = importer.GetErrorString();
+        data->success = false;
+        if (outProgress) *outProgress = 1.0f;
+        return data;
+    }
+
+    std::string directory = path.substr(0, path.find_last_of('/'));
+    data->directory = directory;
+
+    if (outProgress) *outProgress = 0.2f;
+
+    // Step 2: Build skeleton hierarchy
+    ReadHierarchyStatic(data->rootNode, scene->mRootNode);
+    data->skeleton.rootNode = data->rootNode;
+
+    if (outProgress) *outProgress = 0.3f;
+
+    // Step 3: Process meshes (vertices, indices, bones, materials)
+    std::vector<AsyncModelData::RawMeshData> rawMeshes;
+    std::vector<PBRMaterial> materials;
+    
+    auto processNodeAsync = [&](auto&& self, aiNode* node, const aiScene* scene,
+                                const std::string& dir, std::vector<AsyncModelData::RawMeshData>& outMeshes,
+                                std::vector<PBRMaterial>& outMaterials) -> void {
+        for (unsigned i = 0; i < node->mNumMeshes; ++i) {
+            aiMesh* mesh = scene->mMeshes[node->mMeshes[i]];
+            
+            AsyncModelData::RawMeshData rawMesh;
+            rawMesh.directory = dir;
+            
+            // Extract vertices
+            rawMesh.vertices.resize(mesh->mNumVertices);
+            for (unsigned v = 0; v < mesh->mNumVertices; ++v) {
+                Vertex& vert = rawMesh.vertices[v];
+                vert.Position = {mesh->mVertices[v].x, mesh->mVertices[v].y, mesh->mVertices[v].z};
+                vert.Normal = mesh->HasNormals()
+                    ? glm::vec3(mesh->mNormals[v].x, mesh->mNormals[v].y, mesh->mNormals[v].z)
+                    : glm::vec3(0.0f, 0.0f, 1.0f);
+                vert.TexCoords = mesh->mTextureCoords[0]
+                    ? glm::vec2(mesh->mTextureCoords[0][v].x, mesh->mTextureCoords[0][v].y)
+                    : glm::vec2(0.0f, 0.0f);
+                
+                if (mesh->HasTangentsAndBitangents()) {
+                    vert.Tangent = glm::vec3(mesh->mTangents[v].x, mesh->mTangents[v].y, mesh->mTangents[v].z);
+                    vert.Bitangent = glm::vec3(mesh->mBitangents[v].x, mesh->mBitangents[v].y, mesh->mBitangents[v].z);
+                } else {
+                    vert.Tangent = glm::vec3(1.0f, 0.0f, 0.0f);
+                    vert.Bitangent = glm::vec3(0.0f, 1.0f, 0.0f);
+                }
+                
+                for (int j = 0; j < MAX_BONE_INFLUENCE; ++j) {
+                    vert.BoneIDs[j] = -1;
+                    vert.Weights[j] = 0.0f;
+                }
+            }
+            
+            // Extract indices
+            rawMesh.indices.reserve(mesh->mNumFaces * 3);
+            for (unsigned f = 0; f < mesh->mNumFaces; ++f) {
+                for (unsigned j = 0; j < mesh->mFaces[f].mNumIndices; ++j) {
+                    rawMesh.indices.push_back(mesh->mFaces[f].mIndices[j]);
+                }
+            }
+            
+            // Extract bone weights
+            extractBoneWeightsStatic(rawMesh.vertices, mesh, data->skeleton);
+            
+            // Extract bone references
+            ExtractBonesStatic(mesh, data->skeleton);
+            
+            // Process material
+            PBRMaterial pbrMat;
+            if (mesh->mMaterialIndex != static_cast<unsigned int>(-1)) {
+                aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
+                
+                // Albedo
+                aiColor3D diffuse(0.0f, 0.0f, 0.0f);
+                if (material->Get(AI_MATKEY_COLOR_DIFFUSE, diffuse) == AI_SUCCESS) {
+                    pbrMat.albedo = glm::vec3(diffuse.r, diffuse.g, diffuse.b);
+                }
+                
+                // Collect texture paths (not loading them yet)
+                auto addTexturePath = [&](aiTextureType type, const std::string& typeName) {
+                    if (material->GetTextureCount(type) > 0) {
+                        aiString str;
+                        material->GetTexture(type, 0, &str);
+                        std::string texPath = str.C_Str();
+                        std::replace(texPath.begin(), texPath.end(), '\\', '/');
+                        size_t fbmPos = texPath.find(".fbm/");
+                        if (fbmPos != std::string::npos) texPath = texPath.substr(fbmPos + 5);
+                        std::string fullPath = dir + "/" + texPath;
+                        rawMesh.texturePaths.emplace_back(fullPath, typeName);
+                    }
+                };
+                
+                addTexturePath(aiTextureType_DIFFUSE, "diffuse");
+                addTexturePath(aiTextureType_NORMALS, "normal");
+                addTexturePath(aiTextureType_METALNESS, "metallic");
+                addTexturePath(aiTextureType_DIFFUSE_ROUGHNESS, "roughness");
+                addTexturePath(aiTextureType_AMBIENT_OCCLUSION, "ao");
+                addTexturePath(aiTextureType_EMISSIVE, "emissive");
+                
+                // Material properties
+                float roughness = 0.5f;
+                if (material->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness) == AI_SUCCESS) {
+                    pbrMat.roughness = roughness;
+                }
+                float metallic = 0.0f;
+                if (material->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == AI_SUCCESS) {
+                    pbrMat.metallic = metallic;
+                }
+                aiColor3D emissive(0.0f, 0.0f, 0.0f);
+                if (material->Get(AI_MATKEY_COLOR_EMISSIVE, emissive) == AI_SUCCESS) {
+                    pbrMat.emissive = glm::vec3(emissive.r, emissive.g, emissive.b);
+                }
+            }
+            
+            outMaterials.push_back(pbrMat);
+            outMeshes.push_back(std::move(rawMesh));
+        }
+        
+        for (unsigned i = 0; i < node->mNumChildren; ++i) {
+            self(self, node->mChildren[i], scene, dir, outMeshes, outMaterials);
+        }
+    };
+    
+    processNodeAsync(processNodeAsync, scene->mRootNode, scene, directory, rawMeshes, materials);
+    data->meshes = std::move(rawMeshes);
+    data->meshMaterials = std::move(materials);
+
+    if (outProgress) *outProgress = 0.5f;
+
+    // Step 4: Load textures on background thread (file I/O, no GL)
+    {
+        // Collect unique texture paths
+        std::unordered_map<std::string, int> texturePathToIndex;
+        std::vector<std::pair<std::string, std::string>> allTexturePaths;
+        
+        for (const auto& mesh : data->meshes) {
+            for (const auto& [texPath, type] : mesh.texturePaths) {
+                if (texturePathToIndex.find(texPath) == texturePathToIndex.end()) {
+                    texturePathToIndex[texPath] = data->textures.size();
+                    allTexturePaths.emplace_back(texPath, type);
+                    
+                    // Load texture pixels on background thread
+                    int w, h, c;
+                    stbi_set_flip_vertically_on_load(true);
+                    unsigned char* imgData = stbi_load(texPath.c_str(), &w, &h, &c, 0);
+                    
+                    TexturePixelData texData;
+                    texData.path = texPath;
+                    texData.type = type;
+                    texData.isNormalMap = (type == "normal");
+                    
+                    if (imgData) {
+                        texData.width = w;
+                        texData.height = h;
+                        texData.channels = c;
+                        texData.data.assign(imgData, imgData + w * h * c);
+                        stbi_image_free(imgData);
+                    }
+                    
+                    data->textures.push_back(std::move(texData));
+                }
+            }
+        }
+    }
+
+    if (outProgress) *outProgress = 0.7f;
+
+    // Step 5: Build bone maps
+    auto normMap = BuildNormalizedBoneMap(data->skeleton);
+    BuildNodeBoneMapStatic(data->rootNode, normMap);
+    data->skeleton.rootBoneIndex = FindRootBoneIndex(data->skeleton);
+    data->rootBoneIndex = data->skeleton.rootBoneIndex;
+    
+    glm::mat4 rootTransform = aiMat4ToGlm(scene->mRootNode->mTransformation);
+    data->globalInverseTransform = glm::inverse(rootTransform);
+    data->skeleton.globalInverseTransform = data->globalInverseTransform;
+
+    if (outProgress) *outProgress = 0.8f;
+
+    // Step 6: Load animation metadata
+    for (unsigned i = 0; i < scene->mNumAnimations; ++i) {
+        aiAnimation* a = scene->mAnimations[i];
+        data->animations.push_back(std::make_unique<Animation>(
+            a->mName.C_Str(),
+            float(a->mDuration),
+            float(a->mTicksPerSecond > 0 ? a->mTicksPerSecond : 25.0f)));
+    }
+
+    // Step 7: Optimize meshes (CPU only)
+    for (auto& mesh : data->meshes) {
+        MeshUtils::OptimizeTriangleOrderingForsyth(mesh.indices, mesh.vertices.size());
+    }
+
+    if (outProgress) *outProgress = 0.9f;
+
+    // Step 8: Calculate bounding volumes
+    BoundingBox bbox;
+    int totalVerts = 0;
+    int totalTris = 0;
+    
+    for (const auto& mesh : data->meshes) {
+        for (const auto& v : mesh.vertices) {
+            bbox.Extend(v.Position);
+        }
+        totalVerts += mesh.vertices.size();
+        totalTris += mesh.indices.size() / 3;
+    }
+    
+    data->boundingBox = bbox;
+    data->boundingSphere = BoundingSphere::FromBoundingBox(bbox);
+    data->totalVertices = totalVerts;
+    data->totalTriangles = totalTris;
+    data->success = true;
+
+    if (outProgress) *outProgress = 1.0f;
+    return data;
+}
+
+Model* Model::CreateFromAsync(AsyncLoadHandle& handle)
+{
+    if (!handle.isValid()) {
+        std::cerr << "[Model::CreateFromAsync] Invalid async handle\n";
+        return nullptr;
+    }
+    
+    // Block until loading is complete
+    auto data = handle.future.get();
+    
+    if (!data->success) {
+        std::cerr << "[Model::CreateFromAsync] Loading failed: " << data->error << "\n";
+        Model* model = new Model("");
+        return model;
+    }
+    
+    // Create model on main thread (GL resources)
+    Model* model = new Model("");
+    model->setupFromAsyncData(std::move(data));
+    
+    return model;
+}
+
+void Model::setupFromAsyncData(std::unique_ptr<AsyncModelData> data)
+{
+    // This MUST be called on the main thread (GL context required)
+    meshes.reserve(data->meshes.size());
+    meshMaterials = std::move(data->meshMaterials);
+    
+    // Create meshes with GL resources
+    for (size_t i = 0; i < data->meshes.size(); ++i) {
+        auto& rawMesh = data->meshes[i];
+        
+        // Create mesh (SetupMesh is called in constructor - GL thread)
+        Mesh mesh(rawMesh.vertices, rawMesh.indices);
+        mesh.CalculateBoundingVolumes();
+        mesh.stats.Calculate(mesh.vertices, mesh.indices, mesh.textures);
+        
+        meshes.push_back(std::move(mesh));
+    }
+    
+    // Upload textures to GL
+    std::unordered_map<std::string, unsigned int> loadedTextures;
+    
+    for (size_t meshIdx = 0; meshIdx < data->meshes.size(); ++meshIdx) {
+        auto& rawMesh = data->meshes[meshIdx];
+        
+        // Apply material textures
+        auto& mat = meshMaterials[meshIdx];
+        
+        for (const auto& [texPath, type] : rawMesh.texturePaths) {
+            if (loadedTextures.find(texPath) == loadedTextures.end()) {
+                // Find the pixel data for this texture
+                for (const auto& texData : data->textures) {
+                    if (texData.path == texPath && !texData.data.empty()) {
+                        unsigned int texID = uploadTextureFromPixels(texData);
+                        loadedTextures[texPath] = texID;
+                        
+                        // Set material texture ID
+                        if (type == "diffuse") {
+                            mat.albedoMap = texID;
+                            mat.hasAlbedoMap = true;
+                        } else if (type == "normal") {
+                            mat.normalMap = texID;
+                            mat.hasNormalMap = true;
+                        } else if (type == "metallic") {
+                            mat.metallicMap = texID;
+                            mat.hasMetallicMap = true;
+                        } else if (type == "roughness") {
+                            mat.roughnessMap = texID;
+                            mat.hasRoughnessMap = true;
+                        } else if (type == "ao") {
+                            mat.aoMap = texID;
+                            mat.hasAOMap = true;
+                        } else if (type == "emissive") {
+                            mat.emissiveMap = texID;
+                            mat.hasEmissiveMap = true;
+                        }
+                        break;
+                    }
+                }
+            } else {
+                unsigned int texID = loadedTextures[texPath];
+                if (type == "diffuse") { mat.albedoMap = texID; mat.hasAlbedoMap = true; }
+                else if (type == "normal") { mat.normalMap = texID; mat.hasNormalMap = true; }
+                else if (type == "metallic") { mat.metallicMap = texID; mat.hasMetallicMap = true; }
+                else if (type == "roughness") { mat.roughnessMap = texID; mat.hasRoughnessMap = true; }
+                else if (type == "ao") { mat.aoMap = texID; mat.hasAOMap = true; }
+                else if (type == "emissive") { mat.emissiveMap = texID; mat.hasEmissiveMap = true; }
+            }
+        }
+        
+        // Set default textures if needed
+        if (!mat.hasAlbedoMap) { mat.albedoMap = DefaultTexture::GetGreyTexture(); mat.hasAlbedoMap = true; }
+        if (!mat.hasNormalMap) { mat.normalMap = DefaultTexture::GetWhiteTexture(); mat.hasNormalMap = true; }
+        if (!mat.hasMetallicMap) { mat.metallicMap = DefaultTexture::GetGreyTexture(); mat.hasMetallicMap = true; }
+        if (!mat.hasRoughnessMap) { mat.roughnessMap = DefaultTexture::GetGreyTexture(); mat.hasRoughnessMap = true; }
+        if (!mat.hasAOMap) { mat.aoMap = DefaultTexture::GetGreyTexture(); mat.hasAOMap = true; }
+    }
+    
+    // Copy skeleton and animation data
+    m_Skeleton = std::move(data->skeleton);
+    m_Skeleton.rootNode = data->rootNode;
+    rootBoneIndex = data->rootBoneIndex;
+    m_Animations = std::move(data->animations);
+    
+    // Copy bounding volumes
+    boundingBox = data->boundingBox;
+    boundingSphere = data->boundingSphere;
+    
+    directory = data->directory;
+    
+    if (debugOutput) {
+        std::cout << "[Model] Async loaded: " << data->sourcePath
+                  << " | Bones: " << m_Skeleton.bones.size()
+                  << " | Meshes: " << meshes.size()
+                  << " | Triangles: " << data->totalTriangles
+                  << " | Vertices: " << data->totalVertices
+                  << "\n";
+    }
+}
+
+unsigned int Model::uploadTextureFromPixels(const TexturePixelData& texData)
+{
+    if (texData.data.empty()) {
+        return 0;
+    }
+    
+    unsigned int texID;
+    glGenTextures(1, &texID);
+    glBindTexture(GL_TEXTURE_2D, texID);
+    
+    bool isNormalMap = texData.isNormalMap;
+    GLenum format;
+    GLenum internalFormat;
+    
+    if (texData.channels == 1) {
+        format = GL_RED;
+        internalFormat = GL_RED;
+    } else if (texData.channels == 2) {
+        format = GL_RG;
+        internalFormat = GL_RG;
+    } else if (texData.channels == 3) {
+        format = GL_RGB;
+        internalFormat = isNormalMap ? GL_RGB : GL_SRGB;
+    } else {
+        format = GL_RGBA;
+        internalFormat = isNormalMap ? GL_RGBA : GL_SRGB_ALPHA;
+    }
+    
+    glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, texData.width, texData.height, 0, format, GL_UNSIGNED_BYTE, texData.data.data());
+    glGenerateMipmap(GL_TEXTURE_2D);
+    
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    
+    if (isNormalMap) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    }
+    
+    return texID;
+}
+
+// Static versions of helper functions for async loading (no 'this' pointer)
+void Model::ReadHierarchyStatic(AssimpNodeData& dest, const aiNode* src)
+{
+    dest.name = src->mName.C_Str();
+    dest.transform = aiMat4ToGlm(src->mTransformation);
+    dest.children.resize(src->mNumChildren);
+    
+    for (size_t i = 0; i < src->mNumChildren; ++i) {
+        ReadHierarchyStatic(dest.children[i], src->mChildren[i]);
+    }
+}
+
+void Model::BuildNodeBoneMapStatic(AssimpNodeData& node, const std::unordered_map<std::string, int>& normBoneMap)
+{
+    auto it = normBoneMap.find(node.name);
+    node.boneIndex = (it != normBoneMap.end()) ? it->second : -1;
+    
+    for (auto& child : node.children) {
+        BuildNodeBoneMapStatic(child, normBoneMap);
+    }
+}
+
+void Model::ExtractBonesStatic(aiMesh* mesh, Skeleton& skeleton)
+{
+    for (unsigned i = 0; i < mesh->mNumBones; ++i) {
+        aiBone* bone = mesh->mBones[i];
+        std::string boneName(bone->mName.C_Str());
+        
+        if (skeleton.boneMapping.find(boneName) == skeleton.boneMapping.end()) {
+            BoneInfo newBone;
+            newBone.id = skeleton.bones.size();
+            newBone.offset = aiMat4ToGlm(bone->mOffsetMatrix);
+            skeleton.boneMapping[boneName] = newBone.id;
+            skeleton.bones.push_back(newBone);
+        }
+    }
+}
+
+void Model::extractBoneWeightsStatic(std::vector<Vertex>& vertices, aiMesh* mesh, Skeleton& skeleton)
+{
+    for (unsigned b = 0; b < mesh->mNumBones; ++b) {
+        aiBone* bone = mesh->mBones[b];
+        for (unsigned w = 0; w < bone->mNumWeights; ++w) {
+            int vertexID = bone->mWeights[w].mVertexId;
+            float weight = bone->mWeights[w].mWeight;
+            
+            if (vertexID >= 0 && vertexID < static_cast<int>(vertices.size())) {
+                Vertex& v = vertices[vertexID];
+                
+                for (int j = 0; j < MAX_BONE_INFLUENCE; ++j) {
+                    if (v.Weights[j] == 0.0f) {
+                        int boneIndex = -1;
+                        auto it = skeleton.boneMapping.find(bone->mName.C_Str());
+                        if (it != skeleton.boneMapping.end()) {
+                            boneIndex = it->second;
+                        }
+                        
+                        v.BoneIDs[j] = boneIndex;
+                        v.Weights[j] = weight;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =====================================================
 // Draw Functions
 // =====================================================
 void Model::Draw(Shader &shader, Animator &animator)
@@ -207,10 +700,18 @@ void Model::Draw(Shader &shader, Animator &animator)
         }
     }
 
-    // Upload bone palette
-    std::vector<glm::mat4> paletteMats = finalBones;
-    UploadBoneTexture(shader, paletteMats);
-    shader.setInt("uPaletteSize", (int)paletteMats.size());
+    // Use SSBO/UBO for bone matrices (fast path)
+    if (!finalBones.empty()) {
+        if (!boneBuffer.IsInitialized()) {
+            boneBuffer.Initialize(finalBones.size() * 2); // Double capacity for growth
+        }
+        boneBuffer.Update(finalBones);
+        boneBuffer.Bind(0); // Bind to binding point 0
+        shader.setInt("uBoneBufferBinding", 0);
+        shader.setInt("uBoneBufferEnabled", 1);
+    } else {
+        shader.setInt("uBoneBufferEnabled", 0);
+    }
 
     // Draw all meshes
     for (size_t meshIndex = 0; meshIndex < meshes.size(); ++meshIndex)
@@ -219,10 +720,28 @@ void Model::Draw(Shader &shader, Animator &animator)
         mesh.Draw(shader);
     }
     
+    if (boneBuffer.IsInitialized()) {
+        boneBuffer.Unbind();
+    }
+    
     if (firstDraw && debugOutput) {
         std::cout << "[Model::Draw] Finished drawing all meshes\n";
     }
     firstDraw = false;
+}
+
+void Model::DrawStatic(Shader &shader)
+{
+    // Disable skinning for static models
+    shader.setInt("uBoneBufferEnabled", 0);
+    shader.setInt("uDisableSkinning", 1);
+    
+    // Draw all meshes
+    for (size_t meshIndex = 0; meshIndex < meshes.size(); ++meshIndex)
+    {
+        auto &mesh = meshes[meshIndex];
+        mesh.Draw(shader);
+    }
 }
 
 // =====================================================
@@ -232,10 +751,18 @@ void Model::DrawLOD(Shader &shader, Animator &animator, const glm::vec3& cameraP
 {
     const auto &finalBones = animator.GetFinalBoneMatrices();
 
-    // Upload bone palette
-    std::vector<glm::mat4> paletteMats = finalBones;
-    UploadBoneTexture(shader, paletteMats);
-    shader.setInt("uPaletteSize", (int)paletteMats.size());
+    // Use SSBO/UBO for bone matrices (fast path)
+    if (!finalBones.empty()) {
+        if (!boneBuffer.IsInitialized()) {
+            boneBuffer.Initialize(finalBones.size() * 2);
+        }
+        boneBuffer.Update(finalBones);
+        boneBuffer.Bind(0);
+        shader.setInt("uBoneBufferBinding", 0);
+        shader.setInt("uBoneBufferEnabled", 1);
+    } else {
+        shader.setInt("uBoneBufferEnabled", 0);
+    }
 
     // Calculate distance to model center
     float distance = glm::length(cameraPos - boundingSphere.center);
@@ -260,6 +787,10 @@ void Model::DrawLOD(Shader &shader, Animator &animator, const glm::vec3& cameraP
 
         meshToDraw->Draw(shader);
     }
+    
+    if (boneBuffer.IsInitialized()) {
+        boneBuffer.Unbind();
+    }
 }
 
 // =====================================================
@@ -271,10 +802,18 @@ void Model::DrawInstanced(Shader& shader, Animator& animator, const std::vector<
     
     const auto &finalBones = animator.GetFinalBoneMatrices();
     
-    // Upload bone palette (shared across all instances)
-    std::vector<glm::mat4> paletteMats = finalBones;
-    UploadBoneTexture(shader, paletteMats);
-    shader.setInt("uPaletteSize", (int)paletteMats.size());
+    // Use SSBO/UBO for bone matrices (fast path)
+    if (!finalBones.empty()) {
+        if (!boneBuffer.IsInitialized()) {
+            boneBuffer.Initialize(finalBones.size() * 2);
+        }
+        boneBuffer.Update(finalBones);
+        boneBuffer.Bind(0);
+        shader.setInt("uBoneBufferBinding", 0);
+        shader.setInt("uBoneBufferEnabled", 1);
+    } else {
+        shader.setInt("uBoneBufferEnabled", 0);
+    }
 
     // Enable instancing
     shader.setInt("uInstancingEnabled", 1);
@@ -293,10 +832,22 @@ void Model::DrawInstanced(Shader& shader, Animator& animator, const std::vector<
     }
     
     shader.setInt("uInstancingEnabled", 0);
+    
+    if (boneBuffer.IsInitialized()) {
+        boneBuffer.Unbind();
+    }
 }
 
 // =====================================================
 Animation* Model::GetAnimation(size_t index)
+{
+    if (index >= m_Animations.size())
+        return nullptr;
+    return m_Animations[index].get();
+}
+
+// =====================================================
+const Animation* Model::GetAnimation(size_t index) const
 {
     if (index >= m_Animations.size())
         return nullptr;
@@ -354,8 +905,14 @@ void Model::loadModel(const std::string &path)
             float(a->mTicksPerSecond > 0 ? a->mTicksPerSecond : 25.0f)));
     }
 
-    // Generate LOD levels
-    generateLODLevels();
+    // Generate LOD levels (skip optimization to avoid crashes with complex FBX models)
+    // generateLODLevels();
+
+    // Optimize all meshes for rendering (skip to avoid crashes with complex FBX models)
+    // for (auto& mesh : meshes)
+    // {
+    //     mesh.Optimize();
+    // }
 }
 
 // =====================================================
@@ -602,45 +1159,92 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
     // Check if OpenGL context is available
     if (!glGenTextures) {
         std::cerr << "[Model] WARNING: No OpenGL context available, skipping texture: " << path << "\n";
-        return 0;  // Return 0 (invalid texture ID) instead of crashing
+        return 0;
     }
     
     unsigned int textureID = 0;
+    
+    // === PATH 1: Try DDS file (pre-compressed BC7/BC5) ===
+    std::string ddsPath = path;
+    size_t dotPos = ddsPath.rfind('.');
+    if (dotPos != std::string::npos) {
+        ddsPath.replace(dotPos, std::string::npos, ".dds");
+    } else {
+        ddsPath += ".dds";
+    }
+    
+    FILE* ddsTest = fopen(ddsPath.c_str(), "rb");
+    if (ddsTest) {
+        fclose(ddsTest);
+        textureID = LoadDDS(ddsPath);
+        if (textureID) {
+            return textureID;
+        }
+    }
+    
+    // === PATH 2: Load uncompressed image and compress to BC1/BC3 ===
     glGenTextures(1, &textureID);
     glBindTexture(GL_TEXTURE_2D, textureID);
 
-    // Set texture parameters
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    // Load texture
     int width, height, nrComponents;
     stbi_set_flip_vertically_on_load(true);
-    unsigned char *data = stbi_load(path.c_str(), &width, &height, &nrComponents, 0);
+    unsigned char* data = stbi_load(path.c_str(), &width, &height, &nrComponents, 0);
 
     if (data)
     {
-        GLenum format;
-        if (nrComponents == 1)
-            format = GL_RED;
-        else if (nrComponents == 3)
-            format = GL_RGB;
-        else if (nrComponents == 4)
-            format = GL_RGBA;
-        else
-            format = GL_RGB;
+        bool isNormalMap = (type == aiTextureType_NORMALS);
+        bool useCompression = (width >= 4 && height >= 4); // Skip compression for tiny textures
 
-        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);
+        if (useCompression && nrComponents <= 3 && !isNormalMap && nrComponents == 3) {
+            // === COMPRESSED: BC1/DXT1 for RGB (6:1 ratio) ===
+            std::vector<uint8_t> compressed = CompressBC1(data, width, height);
+            int blockW = (width + 3) / 4;
+            int blockH = (height + 3) / 4;
+            glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGB_S3TC_DXT1_EXT, width, height, 0,
+                                   blockW * blockH * 8, compressed.data());
+            glGenerateMipmap(GL_TEXTURE_2D);
+        } else if (useCompression && nrComponents == 4) {
+            // === COMPRESSED: BC3/DXT5 for RGBA (4:1 ratio) ===
+            std::vector<uint8_t> compressed = CompressBC3(data, width, height);
+            int blockW = (width + 3) / 4;
+            int blockH = (height + 3) / 4;
+            glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, width, height, 0,
+                                   blockW * blockH * 16, compressed.data());
+            glGenerateMipmap(GL_TEXTURE_2D);
+        } else if (nrComponents == 1) {
+            // === 1-channel: Use compressed RGTC1 if available, else uncompressed ===
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, data);
+            glGenerateMipmap(GL_TEXTURE_2D);
+        } else if (isNormalMap && nrComponents == 3) {
+            // === Normal map: Use BC5 (RG compression) - pack RGB into RG ===
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RG, width, height, 0, GL_RG, GL_UNSIGNED_BYTE, data);
+            glGenerateMipmap(GL_TEXTURE_2D);
+        } else {
+            // === UNCOMPRESSED FALLBACK (tiny textures or unusual formats) ===
+            GLenum format;
+            if (nrComponents == 1)
+                format = GL_RED;
+            else if (nrComponents == 3)
+                format = GL_RGB;
+            else if (nrComponents == 4)
+                format = GL_RGBA;
+            else
+                format = GL_RGB;
+
+            glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+            glGenerateMipmap(GL_TEXTURE_2D);
+        }
 
         stbi_image_free(data);
     }
     else
     {
         std::cerr << "Texture failed to load at path: " << path << std::endl;
-        stbi_image_free(data);
     }
 
     return textureID;
@@ -894,11 +1498,15 @@ void Model::UploadBoneTexture(Shader &shader, const std::vector<glm::mat4> &mats
         return;  // Silently skip - no GL context (e.g., in unit tests)
     }
 
-    // Create once
+    // Create once with fixed size
     if (boneTexID == 0)
     {
         glGenTextures(1, &boneTexID);
         glBindTexture(GL_TEXTURE_2D, boneTexID);
+
+        // Allocate once with maximum reasonable size
+        int maxWidth = 256 * 4; // Support up to 256 bones
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, maxWidth, 1, 0, GL_RGBA, GL_FLOAT, nullptr);
 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -926,18 +1534,19 @@ void Model::UploadBoneTexture(Shader &shader, const std::vector<glm::mat4> &mats
     glActiveTexture(GL_TEXTURE10);
     glBindTexture(GL_TEXTURE_2D, boneTexID);
 
-    glTexImage2D(
+    // Use glTexSubImage2D instead of glTexImage2D (no reallocation)
+    glTexSubImage2D(
         GL_TEXTURE_2D,
         0,
-        GL_RGBA32F,
+        0, 0,
         width,
         1,
-        0,
         GL_RGBA,
         GL_FLOAT,
         pixels.data());
 
     shader.setInt("boneTex", 10);
+    shader.setInt("uPaletteSize", (int)mats.size());
 }
 
 // =====================================================
@@ -972,24 +1581,74 @@ void Model::calculateBoundingVolumes()
 // =====================================================
 void Model::generateLODLevels()
 {
-    // For now, we'll create simple LOD levels by decimating meshes
-    // In a production system, you would use a proper mesh simplification algorithm
-    // like quadric error metrics or vertex clustering
-    
     lodLevels.resize(meshes.size());
     
     for (size_t i = 0; i < meshes.size(); ++i)
     {
-        // Create LOD levels at different distances
-        // Note: This is a placeholder - actual LOD would require mesh simplification
-        lodLevels[i].emplace_back(meshes[i], 0.0f);      // Highest quality (original)
-        // lodLevels[i].emplace_back(simplifiedMesh1, 10.0f);  // Medium quality
-        // lodLevels[i].emplace_back(simplifiedMesh2, 25.0f);  // Low quality
-        // lodLevels[i].emplace_back(simplifiedMesh3, 50.0f);  // Lowest quality
+        // LOD 0: Original mesh with Forsyth triangle reordering only
+        {
+            Mesh lodMesh = meshes[i];
+            MeshUtils::MeshOptimizationConfig config;
+            config.reorderTriangles = true;
+            config.clusterVertices = false;
+            config.targetCacheSize = 24;
+            MeshUtils::OptimizeMeshForRendering(lodMesh, config);
+            lodLevels[i].emplace_back(std::move(lodMesh), 0.0f);
+        }
+        
+        // LOD 1: Medium quality (light vertex clustering)
+        {
+            Mesh lodMesh = meshes[i];
+            float cellSize = glm::max(0.05f, meshes[i].boundingBox.Radius() * 0.05f);
+            MeshUtils::MeshOptimizationConfig config;
+            config.reorderTriangles = true;
+            config.clusterVertices = true;
+            config.clusterCellSize = cellSize;
+            config.targetCacheSize = 24;
+            MeshUtils::OptimizeMeshForRendering(lodMesh, config);
+            lodMesh.RecalculateNormals();
+            lodLevels[i].emplace_back(std::move(lodMesh), 10.0f);
+        }
+        
+        // LOD 2: Low quality (moderate vertex clustering)
+        {
+            Mesh lodMesh = meshes[i];
+            float cellSize = glm::max(0.1f, meshes[i].boundingBox.Radius() * 0.1f);
+            MeshUtils::MeshOptimizationConfig config;
+            config.reorderTriangles = true;
+            config.clusterVertices = true;
+            config.clusterCellSize = cellSize;
+            config.targetCacheSize = 24;
+            MeshUtils::OptimizeMeshForRendering(lodMesh, config);
+            lodMesh.RecalculateNormals();
+            lodLevels[i].emplace_back(std::move(lodMesh), 25.0f);
+        }
+        
+        // LOD 3: Lowest quality (aggressive vertex clustering)
+        {
+            Mesh lodMesh = meshes[i];
+            float cellSize = glm::max(0.2f, meshes[i].boundingBox.Radius() * 0.2f);
+            MeshUtils::MeshOptimizationConfig config;
+            config.reorderTriangles = true;
+            config.clusterVertices = true;
+            config.clusterCellSize = cellSize;
+            config.targetCacheSize = 24;
+            MeshUtils::OptimizeMeshForRendering(lodMesh, config);
+            lodMesh.RecalculateNormals();
+            lodLevels[i].emplace_back(std::move(lodMesh), 50.0f);
+        }
     }
     
     if (debugOutput) {
-        std::cout << "[LOD] Generated " << lodLevels.size() << " LOD level sets\n";
+        std::cout << "[LOD] Generated " << lodLevels.size() << " LOD level sets with Forsyth optimization\n";
+        for (size_t i = 0; i < lodLevels.size(); ++i) {
+            std::cout << "  Mesh " << i << ": " << lodLevels[i].size() << " LOD levels\n";
+            for (size_t j = 0; j < lodLevels[i].size(); ++j) {
+                std::cout << "    LOD" << j << ": " << lodLevels[i][j].mesh.vertices.size() 
+                          << " vertices, " << lodLevels[i][j].mesh.indices.size() / 3 
+                          << " triangles (threshold: " << lodLevels[i][j].distanceThreshold << ")\n";
+            }
+        }
     }
 }
 

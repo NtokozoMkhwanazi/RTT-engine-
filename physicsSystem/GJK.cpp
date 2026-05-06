@@ -1,5 +1,6 @@
 #include "GJK.h"
 #include "Physics.h"  // For MAX_SUB_STEP_DT
+#include <glm/gtx/norm.hpp>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -337,6 +338,401 @@ bool GJK_Intersect_Fast(
         }
     }
     
+    return false;
+}
+
+// ============================================================================
+// EPA (EXPANDING POLYTOPE ALGORITHM)
+// ============================================================================
+
+/**
+ * EPA - Expanding Polytope Algorithm
+ * 
+ * Takes the final GJK simplex (which contains the origin) and expands
+ * it to find the closest face to the origin. That face's normal and
+ * distance give us the penetration depth and contact normal.
+ */
+EPAResult EPA(
+    const Simplex& simplex,
+    std::function<SupportResult(const glm::vec3&)> supportA,
+    std::function<SupportResult(const glm::vec3&)> supportB,
+    int maxIterations)
+{
+    EPAResult result;
+    result.iterations = 0;
+
+    if (simplex.Size() < 4) {
+        return result;  // Need at least a tetrahedron
+    }
+
+    // EPA polytope: list of triangular faces
+    struct Face {
+        int v[3];           // Vertex indices
+        glm::vec3 normal;   // Face normal (points away from origin)
+        float distance;     // Distance from origin to face plane
+        bool valid;         // Face is still part of the polytope
+    };
+
+    // Vertices of the expanding polytope
+    std::vector<glm::vec3> vertices;
+    vertices.reserve(maxIterations + 4);
+
+    // Initialize vertices from GJK simplex
+    for (int i = 0; i < 4; ++i) {
+        vertices.push_back(simplex.points[i]);
+    }
+
+    // Initialize faces of the tetrahedron
+    // A tetrahedron has 4 faces. We need to orient them so normals point outward.
+    std::vector<Face> faces;
+    faces.reserve(maxIterations + 4);
+
+    // Face orientation: use the vertex that's NOT in the face to check orientation
+    auto createFace = [&](int a, int b, int c, int ref) {
+        Face f;
+        f.v[0] = a; f.v[1] = b; f.v[2] = c;
+        f.valid = true;
+
+        glm::vec3 edge1 = vertices[b] - vertices[a];
+        glm::vec3 edge2 = vertices[c] - vertices[a];
+        f.normal = glm::cross(edge1, edge2);
+        float len = glm::length(f.normal);
+
+        if (len < 1e-8f) {
+            f.valid = false;
+            return f;
+        }
+
+        f.normal /= len;
+        f.distance = glm::dot(f.normal, vertices[a]);
+
+        // Ensure normal points away from origin (distance > 0)
+        // If the reference vertex is on the same side as the normal, flip
+        if (glm::dot(f.normal, vertices[ref]) > f.distance) {
+            f.normal = -f.normal;
+            f.distance = -f.distance;
+            // Swap two vertices to flip face orientation
+            std::swap(f.v[0], f.v[1]);
+        }
+
+        return f;
+    };
+
+    // Tetrahedron faces: (0,1,2) ref=3, (0,2,3) ref=1, (0,3,1) ref=2, (1,3,2) ref=0
+    faces.push_back(createFace(0, 1, 2, 3));
+    faces.push_back(createFace(0, 2, 3, 1));
+    faces.push_back(createFace(0, 3, 1, 2));
+    faces.push_back(createFace(1, 3, 2, 0));
+
+    // EPA main loop: expand polytope toward the closest face
+    for (int iter = 0; iter < maxIterations; ++iter) {
+        result.iterations = iter + 1;
+
+        // Find the face closest to the origin
+        int closestFace = -1;
+        float minDistance = std::numeric_limits<float>::max();
+
+        for (int i = 0; i < static_cast<int>(faces.size()); ++i) {
+            if (!faces[i].valid) continue;
+            float d = std::abs(faces[i].distance);
+            if (d < minDistance) {
+                minDistance = d;
+                closestFace = i;
+            }
+        }
+
+        if (closestFace == -1) {
+            break;  // No valid faces
+        }
+
+        // Get support point in direction of the closest face normal
+        const Face& face = faces[closestFace];
+        glm::vec3 dir = face.normal;
+        float dirLen = glm::length(dir);
+        if (dirLen < 1e-8f) continue;
+        dir /= dirLen;
+
+        SupportResult supA = supportA(dir);
+        SupportResult supB = supportB(-dir);
+        glm::vec3 supportPoint = supA.point - supB.point;
+
+        // Check convergence: if support point is close enough to the face, we're done
+        float supportDist = glm::dot(dir, supportPoint);
+        float convergence = supportDist - std::abs(face.distance);
+
+        if (convergence < 0.001f) {
+            result.found = true;
+            result.penetrationDepth = std::abs(face.distance);
+            result.contactNormal = face.normal;
+
+            // Contact point: midpoint between closest points on A and B
+            result.contactPoint = (supA.point + supB.point) * 0.5f;
+            return result;
+        }
+
+        // Add new vertex
+        int newVertIdx = static_cast<int>(vertices.size());
+        vertices.push_back(supportPoint);
+
+        // Find horizon edges: edges of the closest face's visible region
+        // An edge is on the horizon if the new vertex can "see" one face but not its neighbor
+        std::vector<std::pair<int, int>> horizonEdges;
+        std::vector<int> visibleFaces;
+
+        // Mark faces visible from the new point
+        for (int i = 0; i < static_cast<int>(faces.size()); ++i) {
+            if (!faces[i].valid) continue;
+            // If the new vertex is on the positive side of the face plane, it's visible
+            glm::vec3 toNew = supportPoint - vertices[faces[i].v[0]];
+            if (glm::dot(faces[i].normal, toNew) > 0.0f) {
+                faces[i].valid = false;
+                visibleFaces.push_back(i);
+            }
+        }
+
+        // Find horizon edges: edges that belong to exactly one visible face
+        for (int vi : visibleFaces) {
+            const Face& f = faces[vi];
+            for (int e = 0; e < 3; ++e) {
+                int vStart = f.v[e];
+                int vEnd = f.v[(e + 1) % 3];
+
+                // Check if any adjacent (non-visible) face shares this edge
+                bool shared = false;
+                for (int j = 0; j < static_cast<int>(faces.size()); ++j) {
+                    if (j == vi || !faces[j].valid) continue;
+                    const Face& g = faces[j];
+                    for (int ge = 0; ge < 3; ++ge) {
+                        if (g.v[ge] == vEnd && g.v[(ge + 1) % 3] == vStart) {
+                            shared = true;
+                            break;
+                        }
+                    }
+                    if (shared) break;
+                }
+                if (!shared) {
+                    horizonEdges.emplace_back(vStart, vEnd);
+                }
+            }
+        }
+
+        // Create new faces from horizon edges to the new vertex
+        for (const auto& edge : horizonEdges) {
+            Face newFace;
+            newFace.v[0] = edge.first;
+            newFace.v[1] = edge.second;
+            newFace.v[2] = newVertIdx;
+            newFace.valid = true;
+
+            glm::vec3 e1 = vertices[edge.second] - vertices[edge.first];
+            glm::vec3 e2 = vertices[newVertIdx] - vertices[edge.first];
+            newFace.normal = glm::cross(e1, e2);
+            float len = glm::length(newFace.normal);
+            if (len < 1e-8f) {
+                newFace.valid = false;
+                continue;
+            }
+            newFace.normal /= len;
+            newFace.distance = glm::dot(newFace.normal, vertices[edge.first]);
+
+            // Ensure normal points outward
+            if (newFace.distance < 0.0f) {
+                newFace.normal = -newFace.normal;
+                newFace.distance = -newFace.distance;
+                std::swap(newFace.v[0], newFace.v[1]);
+            }
+
+            faces.push_back(newFace);
+        }
+    }
+
+    // If we ran out of iterations, use the closest face we found
+    for (const auto& face : faces) {
+        if (!face.valid) continue;
+        float d = std::abs(face.distance);
+        if (d < result.penetrationDepth || !result.found) {
+            result.found = true;
+            result.penetrationDepth = d;
+            result.contactNormal = face.normal;
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Combined GJK + EPA: detect collision and get contact info
+ */
+GJKResult GJK_DetectContact(
+    std::function<SupportResult(const glm::vec3&)> supportA,
+    std::function<SupportResult(const glm::vec3&)> supportB,
+    glm::vec3& outContactNormal,
+    float& outPenetrationDepth,
+    glm::vec3& outContactPoint)
+{
+    GJKResult gjkResult = GJK_Intersect(supportA, supportB);
+
+    if (gjkResult.collided && gjkResult.distance < 0.001f) {
+        // Shapes are intersecting - use EPA for penetration info
+        Simplex simplex;
+        if (GJK_Intersect_WithSimplex(supportA, supportB, simplex, 100)) {
+            EPAResult epaResult = EPA(simplex, supportA, supportB, 50);
+
+            if (epaResult.found) {
+                outContactNormal = epaResult.contactNormal;
+                outPenetrationDepth = epaResult.penetrationDepth;
+                outContactPoint = epaResult.contactPoint;
+            } else {
+                // Fallback: use GJK normal
+                outContactNormal = gjkResult.contactNormal;
+                outPenetrationDepth = 0.01f;
+                outContactPoint = (gjkResult.closestPointA + gjkResult.closestPointB) * 0.5f;
+            }
+        } else {
+            outContactNormal = gjkResult.contactNormal;
+            outPenetrationDepth = 0.01f;
+            outContactPoint = (gjkResult.closestPointA + gjkResult.closestPointB) * 0.5f;
+        }
+    } else if (!gjkResult.collided) {
+        outContactNormal = gjkResult.contactNormal;
+        outPenetrationDepth = 0.0f;
+        outContactPoint = gjkResult.closestPointA;
+    }
+
+    return gjkResult;
+}
+
+/**
+ * GJK with simplex output (needed for EPA)
+ */
+bool GJK_Intersect_WithSimplex(
+    std::function<SupportResult(const glm::vec3&)> supportA,
+    std::function<SupportResult(const glm::vec3&)> supportB,
+    Simplex& outSimplex,
+    int maxIterations)
+{
+    outSimplex.Clear();
+
+    glm::vec3 searchDir = glm::vec3(1.0f, 0.0f, 0.0f);
+
+    SupportResult supA = supportA(searchDir);
+    SupportResult supB = supportB(-searchDir);
+
+    outSimplex.AddPoint(supA.point - supB.point, supA.point, supB.point, supA.vertexIndex);
+
+    searchDir = -supA.point + supB.point;
+
+    for (int iter = 0; iter < maxIterations; ++iter) {
+        if (glm::length2(searchDir) < 1e-8f) {
+            searchDir = glm::vec3(1.0f, 0.0f, 0.0f);
+        }
+
+        supA = supportA(searchDir);
+        supB = supportB(-searchDir);
+
+        glm::vec3 newPoint = supA.point - supB.point;
+
+        if (glm::dot(newPoint, searchDir) <= 0.0f) {
+            return false;  // No collision
+        }
+
+        outSimplex.AddPoint(newPoint, supA.point, supB.point, supA.vertexIndex);
+
+        switch (outSimplex.Size()) {
+            case 2: {
+                glm::vec3 a = outSimplex.points[1];
+                glm::vec3 b = outSimplex.points[0];
+                glm::vec3 ab = b - a;
+                glm::vec3 ao = -a;
+
+                glm::vec3 abPerp = glm::cross(ab, glm::cross(ao, ab));
+                float len = glm::length(abPerp);
+                searchDir = (len > 1e-8f) ? abPerp : glm::cross(ab, glm::vec3(1,0,0));
+                break;
+            }
+            case 3: {
+                glm::vec3 a = outSimplex.points[2];
+                glm::vec3 b = outSimplex.points[1];
+                glm::vec3 c = outSimplex.points[0];
+                glm::vec3 ab = b - a;
+                glm::vec3 ac = c - a;
+                glm::vec3 ao = -a;
+
+                glm::vec3 abc = glm::cross(ab, ac);
+                glm::vec3 abPerp = glm::cross(ab, abc);
+                glm::vec3 acPerp = glm::cross(abc, ac);
+
+                float abDot = glm::dot(abPerp, ao);
+                float acDot = glm::dot(acPerp, ao);
+
+                if (abDot > 0.0f && abDot > glm::dot(ab, ao)) {
+                    outSimplex.points = {a, b};
+                    outSimplex.pointsA = {outSimplex.pointsA[2], outSimplex.pointsA[1]};
+                    outSimplex.pointsB = {outSimplex.pointsB[2], outSimplex.pointsB[1]};
+                    glm::vec3 abEdge = b - a;
+                    glm::vec3 abPerp2 = glm::cross(abEdge, glm::cross(ao, abEdge));
+                    float len2 = glm::length(abPerp2);
+                    searchDir = (len2 > 1e-8f) ? abPerp2 : glm::cross(abEdge, glm::vec3(1,0,0));
+                } else if (acDot > 0.0f && acDot > glm::dot(ac, ao)) {
+                    outSimplex.points = {a, c};
+                    outSimplex.pointsA = {outSimplex.pointsA[2], outSimplex.pointsA[0]};
+                    outSimplex.pointsB = {outSimplex.pointsB[2], outSimplex.pointsB[0]};
+                    glm::vec3 acEdge = c - a;
+                    glm::vec3 acPerp2 = glm::cross(glm::cross(ao, acEdge), acEdge);
+                    float len2 = glm::length(acPerp2);
+                    searchDir = (len2 > 1e-8f) ? acPerp2 : glm::cross(acEdge, glm::vec3(1,0,0));
+                } else {
+                    float abcLen = glm::length(abc);
+                    float abcDot = glm::dot(abc, ao);
+                    searchDir = (abcDot > 0.0f) ? (abc / abcLen) : (-abc / abcLen);
+                }
+                break;
+            }
+            case 4: {
+                glm::vec3 a = outSimplex.points[3];
+                glm::vec3 b = outSimplex.points[2];
+                glm::vec3 c = outSimplex.points[1];
+                glm::vec3 d = outSimplex.points[0];
+
+                glm::vec3 ab = b - a;
+                glm::vec3 ac = c - a;
+                glm::vec3 ad = d - a;
+                glm::vec3 ao = -a;
+
+                glm::vec3 abc = glm::cross(ab, ac);
+                glm::vec3 acd = glm::cross(ac, ad);
+                glm::vec3 adb = glm::cross(ad, ab);
+
+                float abcDot = glm::dot(abc, ao);
+                float acdDot = glm::dot(acd, ao);
+                float adbDot = glm::dot(adb, ao);
+
+                if (abcDot > 0.0f) {
+                    outSimplex.points = {a, b, c};
+                    outSimplex.pointsA = {outSimplex.pointsA[3], outSimplex.pointsA[2], outSimplex.pointsA[1]};
+                    outSimplex.pointsB = {outSimplex.pointsB[3], outSimplex.pointsB[2], outSimplex.pointsB[1]};
+                    float abcLen = glm::length(abc);
+                    searchDir = (abcDot > 0.0f) ? (abc / abcLen) : (-abc / abcLen);
+                } else if (acdDot > 0.0f) {
+                    outSimplex.points = {a, c, d};
+                    outSimplex.pointsA = {outSimplex.pointsA[3], outSimplex.pointsA[1], outSimplex.pointsA[0]};
+                    outSimplex.pointsB = {outSimplex.pointsB[3], outSimplex.pointsB[1], outSimplex.pointsB[0]};
+                    float acdLen = glm::length(acd);
+                    searchDir = (acdDot > 0.0f) ? (acd / acdLen) : (-acd / acdLen);
+                } else if (adbDot > 0.0f) {
+                    outSimplex.points = {a, d, b};
+                    outSimplex.pointsA = {outSimplex.pointsA[3], outSimplex.pointsA[0], outSimplex.pointsA[2]};
+                    outSimplex.pointsB = {outSimplex.pointsB[3], outSimplex.pointsB[0], outSimplex.pointsB[2]};
+                    float adbLen = glm::length(adb);
+                    searchDir = (adbDot > 0.0f) ? (adb / adbLen) : (-adb / adbLen);
+                } else {
+                    return true;  // Origin is inside tetrahedron = collision
+                }
+                break;
+            }
+        }
+    }
+
     return false;
 }
 

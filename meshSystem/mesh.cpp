@@ -408,7 +408,8 @@ void Mesh::RecalculateTangents()
 // ============================================================
 void Mesh::Optimize()
 {
-    MeshUtils::OptimizeVertexCache(indices, vertices.size());
+    MeshUtils::OptimizeTriangleOrderingForsyth(indices, vertices.size(), 24);
+    UpdateIndexBuffer();
 }
 
 // ============================================================
@@ -585,6 +586,9 @@ namespace MeshUtils
     }
     
     // --------------------------------------------------------
+    // DEPRECATED: Use OptimizeTriangleOrderingForsyth instead.
+    // This simple greedy algorithm provides inferior cache performance
+    // compared to the Forsyth algorithm. Kept for backward compatibility.
     void OptimizeVertexCache(std::vector<unsigned int>& indices,
                             size_t vertexCount)
     {
@@ -806,7 +810,23 @@ namespace MeshUtils
         if (triangleCount == 0)
             return;
 
-        // Cache scoring parameters (tuned for typical GPU caches)
+        // Safety check: prevent huge allocations
+        constexpr size_t MAX_VERTEX_COUNT = 500000;
+        if (vertexCount > MAX_VERTEX_COUNT) {
+            std::cerr << "[MeshUtils] Skipping optimization: vertexCount " << vertexCount 
+                      << " exceeds limit " << MAX_VERTEX_COUNT << "\n";
+            return;
+        }
+
+        // Validate all indices are within bounds
+        for (size_t i = 0; i < indices.size(); i++) {
+            if (indices[i] >= vertexCount) {
+                std::cerr << "[MeshUtils] Invalid index " << indices[i] 
+                          << " >= vertexCount " << vertexCount << ", skipping optimization\n";
+                return;
+            }
+        }
+
         const float cacheDecayPower = 1.5f;
         const float lastTriScore = 0.75f;
         const size_t valenceMax = 16;

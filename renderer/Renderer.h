@@ -18,6 +18,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <vector>
 #include <array>
+#include <string>
 #include <unordered_map>
 #include <algorithm>
 #include <memory>
@@ -117,11 +118,12 @@ public:
     };
 
     // ========================================================================
-    // Persistent Buffer Pool - Avoids glGen/glDelete every frame
+    // Persistent Buffer Pool - Ring buffer with persistent mapping
     // ========================================================================
     struct BufferPool {
         static constexpr size_t POOL_SIZE = 64 * 1024 * 1024; // 64MB
         static constexpr size_t MAX_BUFFERS = 1024;
+        static constexpr size_t MAX_FRAMES_IN_FLIGHT = 3;
         
         GLuint bufferIDs[MAX_BUFFERS];
         size_t bufferSizes[MAX_BUFFERS];
@@ -129,23 +131,60 @@ public:
         void* mappedPointers[MAX_BUFFERS];
         size_t numBuffers = 0;
         size_t nextFree = 0;
-        
+
+        // Persistent mapped ring buffer for per-frame uploads
+        GLuint ringBuffer = 0;
+        void* ringMappedPtr = nullptr;
+        size_t ringBufferSize = 0;
+        size_t ringOffset = 0;
+        bool ringBufferSupported = false;
+
+        // Frame sync: track GPU fence per ring buffer allocation
+        struct SyncEntry {
+            GLuint64 fence;
+            size_t offset;
+            size_t size;
+        };
+        std::vector<SyncEntry> syncHistory;
+        size_t currentFrame = 0;
+
         void Initialize();
         void Shutdown();
         
-        // Allocate from pool
+        // Allocate from pool (legacy path)
         size_t Allocate(size_t size, void** outMappedPtr);
         void Free(size_t bufferIndex);
         
-        // Ring buffer allocation for per-frame data
+        // Ring buffer allocation for per-frame data (persistent mapped)
         size_t AllocateRing(size_t size, void** outMappedPtr);
         void ResetRing();
-        
-    private:
-        size_t ringBufferOffset = 0;
-        GLuint ringBuffer = 0;
-        void* ringBufferMapped = nullptr;
     };
+
+    // ========================================================================
+    // Multi-Draw Indirect Support
+    // ========================================================================
+    
+    // Indirect draw command for indexed rendering
+    struct DrawElementsIndirectCommand {
+        GLuint count;           // Number of indices
+        GLuint instanceCount;    // Number of instances
+        GLuint firstIndex;       // Offset in index buffer
+        GLint  baseVertex;       // Offset in vertex buffer
+        GLuint baseInstance;     // Base instance
+    };
+
+    // Indirect draw command for non-indexed rendering
+    struct DrawArraysIndirectCommand {
+        GLuint count;           // Number of vertices
+        GLuint instanceCount;    // Number of instances
+        GLuint first;            // Start vertex
+        GLuint baseInstance;     // Base instance
+    };
+
+    static constexpr size_t MAX_INDIRECT_COMMANDS = 4096;
+
+    void InitializeMDI();
+    void ExecuteMultiDraw();
 
     Renderer();
     ~Renderer();
@@ -158,6 +197,8 @@ public:
                       GLenum primitiveType, GLuint shaderProgram,
                       const std::vector<glm::mat4>& transforms = {},
                       const glm::vec3& color = glm::vec3(1.0f),
+                      float metallic = 0.0f,
+                      float roughness = 0.5f,
                       const glm::vec3& bboxMin = glm::vec3(-1),
                       const glm::vec3& bboxMax = glm::vec3(1));
 
@@ -224,15 +265,23 @@ private:
     // Buffer pool for instance data
     BufferPool bufferPool;
     
-    // Cached uniform locations (fallback for shaders without explicit layout)
-    std::unordered_map<GLuint, std::unordered_map<GLint, GLint>> uniformCache;
+    // Cached uniform locations per shader program
+    std::unordered_map<GLuint, std::unordered_map<std::string, int>> shaderUniformCache;
     
     // Pre-computed sort keys
     std::vector<size_t> batchIndices;
 
+    // Multi-Draw Indirect state
+    GLuint mdiIndirectBuffer = 0;           // SSBO for indirect commands
+    GLuint mdiVertexArray = 0;              // Quad VAO for indirect draws
+    void* mdiMappedCommands = nullptr;      // Persistent mapped pointer
+    bool mdiSupported = false;              // Whether GL_ARB_multi_draw_indirect is available
+    bool useMultiDraw = true;               // Toggle MDI (falls back to individual draws)
+
     void SetupBatch(RenderBatch& batch, const std::vector<glm::mat4>& transforms);
     void UpdateCameraUBO();
     void BindCameraUBO(GLuint shaderProgram);
+    int GetCachedUniformLocation(GLuint shaderProgram, const std::string& name);
 };
 
 // ============================================================================
@@ -250,4 +299,15 @@ inline void Renderer::BindCameraUBO(GLuint shaderProgram) {
     if (uboIndex != GL_INVALID_INDEX) {
         glUniformBlockBinding(shaderProgram, uboIndex, CAMERA_UBO_BINDING);
     }
+}
+
+inline int Renderer::GetCachedUniformLocation(GLuint shaderProgram, const std::string& name) {
+    auto& cache = shaderUniformCache[shaderProgram];
+    auto it = cache.find(name);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    int loc = glGetUniformLocation(shaderProgram, name.c_str());
+    cache[name] = loc;
+    return loc;
 }

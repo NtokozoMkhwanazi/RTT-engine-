@@ -287,7 +287,7 @@ public:
     // Utilities
     void RecalculateNormals();
     void RecalculateTangents();
-    void Optimize();  // Optimize vertex cache
+    void Optimize();  // Uses Forsyth triangle ordering (advanced optimization)
     
     // Bone palette
     void BuildBonePalette();
@@ -329,7 +329,9 @@ namespace MeshUtils
     void RecalculateNormals(std::vector<Vertex>& vertices,
                            const std::vector<unsigned int>& indices);
 
-    // Optimize vertex cache for better GPU performance
+    // Optimizes vertex cache for better GPU performance
+    // DEPRECATED: Use OptimizeTriangleOrderingForsyth for superior results
+    [[deprecated("Use OptimizeTriangleOrderingForsyth instead")]]
     void OptimizeVertexCache(std::vector<unsigned int>& indices,
                             size_t vertexCount);
 

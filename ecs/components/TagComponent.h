@@ -1,66 +1,90 @@
 #pragma once
 
 #include "../ECS.h"
+#include "../DynamicTypes.h"
 #include <string>
 #include <vector>
 #include <algorithm>
 
 namespace ecs {
 
-/**
- * Name Component - Entity name for debugging
- */
+constexpr size_t MAX_NAME_LENGTH = 64;
+constexpr size_t MAX_TAG_LENGTH = 32;
+
 struct NameComponent : public Component {
-    std::string name;
+    char name[MAX_NAME_LENGTH];
     
-    NameComponent() = default;
-    NameComponent(const std::string& n) : name(n) {}
+    NameComponent() { name[0] = '\0'; }
+    NameComponent(const std::string& n) { setName(n); }
+    
+    void setName(const std::string& n) {
+        std::strncpy(name, n.c_str(), MAX_NAME_LENGTH - 1);
+        name[MAX_NAME_LENGTH - 1] = '\0';
+    }
+    
+    const char* getName() const { return name; }
+    bool hasName() const { return name[0] != '\0'; }
 };
 
-/**
- * Tag Component - Simple tag for entity categorization
- */
 struct TagComponent : public Component {
-    std::string tag;
+    char tag[MAX_TAG_LENGTH];
     
-    TagComponent() = default;
-    TagComponent(const std::string& t) : tag(t) {}
+    TagComponent() { tag[0] = '\0'; }
+    TagComponent(const std::string& t) { setTag(t); }
+    
+    void setTag(const std::string& t) {
+        std::strncpy(tag, t.c_str(), MAX_TAG_LENGTH - 1);
+        tag[MAX_TAG_LENGTH - 1] = '\0';
+    }
+    
+    const char* getTag() const { return tag; }
+    bool hasTag() const { return tag[0] != '\0'; }
     
     bool operator==(const TagComponent& other) const {
-        return tag == other.tag;
+        return std::strcmp(tag, other.tag) == 0;
     }
 };
 
-/**
- * Tags Component - Multiple tags per entity
- */
 struct TagsComponent : public Component {
-    std::vector<std::string> tags;
+    char tags[8][MAX_TAG_LENGTH];
+    size_t count = 0;
     
     TagsComponent() = default;
     
     void addTag(const std::string& tag) {
-        if (!hasTag(tag)) {
-            tags.push_back(tag);
-        }
+        if (count >= 8) return;
+        if (hasTag(tag)) return;
+        std::strncpy(tags[count], tag.c_str(), MAX_TAG_LENGTH - 1);
+        tags[count][MAX_TAG_LENGTH - 1] = '\0';
+        count++;
     }
     
     void removeTag(const std::string& tag) {
-        tags.erase(std::remove(tags.begin(), tags.end(), tag), tags.end());
+        for (size_t i = 0; i < count; i++) {
+            if (std::strcmp(tags[i], tag.c_str()) == 0) {
+                for (size_t j = i; j < count - 1; j++) {
+                    std::strcpy(tags[j], tags[j + 1]);
+                }
+                count--;
+                return;
+            }
+        }
     }
     
     bool hasTag(const std::string& tag) const {
-        return std::find(tags.begin(), tags.end(), tag) != tags.end();
+        for (size_t i = 0; i < count; i++) {
+            if (std::strcmp(tags[i], tag.c_str()) == 0) {
+                return true;
+            }
+        }
+        return false;
     }
     
-    void clearTags() {
-        tags.clear();
-    }
+    void clearTags() { count = 0; }
+    bool empty() const { return count == 0; }
+    size_t size() const { return count; }
 };
 
-/**
- * Parent Component - Entity hierarchy
- */
 struct ParentComponent : public Component {
     Entity parent{INVALID_ENTITY_ID};
     
@@ -68,31 +92,41 @@ struct ParentComponent : public Component {
     ParentComponent(Entity p) : parent(p) {}
 };
 
-/**
- * Children Component - List of child entities
- */
 struct ChildrenComponent : public Component {
-    std::vector<Entity> children;
+    Entity children[16];
+    size_t count = 0;
+    
+    ChildrenComponent() = default;
     
     void addChild(Entity child) {
-        children.push_back(child);
+        if (count >= 16) return;
+        if (hasChild(child)) return;
+        children[count++] = child;
     }
     
     void removeChild(Entity child) {
-        children.erase(
-            std::remove(children.begin(), children.end(), child),
-            children.end()
-        );
+        for (size_t i = 0; i < count; i++) {
+            if (children[i] == child) {
+                for (size_t j = i; j < count - 1; j++) {
+                    children[j] = children[j + 1];
+                }
+                count--;
+                return;
+            }
+        }
     }
     
     bool hasChild(Entity child) const {
-        return std::find(children.begin(), children.end(), child) != children.end();
+        for (size_t i = 0; i < count; i++) {
+            if (children[i] == child) return true;
+        }
+        return false;
     }
+    
+    bool empty() const { return count == 0; }
+    size_t size() const { return count; }
 };
 
-/**
- * Lifetime Component - Auto-destroy entity after time
- */
 struct LifetimeComponent : public Component {
     float lifetime = 1.0f;
     float elapsed = 0.0f;
@@ -102,34 +136,21 @@ struct LifetimeComponent : public Component {
     LifetimeComponent(float life, bool destroy = true) 
         : lifetime(life), destroyOnExpire(destroy) {}
     
-    /**
-     * Update lifetime
-     * @return true if expired
-     */
     bool update(float deltaTime) {
         elapsed += deltaTime;
         return elapsed >= lifetime;
     }
     
-    /**
-     * Get remaining lifetime
-     */
     float getRemaining() const {
         return std::max(0.0f, lifetime - elapsed);
     }
     
-    /**
-     * Get normalized lifetime (0 = expired, 1 = fresh)
-     */
     float getNormalized() const {
         if (lifetime <= 0.0f) return 0.0f;
         return 1.0f - (elapsed / lifetime);
     }
 };
 
-/**
- * Active Component - Enable/disable entity
- */
 struct ActiveComponent : public Component {
     bool active = true;
     

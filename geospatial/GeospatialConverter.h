@@ -115,6 +115,10 @@ public:
         return glm::dvec3(originLat, originLon, originAlt);
     }
 
+    double getOriginLat() const { return originLat; }
+    double getOriginLon() const { return originLon; }
+    double getOriginAlt() const { return originAlt; }
+
     /**
      * Get the origin in ECEF.
      */

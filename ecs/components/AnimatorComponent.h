@@ -1,109 +1,103 @@
 #pragma once
 
 #include "../ECS.h"
+#include "../DynamicTypes.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <vector>
 #include <string>
 #include <map>
+#include <cstring>
 
-// Include engine Animation class
 #include "../../animationSystem/Animation.h"
 
 namespace ecs {
 
-/**
- * Bone/Joint data for skeletal animation
- */
+constexpr size_t MAX_BONE_NAME_LENGTH = 32;
+
 struct Bone {
-    std::string name;
+    char name[MAX_BONE_NAME_LENGTH];
     int parentIndex = -1;
     glm::mat4 inverseBindMatrix{1.0f};
     glm::mat4 localTransform{1.0f};
     glm::mat4 worldTransform{1.0f};
+    
+    Bone() { name[0] = '\0'; }
+    
+    Bone(const std::string& n, int parent) : parentIndex(parent) {
+        setName(n);
+    }
+    
+    void setName(const std::string& n) {
+        std::strncpy(name, n.c_str(), MAX_BONE_NAME_LENGTH - 1);
+        name[MAX_BONE_NAME_LENGTH - 1] = '\0';
+    }
+    
+    const char* getName() const { return name; }
+    
+    bool hasName() const { return name[0] != '\0'; }
 };
 
-/**
- * Skeleton Component - Bone hierarchy for animation
- */
 struct SkeletonComponent : public Component {
-    std::vector<Bone> bones;
+    DynamicVector<Bone> bones;
     int rootBoneIndex = -1;
 
-    // Bone texture info (for GPU skinning)
     int boneTextureWidth = 0;
     int boneTextureHeight = 0;
 
     SkeletonComponent() = default;
 
-    /**
-     * Find bone by name
-     */
     int findBoneIndex(const std::string& name) const {
         for (size_t i = 0; i < bones.size(); ++i) {
-            if (bones[i].name == name) {
+            if (std::strcmp(bones[i].name, name.c_str()) == 0) {
                 return static_cast<int>(i);
             }
         }
         return -1;
     }
 
-    /**
-     * Get bone count
-     */
     size_t getBoneCount() const { return bones.size(); }
 
-    /**
-     * Check if skeleton is valid
-     */
     bool isValid() const { return !bones.empty() && rootBoneIndex >= 0; }
+    
+    void setPool(DynamicPool* pool) { bones.setPool(pool); }
 };
 
-/**
- * Animator Component - Controls animation playback
- * Holds references to engine Animation objects
- */
 struct AnimatorComponent : public Component {
-    // Animation references (engine objects)
-    std::vector<Animation*> animations;  // Loaded animations
+    DynamicVector<Animation*> animations;
     int currentAnimation = -1;
     int previousAnimation = -1;
     
-    // Playback state
     float currentTime = 0.0f;
     float playbackSpeed = 1.0f;
     bool isPlaying = true;
     bool loop = true;
 
-    // Blending
     float blendWeight = 1.0f;
     float blendDuration = 0.2f;
     float blendTime = 0.0f;
     bool isBlending = false;
 
-    // Animation layers
     int activeLayer = 0;
-    std::vector<int> animationLayers;
+    DynamicVector<int> animationLayers;
 
-    // Root motion
     bool useRootMotion = true;
     glm::vec3 rootMotionDelta{0.0f};
     float rootMotionRotation = 0.0f;
 
     AnimatorComponent() = default;
+    
+    void setPool(DynamicPool* pool) { 
+        animations.setPool(pool); 
+        animationLayers.setPool(pool);
+    }
 
-    /**
-     * Add an animation to the animator
-     */
     void addAnimation(Animation* anim) {
         if (anim) {
             animations.push_back(anim);
         }
     }
 
-    /**
-     * Get animation by index
-     */
     Animation* getAnimation(int index) {
         if (index >= 0 && index < static_cast<int>(animations.size())) {
             return animations[index];
@@ -111,16 +105,10 @@ struct AnimatorComponent : public Component {
         return nullptr;
     }
 
-    /**
-     * Get current animation
-     */
     Animation* getCurrentAnimation() {
         return getAnimation(currentAnimation);
     }
 
-    /**
-     * Start playing an animation
-     */
     void play(int animIndex, bool loopAnim = true) {
         if (animIndex == currentAnimation) {
             isPlaying = true;
@@ -133,44 +121,17 @@ struct AnimatorComponent : public Component {
         loop = loopAnim;
         isPlaying = true;
 
-        // Start blending from previous animation
         if (previousAnimation >= 0) {
             isBlending = true;
             blendTime = 0.0f;
         }
     }
 
-    /**
-     * Stop animation
-     */
-    void stop() {
-        isPlaying = false;
-    }
+    void stop() { isPlaying = false; }
+    void pause() { isPlaying = false; }
+    void resume() { isPlaying = true; }
+    void setTime(float time) { currentTime = time; }
 
-    /**
-     * Pause animation
-     */
-    void pause() {
-        isPlaying = false;
-    }
-
-    /**
-     * Resume animation
-     */
-    void resume() {
-        isPlaying = true;
-    }
-
-    /**
-     * Set animation time
-     */
-    void setTime(float time) {
-        currentTime = time;
-    }
-
-    /**
-     * Get animation duration
-     */
     float getAnimationDuration() const {
         if (currentAnimation >= 0 && currentAnimation < static_cast<int>(animations.size())) {
             if (animations[currentAnimation]) {
@@ -180,9 +141,6 @@ struct AnimatorComponent : public Component {
         return 0.0f;
     }
 
-    /**
-     * Get normalized time (0-1)
-     */
     float getNormalizedTime() const {
         float duration = getAnimationDuration();
         if (duration <= 0.0f) return 0.0f;
@@ -190,15 +148,11 @@ struct AnimatorComponent : public Component {
     }
 };
 
-/**
- * Animation State Machine Component
- */
 struct AnimationStateComponent : public Component {
     int currentState = 0;
     int previousState = 0;
     float stateTime = 0.0f;
 
-    // State flags
     bool isIdle = true;
     bool isWalking = false;
     bool isRunning = false;
@@ -206,7 +160,6 @@ struct AnimationStateComponent : public Component {
     bool isFalling = false;
     bool isAttacking = false;
 
-    // Transition parameters
     float moveSpeed = 0.0f;
     float verticalVelocity = 0.0f;
     bool isGrounded = true;

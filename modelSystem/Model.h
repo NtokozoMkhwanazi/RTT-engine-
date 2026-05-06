@@ -5,6 +5,9 @@
 #include <memory>
 #include <unordered_map>
 #include <cfloat>
+#include <iostream>
+#include <future>
+#include <atomic>
 
 #include <glm/glm.hpp>
 
@@ -15,6 +18,7 @@
 #include "../shaderSystem/Shader.h"
 #include "../animationSystem/Animation.h"
 #include "../animationSystem/Animator.h"
+#include "../animationSystem/BoneMatrixBuffer.h"
 #include "../boneSystem/Skeleton.h"
 #include "../boneSystem/BoneName.h"
 
@@ -97,6 +101,53 @@ struct ModelInstance {
 };
 
 // ============================================================
+// Async Model Loading Data
+// ============================================================
+struct TexturePixelData {
+    std::string path;
+    std::string type;       // "diffuse", "normal", etc.
+    int width{0};
+    int height{0};
+    int channels{0};
+    std::vector<uint8_t> data;
+    bool isNormalMap{false};
+};
+
+struct AsyncModelData {
+    // Raw mesh data (CPU only, no GL resources)
+    struct RawMeshData {
+        std::vector<Vertex> vertices;
+        std::vector<unsigned int> indices;
+        PBRMaterial material;
+        std::string directory;
+        std::vector<std::pair<std::string, std::string>> texturePaths; // (path, type)
+    };
+    
+    std::vector<RawMeshData> meshes;
+    std::vector<TexturePixelData> textures;
+    std::vector<PBRMaterial> meshMaterials;
+    
+    // Skeleton & animation
+    Skeleton skeleton;
+    int rootBoneIndex{0};
+    std::vector<std::unique_ptr<Animation>> animations;
+    AssimpNodeData rootNode;
+    glm::mat4 globalInverseTransform{1.0f};
+    
+    // Bounding volumes
+    BoundingBox boundingBox;
+    BoundingSphere boundingSphere;
+    
+    // Metadata
+    std::string sourcePath;
+    std::string directory;
+    int totalTriangles{0};
+    int totalVertices{0};
+    bool success{false};
+    std::string error;
+};
+
+// ============================================================
 // Model Class
 // ============================================================
 // Model Class
@@ -107,8 +158,21 @@ public:
     explicit Model(const std::string& path = "");
     ~Model();
 
+    // Async loading handle
+    struct AsyncLoadHandle {
+        std::future<std::unique_ptr<AsyncModelData>> future;
+        float progress{0.0f};
+        bool isValid() const { return future.valid(); }
+        bool isComplete() const { return future.valid() && future.wait_for(std::chrono::seconds(0)) == std::future_status::ready; }
+    };
+
     // Factory method for programmatic mesh creation
     static Model* CreateFromVAO(GLuint VAO, GLsizei indexCount);
+
+    // Async loading factory methods
+    static AsyncLoadHandle LoadAsync(const std::string& path);
+    static Model* CreateFromAsync(AsyncLoadHandle& handle);
+    static std::unique_ptr<AsyncModelData> LoadModelData(const std::string& path, float* outProgress = nullptr);
 
     // Debug methods for programmatic mesh creation
     void setDebugVAO(GLuint VAO) { m_debugVAO = VAO; }
@@ -118,6 +182,7 @@ public:
     
     // Rendering
     void Draw(Shader& shader, Animator& animator);
+    void DrawStatic(Shader& shader);  // For models without animations
     void DrawLOD(Shader& shader, Animator& animator, const glm::vec3& cameraPos, float lodBias = 1.0f);
     void DrawInstanced(Shader& shader, Animator& animator, const std::vector<ModelInstance>& instances);
     
@@ -126,6 +191,7 @@ public:
     
     // Animation
     Animation* GetAnimation(size_t index);
+    const Animation* GetAnimation(size_t index) const;
     size_t GetAnimationCount() const { return m_Animations.size(); }
     
     // Model info
@@ -141,7 +207,9 @@ public:
     // Meshes
     Mesh& GetMesh(size_t i) { return meshes.at(i); }
     const Mesh& GetMesh(size_t i) const { return meshes.at(i); }
-    size_t GetMeshCount() const { return meshes.size(); }
+    size_t GetMeshCount() const { 
+        return meshes.size(); 
+    }
     
     // Materials
     void SetMeshMaterial(size_t meshIndex, const PBRMaterial& material);
@@ -182,9 +250,11 @@ private:
     BoundingBox boundingBox;
     BoundingSphere boundingSphere;
     
-    // Bone bookkeeping
-    int m_BoneCounter = 0;
+    // Bone texture (legacy - kept for compatibility)
     unsigned int boneTexID = 0;
+    
+    // SSBO/UBO for bone matrices (fast path)
+    BoneMatrixBuffer boneBuffer;
 
     // Debug output flag
     bool debugOutput = false;
@@ -196,6 +266,8 @@ private:
     // Loading
     void loadModel(const std::string& path);
     void calculateBoundingVolumes();
+    void setupFromAsyncData(std::unique_ptr<AsyncModelData> data);
+    unsigned int uploadTextureFromPixels(const TexturePixelData& texData);
     
     // Hierarchy
     void ReadHierarchyRecursive(AssimpNodeData& dest, const aiNode* src, const glm::mat4& accumulatedTransform);
@@ -228,4 +300,10 @@ private:
     
     // Utilities
     static glm::mat4 aiMat4ToGlm(const aiMatrix4x4& m);
+    
+    // Static helpers for async loading (no 'this' pointer)
+    static void ReadHierarchyStatic(AssimpNodeData& dest, const aiNode* src);
+    static void BuildNodeBoneMapStatic(AssimpNodeData& node, const std::unordered_map<std::string, int>& normBoneMap);
+    static void ExtractBonesStatic(aiMesh* mesh, Skeleton& skeleton);
+    static void extractBoneWeightsStatic(std::vector<Vertex>& vertices, aiMesh* mesh, Skeleton& skeleton);
 };

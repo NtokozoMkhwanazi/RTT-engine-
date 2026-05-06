@@ -39,16 +39,18 @@ struct Entity {
 using ComponentTypeID = size_t;
 
 /**
- * Get a unique type ID for each component type
+ * Get a unique type ID for each component type.
+ * Returns the registered ID for type T. Must be called after registration.
  */
 template<typename T>
-inline ComponentTypeID getComponentTypeID() {
-    static ComponentTypeID id = []() {
-        static ComponentTypeID nextID = 0;
-        return nextID++;
-    }();
-    return id;
-}
+ComponentTypeID getComponentTypeID();
+
+/**
+ * Register a component type and return its unique ID.
+ * Must be called exactly once per type, ideally in a single translation unit.
+ */
+template<typename T>
+ComponentTypeID registerComponentTypeID();
 
 /**
  * Get component type name (for debugging)

@@ -37,6 +37,11 @@ struct RigidBody {
     bool isModel {false};
     bool isPlayer {false};
 
+    // Sleeping system
+    bool isSleeping {false};
+    float sleepTime {0.0f};          // Time body has been below energy threshold
+    int sleepIslandIndex {-1};       // Island assignment for sleep management
+
     // Additional physics properties
     bool useContinuousCollisionDetection {false};
     float linearDamping {0.99f};
@@ -131,11 +136,23 @@ struct RigidBody {
     }
 
     void applyForce(const glm::vec3& f) {
-        if (!isStatic) forceAccumulator += f;
+        if (!isStatic) {
+            forceAccumulator += f;
+            if (isSleeping) {
+                isSleeping = false;
+                sleepTime = 0.0f;
+            }
+        }
     }
 
     void applyTorque(const glm::vec3& t) {
-        if (!isStatic) torqueAccumulator += t;
+        if (!isStatic) {
+            torqueAccumulator += t;
+            if (isSleeping) {
+                isSleeping = false;
+                sleepTime = 0.0f;
+            }
+        }
     }
 
     void clearAccumulators() {

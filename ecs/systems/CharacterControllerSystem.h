@@ -95,19 +95,19 @@ public:
     void createController(EntityID entityID, TransformComponent& transform, CharacterControllerComponent& controller) {
         if (!m_physicsWorld) return;
 
-        // Create rigidbody for character
-        auto body = std::make_shared<RigidBody>();
-        body->position = transform.position;
-        body->size = glm::vec3(controller.radius * 2.0f, controller.height, controller.radius * 2.0f);
-        body->mass = 80.0f;  // Default character mass
-        body->colliderType = ::ColliderType::CAPSULE;
-        body->isModel = false;
+        // Create rigidbody for character (added directly to contiguous storage)
+        RigidBody body;
+        body.position = transform.position;
+        body.size = glm::vec3(controller.radius * 2.0f, controller.height, controller.radius * 2.0f);
+        body.mass = 80.0f;  // Default character mass
+        body.colliderType = ::ColliderType::CAPSULE;
+        body.isModel = false;
 
-        // Add to physics world
-        m_physicsWorld->addBody(body);
+        // Add to physics world (returns handle)
+        BodyHandle handle = m_physicsWorld->addBody(body);
 
-        // Create character controller
-        auto charController = std::make_unique<CharacterController>(body, m_physicsWorld);
+        // Create character controller with direct pointer
+        auto charController = std::make_unique<CharacterController>(m_physicsWorld->getBody(handle), m_physicsWorld);
         
         // Configure character controller
         charController->setWalkSpeed(controller.moveSpeed);
@@ -117,7 +117,7 @@ public:
         charController->setMaxSlopeAngle(controller.slopeLimit);
 
         m_controllers[entityID] = std::move(charController);
-        m_bodies[entityID] = body;
+        m_bodies[entityID] = handle;
     }
 
     /**
@@ -165,8 +165,11 @@ public:
      */
     void teleport(Entity entity, const glm::vec3& position) {
         auto it = m_bodies.find(entity.id);
-        if (it != m_bodies.end() && it->second) {
-            it->second->position = position;
+        if (it != m_bodies.end() && m_physicsWorld) {
+            RigidBody* body = m_physicsWorld->getBody(it->second);
+            if (body) {
+                body->position = position;
+            }
         }
         
         auto* transform = m_componentManager->getComponent<TransformComponent>(entity.id);
@@ -188,8 +191,11 @@ public:
      */
     glm::vec3 getVelocity(Entity entity) const {
         auto it = m_bodies.find(entity.id);
-        if (it != m_bodies.end() && it->second) {
-            return it->second->velocity;
+        if (it != m_bodies.end() && m_physicsWorld) {
+            const RigidBody* body = m_physicsWorld->getBody(it->second);
+            if (body) {
+                return body->velocity;
+            }
         }
         return glm::vec3(0.0f);
     }
@@ -201,7 +207,7 @@ private:
     
     // Map from ECS entity ID to engine CharacterController
     std::unordered_map<EntityID, std::unique_ptr<CharacterController>> m_controllers;
-    std::unordered_map<EntityID, std::shared_ptr<RigidBody>> m_bodies;
+    std::unordered_map<EntityID, BodyHandle> m_bodies;
 };
 
 } // namespace ecs

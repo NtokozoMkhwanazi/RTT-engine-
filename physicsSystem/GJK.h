@@ -151,6 +151,15 @@ bool GJK_Intersect_Fast(
     std::function<SupportResult(const glm::vec3&)> supportB,
     int maxIterations = 100);
 
+/**
+ * GJK with simplex output (needed for EPA)
+ */
+bool GJK_Intersect_WithSimplex(
+    std::function<SupportResult(const glm::vec3&)> supportA,
+    std::function<SupportResult(const glm::vec3&)> supportB,
+    Simplex& outSimplex,
+    int maxIterations = 100);
+
 // ============================================================================
 // EPA (EXPANDING POLYTOPE ALGORITHM)
 // ============================================================================
@@ -229,6 +238,16 @@ bool GJK_BoxVsSphere(
     const glm::mat4& boxRotation,
     const glm::vec3& sphereCenter,
     float sphereRadius);
+
+/**
+ * Combined GJK + EPA: detect collision and return full contact info
+ */
+GJKResult GJK_DetectContact(
+    std::function<SupportResult(const glm::vec3&)> supportA,
+    std::function<SupportResult(const glm::vec3&)> supportB,
+    glm::vec3& outContactNormal,
+    float& outPenetrationDepth,
+    glm::vec3& outContactPoint);
 
 // ============================================================================
 // BROAD PHASE OPTIMIZATIONS

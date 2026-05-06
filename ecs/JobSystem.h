@@ -79,8 +79,17 @@ public:
         , m_activeJobs(0)
     {
         if (numThreads == 0) {
-            // Default to hardware concurrency minus 1 (leave one for main thread)
-            numThreads = std::max(1u, std::thread::hardware_concurrency() - 1);
+            // Ryzen 7 3700U: 4 cores, 8 threads
+            // Use 3 worker threads (main + 3 workers = 4 threads total)
+            // Leave 4 threads for OS, background tasks, and GPU driver
+            size_t hwThreads = std::thread::hardware_concurrency();
+            if (hwThreads >= 8) {
+                numThreads = 3;  // 3 workers for 8-thread CPU
+            } else if (hwThreads >= 4) {
+                numThreads = 2;  // 2 workers for 4-thread CPU
+            } else {
+                numThreads = 1;  // Single worker for dual-core
+            }
         }
         
         m_workers.reserve(numThreads);

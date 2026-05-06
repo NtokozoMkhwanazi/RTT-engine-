@@ -1,27 +1,12 @@
-# Geospatial System
+# Geospatial System - Digital Twin Platform
 
-Real-time geospatial tracking for the RTT Engine. Converts WGS84 geographic coordinates (latitude/longitude/altitude) to local engine space using double-precision math, avoiding float precision issues entirely.
+Real-time geospatial tracking and digital twin visualization for the RTT Engine. Converts WGS84 geographic coordinates (latitude/longitude/altitude) to local engine space using double-precision math, avoiding float precision issues entirely.
 
-## 📁 Files
-
-```
-geospatial/
-├── GeospatialConverter.h    # WGS84 ↔ ECEF ↔ ENU conversion engine
-├── GPSTracker.h             # Simulated GPS feed (4 modes)
-└── README.md                # This file
-
-ecs/components/
-└── GeospatialComponent.h    # Double-precision lat/lon/alt component
-
-ecs/systems/
-└── GeospatialSystem.h       # ECS system bridging GPS with entities
-```
-
-## 🏗️ Architecture
+## Architecture (Multithreaded)
 
 ### Zero Float Precision Debt
 
-The key design decision: **geospatial data stays `double`, existing systems stay `float`**.
+Geospatial data stays `double`, existing systems stay `float`.
 
 ```
 WGS84 (double)              Local Engine Space (float)
@@ -30,14 +15,45 @@ WGS84 (double)              Local Engine Space (float)
 │ lon:  151.2153       │───►│ position: glm::vec3      │
 │ alt:  50.0           │    │ (relative to origin)     │
 └──────────────────────┘    └──────────────────────────┘
-        ▲                              │
-        │                       All existing systems
-        │                       (Render, Physics, ECS)
-        │                       work unchanged
-  GeospatialConverter
-  - setOrigin(lat, lon, alt)
-  - geospatialToLocal() → glm::vec3
-  - localToGeospatial() → glm::dvec3
+         ▲                              │
+         │                       All existing systems
+         │                       (Render, Physics, ECS)
+         │                       work unchanged
+   GeospatialConverter
+   - setOrigin(lat, lon, alt)
+   - geospatialToLocal() → glm::vec3
+   - localToGeospatial() → glm::dvec3
+```
+
+### Multithreaded Pipeline
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              GeospatialSystem (Orchestrator)              │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────┐  │
+│  │ GeoIngestion │  │ GeoStorage   │  │ GeoPredic│  │
+│  │ System       │  │ System       │  │ tion     │  │
+│  │ (Thread 1)   │  │ (Thread 2)   │  │ System   │  │
+│  │              │  │              │  │ (Thread 3│  │
+│  │ GPS Feeds    │  │ InfluxDB     │  │          │  │
+│  │ REST/WS      │  │ Batch Write  │  │ Kalman/ML│  │
+│  └──────┬──────┘  └──────┬──────┘  └────┬─────┘  │
+│         │                │              │               │
+│         └────────────────┼──────────────┘               │
+│                          │                              │
+│              ┌───────────▼──────────┐                 │
+│              │ GeoVisualization   │                 │
+│              │ System             │                 │
+│              │ (Main Thread - GL) │                 │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+              ┌──────────────────────┐
+              │ GeoTerrainSystem   │
+              │ (Map/Terrain View) │
+              └──────────────────────┘
 ```
 
 ### Conversion Pipeline
@@ -55,196 +71,232 @@ ENU (East-North-Up relative to origin, double)
 Engine Space (glm::vec3, float)
 ```
 
-## 🚀 Usage
+## Files
 
-### Basic Setup
+```
+geospatial/
+├── GeospatialConverter.h    # WGS84 ↔ ECEF ↔ ENU conversion engine
+├── GPSTracker.h             # Simulated GPS feed (5 modes)
+├── DataFeedManager.h        # Real-time data ingestion (Phase 1)
+├── TimeSeriesDB.h           # InfluxDB storage (Phase 2)
+├── InfluxDBClient.h         # Lightweight InfluxDB v1 HTTP client
+├── PredictiveModel.h        # Kalman filter + prediction (Phase 3)
+├── TFLitePredictor.h        # TensorFlow Lite ML predictor
+└── trajectory_predict.tflite # Pre-trained ML model (43KB)
+
+ecs/systems/
+├── GeospatialSystem.h       # Orchestrator (backward compatible API)
+├── GeoIngestionSystem.h    # Phase 1: GPS input (threaded)
+├── GeoStorageSystem.h      # Phase 2: Time-series DB (threaded)
+├── GeoPredictionSystem.h   # Phase 3: ML prediction (threaded)
+├── GeoVisualizationSystem.h # Phase 4: OpenGL rendering
+├── GeoTerrainSystem.h     # Phase 5: Terrain integration (NEW!)
+└── GeoTerrainRenderer.h   # Map viewport with GPS overlay (NEW!)
+```
+
+## Usage
+
+### Initialize Digital Twin Platform
 
 ```cpp
-#include "ecs/components/GeospatialComponent.h"
 #include "ecs/systems/GeospatialSystem.h"
-#include "geospatial/GeospatialConverter.h"
-#include "geospatial/GPSTracker.h"
+#include "ecs/systems/GeoTerrainSystem.h"
+#include "renderer/GeoTerrainRenderer.h"
 
-// In your engine initialization:
+// Main orchestrator (backward compatible)
 ecs::GeospatialSystem geoSystem;
-
-// Set origin (e.g., Sydney Opera House)
-geoSystem.initialize(-33.8568, 151.2153, 50.0);
-
-// Set GPS simulation mode
+geoSystem.initialize(-33.8568, 151.2153, 50.0);  // Sydney Opera House
 geoSystem.setGPSMode(GPSTracker::Mode::SIMULATED_WALK);
-
-// Add to ECS world
 world.addSystem(&geoSystem);
+
+// Terrain integration (NEW!)
+ecs::GeoTerrainSystem geoTerrain;
+GeoTerrainConfig config;
+config.terrainSize = 2000.0f;
+config.heightScale = 100.0f;
+config.gridResolution = 256;
+geoTerrain.initialize(-33.8568, 151.2153, config);
+geoTerrain.setGeospatialSystem(&geoSystem);
+geoTerrain.generateTerrain();
+
+// Map viewport renderer
+GeoTerrainRenderer terrainRenderer;
+terrainRenderer.initialize();
 ```
 
 ### Per-Frame Update
 
 ```cpp
-// In your main loop (handled automatically if added to ECS world):
-world.update(dt);
+world.update(dt);  // Updates all systems
 
-// Or manually:
-geoSystem.update(dt);
-const GPSFix& fix = geoSystem.getCurrentGPSFix();
+// Render map viewport (top-right corner)
+terrainRenderer.renderMapViewport(&geoTerrain, &geoSystem, view, proj, width, height);
+
+// Render 3D terrain
+terrainRenderer.render3DTerrain(&geoTerrain, view, proj);
 ```
 
-### Converting Coordinates
+## Phase 1: Real-Time Data Ingestion (GeoIngestionSystem)
+
+- **Dedicated thread** for non-blocking data ingestion
+- REST API polling with custom parsers
+- WebSocket stream support (simulated)
+- NMEA 0183 GPS sentence parsing ($GPRMC)
+- Multi-threaded polling with callbacks
+- Thread-safe data queue
 
 ```cpp
-// WGS84 → Local space
-glm::vec3 localPos = geoSystem.getConverter().geospatialToLocal(
-    -33.8570,  // latitude
-    151.2155,  // longitude
-    55.0       // altitude (meters)
-);
-
-// Local space → WGS84
-glm::dvec3 geoPos = geoSystem.getConverter().localToGeospatial(localPos);
-// geoPos.x = latitude, geoPos.y = longitude, geoPos.z = altitude
+auto& ingestion = geoSystem.getIngestionSystem();
+ingestion.addRESTFeed("https://api.example.com/gps", 1000,
+    [](const std::string& json) -> GeoDataPoint {
+        // Parse JSON to GeoDataPoint
+        GeoDataPoint point;
+        // ... parse ...
+        return point;
+    });
+ingestion.startIngestion();  // Starts thread
 ```
 
-### Creating Geospatial Entities
+## Phase 2: Time-Series Storage (GeoStorageSystem)
+
+Uses **InfluxDB** for persistent time-series storage:
+
+- **Dedicated thread** for batch writes
+- In-memory circular buffer (10,000 points) for fast recent access
+- InfluxDB v1 HTTP API for persistent storage
+- Entity-indexed buffers for per-entity queries
+- Time-range queries, trajectory retrieval
+- Playback controller with variable speed
+
+### InfluxDB Connection
 
 ```cpp
-auto entity = world.createEntityWithComponents<
-    ecs::TransformComponent,
-    ecs::GeospatialComponent
->();
+auto& storage = geoSystem.getStorageSystem();
+storage.initialize("http://localhost", 8086, "geospatial");
 
-auto* transform = world.getComponentArchetype<ecs::TransformComponent>(entity);
-auto* geo = world.getComponentArchetype<ecs::GeospatialComponent>(entity);
+// Batch write (automatic in thread)
+storage.store(point);
 
-// Set geographic position
-geo->setLatLon(-33.8570, 151.2155);
-geo->setAltitude(55.0);
-geo->entityId = "player_1";
-
-// Convert to local space and update transform
-geoSystem.updateEntityFromGeospatial(entity.id, *geo, *transform);
+// Query trajectory
+auto history = storage.getTrajectory("gps_tracker", 1000);
 ```
 
-## 📡 GPS Tracker Modes
+## Phase 3: Prediction (GeoPredictionSystem)
 
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `DISABLED` | No GPS output | Testing without geospatial |
-| `SIMULATED_STATIC` | Fixed position with realistic noise | Stationary entity testing |
-| `SIMULATED_WALK` | Figure-8 walking pattern (~1.4 m/s) | Pedestrian simulation |
-| `SIMULATED_VEHICLE` | Circular vehicle path (~7 m/s) | Vehicle simulation |
-| `SIMULATED_AIRCRAFT` | Large circle at altitude (~70 m/s) | Aircraft simulation |
+**Dedicated thread** for prediction engine:
 
-### Configuring GPS
+1. **Kalman Filter** (default): 2D position/velocity tracking
+2. **TensorFlow Lite** (optional): ML-based prediction when model is loaded
+
+### Kalman Filter Features
+- Constant velocity model
+- Growing uncertainty with prediction horizon
+- Monte Carlo simulation (100+ simulations)
+- Confidence scoring per predicted point
+- Uncertainty ellipse calculation
+
+### ML Prediction (TensorFlow Lite)
 
 ```cpp
-// Change mode
-geoSystem.setGPSMode(GPSTracker::Mode::SIMULATED_VEHICLE);
+auto& prediction = geoSystem.getPredictionSystem();
+prediction.initialize(-33.8568, 151.2153, "geospatial/trajectory_predict.tflite");
 
-// Adjust speed (meters/second)
-geoSystem.setGPSSpeed(15.0);  // 15 m/s = 54 km/h
-
-// Adjust noise level (meters of position jitter)
-geoSystem.setGPSNoise(5.0f);  // 5m accuracy (poor GPS)
+// Async prediction (runs on thread)
+prediction.requestPrediction("entity_1", timestamp, 60.0, 50,
+    [](const PredictionResult& result) {
+        // Handle prediction result
+    });
 ```
 
-## 📐 Coordinate Math
+## Phase 4: Visualization (GeoVisualizationSystem)
 
-### Distance Between Points
+- **Runs on main thread** (OpenGL requirement)
+- OpenGL trajectory line rendering (history + predictions)
+- Color-coded confidence (green=high, red=low)
+- Heatmap point rendering
+- Uncertainty ellipse rendering
+- Speed-based coloring for historical trajectories
+
+## Phase 5: Terrain Integration (GeoTerrainSystem) - NEW!
+
+- **Project geospatial coordinates onto 3D terrain**
+- Map viewport with GPS track overlay (top-right corner)
+- Height-colored terrain visualization
+- LOD streaming based on camera position
+- Multithreaded terrain chunk generation
+- GPS trajectories draped over terrain surface
 
 ```cpp
-double dist = GeospatialConverter::haversineDistance(
-    lat1, lon1,  // Point A
-    lat2, lon2   // Point B
-);
-// Returns distance in meters
+// Project GPS coordinates to terrain
+auto projection = geoTerrain.projectToTerrain(lat, lon, alt);
+if (projection.onTerrain) {
+    glm::vec3 terrainPos = projection.terrainPos;
+    float height = projection.height;
+}
+
+// Auto-project ECS entities with GeospatialComponent
+ecs::World world;
+world.update(dt);  // Entities auto-snap to terrain
 ```
 
-### Bearing Between Points
+## GPS Tracker Modes
 
-```cpp
-double bearing = GeospatialConverter::bearing(
-    lat1, lon1,  // From
-    lat2, lon2   // To
-);
-// Returns degrees clockwise from North (0-360)
+| Mode | Description | Speed |
+|------|-------------|-------|
+| `DISABLED` | No GPS output | - |
+| `SIMULATED_STATIC` | Fixed position with noise | 0 m/s |
+| `SIMULATED_WALK` | Figure-8 walking pattern | ~1.4 m/s |
+| `SIMULATED_VEHICLE` | Circular vehicle path | ~7 m/s |
+| `SIMULATED_AIRCRAFT` | Large circle at altitude | ~70 m/s |
+
+## Digital Twin Use Cases
+
+### 1. Fleet Tracking
+- Ingest real-time GPS from multiple vehicles
+- Visualize trajectories on 3D terrain
+- Predict future positions with uncertainty
+
+### 2. Drone Simulation
+- Simulate aerial vehicles with altitude
+- Plan flight paths with ML prediction
+- Monitor battery, speed, and heading
+
+### 3. Smart City
+- Track public transport in real-time
+- Analyze traffic patterns with time-series data
+- Visualize heatmaps of activity
+
+### 4. Environmental Monitoring
+- Weather station data ingestion
+- Ocean current prediction
+- Wildlife tracking with GPS collars
+
+## Dependencies
+
+| Library | Purpose | Required |
+|---------|---------|----------|
+| libcurl | InfluxDB HTTP client, REST feeds | Yes |
+| InfluxDB v1+ | Time-series persistence | Optional |
+| libtensorflowlite_c | ML prediction | Optional |
+| OpenGL 4.5 | Visualization | Yes |
+
+## Known Limitations
+
+1. **Single origin**: One origin per scene. Multi-origin requires origin rebasing.
+2. **InfluxDB optional**: Falls back to memory-only if InfluxDB is not running.
+3. **TensorFlow Lite optional**: Falls back to Kalman Filter if library/model not found.
+4. **No map tiles**: Satellite imagery overlay not yet implemented.
+
+## Testing
+
+```bash
+# Build and run geoterrain integration tests
+make geoterrain_test && ./bin/geoterrain_test
+
+# Run main application with map viewport
+make && ./bin/test
+
+# Click "GPS" button to cycle modes
+# Enable "Geo" button to see visualization
+# View map viewport in top-right corner
 ```
-
-## 🎮 Editor Integration
-
-### Toolbar
-- **GPS Button**: Cycles through GPS simulation modes
-- Hover for current mode tooltip
-
-### Left Panel → "Geo" Tab
-- GPS mode and satellite count
-- WGS84 position (decimal degrees)
-- DMS format display
-- Speed, heading, simulation time
-- Distance and bearing from origin
-
-### Viewport Overlay
-- Camera position shown in top-left corner
-- Wireframe mode indicator
-
-## 🔬 Technical Details
-
-### WGS84 Ellipsoid Parameters
-
-| Parameter | Value |
-|-----------|-------|
-| Semi-major axis (a) | 6,378,137.0 m |
-| Flattening (f) | 1/298.257223563 |
-| Semi-minor axis (b) | 6,356,752.3142 m |
-| Eccentricity² (e²) | 0.00669437999014 |
-
-### ECEF Conversion
-
-Earth-Centered Earth-Fixed coordinates use the standard WGS84 ellipsoid model:
-
-```
-X = (N + h) · cos(φ) · cos(λ)
-Y = (N + h) · cos(φ) · sin(λ)
-Z = (N·(1-e²) + h) · sin(φ)
-```
-
-Where:
-- φ = latitude, λ = longitude, h = altitude
-- N = radius of curvature in the prime vertical
-
-### ENU Convention
-
-The converter uses East-North-Up convention, mapped to engine space as:
-- **East → +X**
-- **Up → +Y**
-- **South → +Z** (negative North)
-
-This maintains a right-handed coordinate system consistent with OpenGL conventions.
-
-## 🛣️ Future Phases
-
-### Phase 2 (Planned)
-- Origin rebasing for large-scale worlds
-- Real terrain heightmap import (SRTM data)
-- Satellite imagery overlay
-- Large-scale world chunking
-
-### Phase 3 (Planned)
-- Network layer for live data feeds
-- Real GPS device integration (NMEA serial)
-- Time-series entity tracking
-- Multi-entity geospatial queries
-
-## 🐛 Known Limitations
-
-1. **Single origin**: Currently supports one origin per scene. Multi-origin (continental scale) requires origin rebasing (Phase 2).
-
-2. **Simulated GPS only**: Real GPS device support planned for Phase 3.
-
-3. **No map tiles**: Satellite imagery overlay not yet implemented.
-
-## 📚 References
-
-- [WGS84 Standard](https://earth-info.nga.mil/GandG/wgs84.html)
-- [ECEF to ENU Conversion](https://gssc.esa.int/navipedia/index.php/Transformations_between_ECEF_and_ENU_coordinates)
-- [Haversine Formula](https://en.wikipedia.org/wiki/Haversine_formula)
-- [Bowring's Method](https://en.wikipedia.org/wiki/Geographic_coordinate_conversion)

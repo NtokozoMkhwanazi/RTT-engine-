@@ -1,4 +1,5 @@
 #include "grid_renderer.h"
+#include "editor_state.h"
 #include "editor/shader_manager.h"
 #include <vector>
 
@@ -6,7 +7,6 @@ namespace GridRenderer {
 
 static GLuint g_gridVAO = 0, g_gridVBO = 0;
 static GLsizei g_gridLineCount = 0;
-static bool g_show = true;
 
 void Init(int gridSize, float spacing) {
     std::vector<float> gridVerts;
@@ -54,7 +54,7 @@ void Cleanup() {
 }
 
 void Draw(const glm::mat4& view, const glm::mat4& projection, GLuint shaderProgram) {
-    if (!g_show || g_gridVAO == 0) return;
+    if (!g_editor.showGrid || g_gridVAO == 0) return;
 
     glDisable(GL_DEPTH_TEST);
     glUseProgram(shaderProgram);
@@ -85,7 +85,7 @@ void Draw(const glm::mat4& view, const glm::mat4& projection, GLuint shaderProgr
     glEnable(GL_DEPTH_TEST);
 }
 
-void Show(bool show) { g_show = show; }
-bool IsVisible() { return g_show; }
+void Show(bool show) { g_editor.showGrid = show; }
+bool IsVisible() { return g_editor.showGrid; }
 
 } // namespace GridRenderer

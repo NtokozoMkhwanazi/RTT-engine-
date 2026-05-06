@@ -1,93 +1,12 @@
 #include "entity_manager.h"
 #include "editor_state.h"
 #include "console.h"
+#include "ecs/components/ModelComponent.h"
+#include "modelSystem/ModelManager.h"
 
 namespace EntityManager {
 
-ecs::Entity CreateCube(const glm::vec3& pos, const glm::vec3& scale, const glm::vec3& color) {
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
-    if (!e.isValid()) return e;
-
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
-    auto* m = g_editor.world.getComponentArchetype<ecs::MeshComponent>(e);
-
-    if (t) { t->position = pos; t->scale = scale; t->rotation = glm::quat(1, 0, 0, 0); }
-    if (m) { m->visible = true; m->meshID = 0; m->color = color; m->meshType = ecs::MeshType::Cube; }
-
-    EditorConsole::Log("Created Cube at (" + std::to_string(pos.x) + ", " + 
-                       std::to_string(pos.y) + ", " + std::to_string(pos.z) + ")");
-    return e;
-}
-
-ecs::Entity CreateSphere(const glm::vec3& pos, float radius, const glm::vec3& color) {
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
-    if (!e.isValid()) return e;
-
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
-    auto* m = g_editor.world.getComponentArchetype<ecs::MeshComponent>(e);
-
-    if (t) { t->position = pos; t->scale = glm::vec3(radius); t->rotation = glm::quat(1, 0, 0, 0); }
-    if (m) { m->visible = true; m->color = color; m->meshID = 0; m->meshType = ecs::MeshType::Sphere; }
-
-    EditorConsole::Log("Created Sphere");
-    return e;
-}
-
-ecs::Entity CreatePlane(const glm::vec3& pos, const glm::vec2& size, const glm::vec3& color) {
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
-    if (!e.isValid()) return e;
-
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
-    auto* m = g_editor.world.getComponentArchetype<ecs::MeshComponent>(e);
-
-    if (t) { t->position = pos; t->scale = glm::vec3(size.x, 0.01f, size.y); t->rotation = glm::quat(1, 0, 0, 0); }
-    if (m) { m->visible = true; m->color = color; m->meshID = 0; m->meshType = ecs::MeshType::Plane; }
-
-    EditorConsole::Log("Created Plane");
-    return e;
-}
-
-ecs::Entity CreateCylinder(const glm::vec3& pos, float radius, float height, const glm::vec3& color) {
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
-    if (!e.isValid()) return e;
-
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
-    auto* m = g_editor.world.getComponentArchetype<ecs::MeshComponent>(e);
-
-    if (t) { t->position = pos; t->scale = glm::vec3(radius, height, radius); t->rotation = glm::quat(1, 0, 0, 0); }
-    if (m) { m->visible = true; m->color = color; m->meshID = 0; m->meshType = ecs::MeshType::Cylinder; }
-
-    EditorConsole::Log("Created Cylinder");
-    return e;
-}
-
-ecs::Entity CreateCone(const glm::vec3& pos, float radius, float height, const glm::vec3& color) {
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
-    if (!e.isValid()) return e;
-
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
-    auto* m = g_editor.world.getComponentArchetype<ecs::MeshComponent>(e);
-
-    if (t) { t->position = pos; t->scale = glm::vec3(radius, height, radius); t->rotation = glm::quat(1, 0, 0, 0); }
-    if (m) { m->visible = true; m->color = color; m->meshID = 0; m->meshType = ecs::MeshType::Cone; }
-
-    EditorConsole::Log("Created Cone");
-    return e;
-}
-
-ecs::Entity CreateTorus(const glm::vec3& pos, float majorRadius, float minorRadius, const glm::vec3& color) {
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
-    if (!e.isValid()) return e;
-
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
-    auto* m = g_editor.world.getComponentArchetype<ecs::MeshComponent>(e);
-
-    if (t) { t->position = pos; t->scale = glm::vec3(majorRadius); t->rotation = glm::quat(1, 0, 0, 0); }
-    if (m) { m->visible = true; m->color = color; m->meshID = 0; m->meshType = ecs::MeshType::Torus; }
-
-    EditorConsole::Log("Created Torus");
-    return e;
-}
+// Remove primitives - use model loading instead
 
 ecs::Entity CreateLight(const glm::vec3& pos, const glm::vec3& color, float intensity) {
     auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent>();
@@ -153,7 +72,7 @@ void DuplicateEntity(ecs::EntityID id) {
 std::string GetEntityName(ecs::EntityID id) {
     ecs::Entity entity{id};
     auto* n = g_editor.world.getComponentArchetype<ecs::NameComponent>(entity);
-    if (n) return n->name;
+    if (n && n->hasName()) return n->getName();
     return "Entity " + std::to_string(id);
 }
 
@@ -161,8 +80,78 @@ void SetEntityName(ecs::EntityID id, const std::string& name) {
     ecs::Entity entity{id};
     auto* n = g_editor.world.getComponentArchetype<ecs::NameComponent>(entity);
     if (n) {
-        n->name = name;
+        n->setName(name);
     }
+}
+
+ecs::Entity CreateModel(const std::string& modelPath, const glm::vec3& pos, const glm::vec3& scale, const glm::vec3& rotation) {
+    auto handle = ModelSystem::ModelRegistry::getInstance().load(modelPath);
+    Model* model = ModelSystem::ModelRegistry::getInstance().get(handle);
+    if (!model) {
+        EditorConsole::Log("Failed to load model: " + modelPath, 2);
+        return ecs::Entity{ecs::INVALID_ENTITY_ID};
+    }
+
+    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::ModelComponent>();
+    if (!e.isValid()) return e;
+
+    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
+    auto* m = g_editor.world.getComponentArchetype<ecs::ModelComponent>(e);
+
+    if (t) {
+        t->position = pos;
+        t->scale = scale;
+        t->setEulerAngles(glm::radians(rotation));
+    }
+
+    if (m) {
+        m->modelHandle = handle;
+        m->visible = true;
+        m->setModelPath(modelPath);
+    }
+
+    EditorConsole::Log("Loaded model: " + modelPath + 
+                       " | Meshes: " + std::to_string(model->GetMeshCount()) +
+                       " | Triangles: " + std::to_string(model->GetTotalTriangleCount()));
+    
+    return e;
+}
+
+ecs::Entity CreateAnimatedModel(const std::string& modelPath, const glm::vec3& pos, const glm::vec3& scale, const glm::vec3& rotation, int animationIndex) {
+    auto handle = ModelSystem::ModelRegistry::getInstance().load(modelPath);
+    Model* model = ModelSystem::ModelRegistry::getInstance().get(handle);
+    if (!model) {
+        EditorConsole::Log("Failed to load animated model: " + modelPath, 2);
+        return ecs::Entity{ecs::INVALID_ENTITY_ID};
+    }
+
+    if (model->GetAnimationCount() == 0) {
+        EditorConsole::Log("Model has no animations, creating as static model", 1);
+        return CreateModel(modelPath, pos, scale, rotation);
+    }
+
+    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::ModelComponent>();
+    if (!e.isValid()) return e;
+
+    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
+    auto* m = g_editor.world.getComponentArchetype<ecs::ModelComponent>(e);
+
+    if (t) {
+        t->position = pos;
+        t->scale = scale;
+        t->setEulerAngles(glm::radians(rotation));
+    }
+
+    if (m) {
+        m->modelHandle = handle;
+        m->visible = true;
+        m->setModelPath(modelPath);
+    }
+
+    EditorConsole::Log("Loaded model: " + modelPath +
+                       " | Animations: " + std::to_string(model->GetAnimationCount()));
+
+    return e;
 }
 
 } // namespace EntityManager

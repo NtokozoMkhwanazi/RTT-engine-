@@ -99,7 +99,7 @@ vec3 calculatePBR() {
     
     vec3 specular = (D * F * G) / (4.0 * NdotL * NdotV + 0.001);
     
-    vec3 ambient = vec3(0.03) * baseColor * ao;
+    vec3 ambient = vec3(0.15) * baseColor * ao;
     vec3 result = ambient + (diffuse + specular) * NdotL;
     
     result = result / (result + vec3(1.0));

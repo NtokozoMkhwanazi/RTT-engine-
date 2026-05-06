@@ -58,11 +58,10 @@ public:
         Target = glm::vec3(0.0f);
         FirstMouse = true;
         LastX = 400; LastY = 300;
-        // Don't call updateCameraVectors() - it would overwrite Position
-        // Calculate Right and Up from current Position/Target
-        glm::vec3 front = glm::normalize(Target - Position);
-        Right = glm::normalize(glm::cross(front, WorldUp));
-        Up = glm::normalize(glm::cross(Right, front));
+        
+        // Calculate orbit position from Yaw, Pitch, and DistanceToTarget
+        // This positions the camera correctly for orbit camera behavior
+        updateCameraVectors();
     }
 
     // Get view matrix

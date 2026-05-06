@@ -98,11 +98,31 @@ void InitEditor() {
     g_editor.renderSystem.setWorld(&g_editor.world);
     g_editor.renderSystem.setDefaultShaderProgram(ShaderManager::GetMainShaderProgram());
     g_editor.world.addSystem(&g_editor.renderSystem);
+
+    // Initialize Model Render System
+    g_editor.modelRenderSystem.setRenderer(&g_editor.renderer);
+    g_editor.modelRenderSystem.setWorld(&g_editor.world);
+    g_editor.modelRenderSystem.setDefaultShaderProgram(ShaderManager::GetMainShaderProgram());
+    g_editor.world.addSystem(&g_editor.modelRenderSystem);
     
     // Initialize Geospatial System
     g_editor.geospatialSystem.initialize(-33.8568, 151.2153, 50.0);
     g_editor.geospatialSystem.setGPSMode(GPSTracker::Mode::SIMULATED_WALK);
+
+    // Initialize GeoTerrain System (map/terrain integration)
+    ecs::GeoTerrainConfig terrainConfig;
+    terrainConfig.terrainSize = 2000.0f;
+    terrainConfig.heightScale = 100.0f;
+    terrainConfig.gridResolution = 256;
+    g_editor.geoTerrainSystem.initialize(-33.8568, 151.2153, terrainConfig);
+    g_editor.geoTerrainSystem.setGeospatialSystem(&g_editor.geospatialSystem);
+    g_editor.geoTerrainSystem.generateTerrain();
+
+    // Initialize GeoTerrain Renderer
+    g_editor.geoTerrainRenderer.initialize();
+
     g_editor.world.addSystem(&g_editor.geospatialSystem);
+    g_editor.world.addSystem(&g_editor.geoTerrainSystem);
     
     std::cout << "Editor initialized\n";
 }

@@ -203,19 +203,21 @@ private:
      * Calculate ideal camera position (without collision)
      */
     glm::vec3 calculateIdealPosition(const CameraInput& input) {
-        // Use character forward if available, otherwise calculate from camera
-        glm::vec3 forward = input.characterForward;
+        // Use yaw and pitch for orbit control
+        float yawRad = glm::radians(yaw);
+        float pitchRad = glm::radians(pitch);
         
-        if (glm::length(forward) < 0.01f) {
-            forward = input.characterPosition - position;
-            forward.y = 0.0f;
-            forward = glm::normalize(forward);
-        }
+        // Calculate direction from yaw and pitch
+        glm::vec3 direction;
+        direction.x = cos(yawRad) * cos(pitchRad);
+        direction.y = sin(pitchRad);
+        direction.z = sin(yawRad) * cos(pitchRad);
+        direction = glm::normalize(direction);
         
         // Calculate position behind character
         glm::vec3 idealPos = input.characterPosition 
-                           - forward * config.distance 
-                           + glm::vec3(0.0f, config.height, 0.0f);
+                           - direction * config.distance 
+                           + glm::vec3(0.0f, config.height * 0.3f, 0.0f);
         
         return idealPos;
     }

@@ -39,6 +39,17 @@ static glm::mat4 composeMatrix(const glm::vec3& translation, const glm::quat& ro
     return matrix;
 }
 
+/**
+ * Blend two TRS values (fast - no matrix operations)
+ */
+static Animator::BoneTRS BlendTRS(const Animator::BoneTRS& a, const Animator::BoneTRS& b, float t) {
+    Animator::BoneTRS result;
+    result.translation = glm::mix(a.translation, b.translation, t);
+    result.rotation = glm::normalize(glm::slerp(a.rotation, b.rotation, t));
+    result.scale = glm::mix(a.scale, b.scale, t);
+    return result;
+}
+
 // ============================================================
 // Animator Implementation
 // ============================================================
@@ -48,6 +59,28 @@ static glm::mat4 composeMatrix(const glm::vec3& translation, const glm::quat& ro
 // ------------------------------------------------------------
 // Animator
 // ------------------------------------------------------------
+Animator::~Animator() {
+    // Clear all owned resources
+    boneBuffer.reset();
+    
+    // Clear vectors to free memory
+    finalBoneMatrices.clear();
+    globalBoneMatrices.clear();
+    prevBoneWorldPos.clear();
+    currBoneWorldPos.clear();
+    ikOffsets.clear();
+    activeAnimations.clear();
+    queuedAnimations.clear();
+    cachedAnimationTimes.clear();
+    cachedBoneTransforms.clear();
+    animationEvents.clear();
+    
+    // Reset pointers (these are NOT owned, just references)
+    skeleton = nullptr;
+    current = nullptr;
+    next = nullptr;
+}
+
 Animator::Animator(const Skeleton *skel)
     : skeleton(skel),
       current(nullptr),
@@ -272,7 +305,7 @@ void Animator::Update(float dt)
                 }
                 else if (activeAnimations.size() > 1)
                 {
-                    // Multiple animations - full weighted blending
+                    // Multiple animations - TRS-based weighted blending (no decompose/recompose per layer)
                     // First, calculate total weight for normalization
                     float totalWeight = 0.0f;
                     for (const auto& layer : activeAnimations) {
@@ -283,40 +316,45 @@ void Animator::Update(float dt)
                     
                     if (totalWeight > 0.0f)
                     {
-                        // Apply each animation with normalized weight
-                        // Start with bind pose
-                        EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
-                        std::vector<glm::mat4> bindPose = finalBoneMatrices;
+                        size_t numBones = finalBoneMatrices.size();
                         
-                        // Apply each animation layer with its normalized weight
-                        for (size_t i = 0; i < activeAnimations.size(); i++) {
-                            const auto& layer = activeAnimations[i];
+                        // Start with bind pose TRS
+                        std::vector<BoneTRS> blendedTRS(numBones);
+                        {
+                            // Evaluate bind pose
+                            std::vector<BoneTRS> bindTRS;
+                            EvaluateNodeTRS(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f, bindTRS);
+                            if (bindTRS.size() <= numBones) {
+                                blendedTRS = bindTRS;
+                            }
+                        }
+                        
+                        // Apply each animation layer with normalized weight using TRS blending
+                        for (const auto& layer : activeAnimations) {
                             if (layer.animation && layer.enabled && layer.weight > 0.0f) {
                                 float normalizedWeight = layer.weight / totalWeight;
                                 
-                                // Evaluate this animation
-                                EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), layer.animation, layer.time);
+                                // Evaluate this animation directly to TRS (no matrix decompose needed)
+                                std::vector<BoneTRS> animTRS;
+                                EvaluateNodeTRS(skeleton->rootNode, glm::mat4(1.0f), layer.animation, layer.time, animTRS);
                                 
-                                // Blend with accumulated result using matrix interpolation
-                                for (size_t j = 0; j < finalBoneMatrices.size() && j < bindPose.size(); j++) {
-                                    // Decompose matrices for proper blending
-                                    glm::vec3 bindScale, bindTrans;
-                                    glm::quat bindRot;
-                                    decomposeMatrix(bindPose[j], bindTrans, bindRot, bindScale);
-                                    
-                                    glm::vec3 currScale, currTrans;
-                                    glm::quat currRot;
-                                    decomposeMatrix(finalBoneMatrices[j], currTrans, currRot, currScale);
-                                    
-                                    // Blend components
-                                    glm::vec3 blendedTrans = glm::mix(bindTrans, currTrans, normalizedWeight);
-                                    glm::quat blendedRot = glm::slerp(bindRot, currRot, normalizedWeight);
-                                    glm::vec3 blendedScale = glm::mix(bindScale, currScale, normalizedWeight);
-                                    
-                                    // Recompose matrix
-                                    finalBoneMatrices[j] = composeMatrix(blendedTrans, blendedRot, blendedScale);
+                                // Blend TRS directly (avoid decomposeMatrix per bone per layer)
+                                size_t blendCount = std::min(numBones, animTRS.size());
+                                for (size_t j = 0; j < blendCount; j++) {
+                                    blendedTRS[j] = BlendTRS(blendedTRS[j], animTRS[j], normalizedWeight);
                                 }
                             }
+                        }
+                        
+                        // Compose TRS to final bone matrices ONCE (not per layer)
+                        for (size_t j = 0; j < numBones && j < skeleton->bones.size(); j++) {
+                            glm::mat4 globalTransform =
+                                glm::translate(glm::mat4(1.0f), blendedTRS[j].translation) *
+                                glm::mat4_cast(blendedTRS[j].rotation) *
+                                glm::scale(glm::mat4(1.0f), blendedTRS[j].scale);
+                            
+                            globalBoneMatrices[j] = globalTransform;
+                            finalBoneMatrices[j] = globalTransform * skeleton->bones[j].offset;
                         }
                         
                         dominantLayerIdx = 0;
@@ -584,6 +622,86 @@ void Animator::EvaluateNode(
         {
             EvaluateNode(child, globalTransform, blendAnim, blendFactor);
         }
+    }
+}
+
+// ============================================================
+// TRS-based Evaluation (for fast multi-layer blending)
+// ============================================================
+void Animator::EvaluateNodeTRS(
+    const AssimpNodeData &node,
+    const glm::mat4& parentGlobal,
+    Animation* anim,
+    float time,
+    std::vector<Animator::BoneTRS>& outTRS)
+{
+    std::string name = NormalizeBoneName(node.name);
+
+    glm::mat4 bindLocal = node.transform;
+
+    // ---- Decompose bind pose ----
+    glm::vec3 bindScale, bindPos, skew;
+    glm::quat bindRot;
+    glm::vec4 perspective;
+
+    glm::decompose(bindLocal, bindScale, bindRot, bindPos, skew, perspective);
+    bindRot = glm::normalize(bindRot);
+
+    // ---- Start from bind pose ----
+    glm::vec3 pos = bindPos;
+    glm::quat rot = bindRot;
+    glm::vec3 scale = bindScale;
+
+    // ---- Apply animation (override bind channels) ----
+    if (anim)
+    {
+        if (const BoneAnimation *boneAnim = anim->GetBoneAnimation(name))
+        {
+            if (boneAnim->HasPositionAnimation())
+            {
+                pos = boneAnim->InterpolatePosition(time);
+                
+                if (lockRootPosition && node.boneIndex == skeleton->rootBoneIndex) {
+                    pos = bindPos;
+                }
+            }
+
+            if (boneAnim->HasRotationAnimation())
+            {
+                rot = boneAnim->InterpolateRotation(time);
+            }
+
+            if (boneAnim->HasScaleAnimation())
+            {
+                scale = boneAnim->InterpolateScale(time);
+            }
+
+            if (debugForceIdentityScale)
+                scale = glm::vec3(1.0f);
+        }
+    }
+
+    int boneIndex = node.boneIndex;
+
+    if (boneIndex != -1)
+    {
+        if (boneIndex >= static_cast<int>(outTRS.size())) {
+            outTRS.resize(boneIndex + 1);
+        }
+        outTRS[boneIndex] = {pos, rot, scale};
+    }
+
+    // ---- Compute global for children ----
+    glm::mat4 localTransform =
+        glm::translate(glm::mat4(1.0f), pos) *
+        glm::mat4_cast(rot) *
+        glm::scale(glm::mat4(1.0f), scale);
+
+    glm::mat4 globalTransform = parentGlobal * localTransform;
+
+    for (const auto &child : node.children)
+    {
+        EvaluateNodeTRS(child, globalTransform, anim, time, outTRS);
     }
 }
 

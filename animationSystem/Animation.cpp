@@ -264,3 +264,156 @@ size_t Animation::GetCompressedSize() const
     }
     return count;
 }
+
+size_t Animation::GetOriginalKeyframeCount() const
+{
+    return originalKeyframeCount > 0 ? originalKeyframeCount : GetTotalKeyframeCount();
+}
+
+float Animation::GetCompressionRatio() const
+{
+    size_t original = GetOriginalKeyframeCount();
+    size_t compressed = GetCompressedSize();
+    return (original > 0) ? static_cast<float>(compressed) / static_cast<float>(original) : 1.0f;
+}
+
+void Animation::RemoveConstantChannels(float tolerance)
+{
+    for (auto it = boneAnimations.begin(); it != boneAnimations.end(); ) {
+        auto& [name, boneAnim] = *it;
+        bool hasConstantPos = false;
+        bool hasConstantRot = false;
+        bool hasConstantScale = false;
+        
+        // Check if position channel is constant
+        if (boneAnim.positionValues.size() > 1) {
+            hasConstantPos = true;
+            const auto& firstPos = boneAnim.positionValues[0];
+            for (size_t i = 1; i < boneAnim.positionValues.size(); ++i) {
+                if (glm::distance(firstPos, boneAnim.positionValues[i]) > tolerance) {
+                    hasConstantPos = false;
+                    break;
+                }
+            }
+        }
+        
+        // Check if rotation channel is constant
+        if (boneAnim.rotationValues.size() > 1) {
+            hasConstantRot = true;
+            const auto& firstRot = boneAnim.rotationValues[0];
+            for (size_t i = 1; i < boneAnim.rotationValues.size(); ++i) {
+                float dot = glm::abs(glm::dot(firstRot, boneAnim.rotationValues[i]));
+                if (dot < (1.0f - tolerance)) {
+                    hasConstantRot = false;
+                    break;
+                }
+            }
+        }
+        
+        // Check if scale channel is constant
+        if (boneAnim.scaleValues.size() > 1) {
+            hasConstantScale = true;
+            const auto& firstScale = boneAnim.scaleValues[0];
+            for (size_t i = 1; i < boneAnim.scaleValues.size(); ++i) {
+                if (glm::distance(firstScale, boneAnim.scaleValues[i]) > tolerance) {
+                    hasConstantScale = false;
+                    break;
+                }
+            }
+        }
+        
+        // Collapse constant channels to single keyframe
+        if (hasConstantPos && boneAnim.positionValues.size() > 1) {
+            boneAnim.positionTimes = {boneAnim.positionTimes[0]};
+            boneAnim.positionValues = {boneAnim.positionValues[0]};
+        }
+        if (hasConstantRot && boneAnim.rotationValues.size() > 1) {
+            boneAnim.rotationTimes = {boneAnim.rotationTimes[0]};
+            boneAnim.rotationValues = {boneAnim.rotationValues[0]};
+        }
+        if (hasConstantScale && boneAnim.scaleValues.size() > 1) {
+            boneAnim.scaleTimes = {boneAnim.scaleTimes[0]};
+            boneAnim.scaleValues = {boneAnim.scaleValues[0]};
+        }
+        
+        ++it;
+    }
+}
+
+void Animation::QuantizeTranslations(uint8_t bits)
+{
+    if (bits < 8 || bits > 32) return;
+    
+    float maxVal = (1 << bits) - 1;
+    float invMaxVal = 1.0f / maxVal;
+    
+    for (auto& [name, boneAnim] : boneAnimations) {
+        // Quantize and dequantize position values
+        for (auto& pos : boneAnim.positionValues) {
+            pos.x = std::round(pos.x * maxVal) * invMaxVal;
+            pos.y = std::round(pos.y * maxVal) * invMaxVal;
+            pos.z = std::round(pos.z * maxVal) * invMaxVal;
+        }
+    }
+}
+
+void Animation::QuantizeRotations(uint8_t bits)
+{
+    if (bits < 8 || bits > 32) return;
+    
+    float maxVal = (1 << bits) - 1;
+    float invMaxVal = 1.0f / maxVal;
+    
+    for (auto& [name, boneAnim] : boneAnimations) {
+        for (auto& rot : boneAnim.rotationValues) {
+            // Quantize each component
+            float qx = std::round(rot.x * maxVal) * invMaxVal;
+            float qy = std::round(rot.y * maxVal) * invMaxVal;
+            float qz = std::round(rot.z * maxVal) * invMaxVal;
+            float qw = std::round(rot.w * maxVal) * invMaxVal;
+            
+            // Re-normalize to ensure unit quaternion
+            glm::quat quantized(qw, qx, qy, qz);
+            rot = glm::normalize(quantized);
+        }
+    }
+}
+
+void Animation::QuantizeScales(uint8_t bits)
+{
+    if (bits < 8 || bits > 32) return;
+    
+    float maxVal = (1 << bits) - 1;
+    float invMaxVal = 1.0f / maxVal;
+    
+    for (auto& [name, boneAnim] : boneAnimations) {
+        for (auto& scale : boneAnim.scaleValues) {
+            scale.x = std::round(scale.x * maxVal) * invMaxVal;
+            scale.y = std::round(scale.y * maxVal) * invMaxVal;
+            scale.z = std::round(scale.z * maxVal) * invMaxVal;
+        }
+    }
+}
+
+void Animation::FullCompression(float keyframeTolerance)
+{
+    // Store original keyframe count before compression
+    if (originalKeyframeCount == 0) {
+        originalKeyframeCount = GetTotalKeyframeCount();
+    }
+    
+    // Step 1: Remove constant channels (biggest win for idle bones)
+    RemoveConstantChannels(0.001f);
+    
+    // Step 2: Iterative keyframe reduction
+    Compress(keyframeTolerance, keyframeTolerance * 0.5f, keyframeTolerance);
+    
+    // Step 3: Quantize values (enables better compression for storage)
+    QuantizeTranslations(16);
+    QuantizeRotations(14);
+    QuantizeScales(16);
+    
+    // Update compression statistics
+    isCompressed = true;
+    compressionRatio = GetCompressionRatio();
+}

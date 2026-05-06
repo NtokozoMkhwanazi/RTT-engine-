@@ -48,6 +48,15 @@ public:
     void Compress(float positionTolerance = 0.01f, float rotationTolerance = 0.01f, float scaleTolerance = 0.01f);
     void ReduceKeyframes(float tolerance = 0.01f);
     size_t GetCompressedSize() const;
+    
+    // Advanced compression
+    void RemoveConstantChannels(float tolerance = 0.001f);
+    void QuantizeTranslations(uint8_t bits = 16);
+    void QuantizeRotations(uint8_t bits = 14);
+    void QuantizeScales(uint8_t bits = 16);
+    void FullCompression(float keyframeTolerance = 0.005f);
+    size_t GetOriginalKeyframeCount() const;
+    float GetCompressionRatio() const;
 
 //temp
 public:
@@ -60,5 +69,6 @@ public:
     // Compression data
     bool isCompressed = false;
     float compressionRatio = 1.0f;
+    size_t originalKeyframeCount = 0;
 };
 

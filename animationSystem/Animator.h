@@ -18,6 +18,7 @@ class Animator
 {
 public:
     Animator(const Skeleton *skeleton);
+    ~Animator();
 
     void Play(Animation *animation);
     void BlendTo(Animation *animation, float duration);
@@ -240,6 +241,13 @@ public:
             : animation(anim), weight(w), targetWeight(w), blendProgress(0.0f), blendDuration(dur), time(0.0f), normalizedWeight(1.0f) {}
     };
 
+    // TRS structure for fast multi-layer blending (avoids matrix decompose/recompose)
+    struct BoneTRS {
+        glm::vec3 translation{0.0f};
+        glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+        glm::vec3 scale{1.0f};
+    };
+
 private:
     // Animation Quality of Service
     AnimationQualityLevel qualityLevel = AnimationQualityLevel::HIGH;
@@ -327,6 +335,14 @@ private:
         const glm::mat4 &parent,
         Animation *blendAnim,
         float blendFactor);
+
+    // TRS-based evaluation for fast multi-layer blending
+    void EvaluateNodeTRS(
+        const AssimpNodeData &node,
+        const glm::mat4& parentGlobal,
+        Animation* anim,
+        float time,
+        std::vector<BoneTRS>& outTRS);
 
     // static std::string NormalizeName(const std::string& name);
 };

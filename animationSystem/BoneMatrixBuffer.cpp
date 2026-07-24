@@ -3,6 +3,15 @@
 #include <chrono>
 #include <cstring>
 
+// Local copy of the binding point. The canonical definition lives in
+// renderer/Renderer.h (#define BONE_BUFFER_BINDING 3). We can't pull Renderer.h
+// here without dragging in heavy GL/font dependencies and risking circular
+// includes, so we duplicate the constant and rely on the shader (VS.glsl)
+// as the runtime source of truth. If you change one, change all three.
+#ifndef BONE_BUFFER_BINDING
+#define BONE_BUFFER_BINDING 3
+#endif
+
 // Define SSBO constants if not available (OpenGL 4.3+)
 #ifndef GL_SHADER_STORAGE_BUFFER
 #define GL_SHADER_STORAGE_BUFFER 0x90D2
@@ -90,7 +99,7 @@ bool BoneMatrixBuffer::Initialize(size_t maxBones, const BoneBufferConfig& cfg) 
         // UBO binding
         glBindBuffer(GL_UNIFORM_BUFFER, buffer);
         glBufferData(GL_UNIFORM_BUFFER, bufferSize, nullptr, GL_DYNAMIC_DRAW);
-        glBindBufferBase(GL_UNIFORM_BUFFER, 0, buffer);
+        glBindBufferBase(GL_UNIFORM_BUFFER, BONE_BUFFER_BINDING, buffer);
         glBindBuffer(GL_UNIFORM_BUFFER, 0);
         
         std::cout << "[BoneMatrixBuffer] UBO initialized: " << maxBones << " bones, " 
@@ -99,7 +108,7 @@ bool BoneMatrixBuffer::Initialize(size_t maxBones, const BoneBufferConfig& cfg) 
         // SSBO binding
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
         glBufferData(GL_SHADER_STORAGE_BUFFER, bufferSize, nullptr, GL_DYNAMIC_DRAW);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BONE_BUFFER_BINDING, buffer);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         
         std::cout << "[BoneMatrixBuffer] SSBO initialized: " << maxBones << " bones, " 
@@ -124,7 +133,8 @@ void BoneMatrixBuffer::Shutdown() {
     initialized = false;
     needsUpdate = true;
     
-    std::cout << "[BoneMatrixBuffer] Shutdown complete\n";
+    // Only print if it was actually initialized to avoid spam during global destruction
+    // std::cout << "[BoneMatrixBuffer] Shutdown complete\n";
 }
 
 bool BoneMatrixBuffer::Update(const std::vector<glm::mat4>& boneMatrices, bool forceUpdate) {
@@ -238,7 +248,13 @@ void BoneMatrixBuffer::Bind(GLuint bindingPoint) const {
     }
 
     if (bufferType == BoneBufferType::UBO) {
-        glBindBufferBase(GL_UNIFORM_BUFFER, bindingPoint, buffer);
+        // Bind only the range that contains valid bone matrices, rounded up to
+        // std140 mat4 alignment (64 bytes). This keeps the bound size within the
+        // shader-declared block size and avoids GL_INVALID_OPERATION on strict
+        // drivers when the buffer is smaller than the declared array.
+        size_t size = ((currentBoneCount * 64 + 255) / 256) * 256;
+        if (size == 0) size = 64;
+        glBindBufferRange(GL_UNIFORM_BUFFER, bindingPoint, buffer, 0, size);
     } else {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, bindingPoint, buffer);
     }

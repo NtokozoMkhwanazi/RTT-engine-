@@ -350,7 +350,11 @@ void HybridMMFSM::UpdateCrouch(float dt) {
         crouchInput.grounded = characterState.grounded;
 
         // Temporarily switch to crouch database
-        motionMatcher.SetDatabase(std::move(it->second), 0.1f);
+        // Temporarily switch to crouch database (non-owning — the database
+        // remains owned by stateDatabases so the next UpdateCrouch call can
+        // still find it. Previously this std::move'd the unique_ptr out of
+        // the map, permanently emptying the slot).
+        motionMatcher.SetDatabase(*it->second, 0.1f);
         motionMatcher.Update(dt, crouchInput, crouchState);
     } else {
         // Fallback: use locomotion MM with crouching flag

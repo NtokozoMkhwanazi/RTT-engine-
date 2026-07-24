@@ -37,7 +37,7 @@ enum class BoneBufferType {
 
 // Configuration
 struct BoneBufferConfig {
-    size_t uboMaxBones = 120;      // Switch to SSBO above this count
+    size_t uboMaxBones = 256;      // Switch to SSBO above this count
     bool preferSSBO = false;        // Force SSBO even for small skeletons (for crowds)
     bool usePersistentMapping = false;  // Use persistent mapping for even faster updates
 };

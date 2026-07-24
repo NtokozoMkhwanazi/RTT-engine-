@@ -195,7 +195,7 @@ TEST_F(MotionMatchingIntegrationTest, MotionDatabase_GetPoses_ForKDTree) {
     matcher->LoadAnimation("Test", testAnim);
 
     // Get poses for KD-Tree building
-    const auto& poses = matcher->GetDatabase().GetPoses();
+    const auto& poses = matcher->GetDatabase()->GetPoses();
 
     // Should have some poses (depends on animation length)
     EXPECT_GT(poses.size(), 0);

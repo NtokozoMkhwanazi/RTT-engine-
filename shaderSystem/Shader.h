@@ -2,7 +2,9 @@
 #define SHADER_H
 
 #include <string>
+#include <unordered_map>
 #include <glm/glm.hpp>
+#include <glad/glad.h>
 
 // ------------------------------------------------------------
 // Shader Class
@@ -12,8 +14,11 @@ class Shader
 public:
     unsigned int ID;
 
-    // Constructor
+    // Constructor (from file paths)
     Shader(const char* vertexPath, const char* fragmentPath);
+
+    // Constructor (from raw source strings)
+    Shader(const std::string& vertexSource, const std::string& fragmentSource, bool fromString);
 
     // Use program
     void use() const;
@@ -25,9 +30,15 @@ public:
     void setVec3 (const std::string& name, const glm::vec3& value) const;
     void setMat4 (const std::string& name, const glm::mat4& mat) const;
 
+    // Get cached uniform location
+    GLint getUniformLocation(const std::string& name) const;
+
 private:
     // Internal error checking
     void checkCompileErrors(unsigned int shader, const std::string& type);
+
+    // Cached uniform locations (populated on first use)
+    mutable std::unordered_map<std::string, GLint> m_uniformLocations;
 };
 
 #endif // SHADER_H

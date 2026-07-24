@@ -10,18 +10,22 @@
 CXX       := g++
 CXXFLAGS  := -std=c++17 -Wall -Wextra -Wno-unused-parameter
 
+# --- Optional: disable geospatial subsystem for faster iteration ---
+ifdef DISABLE_GEOSPATIAL
+    CXXFLAGS += -DDISABLE_GEOSPATIAL
+endif
+
 # --- Build mode ---
 MODE ?= debug
 
 # --- Output names ---
-TARGET    := test
+TARGET    := app
 TEST_TARGET := test_runner
-BIN_DIR   := bin
 BUILD_DIR := build
 TEST_DIR  := tests
 
 # --- Include paths ---
-INCLUDES := -I. -Isrc -IcameraSystem -ImotionMatching -IanimationSystem -IboneSystem -IshaderSystem -ImeshSystem -ImodelSystem -IphysicsSystem -IplayerSystem -Irenderer -Ilighting -Imemory -Iworld -Idemo -Iutils -IanimationSystem -Irenderer -Iutils -ImeshSystem -Iecs -I/usr/include/jsoncpp
+INCLUDES := -I. -Isrc -IcameraSystem -ImotionMatching -IanimationSystem -IboneSystem -IshaderSystem -ImeshSystem -ImodelSystem -IphysicsSystem -IplayerSystem -Irenderer -Ilighting -Imemory -Iworld -Idemo -Iutils -IanimationSystem -Irenderer -Iutils -ImeshSystem -Iecs -Ieditor -Igeospatial -I/usr/include/jsoncpp -I/usr/include/eigen3
 
 # ImGui support (optional)
 IMGUI_DIR := external/imgui
@@ -38,21 +42,21 @@ else
 endif
 
 # --- Libraries (your engine dependencies) ---
-LIBS := -lassimp -lopenal -lz -ldl -lglfw -lGL -lX11 -lGLEW -ljsoncpp -pthread
+LIBS := -lassimp -lopenal -lz -ldl -lglfw -lGL -lX11 -lGLEW -ljsoncpp -pthread -lcurl
 
 # --- Google Test (installed via apt) ---
 GTEST_LIBS := -lgtest -lgtest_main -pthread
 
 # --- Mode flags ---
 ifeq ($(MODE),release)
-	CXXFLAGS += -O2 -DNDEBUG -fsanitize=address
-	LDFLAGS += -fsanitize=address
+	CXXFLAGS += -O2 -DNDEBUG
+	LDFLAGS := 
 else ifeq ($(MODE),asan)
 	CXXFLAGS += -g -O0 -DDEBUG -fsanitize=address -fno-omit-frame-pointer
-	LDFLAGS += -fsanitize=address
+	LDFLAGS := -fsanitize=address -rdynamic
 else
 	CXXFLAGS += -g -O0 -DDEBUG
-	LDFLAGS += -fsanitize=address
+	LDFLAGS := 
 endif
 
 # --- Source files (auto collect) ---
@@ -70,7 +74,17 @@ SRC_CPP := \
 	$(wildcard world/*.cpp) \
 	$(wildcard motionMatching/*.cpp) \
 	$(wildcard demo/*.cpp) \
+	$(wildcard editor/*.cpp) \
+	$(wildcard geospatial/*.cpp) \
+	$(wildcard ecs/systems/*.cpp) \
+	ComponentRegistry.cpp \
+	ecs/ComponentTypeID.cpp \
 	test.cpp
+
+# --- Optional: drop geospatial sources when DISABLE_GEOSPATIAL=1 ---
+ifdef DISABLE_GEOSPATIAL
+    SRC_CPP := $(filter-out editor/geo_config_panel.cpp,$(SRC_CPP))
+endif
 
 # ImGui source files (if enabled)
 ifeq ($(IMGUI_ENABLED),1)
@@ -109,12 +123,12 @@ TEST_OBJ := $(patsubst $(TEST_DIR)/%.cpp,$(BUILD_DIR)/tests/%.o,$(TEST_SRC))
 OBJS    := $(filter-out build/test.o,$(OBJ_CPP)) $(OBJ_C)
 
 # --- Final output ---
-OUTPUT := $(BIN_DIR)/$(TARGET)
+OUTPUT := $(TARGET)
 
 # ============================================================
 #  Default target
 # ============================================================
-all: dirs $(OUTPUT)
+all: dirs copy-fonts $(OUTPUT)
 
 # ============================================================
 #  Link
@@ -140,17 +154,25 @@ $(BUILD_DIR)/%.o: %.c
 #  Create output directories
 # ============================================================
 dirs:
-	@mkdir -p $(BIN_DIR)
 	@mkdir -p $(BUILD_DIR)
+
+# ============================================================
+#  Copy required fonts to bin
+# ============================================================
+copy-fonts: dirs
+	@echo "Copying fonts..."
+	@cp -n phosphor-icons/Fonts/regular/Phosphor.ttf . 2>/dev/null || true
+	@cp -n devicon-master/fonts/devicon.ttf . 2>/dev/null || true
+	@echo "Fonts copied."
 
 # ============================================================
 #  Run
 # ============================================================
-run: all
-	./$(OUTPUT)
+run: all copy-fonts
+	./$(TARGET)
 
 # Run with ECS debug
-run-ecs: all
+run-ecs: all copy-fonts
 	./$(OUTPUT)
 
 # ============================================================
@@ -162,7 +184,7 @@ clean:
 # ============================================================
 #  Rebuild
 # ============================================================
-rebuild: clean all
+rebuild: clean all copy-fonts
 
 # ============================================================
 #  Release build
@@ -232,7 +254,15 @@ viewport-debug-test: $(OBJS)
 	@echo "Run with: ./bin/viewport_debug_test"
 
 # Build all test applications
-all-tests: physics_test animation_test world_test viewport-test
+all-tests: physics_test animation_test world_test viewport-test geoterrain_test
+
+# GeoTerrain integration test
+geoterrain_test: $(OBJS)
+	@echo "\n========================================"
+	@echo "  Building GeoTerrain Test"
+	@echo "========================================\n"
+	$(CXX) $(CXXFLAGS) $(INCLUDES) tests/test_geoterrain.cpp $(filter-out build/test.o,$(OBJS)) -o $(BIN_DIR)/geoterrain_test $(LIBS)
+	@echo "Run with: ./bin/geoterrain_test"
 
 # Clean test applications
 clean-test-apps:

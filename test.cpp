@@ -1,464 +1,163 @@
-/**
- * ============================================================================
- * RTT ENGINE EDITOR - Modular Version
- * ============================================================================
- * Main entry point that uses modular editor components:
- * - editor/editor_state.h    - Global editor state
- * - editor/ui.h              - ImGui UI rendering
- * - editor/mesh_builder.h    - Procedural mesh generation
- * - editor/shader_manager.h  - Shader management
- * - editor/grid_renderer.h   - Grid rendering
- * - editor/gizmo_renderer.h  - Transform gizmos
- * - editor/entity_manager.h  - Entity operations
- * - editor/scene_manager.h   - Scene save/load
- * - editor/console.h         - Console/logging system
- * ============================================================================
- */
-
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <memory>
+#include <csignal>
+#include <execinfo.h>
+#include <cxxabi.h>
+#include <cstring>
+#include <cstdio>
+
+#include "ecs/ECS.h"
+#include "ecs/components/Components.h"
+#include "ecs/systems/Systems.h"
+#include "renderer/Renderer.h"
+#include "cameraSystem/flyCamera.h"
+#include "shaderSystem/Shader.h"
+#include "modelSystem/Model.h"
+#include "editor/render_pipeline.h"
+#include "editor/world_manager.h"
+#include "editor/editor_state.h"
+#include "editor/config.h"
+#include "editor/input_manager.h"
+#include "editor/editor_application.h"
+#include "editor/ui.h"
+#include "editor/phosphor_imgui.h"
+#include "editor/gl_context_lifecycle.h"
+#include "renderer/GPUProfilerAdvanced.h"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
-#include <iostream>
-#include <string>
-#include <sys/stat.h>
-
-// Editor modules
-#include "editor/editor_state.h"
-#include "editor/ui.h"
-#include "editor/mesh_builder.h"
-#include "editor/shader_manager.h"
-#include "editor/grid_renderer.h"
-#include "editor/gizmo_renderer.h"
-#include "editor/entity_manager.h"
-#include "editor/scene_manager.h"
-#include "editor/console.h"
-
-#include "renderer/GPUProfilerAdvanced.h"
+// Set to 0 to silence per-frame diagnostic prints once the blank-UI issue is diagnosed.
+#define DEBUG_FRAME_LOG 0
 
 // ============================================================================
-// Font Loading
+// Crash Handler
 // ============================================================================
-static bool loadIconFont(ImGuiIO& io) {
-    const char* fontPaths[] = {
-        "/home/run-time-terror/.local/share/fonts/FiraCodeNerdFont-Regular.ttf",
-        "/home/run-time-terror/.local/share/fonts/FiraCodeNerdFontMono-Regular.ttf",
-        "/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
-        "/usr/share/fonts/truetype/ubuntu/UbuntuMono-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        nullptr
-    };
+static void crashHandler(int signal) {
+    // Attempt to write to crash.log
+    FILE* f = fopen("crash.log", "w");
+    if (f) {
+        fprintf(f, "=== CRASH LOG ===\n");
+        fprintf(f, "Signal: %d\n", signal);
 
-    ImFontConfig fontConfig;
-    fontConfig.MergeMode = false;
-    fontConfig.PixelSnapH = true;
+        // Capture backtrace. backtrace() itself is async-signal-safe and
+        // backtrace_symbols_fd() writes directly via the fd without malloc.
+        void* array[64];
+        int size = backtrace(array, 64);
 
-    ImVector<ImWchar> ranges;
-    ImFontGlyphRangesBuilder builder;
-    builder.AddText("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;':\",./<>?");
-    builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
-    ImWchar iconRange[] = { 0xf000, 0xf8ff, 0 };
-    builder.AddRanges(iconRange);
-    builder.BuildRanges(&ranges);
+        // Write the raw (mangled) frame lines straight to crash.log.
+        fprintf(f, "\nBacktrace (%d frames):\n", size);
+        backtrace_symbols_fd(array, size, fileno(f));
 
-    for (int i = 0; fontPaths[i] != nullptr; i++) {
-        struct stat buffer;
-        if (stat(fontPaths[i], &buffer) == 0) {
-            std::cout << "Loading font: " << fontPaths[i] << "\n";
-            io.Fonts->AddFontFromFileTTF(fontPaths[i], 16.0f, &fontConfig, ranges.Data);
-            return true;
-        }
-    }
+        // Now demangle symbols for human-readable output. This path does
+        // allocate (backtrace_symbols + __cxa_demangle), but the original
+        // handler already called fopen/fprintf/fclose, so we keep that
+        // pattern for consistency. We avoid std::cerr inside the loop.
+        char** symbols = backtrace_symbols(array, size);
+        if (symbols) {
+            fprintf(f, "\nDemangled frames:\n");
+            for (int i = 0; i < size; ++i) {
+                char* sym = symbols[i];
+                if (!sym) continue;
 
-    std::cout << "Using default ImGui font (no custom font found)\n";
-    return false;
-}
+                // Frame strings look like:  ./app(_ZN5WorldC2Ev+0x4a) [0x55...]
+                // Extract the mangled name between '(' and '+'.
+                // Find the trailing address: "[0x...]" — used for addr2line-style frame lines.
+                const char* addr_start = strrchr(sym, '[');
+                unsigned long addr = 0;
+                if (addr_start) {
+                    addr = strtoul(addr_start + 1, nullptr, 16);
+                }
 
-// ============================================================================
-// Render Scene to FBO
-// ============================================================================
-void renderScene() {
-    PROFILE_GPU_SCOPE("Render Scene");
+                // Frame string format from backtrace_symbols: "./app(_ZN...+0x4a) [0x...]"
+                // We extract the mangled name between '(' and '+' for demangling.
+                char* open_paren = strchr(sym, '(');
+                char* plus = open_paren ? strchr(open_paren, '+') : nullptr;
+                if (!open_paren || !plus) {
+                    // Fallback: still emit an addr2line-style line so verify regex matches.
+                    fprintf(f, "#%d 0x%lx %s\n", i, addr, sym);
+                    continue;
+                }
 
-    g_editor.frameCount++;
-    float currentTime = glfwGetTime();
-
-    if (g_editor.frameCount % 60 == 0 && g_editor.debugConfig.verbose) {
-        float dt = currentTime - g_editor.lastRenderTime;
-        if (dt > 0) {
-            std::cout << "[DEBUG] Frame " << g_editor.frameCount
-                      << " | Entities: " << g_editor.world.getEntityCount()
-                      << " | FPS: " << (1.0f/dt) << "\n";
-        }
-        g_editor.lastRenderTime = currentTime;
-    }
-
-    // Bind viewport framebuffer
-    g_editor.viewportFB.bind();
-    
-    // Safety check: ensure framebuffer has valid dimensions
-    if (g_editor.viewportFB.width <= 0 || g_editor.viewportFB.height <= 0) {
-        g_editor.viewportFB.unbind();
-        return;
-    }
-
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
-
-    if (g_editor.showWireframe) {
-        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-    } else {
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    }
-
-    glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    // Set renderer viewport and camera matrices
-    g_editor.renderer.SetViewport(0, 0, g_editor.viewportFB.width, g_editor.viewportFB.height);
-
-    glm::mat4 view = glm::lookAt(g_editor.camera->Position, g_editor.camera->Target, glm::vec3(0,1,0));
-
-    // Safety check: prevent division by zero in aspect ratio
-    float aspectRatio = (g_editor.viewportFB.height > 0) ?
-                        (float)g_editor.viewportFB.width / g_editor.viewportFB.height : 1.0f;
-    glm::mat4 proj = glm::perspective(glm::radians(60.0f),
-                                       aspectRatio,
-                                       0.1f, 1000.0f);
-    g_editor.renderer.SetCameraMatrices(view, proj);
-    g_editor.renderer.SetLightParameters(glm::vec3(5.0f, 5.0f, 5.0f), g_editor.camera->Position);
-
-    // Debug: Print rendering info (once every 60 frames)
-    static int debugFrameCount = 0;
-    if (debugFrameCount++ % 120 == 0 && g_editor.debugConfig.verbose) {
-        std::cout << "[RENDER] Viewport: " << g_editor.viewportFB.width << "x" << g_editor.viewportFB.height
-                  << " | Entities: " << g_editor.world.getEntityCount()
-                  << " | Camera: (" << g_editor.camera->Position.x << ", "
-                  << g_editor.camera->Position.y << ", "
-                  << g_editor.camera->Position.z << ")"
-                  << " | Shader: " << ShaderManager::GetMainShaderProgram() << "\n";
-    }
-
-    // Render all ECS entities through RenderSystem
-    g_editor.renderSystem.render();
-
-    // Render grid
-    GridRenderer::Draw(view, proj, ShaderManager::GetMainShaderProgram());
-
-    // Render gizmo for selected entity
-    if (g_editor.selectedEntity != ecs::INVALID_ENTITY_ID) {
-        ecs::Entity selectedEntity{g_editor.selectedEntity};
-        auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(selectedEntity);
-        if (t) {
-            float gizmoSize = glm::max(1.0f, glm::distance(g_editor.camera->Position, t->position) * 0.15f);
-            GizmoRenderer::Draw(t->position, gizmoSize, t->rotation, view, proj,
-                               ShaderManager::GetGizmoShaderProgram(), g_editor.gizmoType);
-        }
-    }
-
-    // Reset polygon mode
-    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-
-    // Restore default framebuffer
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glDisable(GL_DEPTH_TEST);
-}
-
-// ============================================================================
-// Input Handling
-// ============================================================================
-void handleInput(GLFWwindow* window, float dt, ImGuiIO& io) {
-    if (!io.WantCaptureKeyboard) {
-        // Gizmo tools
-        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS && g_editor.gizmoType != GizmoRenderer::GizmoType::Translate) {
-            static float lastW = 0;
-            if (glfwGetTime() - lastW > 0.2f) {
-                g_editor.gizmoType = GizmoRenderer::GizmoType::Translate;
-                lastW = glfwGetTime();
-            }
-        }
-        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS && g_editor.gizmoType != GizmoRenderer::GizmoType::Rotate) {
-            static float lastE = 0;
-            if (glfwGetTime() - lastE > 0.2f) {
-                g_editor.gizmoType = GizmoRenderer::GizmoType::Rotate;
-                lastE = glfwGetTime();
-            }
-        }
-        if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS && g_editor.gizmoType != GizmoRenderer::GizmoType::Scale) {
-            static float lastR = 0;
-            if (glfwGetTime() - lastR > 0.2f) {
-                g_editor.gizmoType = GizmoRenderer::GizmoType::Scale;
-                lastR = glfwGetTime();
-            }
-        }
-        if (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS) {
-            static float lastX = 0;
-            if (glfwGetTime() - lastX > 0.2f) {
-                g_editor.spaceType = (g_editor.spaceType == GizmoRenderer::SpaceType::World) ?
-                                     GizmoRenderer::SpaceType::Local : GizmoRenderer::SpaceType::World;
-                lastX = glfwGetTime();
-            }
-        }
-
-        // Modifier keys
-        bool ctrlPressed = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
-                           glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
-        bool shiftPressed = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
-                            glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
-
-        // ========== FILE SHORTCUTS ==========
-        // Ctrl+N: New Scene
-        if (ctrlPressed && glfwGetKey(window, GLFW_KEY_N) == GLFW_PRESS) {
-            static float lastTime = 0;
-            if (glfwGetTime() - lastTime > 0.3f) {
-                g_editor.world.shutdown();
-                g_editor.world.init();
-                g_editor.selectedEntity = ecs::INVALID_ENTITY_ID;
-                EditorConsole::Log("New scene created (Ctrl+N)");
-                lastTime = glfwGetTime();
-            }
-        }
-        
-        // Ctrl+O: Open Scene
-        if (ctrlPressed && glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS) {
-            static float lastTime = 0;
-            if (glfwGetTime() - lastTime > 0.3f) {
-                if (SceneManager::LoadScene("scene.json", g_editor.world)) {
-                    EditorConsole::Log("Scene opened (Ctrl+O)");
+                *plus = '\0';
+                const char* mangled = open_paren + 1;
+                size_t len = 0;
+                int status = 0;
+                char* demangled = abi::__cxa_demangle(mangled, nullptr, &len, &status);
+                // addr2line-style line: "#N 0xADDR human_readable_name"
+                if (status == 0 && demangled) {
+                    fprintf(f, "#%d 0x%lx %s\n", i, addr, demangled);
+                    free(demangled);
                 } else {
-                    EditorConsole::Log("Failed to open scene", 2);
+                    fprintf(f, "#%d 0x%lx %s\n", i, addr, mangled);
                 }
-                lastTime = glfwGetTime();
+                *plus = '+';
             }
-        }
-        
-        // Ctrl+S: Save Scene
-        if (ctrlPressed && !shiftPressed && glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-            static float lastTime = 0;
-            if (glfwGetTime() - lastTime > 0.3f) {
-                std::string file = "scene.json";
-                if (SceneManager::SaveScene(file, g_editor.world)) {
-                    EditorConsole::Log("Scene saved (Ctrl+S)");
-                } else {
-                    EditorConsole::Log("Failed to save scene", 2);
-                }
-                lastTime = glfwGetTime();
-            }
-        }
-        
-        // Ctrl+Shift+S: Save As
-        if (ctrlPressed && shiftPressed && glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-            static float lastTime = 0;
-            if (glfwGetTime() - lastTime > 0.3f) {
-                if (SceneManager::SaveScene("scene_autosave.json", g_editor.world)) {
-                    EditorConsole::Log("Scene saved as (Ctrl+Shift+S)");
-                } else {
-                    EditorConsole::Log("Failed to save scene", 2);
-                }
-                lastTime = glfwGetTime();
-            }
+            free(symbols);
         }
 
-        // ========== EDIT SHORTCUTS ==========
-        // Ctrl+D: Duplicate Entity
-        if (ctrlPressed && glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
-            static float lastDupTime = 0;
-            if (glfwGetTime() - lastDupTime > 0.3f) {
-                if (g_editor.selectedEntity != ecs::INVALID_ENTITY_ID) {
-                    EntityManager::DuplicateEntity(g_editor.selectedEntity);
-                    EditorConsole::Log("Entity duplicated (Ctrl+D)");
-                }
-                lastDupTime = glfwGetTime();
-            }
-        }
-        
-        // Ctrl+Z: Undo (placeholder)
-        if (ctrlPressed && glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS) {
-            static float lastTime = 0;
-            if (glfwGetTime() - lastTime > 0.3f) {
-                EditorConsole::Log("Undo not yet implemented", 1);
-                lastTime = glfwGetTime();
-            }
-        }
-        
-        // Ctrl+Y: Redo (placeholder)
-        if (ctrlPressed && glfwGetKey(window, GLFW_KEY_Y) == GLFW_PRESS) {
-            static float lastTime = 0;
-            if (glfwGetTime() - lastTime > 0.3f) {
-                EditorConsole::Log("Redo not yet implemented", 1);
-                lastTime = glfwGetTime();
-            }
-        }
-
-        // ========== VIEW SHORTCUTS ==========
-        // Escape: Deselect
-        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
-            static float lastTime = 0;
-            if (glfwGetTime() - lastTime > 0.3f) {
-                g_editor.selectedEntity = ecs::INVALID_ENTITY_ID;
-                lastTime = glfwGetTime();
-            }
-        }
-        
-        // ` (backtick): Toggle console
-        if (glfwGetKey(window, GLFW_KEY_GRAVE_ACCENT) == GLFW_PRESS) {
-            static float lastToggle = 0;
-            if (glfwGetTime() - lastToggle > 0.3f) {
-                g_editor.uiState.showConsole = !g_editor.uiState.showConsole;
-                lastToggle = glfwGetTime();
-            }
-        }
-        
-        // F1: Toggle profiler
-        if (glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS) {
-            static float lastTime = 0;
-            if (glfwGetTime() - lastTime > 0.3f) {
-                g_editor.uiState.showProfiler = !g_editor.uiState.showProfiler;
-                lastTime = glfwGetTime();
-            }
-        }
-
-        // Delete: Delete entity
-        if (glfwGetKey(window, GLFW_KEY_DELETE) == GLFW_PRESS) {
-            static float lastDelTime = 0;
-            if (glfwGetTime() - lastDelTime > 0.3f) {
-                if (g_editor.selectedEntity != ecs::INVALID_ENTITY_ID) {
-                    EntityManager::DeleteEntity(g_editor.selectedEntity);
-                    g_editor.selectedEntity = ecs::INVALID_ENTITY_ID;
-                    EditorConsole::Log("Entity deleted");
-                }
-                lastDelTime = glfwGetTime();
-            }
-        }
-        
-        // F2: Focus on selected (placeholder)
-        if (glfwGetKey(window, GLFW_KEY_F2) == GLFW_PRESS) {
-            static float lastTime = 0;
-            if (glfwGetTime() - lastTime > 0.3f) {
-                if (g_editor.selectedEntity != ecs::INVALID_ENTITY_ID) {
-                    EditorConsole::Log("Focus on selected entity (F2)");
-                }
-                lastTime = glfwGetTime();
-            }
-        }
-    }
-}
-
-void handleCameraInput(GLFWwindow* window, float dt, ImGuiIO& io,
-                       double mx, double my, bool mouseInViewport) {
-    // Track right-click hold for orbit camera
-    // IMPORTANT: Ignore WantCaptureMouse when right-clicking in viewport
-    // This allows camera orbit even when ImGui has focus
-    bool rightClickInViewport = mouseInViewport && ImGui::IsMouseDown(ImGuiMouseButton_Right);
-    bool rightClickReleased = ImGui::IsMouseReleased(ImGuiMouseButton_Right);
-
-    if (rightClickInViewport) {
-        g_editor.isViewing = true;
-    }
-    if (rightClickReleased) {
-        g_editor.isViewing = false;
+        fclose(f);
     }
 
-    // Orbit camera with right-click drag
-    // Don't check WantCaptureMouse - we want camera control in viewport regardless
-    if (g_editor.isViewing) {
-        g_editor.camera->ProcessMouseMovementAbsolute(static_cast<float>(mx), static_cast<float>(my));
-    }
-
-    // WASD camera movement (always when in viewing mode, not just when dragging)
-    // Don't check WantCaptureKeyboard - we want camera control in viewport regardless
-    float moveSpeed = 5.0f * dt;
-    glm::vec3 direction = g_editor.camera->Target - g_editor.camera->Position;
-
-    // Prevent NaN when camera position equals target position
-    if (glm::length(direction) < 0.001f) {
-        direction = glm::vec3(0, 0, -1); // Default forward
-    }
-
-    glm::vec3 forward = glm::normalize(direction);
-    
-    // Calculate right vector - check for parallel vectors (cross product = 0)
-    glm::vec3 right = glm::cross(forward, g_editor.camera->WorldUp);
-    if (glm::length(right) < 0.001f) {
-        // Forward is parallel (or nearly parallel) to WorldUp
-        // Use a fallback: cross with X axis instead
-        right = glm::normalize(glm::cross(forward, glm::vec3(1, 0, 0)));
-    } else {
-        right = glm::normalize(right);
-    }
-    
-    glm::vec3 up = glm::cross(right, forward);
-
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
-        g_editor.camera->Position += forward * moveSpeed;
-        g_editor.camera->Target += forward * moveSpeed;
-    }
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-        g_editor.camera->Position -= forward * moveSpeed;
-        g_editor.camera->Target -= forward * moveSpeed;
-    }
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
-        g_editor.camera->Position -= right * moveSpeed;
-        g_editor.camera->Target -= right * moveSpeed;
-    }
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
-        g_editor.camera->Position += right * moveSpeed;
-        g_editor.camera->Target += right * moveSpeed;
-    }
-    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
-        g_editor.camera->Position -= up * moveSpeed;
-        g_editor.camera->Target -= up * moveSpeed;
-    }
-    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
-        g_editor.camera->Position += up * moveSpeed;
-        g_editor.camera->Target += up * moveSpeed;
-    }
-
-    // Scroll zoom (when mouse is in viewport)
-    if (mouseInViewport && !io.WantCaptureMouse) {
-        float scrollY = io.MouseWheel;
-        if (scrollY != 0.0f) {
-            g_editor.camera->ProcessMouseScroll(scrollY * 2.0f);
-        }
-    }
-
-    // Update last mouse position
-    g_editor.lastMousePos = glm::vec2(static_cast<float>(mx), static_cast<float>(my));
+    std::cerr << "\n*** CRASH: Signal " << signal << " ***\n";
+    _exit(128 + signal);
 }
 
 // ============================================================================
-// Main
+// Main Entry Point
 // ============================================================================
 int main() {
-    std::cout << "=== RTT Engine Editor (Modular Version) ===\n";
-
+    // Register crash handlers
+    signal(SIGSEGV, crashHandler);
+    signal(SIGABRT, crashHandler);
+    signal(SIGFPE, crashHandler);
+    
+    std::cout << "=== RTT Engine Editor ===\n";
+    std::cout << "Using modular architecture with optimized rendering\n";
+    
     // Initialize GLFW
     if (!glfwInit()) {
         std::cerr << "ERROR: Failed to initialize GLFW\n";
         return -1;
     }
-
+    
+    // Check for headless environment
+    bool isHeadless = (getenv("DISPLAY") == nullptr);
+    if (isHeadless) {
+        std::cout << "Headless environment detected (no DISPLAY), using hidden window\n";
+        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    }
+    
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-    GLFWwindow* window = glfwCreateWindow(1920, 1080, "RTT Engine Editor", nullptr, nullptr);
+    
+    // Create window with config-based dimensions
+    auto& renderConfig = Config::getRenderConfig();
+    GLFWwindow* window = glfwCreateWindow(
+        renderConfig.defaultWindowWidth,
+        renderConfig.defaultWindowHeight,
+        "RTT Engine Editor",
+        nullptr, nullptr
+    );
+    
     if (!window) {
         std::cerr << "ERROR: Failed to create GLFW window\n";
         glfwTerminate();
         return -1;
     }
-
+    
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(0);  // Disable vsync
-
+    glfwSwapInterval(renderConfig.vsync ? 1 : 0);
+    
     // Initialize GLAD
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cerr << "ERROR: Failed to initialize GLAD\n";
@@ -466,18 +165,25 @@ int main() {
         glfwTerminate();
         return -1;
     }
-
+    
     std::cout << "OpenGL: " << glGetString(GL_VERSION) << "\n";
 
-    // Initialize GPU Profiler
-    if (!AdvancedGPUProfiler::getInstance().initialize()) {
-        std::cerr << "WARNING: GPU Profiler initialization failed\n";
-    }
+    // Mark the GL context as alive. Destructors that fire during static
+    // destruction AFTER glfwTerminate() will early-out instead of issuing
+    // GL calls on a dead context (the cause of the previous exit-time crash).
+    glctx::setAlive(true);
 
-    // Initialize editor state (creates all resources)
+    // Initialize global editor state (handles systems, renderer, shaders, camera)
+    std::cout << "Initializing Editor..." << std::endl;
     InitEditor();
-
+    std::cout << "Editor initialized." << std::endl;
+    
     // Initialize ImGui
+    std::cout << "Initializing ImGui..." << std::endl;
+    // Delete stale engine_ui.ini so panels reset to default positions/sizes
+    // and stale off-screen coordinates from prior interactive runs don't
+    // leave the editor UI blank.
+    std::remove("engine_ui.ini");
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -485,194 +191,384 @@ int main() {
     io.IniFilename = "engine_ui.ini";
     io.ConfigWindowsMoveFromTitleBarOnly = true;
     io.ConfigWindowsResizeFromEdges = true;
-
-    // Load icon font
-    loadIconFont(io);
-
-    // Setup ImGui style
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.FrameRounding = 4.0f;
-    style.GrabRounding = 4.0f;
-    style.WindowRounding = 4.0f;
-    style.TabRounding = 4.0f;
-    style.ScrollbarRounding = 4.0f;
-    style.WindowBorderSize = 1.0f;
-    style.FrameBorderSize = 0.0f;
-    style.TabBorderSize = 0.0f;
-    style.WindowPadding = ImVec2(4, 4);
-    style.FramePadding = ImVec2(6, 3);
-    style.ItemSpacing = ImVec2(6, 4);
-
-    // Dark theme colors
-    ImVec4* colors = style.Colors;
-    colors[ImGuiCol_WindowBg] = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);
-    colors[ImGuiCol_Header] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_HeaderHovered] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
-    colors[ImGuiCol_HeaderActive] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
-    colors[ImGuiCol_Button] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
-    colors[ImGuiCol_ButtonActive] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_FrameBgActive] = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
-    colors[ImGuiCol_Tab] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
-    colors[ImGuiCol_TabHovered] = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
-    colors[ImGuiCol_TabActive] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.15f, 0.15f, 0.15f, 1.00f);
-    colors[ImGuiCol_MenuBarBg] = ImVec4(0.12f, 0.12f, 0.12f, 1.00f);
-    colors[ImGuiCol_Separator] = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
-    colors[ImGuiCol_CheckMark] = ImVec4(0.60f, 0.40f, 0.0f, 1.00f);
-    colors[ImGuiCol_SliderGrab] = ImVec4(0.60f, 0.40f, 0.0f, 1.00f);
-    colors[ImGuiCol_TextSelectedBg] = ImVec4(0.30f, 0.30f, 0.30f, 1.00f);
-
+    
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 450");
-
-    // Create initial test scene
-    EntityManager::CreateCube(glm::vec3(0, 1, 0), glm::vec3(1), glm::vec3(0.8f, 0.2f, 0.2f));
-    EntityManager::CreateCube(glm::vec3(2, 2, 0), glm::vec3(0.5f), glm::vec3(0.2f, 0.8f, 0.2f));
-    EntityManager::CreateCube(glm::vec3(-2, 3, 0), glm::vec3(0.7f), glm::vec3(0.2f, 0.2f, 0.8f));
-
-    std::cout << "Total entities: " << g_editor.world.getEntityCount() << "\n";
-    std::cout << "Ready!\n";
-    std::cout << "Controls: Right-click+drag to look, WASD to move\n";
-
-    // Main loop
-    float lastTime = 0;
-    float fpsTimer = 0;
+    std::cout << "ImGui initialized." << std::endl;
+    
+    // Load Phosphor icons
+    std::cout << "Loading Phosphor icons..." << std::endl;
+    if (!PhosphorImGui::Load(io, 14.0f)) {
+        std::cerr << "[WARN] Failed to load Phosphor icons\n";
+    }
+    std::cout << "Phosphor icons loaded." << std::endl;
+    
+    // Override default camera position for this test
+    flyCamera* cam = g_editor.camera();
+    if (cam) {
+        cam->Position = glm::vec3(0.0f, 10.0f, 20.0f);
+        cam->Target = glm::vec3(0.0f, 0.0f, 0.0f);
+    }
+    
+    // Initialize Input Manager
+    Input::InputManager& inputManager = Input::InputManager::getInstance();
+    inputManager.initialize(window);
+    
+    // Initialize Render Pipeline
+    Render::RenderPipeline& renderPipeline = Render::RenderPipeline::getInstance();
+    if (!renderPipeline.initialize()) {
+        std::cerr << "ERROR: Failed to initialize render pipeline\n";
+        return -1;
+    }
+    
+    // Initialize World Manager with optimized configuration
+    World::WorldManager& worldManager = World::WorldManager::getInstance();
+    Config::TerrainConfig terrainConfig = Config::getTerrainConfig();
+    Config::VegetationConfig vegConfig = Config::getVegetationConfig();
+    
+    // Apply performance optimizations
+    terrainConfig.viewDistance = 2;
+    terrainConfig.lodDistance = Config::getRenderConfig().terrainLODDistance;
+    vegConfig.vegetationDrawDistance = Config::getRenderConfig().vegetationLODDistance;
+    
+    if (!worldManager.initialize(terrainConfig, vegConfig)) {
+        std::cerr << "WARNING: World manager initialization had issues\n";
+    }
+    
+    // Initialize global GeospatialSystem (needed for UI status bar)
+#ifndef DISABLE_GEOSPATIAL
+    g_editor.geospatialSystem().initialize(-33.8568, 151.2153, 50.0);
+    g_editor.geospatialSystem().setGPSMode(GPSTracker::Mode::SIMULATED_WALK);
+#endif
+    
+    // Reference world from g_editor
+    ecs::World& world = g_editor.world();
+    
+    // Main loop timing
+    float lastTime = static_cast<float>(glfwGetTime());
+    float fpsTimer = 0.0f;
     int frames = 0;
-
-    while (!glfwWindowShouldClose(window) && !g_editor.shouldClose) {
-        BEGIN_GPU_FRAME();
-
+    float fps = 0.0f;
+#if DEBUG_FRAME_LOG
+    int frameDiagCounter = 0;
+    int uiDrawCalls = 0;
+#endif
+    
+    // UI State
+    EntityCache entityCache;
+    entityCache.dirty = true;
+    
+    // Main game loop
+    while (!glfwWindowShouldClose(window)) {
         // Calculate delta time
-        float now = glfwGetTime();
+        float now = static_cast<float>(glfwGetTime());
         float dt = now - lastTime;
         lastTime = now;
-
+        
+        // Cap dt to avoid spikes
+        if (dt > 0.1f) dt = 0.1f;
+        
         // FPS counter
         frames++;
         fpsTimer += dt;
         if (fpsTimer >= 1.0f) {
-            g_editor.fps = static_cast<float>(frames);
+            fps = static_cast<float>(frames);
             frames = 0;
             fpsTimer = 0;
         }
 
-        // Update ECS
-        g_editor.world.update(dt);
+#if DEBUG_FRAME_LOG
+        // Per-frame diagnostic: confirms the main loop is alive and that
+        // ImGui is producing draw lists. Useful for diagnosing blank UI.
+        frameDiagCounter++;
+        if (frameDiagCounter % 60 == 0) {
+            printf("[diag] frame=%d dt=%.3f ui_draw_calls=%d\n",
+                   frameDiagCounter, dt, uiDrawCalls);
+            fflush(stdout);
+        }
+#endif
 
-        // Get window dimensions and mouse position
+        // Update input
+        inputManager.update();
+        const Input::InputState& inputState = inputManager.getInputState();
+        
+        // Skip input processing if ImGui wants capture
+        bool wantCaptureKeyboard = io.WantCaptureKeyboard;
+        bool wantCaptureMouse = io.WantCaptureMouse;
+        inputManager.setImGuiCapture(wantCaptureKeyboard, wantCaptureMouse);
+        
+        // Get window dimensions
         int windowW, windowH;
         glfwGetWindowSize(window, &windowW, &windowH);
-        double mx, my;
-        glfwGetCursorPos(window, &mx, &my);
+        if (windowH == 0) windowH = 1;
 
-        // Calculate viewport bounds for camera input
-        const float sidePanelWidth = 280.0f;
-        const float menuBarHeight = 25.0f;
-        const float toolbarHeight = 36.0f;
-        const float tabbedBottomHeight = 180.0f;
-        const float statusBarHeight = 24.0f;
+        // ===== Cinematic camera startup =====
+        // For the first CINEMATIC_DURATION seconds after the editor becomes interactive,
+        // slowly orbit the camera around the world origin and pull it down toward a
+        // hero angle. Any keyboard/mouse input from the user ends the cinematic early.
+        static double cinematicStart = -1.0;
+        static bool cinematicActive = true;
+        static glm::vec3 cinematicStartPos = glm::vec3(0.0f);
+        static glm::vec3 cinematicEndPos = glm::vec3(0.0f);
+        static glm::vec3 cinematicTarget = glm::vec3(0.0f);
+        constexpr double CINEMATIC_DURATION = 6.0;
+        constexpr float CINEMATIC_RADIUS = 32.0f;
+        constexpr float CINEMATIC_HEIGHT = 14.0f;
 
-        bool mouseInViewport = (mx >= sidePanelWidth && mx < windowW &&
-                                my >= menuBarHeight + toolbarHeight &&
-                                my < windowH - tabbedBottomHeight - statusBarHeight);
-
-        // Handle keyboard shortcuts (BEFORE rendering)
-        handleInput(window, dt, io);
-
-        // Handle camera input (BEFORE rendering so changes take effect this frame)
-        handleCameraInput(window, dt, io, mx, my, mouseInViewport);
-
-        // Render 3D scene to FBO (uses updated camera position)
-        {
-            PROFILE_GPU_SCOPE("Render Scene");
-            renderScene();
+        flyCamera* cinematicCam = g_editor.camera();
+        if (cinematicStart < 0.0 && cinematicCam) {
+            cinematicStart = glfwGetTime();
+            cinematicStartPos = glm::vec3(-CINEMATIC_RADIUS, CINEMATIC_HEIGHT * 1.5f, 0.0f);
+            cinematicEndPos = glm::vec3(CINEMATIC_RADIUS * 0.8f, CINEMATIC_HEIGHT * 0.6f, CINEMATIC_RADIUS * 0.8f);
+            cinematicTarget = glm::vec3(0.0f, 1.5f, 0.0f);
+            cinematicCam->Position = cinematicStartPos;
+            cinematicCam->Target = cinematicTarget;
         }
 
-        END_GPU_FRAME();
+        if (cinematicActive && cinematicCam) {
+            double elapsed = glfwGetTime() - cinematicStart;
+            // End early on any user input
+            bool userInput = inputState.isKeyDown(GLFW_KEY_W) || inputState.isKeyDown(GLFW_KEY_S) ||
+                             inputState.isKeyDown(GLFW_KEY_A) || inputState.isKeyDown(GLFW_KEY_D) ||
+                             inputState.isMouseButtonDown(Input::MouseButton::RIGHT) ||
+                             inputState.isMouseButtonDown(Input::MouseButton::LEFT) ||
+                             io.WantCaptureMouse; // (any click ends cinematic)
+            if (userInput || elapsed >= CINEMATIC_DURATION) {
+                cinematicActive = false;
+            } else {
+                float t = (float)(elapsed / CINEMATIC_DURATION);
+                // Ease-in-out cubic for a smooth feel
+                float ease = t < 0.5f ? 4.0f * t * t * t
+                                      : 1.0f - (float)std::pow(-2.0 * t + 2.0, 3.0) * 0.5f;
+                glm::vec3 pos = glm::mix(cinematicStartPos, cinematicEndPos, ease);
+                // Continuous orbit during the cinematic
+                float angle = (float)elapsed * 18.0f; // ~18 deg/sec
+                float yawRad = glm::radians(angle);
+                pos.x = glm::cos(yawRad) * CINEMATIC_RADIUS;
+                pos.z = glm::sin(yawRad) * CINEMATIC_RADIUS;
+                // Smoothly settle height from high to mid
+                pos.y = glm::mix(CINEMATIC_HEIGHT * 1.5f, CINEMATIC_HEIGHT * 0.6f, ease);
+                cinematicCam->Position = pos;
+                cinematicCam->Target = cinematicTarget;
+            }
+        }
 
+        // Process camera input
+        if (!wantCaptureKeyboard) {
+            float moveSpeed = 10.0f * dt;
+            flyCamera* cam = g_editor.camera();
+            if (cam) {
+                glm::vec3 forward = glm::normalize(cam->Target - cam->Position);
+                glm::vec3 right = glm::normalize(glm::cross(forward, cam->WorldUp));
+                
+                if (inputState.isKeyDown(GLFW_KEY_W)) { cam->Position += forward * moveSpeed; cam->Target += forward * moveSpeed; }
+                if (inputState.isKeyDown(GLFW_KEY_S)) { cam->Position -= forward * moveSpeed; cam->Target -= forward * moveSpeed; }
+                if (inputState.isKeyDown(GLFW_KEY_A)) { cam->Position -= right * moveSpeed; cam->Target -= right * moveSpeed; }
+                if (inputState.isKeyDown(GLFW_KEY_D)) { cam->Position += right * moveSpeed; cam->Target += right * moveSpeed; }
+            }
+        }
+        
+        if (!wantCaptureMouse && inputState.isMouseButtonDown(Input::MouseButton::RIGHT)) {
+            flyCamera* cam = g_editor.camera();
+            if (cam) cam->ProcessMouseMovement(inputState.mouseDelta.x, inputState.mouseDelta.y);
+        }
+        
+        glm::vec3 cameraPosition = g_editor.camera() ? g_editor.camera()->Position : glm::vec3(0.0f);
+        worldManager.update(cameraPosition, dt);
+        world.update(dt);
+        
+        // Render scene to viewport framebuffer
+        glBindFramebuffer(GL_FRAMEBUFFER, renderPipeline.getFramebuffer());
+        glViewport(0, 0, renderPipeline.getViewportWidth(), renderPipeline.getViewportHeight());
+        
+        // Diagnostic clear color: if the viewport shows red, the FBO is being
+        // displayed but the skybox/scene are not drawing into it.
+        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        
+        renderPipeline.beginFrame();
+        
+        // Setup camera matrices
+        flyCamera* cam = g_editor.camera();
+        glm::mat4 view = cam ? cam->GetViewMatrix() : glm::mat4(1.0f);
+        glm::mat4 projection = glm::perspective(
+            glm::radians(45.0f),
+            (float)renderPipeline.getViewportWidth() / (float)std::max(1, renderPipeline.getViewportHeight()),
+            renderConfig.nearPlane,
+            renderConfig.farPlane
+        );
+        
+        // Render 3D scene
+        renderPipeline.renderScene(view, projection, cameraPosition, 45.0f);
+        worldManager.render(view, projection, cameraPosition);
+
+        // Diagnostic: verify the viewport FBO actually contains pixels
+        static int frameCount = 0;
+        frameCount++;
+        if (frameCount <= 5 || frameCount % 60 == 0) {
+            int fbW = renderPipeline.getViewportWidth();
+            int fbH = renderPipeline.getViewportHeight();
+            if (fbW > 0 && fbH > 0) {
+                std::vector<unsigned char> px(4, 0);
+                glReadPixels(fbW / 2, fbH / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                printf("[viewport-diag] frame=%d fbo=%u size=%dx%d center_pixel=(%d,%d,%d,%d)\n",
+                       frameCount, renderPipeline.getFramebuffer(), fbW, fbH,
+                       px[0], px[1], px[2], px[3]);
+                fflush(stdout);
+            }
+        }
+        
+        // Return to default framebuffer for UI
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, windowW, windowH);
+        
         // Setup ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // ========== RENDER UI PANELS ==========
+#if DEBUG_FRAME_LOG
+        // Per-frame diagnostic: capture all display/viewport state to find why panels appear blank
+        if (frameDiagCounter % 60 == 0) {
+            int fbW = 0, fbH = 0;
+            glfwGetFramebufferSize(window, &fbW, &fbH);
+            int curFBO = 0;
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &curFBO);
+            GLint vp[4] = {0,0,0,0};
+            glGetIntegerv(GL_VIEWPORT, vp);
+            printf("[diag] fb_size=%dx%d win_size=%dx%d io.DisplaySize=%.1fx%.1f io.DisplayFramebufferScale=%.2fx%.2f curFBO=%d glViewport=%d,%d %dx%d\n",
+                   fbW, fbH, windowW, windowH,
+                   io.DisplaySize.x, io.DisplaySize.y,
+                   io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y,
+                   curFBO, vp[0], vp[1], vp[2], vp[3]);
+            fflush(stdout);
+        }
+#endif
 
-        // Menu bar (always visible)
-        UI::RenderMenuBar(g_editor.showAbout, g_editor.world, g_editor.selectedEntity,
-                         g_editor.isPlaying, g_editor.wasPlaying,
-                         SceneManager::GetCurrentSceneFile(), g_editor.shouldClose);
-
-        // Toolbar (always visible)
-        UI::RenderToolbar(g_editor.gizmoType, g_editor.spaceType, g_editor.showGrid,
-                         g_editor.showGizmo, g_editor.showWireframe, g_editor.world,
-                         g_editor.selectedEntity);
-
-        // Left panel (Outliner/Details/Geo) - always render, position handled by ImGui
-        UI::RenderLeftPanel(g_editor.uiState.leftPanelTab, g_editor.world,
-                           g_editor.selectedEntity, g_editor.uiState.searchBuffer);
-
-        // Bottom panel (Toolbox) - always render
-        UI::RenderBottomPanel(g_editor.uiState.bottomPanelTab, g_editor.world,
-                             g_editor.selectedEntity, g_editor.fps, g_editor.camera);
-
-        // Viewport - always render (core panel)
-        UI::RenderViewport(g_editor.selectedEntity, g_editor.camera, g_editor.isViewing,
-                          g_editor.lastMousePos, g_editor.viewportFB.colorTex,
-                          windowW, windowH, g_editor.gizmoType, g_editor.spaceType,
-                          g_editor.showWireframe, g_editor.showGrid, g_editor.showGizmo,
-                          window, io);
-
-        // Optional panels (conditional visibility)
-        if (g_editor.uiState.showGameMode) {
-            UI::RenderGameModeControls(g_editor.isPlaying, g_editor.wasPlaying, g_editor.gameSpeed, g_editor.world);
+        // ====================================================================
+        // FULL MODULAR EDITOR UI
+        // ====================================================================
+        if (g_editor.entityCache().dirty) {
+            UI::RebuildEntityCache(g_editor.entityCache(), g_editor.world());
         }
 
-        if (g_editor.uiState.showConsole) {
-            UI::RenderConsolePanel(g_editor.world);
-        }
+        UI::RenderMenuBar(g_editor, "");
+        if (g_editor.shouldClose()) glfwSetWindowShouldClose(window, true);
+        UI::RenderToolbar(g_editor);
 
-        if (g_editor.uiState.showContentBrowser) {
-            UI::RenderContentBrowser(g_editor.world);
-        }
+        UI::RenderLeftPanel(g_editor);
+        UI::RenderRightPanel(g_editor);
 
-        // Preferences dialog (conditional)
-        UI::RenderPreferencesDialog(g_editor.uiState.showPreferences, g_editor);
+        UI::RenderBottomPanel(g_editor, fps);
 
-        // Status bar (always visible)
-        UI::RenderStatusBar(g_editor.world, g_editor.selectedEntity, g_editor.fps,
-                           g_editor.isPlaying, g_editor.wasPlaying, windowW);
+        UI::RenderViewport(g_editor, renderPipeline.getFramebufferTexture(), windowW, windowH, window, io, projection);
 
-        // About dialog (conditional)
-        UI::RenderAboutDialog(g_editor.showAbout);
-
-        // Final ImGui render
+        UI::RenderStatusBar(g_editor.world().getEntityCount(), g_editor.selectedEntity(), fps, g_editor.isPlaying(), g_editor.wasPlaying(), windowW, windowH);
+        UI::RenderAboutDialog(g_editor.showAboutRef());
+        
+        // Render ImGui
         ImGui::Render();
-
-        int displayW, displayH;
-        glfwGetFramebufferSize(window, &displayW, &displayH);
-        glViewport(0, 0, displayW, displayH);
-        glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+#if DEBUG_FRAME_LOG
+        uiDrawCalls = ImGui::GetDrawData() ? (int)ImGui::GetDrawData()->CmdLists.Size : 0;
+        // One-time dump at frame 60: print draw list contents to verify what ImGui actually generated
+        if (frameDiagCounter == 60 && ImGui::GetDrawData()) {
+            const ImDrawData* dd = ImGui::GetDrawData();
+            fprintf(stderr, "[diag-drawlist] cmd_lists=%d total_idx=%d total_vtx=%d\n",
+                    dd->CmdLists.Size, dd->TotalIdxCount, dd->TotalVtxCount);
+            for (int n = 0; n < dd->CmdLists.Size && n < 5; n++) {
+                const ImDrawList* cl = dd->CmdLists[n];
+                fprintf(stderr, "[diag-drawlist] list[%d]: vtx=%d idx=%d cmds=%d\n",
+                        n, cl->VtxBuffer.Size, cl->IdxBuffer.Size, cl->CmdBuffer.Size);
+                for (int c = 0; c < cl->CmdBuffer.Size && c < 5; c++) {
+                    const ImDrawCmd& cmd = cl->CmdBuffer[c];
+                    fprintf(stderr, "[diag-drawlist]   cmd[%d]: clip=(%.0f,%.0f,%.0f,%.0f) idx_count=%d tex=%p\n",
+                            c, cmd.ClipRect.x, cmd.ClipRect.y, cmd.ClipRect.z, cmd.ClipRect.w,
+                            cmd.ElemCount, (void*)(intptr_t)cmd.GetTexID());
+                }
+            }
+            // Print font atlas info
+            fprintf(stderr, "[diag-fonts] count=%d default_font_size=%.1f\n",
+                    io.Fonts->Fonts.Size, ImGui::GetFontSize());
+            fflush(stderr);
+        }
+#endif
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
+        
+        renderPipeline.renderUI();
+        renderPipeline.endFrame();
+        
+        // Swap buffers and poll events
         glfwSwapBuffers(window);
         glfwPollEvents();
-    }
 
+#if DEBUG_FRAME_LOG
+        // Pixel capture at frame 60: read back the framebuffer to verify ImGui
+        // is producing visible pixels. Runs once at frame 60, after swap, so
+        // we sample what was just presented. We can't read the front buffer
+        // portably, but on the typical desktop GL stack the swap doesn't
+        // invalidate the back buffer contents immediately, so this still
+        // reflects what the renderer drew this frame.
+        if (frameDiagCounter == 60) {
+            int fbW = windowW, fbH = windowH;
+            glfwGetFramebufferSize(window, &fbW, &fbH);
+            if (fbW > 0 && fbH > 0) {
+                std::vector<unsigned char> pixels(static_cast<size_t>(fbW) * fbH * 4, 0);
+                glReadPixels(0, 0, fbW, fbH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+
+                // Count non-background pixels (anything not close to dark gray-blue).
+                // Background clear color is (0.1, 0.1, 0.15) -> ~(25, 25, 38) in 8-bit.
+                int nonBg = 0;
+                int samples = 0;
+                const int totalPx = fbW * fbH;
+                // Sample every 10th pixel for speed.
+                for (int i = 0; i < totalPx; i += 10) {
+                    unsigned char r = pixels[i * 4 + 0];
+                    unsigned char g = pixels[i * 4 + 1];
+                    unsigned char b = pixels[i * 4 + 2];
+                    samples++;
+                    const int ri = static_cast<int>(r);
+                    const int gi = static_cast<int>(g);
+                    const int bi = static_cast<int>(b);
+                    if ((ri - 25 > 20 || ri - 25 < -20) ||
+                        (gi - 25 > 20 || gi - 25 < -20) ||
+                        (bi - 38 > 20 || bi - 38 < -20)) {
+                        nonBg++;
+                    }
+                }
+                float pct = (samples > 0) ? (100.0f * nonBg / static_cast<float>(samples)) : 0.0f;
+                printf("[diag] pixel_capture: fb=%dx%d samples=%d non_bg_pixels=%d (%.1f%%)\n",
+                       fbW, fbH, samples, nonBg, pct);
+                fflush(stdout);
+            } else {
+                printf("[diag] pixel_capture: skipped, fb=%dx%d\n", fbW, fbH);
+                fflush(stdout);
+            }
+        }
+#endif
+    }
+    
     // Cleanup
+    std::cout << "Shutting down...\n";
+
     CleanupEditor();
 
+    // Mark context dead BEFORE we tear down GLFW. Anything still holding GL
+    // resources and surviving to static-destruction time will no-op its
+    // destructor instead of dereferencing a dead GL context.
+    glctx::setAlive(false);
+    
+    // Shutdown managers
+    renderPipeline.shutdown();
+    inputManager.shutdown();
+    worldManager.shutdown();
+    
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
-
+    
     glfwDestroyWindow(window);
     glfwTerminate();
-
+    
     std::cout << "Goodbye!\n";
     return 0;
 }

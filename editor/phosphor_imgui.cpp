@@ -15,7 +15,11 @@ bool Load(ImGuiIO& io, float fontSize) {
         "phosphor-icons/Fonts/regular/Phosphor.ttf",
         "./phosphor-icons/Fonts/regular/Phosphor.ttf",
         "../phosphor-icons/Fonts/regular/Phosphor.ttf",
-        "../../phosphor-icons/Fonts/regular/Phosphor.ttf"
+        "../../phosphor-icons/Fonts/regular/Phosphor.ttf",
+        "Phosphor.ttf",
+        "./Phosphor.ttf",
+        "external/imgui/misc/fonts/Phosphor.ttf",
+        "./external/imgui/misc/fonts/Phosphor.ttf"
     };
 
     std::string foundPath;
@@ -43,6 +47,14 @@ bool Load(ImGuiIO& io, float fontSize) {
         0
     };
 
+    // CRITICAL: Add the default font FIRST so ASCII text glyphs are in the atlas.
+    // Without this, in ImGui 1.92 the Phosphor font becomes Fonts[0] and is the
+    // only font — but its glyph range is restricted to icon codepoints, so all
+    // ASCII text (menu items, labels, status text) renders blank.
+    if (io.Fonts->Fonts.Size == 0) {
+        io.Fonts->AddFontDefault();
+    }
+
     g_iconFont = io.Fonts->AddFontFromFileTTF(foundPath.c_str(), fontSize, &config, iconRanges);
 
     if (!g_iconFont) {
@@ -69,6 +81,64 @@ ImFont* GetFont() {
 
 bool IsLoaded() {
     return g_loaded;
+}
+
+// --- Null-safe API (Chunk 3) ---
+const char* GetCodepointSafe(PhosphorIcons::Icon icon, const char* fallback) {
+    const char* cp = PhosphorIcons::GetCodepoint(icon);
+    return cp ? cp : fallback;
+}
+
+bool IsIconAvailable(PhosphorIcons::Icon icon) {
+    return PhosphorIcons::GetCodepoint(icon) != nullptr;
+}
+
+bool RenderIcon(PhosphorIcons::Icon icon, float size, ImU32 color, const char* fallback) {
+    const char* cp = GetCodepointSafe(icon, fallback);
+    const bool usedFallback = (cp == fallback);
+    Render(cp, size, color);
+    return !usedFallback;
+}
+
+bool IconButtonSafe(PhosphorIcons::Icon icon, const char* label, const ImVec2& size) {
+    const char* cp = GetCodepointSafe(icon);
+    if (g_iconFont) {
+        ImGui::PushFont(g_iconFont);
+        bool result = ImGui::Button(cp, size);
+        ImGui::PopFont();
+        return result;
+    }
+    return ImGui::Button(label ? label : "?", size);
+}
+
+bool ToolbarButtonSafe(PhosphorIcons::Icon icon, bool active, const char* tooltip) {
+    const char* cp = GetCodepointSafe(icon);
+    if (!cp) return false;
+
+    if (active) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyle().Colors[ImGuiCol_ButtonHovered]);
+    }
+
+    if (g_iconFont) {
+        ImGui::PushFont(g_iconFont);
+    }
+
+    bool result = ImGui::Button(cp, ImVec2{22, 22});
+
+    if (g_iconFont) {
+        ImGui::PopFont();
+    }
+
+    if (tooltip && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", tooltip);
+    }
+
+    if (active) {
+        ImGui::PopStyleColor(2);
+    }
+
+    return result;
 }
 
 void Render(const char* codepoint, float size, ImU32 color) {

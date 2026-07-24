@@ -49,6 +49,26 @@ std::string GetEntityName(ecs::EntityID id);
 // Set entity name
 void SetEntityName(ecs::EntityID id, const std::string& name);
 
+// ============================================================================
+// Entity Validation Helpers (UI Safety)
+// ============================================================================
+
+// Cheap syntactic check: id is not the sentinel invalid value.
+inline bool IsValidEntityID(ecs::EntityID id) {
+    return id != ecs::INVALID_ENTITY_ID;
+}
+
+// Full existence check: id is syntactically valid AND the world reports the entity as alive.
+bool EntityExists(ecs::EntityID id);
+
+// Returns id if it exists in the world, otherwise returns ecs::INVALID_ENTITY_ID.
+// Useful for sanitising cached or stale handles before use.
+ecs::EntityID ValidateOrClear(ecs::EntityID id);
+
+// Returns the entity's name when available, or `fallback` for invalid/missing entities.
+// Guaranteed not to crash for INVALID_ENTITY_ID or destroyed entities.
+std::string GetSafeEntityName(ecs::EntityID id, const char* fallback = "Invalid Entity");
+
 } // namespace EntityManager
 
 #endif // EDITOR_ENTITY_MANAGER_H

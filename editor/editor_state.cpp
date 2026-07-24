@@ -1,5 +1,3 @@
-#include <glad/glad.h>
-#include <GLFW/glfw3.h>
 #include "editor_state.h"
 #include "mesh_builder.h"
 #include "shader_manager.h"
@@ -8,67 +6,38 @@
 #include "renderer/GPUProfilerAdvanced.h"
 #include <iostream>
 
-EditorState g_editor;
+// Legacy global instance preserved for backward compatibility.
+Editor::Editor g_editor;
 
-void EditorState::Framebuffer::init(int w, int h) {
-    cleanup();
-    width = w; height = h;
+namespace Editor {
 
-    glGenFramebuffers(1, &fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+Editor::Editor() = default;
 
-    glGenTextures(1, &colorTex);
-    glBindTexture(GL_TEXTURE_2D, colorTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex, 0);
+Editor::~Editor() {
+    // RAII: ensure cleanup runs even if shutdown() was not called.
+    shutdown();
+}
 
-    glGenRenderbuffers(1, &rbo);
-    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);
+void Editor::setSelectedEntity(ecs::EntityID id) noexcept {
+    selectedEntity_ = id;
+}
 
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        std::cerr << "ERROR: Framebuffer incomplete!\n";
+bool Editor::initialize() {
+    if (initialized_) {
+        return true;
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
-
-void EditorState::Framebuffer::resize(int w, int h) {
-    if (w <= 0 || h <= 0 || (w == width && h == height)) return;
-    init(w, h);
-}
-
-void EditorState::Framebuffer::cleanup() {
-    if (fbo) glDeleteFramebuffers(1, &fbo);
-    if (colorTex) glDeleteTextures(1, &colorTex);
-    if (rbo) glDeleteRenderbuffers(1, &rbo);
-    fbo = 0; colorTex = 0; rbo = 0;
-}
-
-void EditorState::Framebuffer::bind() {
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glViewport(0, 0, width, height);
-}
-
-void EditorState::Framebuffer::unbind() {
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-}
-
-void InitEditor() {
     std::cout << "=== RTT Engine Editor ===\n";
-    
+
     // Initialize resources
     ShaderManager::InitShaders();
     MeshBuilder::InitAll();
     GridRenderer::Init(20, 1.0f);
-    g_editor.viewportFB.init(1280, 720);
-    
+    viewportFB_.initialize(1280, 720);
+
     // Register meshes
     auto& meshReg = MeshRegistry::getInstance();
-    meshReg.registerMesh(ecs::MeshType::Cube, MeshBuilder::GetCube().vao, MeshBuilder::GetCube().vbo, 
+    meshReg.registerMesh(ecs::MeshType::Cube, MeshBuilder::GetCube().vao, MeshBuilder::GetCube().vbo,
                          MeshBuilder::GetCube().ebo, MeshBuilder::GetCube().indexCount);
     meshReg.registerMesh(ecs::MeshType::Sphere, MeshBuilder::GetSphere().vao, MeshBuilder::GetSphere().vbo,
                          MeshBuilder::GetSphere().ebo, MeshBuilder::GetSphere().indexCount);
@@ -80,69 +49,93 @@ void InitEditor() {
                          MeshBuilder::GetCone().ebo, MeshBuilder::GetCone().indexCount);
     meshReg.registerMesh(ecs::MeshType::Torus, MeshBuilder::GetTorus().vao, MeshBuilder::GetTorus().vbo,
                          MeshBuilder::GetTorus().ebo, MeshBuilder::GetTorus().indexCount);
-    
+
     std::cout << "[MeshRegistry] Registered 6 mesh types\n";
-    
+
     // Set texture for renderer
-    g_editor.renderer.SetDefaultTexture(MeshBuilder::GetProceduralTexture());
-    
+    renderer_.SetDefaultTexture(MeshBuilder::GetProceduralTexture());
+
     // Initialize camera and ECS
     // Camera at (0,5,10) looking at origin with -20 degree pitch (looking down at objects)
-    g_editor.camera = new flyCamera(glm::vec3(0, 5, 10), glm::vec3(0, 0, 0), -90, -20, 10);
-    g_editor.world.init();
-    g_editor.world.addSystem<ecs::PhysicsSystem>().setGravity(glm::vec3(0, -9.81f, 0));
-    
+    camera_ = std::make_unique<flyCamera>(glm::vec3(0, 5, 10), glm::vec3(0, 0, 0), -90, -20, 10);
+    world_.init();
+    world_.addSystem<ecs::PhysicsSystem>().setGravity(glm::vec3(0, -9.81f, 0));
+
     // Initialize Renderer and Render System
-    g_editor.renderer.Initialize();
-    g_editor.renderSystem.setRenderer(&g_editor.renderer);
-    g_editor.renderSystem.setWorld(&g_editor.world);
-    g_editor.renderSystem.setDefaultShaderProgram(ShaderManager::GetMainShaderProgram());
-    g_editor.world.addSystem(&g_editor.renderSystem);
+    renderer_.Initialize();
+    renderSystem_.setRenderer(&renderer_);
+    renderSystem_.setWorld(&world_);
+    renderSystem_.setDefaultShaderProgram(ShaderManager::GetMainShaderProgram());
+    world_.addStaticSystem(&renderSystem_);
 
     // Initialize Model Render System
-    g_editor.modelRenderSystem.setRenderer(&g_editor.renderer);
-    g_editor.modelRenderSystem.setWorld(&g_editor.world);
-    g_editor.modelRenderSystem.setDefaultShaderProgram(ShaderManager::GetMainShaderProgram());
-    g_editor.world.addSystem(&g_editor.modelRenderSystem);
-    
+    modelRenderSystem_.setRenderer(&renderer_);
+    modelRenderSystem_.setWorld(&world_);
+    modelRenderSystem_.setDefaultShaderProgram(ShaderManager::GetMainShaderProgram());
+    world_.addStaticSystem(&modelRenderSystem_);
+
     // Initialize Geospatial System
-    g_editor.geospatialSystem.initialize(-33.8568, 151.2153, 50.0);
-    g_editor.geospatialSystem.setGPSMode(GPSTracker::Mode::SIMULATED_WALK);
+#ifndef DISABLE_GEOSPATIAL
+    geospatialSystem_.initialize(-33.8568, 151.2153, 50.0);
+    geospatialSystem_.setGPSMode(GPSTracker::Mode::SIMULATED_WALK);
 
     // Initialize GeoTerrain System (map/terrain integration)
     ecs::GeoTerrainConfig terrainConfig;
     terrainConfig.terrainSize = 2000.0f;
     terrainConfig.heightScale = 100.0f;
     terrainConfig.gridResolution = 256;
-    g_editor.geoTerrainSystem.initialize(-33.8568, 151.2153, terrainConfig);
-    g_editor.geoTerrainSystem.setGeospatialSystem(&g_editor.geospatialSystem);
-    g_editor.geoTerrainSystem.generateTerrain();
+    geoTerrainSystem_.initialize(-33.8568, 151.2153, terrainConfig);
+    geoTerrainSystem_.setGeospatialSystem(&geospatialSystem_);
+    geoTerrainSystem_.generateTerrain();
 
     // Initialize GeoTerrain Renderer
-    g_editor.geoTerrainRenderer.initialize();
+    geoTerrainRenderer_.initialize();
 
-    g_editor.world.addSystem(&g_editor.geospatialSystem);
-    g_editor.world.addSystem(&g_editor.geoTerrainSystem);
-    
+    world_.addStaticSystem(&geospatialSystem_);
+    world_.addStaticSystem(&geoTerrainSystem_);
+#endif
+
+    initialized_ = true;
     std::cout << "Editor initialized\n";
+    return true;
 }
 
-void CleanupEditor() {
+void Editor::shutdown() {
+    if (!initialized_) {
+        return;
+    }
+
     std::cout << "Shutting down editor...\n";
-    
+
+    initialized_ = false;
+
     AdvancedGPUProfiler::getInstance().shutdown();
-    
-    g_editor.world.shutdown();
-    
+
+    world_.shutdown();
+
+    renderer_.Shutdown();
+#ifndef DISABLE_GEOSPATIAL
+    geoTerrainRenderer_.shutdown();
+    geospatialSystem_.shutdown();
+#endif
+
     GridRenderer::Cleanup();
     MeshBuilder::CleanupAll();
     ShaderManager::CleanupShaders();
-    g_editor.viewportFB.cleanup();
-    
-    if (g_editor.camera) {
-        delete g_editor.camera;
-        g_editor.camera = nullptr;
-    }
-    
+    viewportFB_.cleanup();
+
+    camera_.reset();
+
     std::cout << "Editor shutdown complete\n";
+}
+
+} // namespace Editor
+
+// Legacy free functions delegate to the global Editor instance.
+void InitEditor() {
+    g_editor.initialize();
+}
+
+void CleanupEditor() {
+    g_editor.shutdown();
 }

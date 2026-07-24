@@ -66,7 +66,7 @@ static float PointToLineDistance(const glm::vec3& point, const glm::vec3& lineSt
 void Draw(const glm::vec3& position, float size, const glm::quat& rotation,
           const glm::mat4& view, const glm::mat4& projection, GLuint gizmoShaderProgram,
           GizmoType type) {
-    if (!g_editor.showGizmo || type == GizmoType::None) return;
+    if (!g_editor.showGizmo() || type == GizmoType::None) return;
 
     glDisable(GL_DEPTH_TEST);
     glUseProgram(gizmoShaderProgram);
@@ -170,8 +170,8 @@ void SetGizmoType(GizmoType type) { g_gizmoType = type; }
 GizmoType GetGizmoType() { return g_gizmoType; }
 void SetSpaceType(SpaceType space) { g_spaceType = space; }
 SpaceType GetSpaceType() { return g_spaceType; }
-void Show(bool show) { g_editor.showGizmo = show; }
-bool IsVisible() { return g_editor.showGizmo; }
+void Show(bool show) { g_editor.setShowGizmo(show); }
+bool IsVisible() { return g_editor.showGizmo(); }
 
 // ============================================================================
 // Gizmo Interaction Implementation

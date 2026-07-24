@@ -54,7 +54,7 @@ void Cleanup() {
 }
 
 void Draw(const glm::mat4& view, const glm::mat4& projection, GLuint shaderProgram) {
-    if (!g_editor.showGrid || g_gridVAO == 0) return;
+    if (!g_editor.showGrid() || g_gridVAO == 0) return;
 
     glDisable(GL_DEPTH_TEST);
     glUseProgram(shaderProgram);
@@ -85,7 +85,7 @@ void Draw(const glm::mat4& view, const glm::mat4& projection, GLuint shaderProgr
     glEnable(GL_DEPTH_TEST);
 }
 
-void Show(bool show) { g_editor.showGrid = show; }
-bool IsVisible() { return g_editor.showGrid; }
+void Show(bool show) { g_editor.setShowGrid(show); }
+bool IsVisible() { return g_editor.showGrid(); }
 
 } // namespace GridRenderer

@@ -9,10 +9,10 @@ namespace EntityManager {
 // Remove primitives - use model loading instead
 
 ecs::Entity CreateLight(const glm::vec3& pos, const glm::vec3& color, float intensity) {
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent>();
+    auto e = g_editor.world().createEntityWithComponents<ecs::TransformComponent>();
     if (!e.isValid()) return e;
 
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
+    auto* t = g_editor.world().getComponentArchetype<ecs::TransformComponent>(e);
     if (t) { t->position = pos; t->scale = glm::vec3(0.2f); t->rotation = glm::quat(1, 0, 0, 0); }
 
     EditorConsole::Log("Created Light");
@@ -21,10 +21,10 @@ ecs::Entity CreateLight(const glm::vec3& pos, const glm::vec3& color, float inte
 }
 
 ecs::Entity CreateCamera(const glm::vec3& pos, const glm::vec3& target) {
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent>();
+    auto e = g_editor.world().createEntityWithComponents<ecs::TransformComponent>();
     if (!e.isValid()) return e;
 
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
+    auto* t = g_editor.world().getComponentArchetype<ecs::TransformComponent>(e);
     if (t) { t->position = pos; t->scale = glm::vec3(1); t->rotation = glm::quat(1, 0, 0, 0); }
 
     EditorConsole::Log("Created Camera");
@@ -33,27 +33,27 @@ ecs::Entity CreateCamera(const glm::vec3& pos, const glm::vec3& target) {
 }
 
 void DeleteEntity(ecs::EntityID id) {
-    if (id == ecs::INVALID_ENTITY_ID) return;
-    
+    if (!EntityExists(id)) return;
+
     EditorConsole::Log("Deleted entity " + std::to_string(id));
-    
+
     // TODO: Properly destroy entity through ECS
-    if (g_editor.selectedEntity == id) {
-        g_editor.selectedEntity = ecs::INVALID_ENTITY_ID;
+    if (g_editor.selectedEntity() == id) {
+        g_editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
     }
 }
 
 void DuplicateEntity(ecs::EntityID id) {
-    if (id == ecs::INVALID_ENTITY_ID) return;
+    if (!EntityExists(id)) return;
 
     ecs::Entity entity{id};
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(entity);
-    auto* m = g_editor.world.getComponentArchetype<ecs::MeshComponent>(entity);
+    auto* t = g_editor.world().getComponentArchetype<ecs::TransformComponent>(entity);
+    auto* m = g_editor.world().getComponentArchetype<ecs::MeshComponent>(entity);
 
     if (t && m) {
-        auto newEntity = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
-        auto* newT = g_editor.world.getComponentArchetype<ecs::TransformComponent>(newEntity);
-        auto* newM = g_editor.world.getComponentArchetype<ecs::MeshComponent>(newEntity);
+        auto newEntity = g_editor.world().createEntityWithComponents<ecs::TransformComponent, ecs::MeshComponent>();
+        auto* newT = g_editor.world().getComponentArchetype<ecs::TransformComponent>(newEntity);
+        auto* newM = g_editor.world().getComponentArchetype<ecs::MeshComponent>(newEntity);
 
         if (newT && newM) {
             newT->position = t->position + glm::vec3(1, 0, 0);
@@ -71,17 +71,37 @@ void DuplicateEntity(ecs::EntityID id) {
 
 std::string GetEntityName(ecs::EntityID id) {
     ecs::Entity entity{id};
-    auto* n = g_editor.world.getComponentArchetype<ecs::NameComponent>(entity);
+    auto* n = g_editor.world().getComponentArchetype<ecs::NameComponent>(entity);
     if (n && n->hasName()) return n->getName();
     return "Entity " + std::to_string(id);
 }
 
 void SetEntityName(ecs::EntityID id, const std::string& name) {
+    if (!EntityExists(id)) return;
+
     ecs::Entity entity{id};
-    auto* n = g_editor.world.getComponentArchetype<ecs::NameComponent>(entity);
+    auto* n = g_editor.world().getComponentArchetype<ecs::NameComponent>(entity);
     if (n) {
         n->setName(name);
     }
+}
+
+// ============================================================================
+// Entity Validation Helpers
+// ============================================================================
+
+bool EntityExists(ecs::EntityID id) {
+    if (!IsValidEntityID(id)) return false;
+    return g_editor.world().isAlive(ecs::Entity{id});
+}
+
+ecs::EntityID ValidateOrClear(ecs::EntityID id) {
+    return EntityExists(id) ? id : ecs::INVALID_ENTITY_ID;
+}
+
+std::string GetSafeEntityName(ecs::EntityID id, const char* fallback) {
+    if (!EntityExists(id)) return std::string(fallback ? fallback : "Invalid Entity");
+    return GetEntityName(id);
 }
 
 ecs::Entity CreateModel(const std::string& modelPath, const glm::vec3& pos, const glm::vec3& scale, const glm::vec3& rotation) {
@@ -92,11 +112,11 @@ ecs::Entity CreateModel(const std::string& modelPath, const glm::vec3& pos, cons
         return ecs::Entity{ecs::INVALID_ENTITY_ID};
     }
 
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::ModelComponent>();
+    auto e = g_editor.world().createEntityWithComponents<ecs::TransformComponent, ecs::ModelComponent>();
     if (!e.isValid()) return e;
 
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
-    auto* m = g_editor.world.getComponentArchetype<ecs::ModelComponent>(e);
+    auto* t = g_editor.world().getComponentArchetype<ecs::TransformComponent>(e);
+    auto* m = g_editor.world().getComponentArchetype<ecs::ModelComponent>(e);
 
     if (t) {
         t->position = pos;
@@ -130,11 +150,11 @@ ecs::Entity CreateAnimatedModel(const std::string& modelPath, const glm::vec3& p
         return CreateModel(modelPath, pos, scale, rotation);
     }
 
-    auto e = g_editor.world.createEntityWithComponents<ecs::TransformComponent, ecs::ModelComponent>();
+    auto e = g_editor.world().createEntityWithComponents<ecs::TransformComponent, ecs::ModelComponent>();
     if (!e.isValid()) return e;
 
-    auto* t = g_editor.world.getComponentArchetype<ecs::TransformComponent>(e);
-    auto* m = g_editor.world.getComponentArchetype<ecs::ModelComponent>(e);
+    auto* t = g_editor.world().getComponentArchetype<ecs::TransformComponent>(e);
+    auto* m = g_editor.world().getComponentArchetype<ecs::ModelComponent>(e);
 
     if (t) {
         t->position = pos;

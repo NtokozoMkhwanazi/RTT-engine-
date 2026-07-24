@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "phosphor_imgui.h"
 #include "phosphor_icons_codepoints.h"
 #include "editor_state.h"
 #include "entity_manager.h"
@@ -8,7 +9,10 @@
 #include "ecs/components/Components.h"
 #include "cameraSystem/flyCamera.h"
 #include "gizmo_renderer.h"
+#include "grid_renderer.h"
+#include "shader_manager.h"
 #include "geo_config_panel.h"
+#include "ui_helpers.h"
 #include <GLFW/glfw3.h>
 #include <iostream>
 #include <algorithm>
@@ -17,119 +21,91 @@
 
 namespace UI {
 
-// ============================================================================
-// Entity cache rebuild - only on dirty flag, not every frame
-// ============================================================================
-void RebuildEntityCache(EntityCache& cache, ecs::World& world) {
-    cache.entries.clear();
+// Fixed editor layout constants (Unreal/Unity-style docked layout)
+constexpr float MENU_BAR_HEIGHT     = 25.0f;
+constexpr float TOOLBAR_HEIGHT      = 38.0f;
+constexpr float LEFT_PANEL_WIDTH    = 280.0f;
+constexpr float RIGHT_PANEL_WIDTH   = 300.0f;
+constexpr float BOTTOM_PANEL_HEIGHT = 180.0f;
+constexpr float STATUS_BAR_HEIGHT   = 24.0f;
 
-    // Reserve to avoid reallocations
-    size_t estimatedCount = world.getEntityCount();
-    cache.entries.reserve(estimatedCount);
-
-    // Single pass: collect all entities with TransformComponent
-    // Use archetype iteration which is faster than forEach
-    world.forEach<ecs::TransformComponent>([&](ecs::EntityID id, ecs::TransformComponent&) {
-        EntityCache::Entry entry;
-        entry.id = id;
-        entry.hasGeo = false;
-
-        // Determine icon type (minimal checks)
-        if (world.hasComponent<ecs::CameraComponent>(ecs::Entity{id})) {
-            entry.icon = "C";
-        } else if (world.hasComponent<ecs::LightComponent>(ecs::Entity{id})) {
-            entry.icon = "L";
-        } else if (world.hasComponent<ecs::ModelComponent>(ecs::Entity{id})) {
-            entry.icon = "M";
-        } else {
-            entry.icon = "[]";
-        }
-
-        if (world.hasComponent<ecs::GeospatialComponent>(ecs::Entity{id})) {
-            entry.hasGeo = true;
-        }
-
-        cache.entries.push_back(entry);
-    });
-
-    cache.dirty = false;
-    cache.lastRebuildTime = (float)glfwGetTime();
-}
+static ImVec2 GetDisplaySize() { return ImGui::GetIO().DisplaySize; }
 
 // ============================================================================
 // Menu bar
 // ============================================================================
-void RenderMenuBar(bool& showAbout, ecs::World& world, ecs::EntityID& selected,
-               bool& isPlaying, bool& wasPlaying, const std::string& currentSceneFile,
-               bool& shouldClose) {
-    if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
+void RenderMenuBar(Editor::Editor& editor, const std::string& currentSceneFile) {
+    if (!ImGui::BeginMainMenuBar()) return;
+    if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("New Scene", "Ctrl+N")) {
-                world.shutdown();
-                world.init();
-                selected = ecs::INVALID_ENTITY_ID;
+                editor.world().shutdown();
+                editor.world().init();
+                editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
                 EditorConsole::Log("New scene created");
             }
             if (ImGui::MenuItem("Open Scene...", "Ctrl+O")) {
-                if (SceneManager::LoadScene("scene.json", world)) {
+                if (SceneManager::LoadScene("scene.json", editor.world())) {
                     EditorConsole::Log("Scene loaded");
                 }
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Save", "Ctrl+S")) {
-                SceneManager::SaveScene(currentSceneFile.empty() ? "scene.json" : currentSceneFile, world);
+                SceneManager::SaveScene(currentSceneFile.empty() ? "scene.json" : currentSceneFile, editor.world());
             }
             if (ImGui::MenuItem("Exit", "Alt+F4")) {
-                shouldClose = true;
+                editor.setShouldClose(true);
             }
             ImGui::EndMenu();
         }
 
         if (ImGui::BeginMenu("Edit")) {
-            bool hasSel = (selected != ecs::INVALID_ENTITY_ID);
+            bool hasSel = (editor.selectedEntity() != ecs::INVALID_ENTITY_ID);
             if (ImGui::MenuItem("Undo", "Ctrl+Z", false, false)) {}
             if (ImGui::MenuItem("Redo", "Ctrl+Y", false, false)) {}
             ImGui::Separator();
             if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, hasSel)) {
-                EntityManager::DuplicateEntity(selected);
+                EntityManager::DuplicateEntity(editor.selectedEntity());
             }
             if (ImGui::MenuItem("Delete", "Del", false, hasSel)) {
-                EntityManager::DeleteEntity(selected);
-                selected = ecs::INVALID_ENTITY_ID;
+                EntityManager::DeleteEntity(editor.selectedEntity());
+                editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
             }
             ImGui::EndMenu();
         }
 
         if (ImGui::BeginMenu("View")) {
-            ImGui::MenuItem("Show Grid", nullptr, &g_editor.showGrid);
-            ImGui::MenuItem("Show Gizmo", nullptr, &g_editor.showGizmo);
+            bool showGrid = editor.showGrid();
+            bool showGizmo = editor.showGizmo();
+            if (ImGui::MenuItem("Show Grid", nullptr, &showGrid)) editor.setShowGrid(showGrid);
+            if (ImGui::MenuItem("Show Gizmo", nullptr, &showGizmo)) editor.setShowGizmo(showGizmo);
             ImGui::Separator();
-            ImGui::MenuItem("Outliner", nullptr, &g_editor.uiState.showOutliner);
-            ImGui::MenuItem("Details", nullptr, &g_editor.uiState.showDetails);
+            ImGui::MenuItem("Outliner", nullptr, &editor.uiState.showOutliner);
+            ImGui::MenuItem("Details", nullptr, &editor.uiState.showDetails);
             ImGui::EndMenu();
         }
 
         if (ImGui::BeginMenu("Help")) {
             if (ImGui::MenuItem("About")) {
-                showAbout = true;
+                editor.setShowAbout(true);
             }
             ImGui::EndMenu();
         }
 
-        ImGui::EndMainMenuBar();
-    }
+    ImGui::EndMainMenuBar();
 }
 
-void RenderPreferencesDialog(bool& showPreferences, EditorState& editor) {
+void RenderPreferencesDialog(bool& showPreferences, Editor::Editor& editor) {
     if (!showPreferences) return;
     ImGui::OpenPopup("Preferences");
     if (ImGui::BeginPopupModal("Preferences", &showPreferences, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1), "Editor Preferences");
         ImGui::Separator();
-        ImGui::Checkbox("Show Grid", &g_editor.showGrid);
-        ImGui::Checkbox("Show Gizmo", &g_editor.showGizmo);
+        bool showGrid = editor.showGrid();
+        bool showGizmo = editor.showGizmo();
+        if (UI::CheckboxSafe("Show Grid", &showGrid)) editor.setShowGrid(showGrid);
+        if (UI::CheckboxSafe("Show Gizmo", &showGizmo)) editor.setShowGizmo(showGizmo);
         ImGui::Separator();
-        if (ImGui::Button("Close", ImVec2(120, 0))) {
+        if (UI::ButtonSafe("Close", ImVec2(120, 0))) {
             showPreferences = false;
             ImGui::CloseCurrentPopup();
         }
@@ -139,127 +115,282 @@ void RenderPreferencesDialog(bool& showPreferences, EditorState& editor) {
 }
 
 // ============================================================================
-// Toolbar - minimal, no heavy ops
+// Toolbar - Unreal Engine style top toolbar (fixed)
 // ============================================================================
-void RenderToolbar(GizmoRenderer::GizmoType& gizmoType, GizmoRenderer::SpaceType& spaceType,
-               bool& showGrid, bool& showGizmo, int& showWireframe) {
-    ImGui::BeginChild("Toolbar", ImVec2(-1, 38), false, ImGuiWindowFlags_HorizontalScrollbar);
+void RenderToolbar(Editor::Editor& editor) {
+    ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+    UI::BeginFixedPanel("Toolbar", ImVec2(0, MENU_BAR_HEIGHT), ImVec2(displaySize.x, TOOLBAR_HEIGHT));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
 
-    bool tActive = (gizmoType == GizmoRenderer::GizmoType::Translate);
-    ImGui::PushStyleColor(ImGuiCol_Button, tActive ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button(phosphor_icons::arrows_out(), ImVec2(28, 28))) {
-        gizmoType = GizmoRenderer::GizmoType::Translate;
-    }
-    ImGui::PopStyleColor();
+    auto ToolbarButton = [&](PhosphorIcons::Icon icon, bool active, const char* tooltip, ImU32 activeCol = IM_COL32(60, 60, 60, 255)) {
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, activeCol);
+        PhosphorImGui::ToolbarButton(icon, active, tooltip);
+        if (active) ImGui::PopStyleColor();
+    };
+
+    // ----- File / Edit quick actions -----
+    ToolbarButton(PhosphorIcons::Save, false, "Save Scene");
+    if (ImGui::IsItemClicked()) SceneManager::SaveScene("scene.json", editor.world());
+    ImGui::SameLine();
+    ImGui::Dummy(ImVec2(4, 0));
     ImGui::SameLine();
 
-    bool rActive = (gizmoType == GizmoRenderer::GizmoType::Rotate);
-    ImGui::PushStyleColor(ImGuiCol_Button, rActive ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button("R", ImVec2(28, 28))) {
-        gizmoType = GizmoRenderer::GizmoType::Rotate;
-    }
-    ImGui::PopStyleColor();
+    // ----- Transform tools -----
+    bool tActive = (editor.gizmoType() == GizmoRenderer::GizmoType::Translate);
+    ToolbarButton(PhosphorIcons::ArrowsOut, tActive, "Translate (W)");
+    if (ImGui::IsItemClicked()) editor.setGizmoType(GizmoRenderer::GizmoType::Translate);
     ImGui::SameLine();
 
-    bool sActive = (gizmoType == GizmoRenderer::GizmoType::Scale);
-    ImGui::PushStyleColor(ImGuiCol_Button, sActive ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button("S", ImVec2(28, 28))) {
-        gizmoType = GizmoRenderer::GizmoType::Scale;
-    }
-    ImGui::PopStyleColor();
+    bool rActive = (editor.gizmoType() == GizmoRenderer::GizmoType::Rotate);
+    ToolbarButton(PhosphorIcons::ArrowCounterClockwise, rActive, "Rotate (E)");
+    if (ImGui::IsItemClicked()) editor.setGizmoType(GizmoRenderer::GizmoType::Rotate);
     ImGui::SameLine();
 
-    ImGui::Separator();
-    ImGui::SameLine();
-
-    bool worldSpace = (spaceType == GizmoRenderer::SpaceType::World);
-    ImGui::PushStyleColor(ImGuiCol_Button, worldSpace ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button(worldSpace ? "World" : "Local", ImVec2(55, 28))) {
-        spaceType = worldSpace ? GizmoRenderer::SpaceType::Local : GizmoRenderer::SpaceType::World;
-    }
-    ImGui::PopStyleColor();
+    bool sActive = (editor.gizmoType() == GizmoRenderer::GizmoType::Scale);
+    ToolbarButton(PhosphorIcons::ArrowsIn, sActive, "Scale (R)");
+    if (ImGui::IsItemClicked()) editor.setGizmoType(GizmoRenderer::GizmoType::Scale);
     ImGui::SameLine();
 
     ImGui::Separator();
     ImGui::SameLine();
 
-    bool wf = showWireframe != 0;
-    ImGui::PushStyleColor(ImGuiCol_Button, wf ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button("W", ImVec2(28, 28))) {
-        showWireframe = wf ? 0 : 1;
-    }
+    // ----- Coordinate space -----
+    bool worldSpace = (editor.spaceType() == GizmoRenderer::SpaceType::World);
+    ToolbarButton(PhosphorIcons::GridFour, worldSpace, worldSpace ? "World Space" : "Local Space");
+    if (ImGui::IsItemClicked()) editor.setSpaceType(worldSpace ? GizmoRenderer::SpaceType::Local : GizmoRenderer::SpaceType::World);
+    ImGui::SameLine();
+
+    ImGui::Separator();
+    ImGui::SameLine();
+
+    // ----- Viewport options -----
+    bool wf = editor.showWireframe() != 0;
+    ToolbarButton(PhosphorIcons::Cube, wf, "Wireframe");
+    if (ImGui::IsItemClicked()) editor.setShowWireframe(wf ? 0 : 1);
+    ImGui::SameLine();
+
+    bool grid = editor.showGrid();
+    ToolbarButton(PhosphorIcons::GridFour, grid, "Grid");
+    if (ImGui::IsItemClicked()) editor.setShowGrid(!grid);
+    ImGui::SameLine();
+
+    // ----- Play controls (right side) -----
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 120);
+    bool playing = editor.isPlaying();
+    ImGui::PushStyleColor(ImGuiCol_Button, playing ? IM_COL32(200, 60, 60, 255) : IM_COL32(60, 140, 60, 255));
+    PhosphorImGui::ToolbarButton(PhosphorIcons::Play, false, playing ? "Stop (Esc)" : "Play (F5)");
+    if (ImGui::IsItemClicked()) editor.setPlaying(!playing);
     ImGui::PopStyleColor();
     ImGui::SameLine();
 
-    ImGui::PushStyleColor(ImGuiCol_Button, showGrid ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button("G", ImVec2(28, 28))) {
-        showGrid = !showGrid;
-    }
+    bool paused = editor.wasPlaying() && !playing;
+    ImGui::PushStyleColor(ImGuiCol_Button, paused ? IM_COL32(220, 180, 60, 255) : IM_COL32(80, 80, 80, 255));
+    PhosphorImGui::ToolbarButton(PhosphorIcons::Pause, false, "Pause");
+    if (ImGui::IsItemClicked()) editor.setWasPlaying(playing ? !editor.wasPlaying() : false);
     ImGui::PopStyleColor();
+    ImGui::SameLine();
 
     ImGui::PopStyleVar();
-    ImGui::EndChild();
+    UI::EndFixedPanel();
 }
 
 // ============================================================================
-// Left panel - uses cached entity list
+// Left panel - fixed Unreal-style tabbed sidebar
 // ============================================================================
-void RenderLeftPanel(int& activeTab, ecs::World& world, ecs::EntityID& selected,
-                  EntityCache& entityCache, const char* searchBuffer) {
-    auto& panelConfig = g_editor.scenePanelConfig;
-    ImGui::Begin("Scene");
+void RenderLeftPanel(Editor::Editor& editor) {
+    auto& panelConfig = editor.scenePanelConfig;
+    ImVec2 displaySize = GetDisplaySize();
+    ImVec2 pos(0, MENU_BAR_HEIGHT + TOOLBAR_HEIGHT);
+    ImVec2 size(LEFT_PANEL_WIDTH, displaySize.y - MENU_BAR_HEIGHT - TOOLBAR_HEIGHT - STATUS_BAR_HEIGHT);
 
-    float w = ImGui::GetContentRegionAvail().x;
-    ImVec2 tabSize = ImVec2(w / 3.0f - 4, 24);
+    if (!UI::BeginFixedPanel("Scene Outliner", pos, size)) {
+        UI::EndFixedPanel();
+        return;
+    }
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 4));
-    ImGui::PushStyleColor(ImGuiCol_Button, panelConfig.activeTabIndex == 0 ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button(phosphor_icons::list(), tabSize)) panelConfig.activeTabIndex = 0;
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
+    const char* tabs[] = { "Outliner", "Layers", "World" };
+    const int tabCount = IM_ARRAYSIZE(tabs);
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    float tabW = (avail.x - (tabCount - 1) * 4) / tabCount;
 
-    ImGui::PushStyleColor(ImGuiCol_Button, panelConfig.activeTabIndex == 1 ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button(phosphor_icons::pencil(), tabSize)) panelConfig.activeTabIndex = 1;
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-
-    ImGui::PushStyleColor(ImGuiCol_Button, panelConfig.activeTabIndex == 2 ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button(phosphor_icons::globe(), tabSize)) panelConfig.activeTabIndex = 2;
-    ImGui::PopStyleColor();
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
+    for (int i = 0; i < tabCount; ++i) {
+        bool active = (panelConfig.activeTabIndex == i);
+        ImGui::PushStyleColor(ImGuiCol_Button, active ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
+        if (ImGui::Button(tabs[i], ImVec2(tabW, 24))) panelConfig.activeTabIndex = i;
+        ImGui::PopStyleColor();
+        if (i < tabCount - 1) ImGui::SameLine();
+    }
     ImGui::PopStyleVar();
 
     ImGui::Separator();
 
-    if (panelConfig.activeTabIndex == 0) RenderOutlinerPanel(selected, entityCache, searchBuffer);
-    else if (panelConfig.activeTabIndex == 1) RenderDetailsPanel(world, selected);
-    else RenderGeoPanel(g_editor.geospatialSystem.getGeoAPI(), g_editor.geoPanelState);
+    ecs::EntityID selected = editor.selectedEntity();
+    switch (panelConfig.activeTabIndex) {
+        case 0:
+            RenderOutlinerPanel(selected, editor.entityCache(), editor.uiState.searchBuffer);
+            break;
+        case 1:
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "Layers (placeholder)");
+            break;
+        case 2:
+            RenderWorldSettingsPanel(editor);
+            break;
+        default:
+            panelConfig.activeTabIndex = 0;
+            break;
+    }
 
-    ImGui::End();
+    UI::EndFixedPanel();
 }
 
 // ============================================================================
-// Outliner panel - uses cached entity list (O(1) per entity, no ECS queries)
+// World settings panel (left panel tab)
+// ============================================================================
+void RenderWorldSettingsPanel(Editor::Editor& editor) {
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1), "World Settings");
+    ImGui::Separator();
+
+    bool showGrid = editor.showGrid();
+    if (UI::CheckboxSafe("Show Grid", &showGrid)) editor.setShowGrid(showGrid);
+
+    bool showGizmo = editor.showGizmo();
+    if (UI::CheckboxSafe("Show Gizmo", &showGizmo)) editor.setShowGizmo(showGizmo);
+
+    int wire = editor.showWireframe();
+    bool wireframe = (wire != 0);
+    if (UI::CheckboxSafe("Wireframe", &wireframe)) editor.setShowWireframe(wireframe ? 1 : 0);
+
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Grid");
+    static float gridSpacing = 1.0f;
+    static int gridSize = 20;
+    ImGui::DragFloat("Spacing", &gridSpacing, 0.1f, 0.1f, 10.0f);
+    ImGui::DragInt("Size", &gridSize, 1, 2, 100);
+}
+
+// ============================================================================
+// Right panel - fixed Unreal-style Details panel
+// ============================================================================
+void RenderRightPanel(Editor::Editor& editor) {
+    if (!editor.uiState.showDetails) return;
+
+    ImVec2 displaySize = GetDisplaySize();
+    ImVec2 pos(displaySize.x - RIGHT_PANEL_WIDTH, MENU_BAR_HEIGHT + TOOLBAR_HEIGHT);
+    ImVec2 size(RIGHT_PANEL_WIDTH, displaySize.y - MENU_BAR_HEIGHT - TOOLBAR_HEIGHT - STATUS_BAR_HEIGHT);
+
+    if (!UI::BeginFixedPanel("Details", pos, size)) {
+        UI::EndFixedPanel();
+        return;
+    }
+
+    ecs::EntityID selected = editor.selectedEntity();
+    selected = EntityManager::ValidateOrClear(selected);
+
+    if (selected == ecs::INVALID_ENTITY_ID) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "Select an actor to edit details");
+        UI::EndFixedPanel();
+        return;
+    }
+
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1), "Actor %u", selected);
+    ImGui::Separator();
+
+    // Search/filter box
+    static char detailsFilter[64] = "";
+    UI::InputTextSafe("Search Details", detailsFilter, IM_ARRAYSIZE(detailsFilter));
+    ImGui::Separator();
+
+    ecs::World& world = editor.world();
+    ecs::TransformComponent* t = world.getComponentArchetype<ecs::TransformComponent>(ecs::Entity{selected});
+    ecs::ModelComponent* model = world.getComponentArchetype<ecs::ModelComponent>(ecs::Entity{selected});
+    ecs::MeshComponent* m = world.getComponentArchetype<ecs::MeshComponent>(ecs::Entity{selected});
+    ecs::GeospatialComponent* geo = world.getComponentArchetype<ecs::GeospatialComponent>(ecs::Entity{selected});
+
+    RenderTransformSection(t);
+    RenderModelSection(model);
+    RenderMeshSection(m);
+
+    if (geo && ImGui::CollapsingHeader("Geospatial", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushID("GeoDetail");
+        ImGui::Text("Lat: %.8f", geo->latitude);
+        ImGui::Text("Lon: %.8f", geo->longitude);
+        ImGui::Text("Alt: %.2f m", geo->altitude);
+        ImGui::PopID();
+    }
+
+    // Component tags
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Components");
+    bool hasTrans = (t != nullptr);
+    bool hasMesh = (m != nullptr);
+    bool hasModel = (model != nullptr && model->isValid());
+    bool hasCam = world.hasComponent<ecs::CameraComponent>(ecs::Entity{selected});
+    bool hasLight = world.hasComponent<ecs::LightComponent>(ecs::Entity{selected});
+    bool hasGeo = (geo != nullptr);
+
+    ImGui::TextColored(hasTrans ? ImVec4(0.4f, 0.8f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "Transform");
+    ImGui::SameLine(90);
+    ImGui::TextColored(hasMesh ? ImVec4(0.4f, 0.8f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "Mesh");
+    ImGui::SameLine(150);
+    ImGui::TextColored(hasModel ? ImVec4(0.4f, 0.8f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "Model");
+    ImGui::SameLine(210);
+    ImGui::TextColored(hasCam ? ImVec4(0.4f, 0.8f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "Camera");
+    ImGui::SameLine(270);
+    ImGui::TextColored(hasLight ? ImVec4(0.4f, 0.8f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "Light");
+    ImGui::SameLine(330);
+    ImGui::TextColored(hasGeo ? ImVec4(0.4f, 0.8f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "Geo");
+
+    UI::EndFixedPanel();
+}
+
+void RenderModelSection(ecs::ModelComponent* model) {
+    if (!model || !model->isValid()) return;
+    if (ImGui::CollapsingHeader("Model", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushID("Model");
+        UI::CheckboxSafe("Visible", &model->visible);
+        ImGui::PopID();
+    }
+}
+
+// ============================================================================
+// Outliner panel - renders inside the fixed left panel
 // ============================================================================
 void RenderOutlinerPanel(ecs::EntityID& selected, EntityCache& entityCache, const char* searchBuffer) {
-    ImGui::PushItemWidth(-1);
-    static char buf[64] = "";
-    ImGui::InputTextWithHint("##Search", "Search...", buf, 64);
-    ImGui::PopItemWidth();
-
+    // Search input with safe wrapper
+    UI::InputTextSafe("##Search", const_cast<char*>(searchBuffer), 128);
     ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.5f, 0.7f, 0.5f, 1), "%zu entities", entityCache.entries.size());
+    ImGui::TextColored(ImVec4(0.5f, 0.7f, 0.5f, 1), "%zu entities", entityCache.size());
     ImGui::Separator();
 
     // Rebuild cache if dirty (not every frame)
+    // Note: RebuildEntityCache needs the world, which should be passed from caller
+    // For now, skip auto-rebuild here; caller should handle it
     if (entityCache.dirty) {
-        RebuildEntityCache(entityCache, g_editor.world);
+        // RebuildEntityCache will be called externally with proper world reference
     }
 
     // Render from cache - zero ECS queries
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 1));
     for (const auto& entry : entityCache.entries) {
+        // Validate entity still exists
+        if (!EntityManager::EntityExists(entry.id)) {
+            if (selected == entry.id) {
+                selected = ecs::INVALID_ENTITY_ID;
+            }
+            continue;
+        }
+        
         bool isSel = (selected == entry.id);
+
+        // Use Phosphor icon for entity type
+        PhosphorImGui::PushIconFont();
+        const char* icon = entry.icon;
+        if (PhosphorImGui::SmallIconButton(PhosphorIcons::Cube, "")) {
+            // Click on icon - could expand/collapse in future
+        }
+        PhosphorImGui::PopIconFont();
+        ImGui::SameLine();
 
         // Format: "Icon ID"
         char label[32];
@@ -270,7 +401,7 @@ void RenderOutlinerPanel(ecs::EntityID& selected, EntityCache& entityCache, cons
             ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(40, 60, 40, 255));
         }
 
-        if (ImGui::Selectable(label, isSel, ImGuiSelectableFlags_SpanAllColumns)) {
+        if (UI::SelectableSafe(label, isSel, ImGuiSelectableFlags_SpanAllColumns)) {
             selected = entry.id;
         }
 
@@ -297,8 +428,17 @@ void RenderOutlinerPanel(ecs::EntityID& selected, EntityCache& entityCache, cons
 // Details panel
 // ============================================================================
 void RenderDetailsPanel(ecs::World& world, ecs::EntityID& selected) {
+    // Validate entity exists before rendering
+    selected = EntityManager::ValidateOrClear(selected);
+    
+    if (!UI::BeginPanel("Details")) {
+        UI::EndPanel();
+        return;
+    }
+    
     if (selected == ecs::INVALID_ENTITY_ID) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "No entity selected");
+        UI::EndPanel();
         return;
     }
 
@@ -317,29 +457,39 @@ void RenderDetailsPanel(ecs::World& world, ecs::EntityID& selected) {
     if (t && ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushID("Transform");
         glm::vec3 p = t->position;
-        if (ImGui::DragFloat3("Position", &p.x, 0.1f)) t->position = p;
+        if (UI::DragFloatClamped("Position X", &p.x, 0.1f, -10000.0f, 10000.0f)) t->position.x = p.x;
+        if (UI::DragFloatClamped("Position Y", &p.y, 0.1f, -10000.0f, 10000.0f)) t->position.y = p.y;
+        if (UI::DragFloatClamped("Position Z", &p.z, 0.1f, -10000.0f, 10000.0f)) t->position.z = p.z;
 
         glm::vec3 r = glm::degrees(glm::eulerAngles(t->rotation));
-        if (ImGui::DragFloat3("Rotation", &r.x, 1.0f, -180, 180)) {
+        if (UI::DragFloatClamped("Rotation X", &r.x, 1.0f, -180.0f, 180.0f)) {
+            t->setEulerAngles(glm::radians(r));
+        }
+        if (UI::DragFloatClamped("Rotation Y", &r.y, 1.0f, -180.0f, 180.0f)) {
+            t->setEulerAngles(glm::radians(r));
+        }
+        if (UI::DragFloatClamped("Rotation Z", &r.z, 1.0f, -180.0f, 180.0f)) {
             t->setEulerAngles(glm::radians(r));
         }
 
         glm::vec3 s = t->scale;
-        if (ImGui::DragFloat3("Scale", &s.x, 0.01f, 0.01f, 1000)) t->scale = s;
+        if (UI::DragFloatClamped("Scale X", &s.x, 0.01f, 0.01f, 1000.0f)) t->scale.x = s.x;
+        if (UI::DragFloatClamped("Scale Y", &s.y, 0.01f, 0.01f, 1000.0f)) t->scale.y = s.y;
+        if (UI::DragFloatClamped("Scale Z", &s.z, 0.01f, 0.01f, 1000.0f)) t->scale.z = s.z;
         ImGui::PopID();
     }
 
     if (model && model->isValid() && ImGui::CollapsingHeader("Model", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox("Visible", &model->visible);
+        UI::CheckboxSafe("Visible", &model->visible);
     }
 
     if (m && ImGui::CollapsingHeader("Mesh", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushID("Mesh");
         ImVec4 c = ImVec4(m->color.r, m->color.g, m->color.b, 1.0f);
         if (ImGui::ColorEdit3("Albedo", &c.x)) m->color = glm::vec3(c.x, c.y, c.z);
-        ImGui::Checkbox("Visible", &m->visible);
-        ImGui::SliderFloat("Metallic", &m->metallic, 0.0f, 1.0f);
-        ImGui::SliderFloat("Roughness", &m->roughness, 0.0f, 1.0f);
+        UI::CheckboxSafe("Visible", &m->visible);
+        UI::SliderFloatSafe("Metallic", &m->metallic, 0.0f, 1.0f);
+        UI::SliderFloatSafe("Roughness", &m->roughness, 0.0f, 1.0f);
         ImGui::PopID();
     }
 
@@ -377,46 +527,109 @@ void RenderDetailsPanel(ecs::World& world, ecs::EntityID& selected) {
     ImGui::TextColored(hasLight ? ImVec4(0.4f, 0.8f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "Light");
     ImGui::SameLine(340);
     ImGui::TextColored(hasGeo ? ImVec4(0.4f, 0.8f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1), "Geo");
+    
+    UI::EndPanel();
 }
 
 // ============================================================================
-// Bottom panel
+// Bottom panel - fixed Content Browser / Output Log / Profiler
 // ============================================================================
-void RenderBottomPanel(int& activeTab, float fps, const flyCamera* camera, ecs::EntityID& selected) {
-    ImGui::Begin("Debug");
+void RenderBottomPanel(Editor::Editor& editor, float fps) {
+    ImVec2 displaySize = GetDisplaySize();
+    ImVec2 pos(LEFT_PANEL_WIDTH, displaySize.y - STATUS_BAR_HEIGHT - BOTTOM_PANEL_HEIGHT);
+    ImVec2 size(displaySize.x - LEFT_PANEL_WIDTH - RIGHT_PANEL_WIDTH, BOTTOM_PANEL_HEIGHT);
 
-    ImVec2 tabSize = ImVec2(100, 24);
-    ImGui::PushStyleColor(ImGuiCol_Button, activeTab == 0 ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button("Console", tabSize)) activeTab = 0;
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, activeTab == 1 ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
-    if (ImGui::Button("Profiler", tabSize)) activeTab = 1;
-    ImGui::PopStyleColor();
+    if (!UI::BeginFixedPanel("Content Browser / Output Log", pos, size)) {
+        UI::EndFixedPanel();
+        return;
+    }
+
+    const char* tabs[] = { "Content Browser", "Output Log", "Profiler" };
+    const int tabCount = IM_ARRAYSIZE(tabs);
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    float tabW = (avail.x - (tabCount - 1) * 4) / tabCount;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
+    for (int i = 0; i < tabCount; ++i) {
+        bool active = (editor.uiState.bottomPanelTab == i);
+        ImGui::PushStyleColor(ImGuiCol_Button, active ? IM_COL32(60, 60, 60, 255) : IM_COL32(40, 40, 40, 255));
+        if (ImGui::Button(tabs[i], ImVec2(tabW, 24))) editor.uiState.bottomPanelTab = i;
+        ImGui::PopStyleColor();
+        if (i < tabCount - 1) ImGui::SameLine();
+    }
+    ImGui::PopStyleVar();
 
     ImGui::Separator();
 
-    if (activeTab == 0) {
-        RenderConsolePanel();
-    } else {
-        ImGui::Columns(3, "Stats", true);
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "FPS"); ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1), "%.1f", fps); ImGui::NextColumn();
-
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Frame"); ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.4f, 0.7f, 0.9f, 1), "%.2f ms", 1000.0f / (fps > 0 ? fps : 60)); ImGui::NextColumn();
-
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Entities"); ImGui::NextColumn();
-        ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1), "%zu", g_editor.world.getEntityCount()); ImGui::NextColumn();
-
-        ImGui::Columns(1);
-
-        if (camera) {
-            ImGui::Text("Camera: (%.1f, %.1f, %.1f)", camera->Position.x, camera->Position.y, camera->Position.z);
-        }
+    switch (editor.uiState.bottomPanelTab) {
+        case 0:
+            RenderContentBrowserPanel();
+            break;
+        case 1:
+            UI::RenderConsolePanel();
+            break;
+        case 2:
+            RenderProfilerPanel(editor, fps);
+            break;
+        default:
+            editor.uiState.bottomPanelTab = 0;
+            break;
     }
 
-    ImGui::End();
+    UI::EndFixedPanel();
+}
+
+void RenderContentBrowserPanel() {
+    static char pathBuffer[256] = "/Game/Assets";
+    UI::InputTextSafe("Path", pathBuffer, IM_ARRAYSIZE(pathBuffer));
+    ImGui::Separator();
+
+    // Placeholder asset folders using available Phosphor icons
+    struct AssetFolder { const char* name; PhosphorIcons::Icon icon; };
+    static const AssetFolder folders[] = {
+        { "Materials", PhosphorIcons::Pencil },
+        { "Meshes", PhosphorIcons::Cube },
+        { "Textures", PhosphorIcons::FileText },
+        { "Blueprints", PhosphorIcons::FilePlus },
+        { "Sounds", PhosphorIcons::Star },
+    };
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 8));
+    for (size_t i = 0; i < IM_ARRAYSIZE(folders); ++i) {
+        const auto& folder = folders[i];
+
+        // Group each folder icon + label so ImGui sees proper bounds
+        ImGui::BeginGroup();
+        PhosphorImGui::PushIconFont();
+        ImGui::Button(PhosphorImGui::GetCodepointSafe(folder.icon), ImVec2(64, 64));
+        PhosphorImGui::PopIconFont();
+        ImGui::Text("%s", folder.name);
+        ImGui::EndGroup();
+
+        if (i < IM_ARRAYSIZE(folders) - 1) {
+            ImGui::SameLine();
+        }
+    }
+    ImGui::PopStyleVar();
+}
+
+void RenderProfilerPanel(Editor::Editor& editor, float fps) {
+    ImGui::Columns(2, "ProfilerStats", true);
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "FPS"); ImGui::NextColumn();
+    ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1), "%.1f", fps); ImGui::NextColumn();
+
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Frame Time"); ImGui::NextColumn();
+    ImGui::TextColored(ImVec4(0.4f, 0.7f, 0.9f, 1), "%.2f ms", 1000.0f / (fps > 0 ? fps : 60)); ImGui::NextColumn();
+
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Entities"); ImGui::NextColumn();
+    ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1), "%zu", editor.world().getEntityCount()); ImGui::NextColumn();
+
+    ImGui::Columns(1);
+
+    flyCamera* camera = editor.camera();
+    if (camera) {
+        ImGui::Text("Camera Position: (%.1f, %.1f, %.1f)", camera->Position.x, camera->Position.y, camera->Position.z);
+    }
 }
 
 void RenderConsolePanel() {
@@ -434,53 +647,232 @@ void RenderConsolePanel() {
 }
 
 // ============================================================================
-// Viewport
+// Viewport - fixed center panel, always the largest area
 // ============================================================================
-void RenderViewport(ecs::EntityID& selected, flyCamera* camera, bool& isViewing,
-                 glm::vec2& lastMousePos, GLuint viewportTexture, int windowW, int windowH,
-                 GizmoRenderer::GizmoType gizmoType, GizmoRenderer::SpaceType spaceType, int showWireframe,
-                 bool showGrid, bool showGizmo, GLFWwindow* window, ImGuiIO& io) {
-    float vpX = 270;
-    float vpY = 25 + 38;
-    float vpW = windowW - 270 - 300;
-    float vpH = windowW > 0 ? (windowH - 25 - 38 - 180 - 24) : 800;
+void RenderViewport(Editor::Editor& editor, GLuint viewportTexture,
+                 int windowW, int windowH, GLFWwindow* window, ImGuiIO& io,
+                 const glm::mat4& projection) {
+    // Safety guard 1: no ImGui context -> nothing to render into.
+    if (ImGui::GetCurrentContext() == nullptr) {
+        return;
+    }
 
-    ImGui::SetNextWindowPos(ImVec2(vpX, vpY), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(vpW, vpH), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Viewport", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
+    ImVec2 displaySize = GetDisplaySize();
+    float vpX = LEFT_PANEL_WIDTH;
+    float vpY = MENU_BAR_HEIGHT + TOOLBAR_HEIGHT;
+    float vpW = displaySize.x - LEFT_PANEL_WIDTH - RIGHT_PANEL_WIDTH;
+    if (vpW < 1.0f) vpW = 1.0f;
+    float vpH = displaySize.y - MENU_BAR_HEIGHT - TOOLBAR_HEIGHT - BOTTOM_PANEL_HEIGHT - STATUS_BAR_HEIGHT;
+    if (vpH < 1.0f) vpH = 1.0f;
 
-    ImVec2 cs = ImGui::GetContentRegionAvail();
-    if (cs.x > 10 && cs.y > 10) {
-        ImGui::Image((void*)(intptr_t)viewportTexture, cs, ImVec2(0, 1), ImVec2(1, 0));
+    ImVec2 vpPos(vpX, vpY);
+    ImVec2 vpSize(vpW, vpH);
 
-        ImVec2 vpMin = ImGui::GetCursorScreenPos();
-        ImGui::SetCursorScreenPos(ImVec2(vpMin.x + 10, vpMin.y + 10));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 0.8f));
+    // Push a darker frame background so the FBO content is visually distinct from
+    // the editor's UI panels.
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.05f, 0.07f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 
-        if (camera) {
-            ImGui::Text("Camera: (%.1f, %.1f, %.1f)", camera->Position.x, camera->Position.y, camera->Position.z);
+    ImGuiWindowFlags viewportFlags =
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+    if (!UI::BeginFixedPanel("Viewport", vpPos, vpSize, viewportFlags)) {
+        UI::EndFixedPanel();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    static int vpDiagFrame = 0;
+    vpDiagFrame++;
+    if (vpDiagFrame <= 3 || vpDiagFrame % 120 == 0) {
+        printf("[viewport-ui-diag] frame=%d pos=(%.0f,%.0f) size=(%.0fx%.0f) tex=%u\n",
+               vpDiagFrame, vpPos.x, vpPos.y, vpSize.x, vpSize.y, viewportTexture);
+        fflush(stdout);
+    }
+
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+
+    // ----- Header bar (28px) -----
+    ImVec2 winPos = ImGui::GetWindowPos();
+    ImVec2 winSize = ImGui::GetWindowSize();
+
+    // Background for the header
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(
+        ImVec2(winPos.x, winPos.y),
+        ImVec2(winPos.x + winSize.x, winPos.y + 28.0f),
+        IM_COL32(35, 38, 45, 255)
+    );
+    // Bottom border
+    dl->AddLine(
+        ImVec2(winPos.x, winPos.y + 28.0f),
+        ImVec2(winPos.x + winSize.x, winPos.y + 28.0f),
+        IM_COL32(60, 60, 70, 255)
+    );
+
+    // Title text (manual placement, since we have WindowPadding=0)
+    dl->AddText(ImVec2(winPos.x + 10.0f, winPos.y + 6.0f), IM_COL32(220, 225, 235, 255), "Viewport");
+
+    // Render-mode toggle in header (right side) - read state from editor.
+    const char* modeLabels[] = { "Lit", "Wire", "Normals", "Unlit" };
+    int showWireframe = editor.showWireframe();
+    int modeIdx = showWireframe == 1 ? 1 : 0;
+    for (int i = 0; i < 4; i++) {
+        ImVec2 btnSize(50, 20);
+        ImVec2 btnPos(winPos.x + winSize.x - (4 - i) * (btnSize.x + 2) - 8, winPos.y + 4);
+        bool isActive = (i == modeIdx);
+        dl->AddRectFilled(btnPos, ImVec2(btnPos.x + btnSize.x, btnPos.y + btnSize.y),
+                          isActive ? IM_COL32(70, 110, 180, 255) : IM_COL32(50, 53, 60, 255));
+        dl->AddRect(btnPos, ImVec2(btnPos.x + btnSize.x, btnPos.y + btnSize.y),
+                    IM_COL32(80, 85, 95, 255));
+        dl->AddText(ImVec2(btnPos.x + 8, btnPos.y + 3),
+                    isActive ? IM_COL32(240, 245, 255, 255) : IM_COL32(170, 175, 185, 255),
+                    modeLabels[i]);
+    }
+
+    // ----- 3D viewport content area (below header) -----
+    ImVec2 contentAvail = ImGui::GetContentRegionAvail();
+    float viewY = 28.0f;
+    ImVec2 viewSize(contentAvail.x, contentAvail.y - viewY);
+    if (viewSize.x > 10 && viewSize.y > 10) {
+        // Safety guard 3: missing viewport texture -> draw placeholder text instead
+        // of calling ImGui::Image with a null texture handle.
+        if (viewportTexture == 0) {
+            ImVec2 center(
+                (winPos.x + winSize.x) * 0.5f,
+                (winPos.y + winSize.y) * 0.5f
+            );
+            const char* msg = "Viewport unavailable";
+            ImVec2 textSize = ImGui::CalcTextSize(msg);
+            dl->AddText(ImVec2(center.x - textSize.x * 0.5f, center.y - textSize.y * 0.5f),
+                        IM_COL32(180, 180, 180, 255), msg);
+        } else {
+            // Fill the entire viewport panel with the FBO texture so the skybox
+            // and scene are visible across the whole viewport, matching Unreal.
+            ImVec2 imgSize = viewSize;
+
+            ImVec2 imgScreenMin = ImGui::GetCursorScreenPos();
+            ImVec2 imgScreenMax(imgScreenMin.x + imgSize.x, imgScreenMin.y + imgSize.y);
+
+            ImGui::Image((void*)(intptr_t)viewportTexture, imgSize, ImVec2(0, 1), ImVec2(1, 0));
+
+            // ----- Overlay: bottom-left camera/tool info -----
+            char camBuf[160];
+            // Safety guard 4: camera may be null (editor not initialized yet).
+            flyCamera* camera = editor.camera();
+            GizmoRenderer::GizmoType gizmoType = editor.gizmoType();
+            GizmoRenderer::SpaceType spaceType = editor.spaceType();
+            bool showGrid = editor.showGrid();
+            bool showGizmo = editor.showGizmo();
+            if (camera) {
+                glm::vec3 target = camera->Target;
+                glm::vec3 delta = target - camera->Position;
+                float dist = glm::length(delta);
+                snprintf(camBuf, sizeof(camBuf),
+                         "Pos (%.1f, %.1f, %.1f)  Dist %.1f",
+                         camera->Position.x, camera->Position.y, camera->Position.z, dist);
+            } else {
+                snprintf(camBuf, sizeof(camBuf), "Camera: <none>");
+            }
+            const char* giz = (gizmoType == GizmoRenderer::GizmoType::Translate) ? "Move" :
+                           (gizmoType == GizmoRenderer::GizmoType::Rotate) ? "Rotate" : "Scale";
+            const char* sp = (spaceType == GizmoRenderer::SpaceType::World) ? "World" : "Local";
+            char toolBuf[64];
+            snprintf(toolBuf, sizeof(toolBuf), "Tool: %s  Space: %s", giz, sp);
+
+            // Position: bottom-left of FBO image
+            ImVec2 overlayBL(imgScreenMin.x + 8.0f, imgScreenMax.y - 36.0f);
+            dl->AddRectFilled(ImVec2(overlayBL.x - 4, overlayBL.y - 2),
+                              ImVec2(overlayBL.x + 240, overlayBL.y + 36),
+                              IM_COL32(15, 17, 22, 200));
+            dl->AddText(overlayBL, IM_COL32(190, 210, 230, 255), camBuf);
+            dl->AddText(ImVec2(overlayBL.x, overlayBL.y + 16), IM_COL32(160, 175, 195, 255), toolBuf);
+
+            // ----- Overlay: top-right FPS / draw calls -----
+            float fps = io.Framerate;
+            char fpsBuf[32];
+            snprintf(fpsBuf, sizeof(fpsBuf), "%.0f FPS", fps);
+            char resBuf[48];
+            snprintf(resBuf, sizeof(resBuf), "%dx%d", (int)imgSize.x, (int)imgSize.y);
+
+            ImVec2 overlayTR(imgScreenMax.x - 110.0f, imgScreenMin.y + 6.0f);
+            dl->AddRectFilled(ImVec2(overlayTR.x - 4, overlayTR.y - 2),
+                              ImVec2(overlayTR.x + 110, overlayTR.y + 36),
+                              IM_COL32(15, 17, 22, 200));
+            // Color FPS based on value
+            ImU32 fpsCol = fps >= 60.0f ? IM_COL32(120, 220, 140, 255) :
+                           fps >= 30.0f ? IM_COL32(220, 220, 120, 255) :
+                                           IM_COL32(220, 120, 120, 255);
+            dl->AddText(overlayTR, fpsCol, fpsBuf);
+            dl->AddText(ImVec2(overlayTR.x, overlayTR.y + 16), IM_COL32(160, 175, 195, 255), resBuf);
+
+            // ----- Center crosshair (subtle) -----
+            ImVec2 crosshair(
+                (imgScreenMin.x + imgScreenMax.x) * 0.5f,
+                (imgScreenMin.y + imgScreenMax.y) * 0.5f
+            );
+            dl->AddLine(ImVec2(crosshair.x - 6, crosshair.y), ImVec2(crosshair.x + 6, crosshair.y),
+                        IM_COL32(255, 255, 255, 100), 1.0f);
+            dl->AddLine(ImVec2(crosshair.x, crosshair.y - 6), ImVec2(crosshair.x, crosshair.y + 6),
+                        IM_COL32(255, 255, 255, 100), 1.0f);
+
+            // ----- Grid (always at world origin) -----
+            if (showGrid && camera && ImGui::IsItemHovered()) {
+                glm::mat4 view = camera->GetViewMatrix();
+                GridRenderer::Draw(view, projection, ShaderManager::GetMainShaderProgram());
+            }
+
+            // ----- Selection gizmo (only when something is selected and toggle is on) -----
+            // Safety guard 5: validate the cached selection before dereferencing
+            // its transform. If the selected entity no longer exists, clear it.
+            ecs::EntityID selected = EntityManager::ValidateOrClear(editor.selectedEntity());
+            if (showGizmo && gizmoType != GizmoRenderer::GizmoType::None &&
+                selected != ecs::INVALID_ENTITY_ID && camera) {
+                const ecs::World& w = editor.world();
+                const ecs::TransformComponent* t =
+                    w.getComponent<ecs::TransformComponent>(ecs::Entity{selected});
+                if (t) {
+                    glm::vec3 pos = t->position;
+                    glm::quat rot = (spaceType == GizmoRenderer::SpaceType::World)
+                                       ? glm::quat(1.0f, 0.0f, 0.0f, 0.0f)
+                                       : glm::quat(t->rotation);
+                    float size = 1.0f;
+                    glm::mat4 view = camera->GetViewMatrix();
+                    GizmoRenderer::Draw(pos, size, rot, view, projection,
+                                        ShaderManager::GetGizmoShaderProgram(),
+                                        gizmoType);
+                }
+            }
         }
 
-        const char* giz = (gizmoType == GizmoRenderer::GizmoType::Translate) ? "Translate" :
-                       (gizmoType == GizmoRenderer::GizmoType::Rotate) ? "Rotate" : "Scale";
-        const char* sp = (spaceType == GizmoRenderer::SpaceType::World) ? "World" : "Local";
-        ImGui::Text("Tool: %s | Space: %s", giz, sp);
-        ImGui::PopStyleColor();
+        (void)window;
     }
-    ImGui::End();
+    UI::EndFixedPanel();
 }
 
 // ============================================================================
-// Status bar - reads from cached data, NO ECS iteration
+// Status bar - fixed bottom strip
 // ============================================================================
 void RenderStatusBar(size_t entityCount, ecs::EntityID selected, float fps,
-                   bool isPlaying, bool wasPlaying, int windowW) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(25, 25, 25, 255));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+                   bool isPlaying, bool wasPlaying, int windowW, int windowH) {
+    (void)windowW;
+    (void)windowH;
 
-    ImGui::SetNextWindowPos(ImVec2(0, windowW > 0 ? windowW - 24 : 1056));
-    ImGui::SetNextWindowSize(ImVec2(windowW > 0 ? windowW : 1920, 24));
-    ImGui::Begin("StatusBar", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar);
+    ImVec2 displaySize = GetDisplaySize();
+    ImVec2 pos(0, displaySize.y - STATUS_BAR_HEIGHT);
+    ImVec2 size(displaySize.x, STATUS_BAR_HEIGHT);
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(25, 25, 25, 255));
+
+    if (!UI::BeginFixedPanel("StatusBar", pos, size)) {
+        UI::EndFixedPanel();
+        ImGui::PopStyleColor();
+        return;
+    }
 
     ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1), "%.0f FPS", fps);
     ImGui::SameLine();
@@ -488,7 +880,11 @@ void RenderStatusBar(size_t entityCount, ecs::EntityID selected, float fps,
 
     // Geo status (if geo API available)
     ImGui::SameLine();
-    RenderGeoStatusBar(g_editor.geospatialSystem.getGeoAPI());
+#ifndef DISABLE_GEOSPATIAL
+    UI::RenderGeoStatusBar(g_editor.geospatialSystem().getGeoAPI());
+#else
+    // geo status bar disabled
+#endif
 
     ImGui::SameLine(ImGui::GetWindowWidth() - 200);
     if (selected != ecs::INVALID_ENTITY_ID) {
@@ -501,8 +897,7 @@ void RenderStatusBar(size_t entityCount, ecs::EntityID selected, float fps,
     else if (wasPlaying) ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.3f, 1), "Paused");
     else ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1), "Stopped");
 
-    ImGui::End();
-    ImGui::PopStyleVar(2);
+    UI::EndFixedPanel();
     ImGui::PopStyleColor();
 }
 

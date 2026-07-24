@@ -14,55 +14,115 @@
 #include "renderer/GeoTerrainRenderer.h"
 #include "geo_config_panel.h"
 #include "ui_cache.h"
+#include "viewport_framebuffer.h"
+#include "imgui_context.h"
+#include <memory>
 #include <string>
 
 // ============================================================================
-// Editor Global State
+// Editor Class (RAII wrapper around all editor global state)
 // ============================================================================
-struct EditorState {
-    // ECS and rendering
-    ecs::World world;
-    flyCamera* camera = nullptr;
-    Renderer renderer;
-    ecs::RenderSystem renderSystem;
-    ecs::ModelRenderSystem modelRenderSystem;
-    ecs::GeospatialSystem geospatialSystem;
-    ecs::GeoTerrainSystem geoTerrainSystem;
-    GeoTerrainRenderer geoTerrainRenderer;
+namespace Editor {
 
-    // Scene panel configuration (flexible, not hardcoded)
-    EditorUI::ScenePanelConfig scenePanelConfig;
-    int scenePanelActiveTab = 0;  // Legacy support
+class Editor {
+public:
+    Editor();
+    ~Editor();
 
-    // Geo panel state
-    UI::GeoPanelState geoPanelState;
+    Editor(const Editor&) = delete;
+    Editor& operator=(const Editor&) = delete;
 
-    // Entity cache (avoids per-frame ECS iteration)
-    EntityCache entityCache;
+    bool initialize();
+    void shutdown();
+    bool isInitialized() const noexcept { return initialized_; }
+
+    // ECS / rendering accessors
+    ecs::World& world() noexcept { return world_; }
+    const ecs::World& world() const noexcept { return world_; }
+    Renderer& renderer() noexcept { return renderer_; }
+    const Renderer& renderer() const noexcept { return renderer_; }
+    flyCamera* camera() noexcept { return camera_.get(); }
+    const flyCamera* camera() const noexcept { return camera_.get(); }
+
+    ViewportFramebuffer& viewportFramebuffer() noexcept { return viewportFB_; }
+    const ViewportFramebuffer& viewportFramebuffer() const noexcept { return viewportFB_; }
+
+    EntityCache& entityCache() noexcept { return entityCache_; }
+    const EntityCache& entityCache() const noexcept { return entityCache_; }
+
+    // Subsystem accessors (kept public for minimal call-site churn)
+    ecs::RenderSystem& renderSystem() noexcept { return renderSystem_; }
+    const ecs::RenderSystem& renderSystem() const noexcept { return renderSystem_; }
+    ecs::ModelRenderSystem& modelRenderSystem() noexcept { return modelRenderSystem_; }
+    const ecs::ModelRenderSystem& modelRenderSystem() const noexcept { return modelRenderSystem_; }
+    ecs::GeospatialSystem& geospatialSystem() noexcept { return geospatialSystem_; }
+    const ecs::GeospatialSystem& geospatialSystem() const noexcept { return geospatialSystem_; }
+    ecs::GeoTerrainSystem& geoTerrainSystem() noexcept { return geoTerrainSystem_; }
+    const ecs::GeoTerrainSystem& geoTerrainSystem() const noexcept { return geoTerrainSystem_; }
+    GeoTerrainRenderer& geoTerrainRenderer() noexcept { return geoTerrainRenderer_; }
+    const GeoTerrainRenderer& geoTerrainRenderer() const noexcept { return geoTerrainRenderer_; }
 
     // Selection
-    ecs::EntityID selectedEntity = ecs::INVALID_ENTITY_ID;
-    
-    // Gizmo state
-    GizmoRenderer::GizmoType gizmoType = GizmoRenderer::GizmoType::Translate;
-    GizmoRenderer::SpaceType spaceType = GizmoRenderer::SpaceType::World;
-    GizmoRenderer::GizmoAxis hoveredAxis = GizmoRenderer::GizmoAxis::None;
-    bool showGrid = true;
-    bool showGizmo = true;
-    int showWireframe = 0;  // 0=Fill, 1=Line, 2=Point
-    
-    // Viewport camera
-    bool isViewing = false;
-    glm::vec2 lastMousePos;
-    
-    // UI state
-    struct {
+    ecs::EntityID selectedEntity() const noexcept { return selectedEntity_; }
+    void setSelectedEntity(ecs::EntityID id) noexcept;
+
+    // Gizmo / viewport state
+    GizmoRenderer::GizmoType gizmoType() const noexcept { return gizmoType_; }
+    void setGizmoType(GizmoRenderer::GizmoType t) noexcept { gizmoType_ = t; }
+
+    GizmoRenderer::SpaceType spaceType() const noexcept { return spaceType_; }
+    void setSpaceType(GizmoRenderer::SpaceType t) noexcept { spaceType_ = t; }
+
+    GizmoRenderer::GizmoAxis hoveredAxis() const noexcept { return hoveredAxis_; }
+    void setHoveredAxis(GizmoRenderer::GizmoAxis a) noexcept { hoveredAxis_ = a; }
+
+    bool showGrid() const noexcept { return showGrid_; }
+    void setShowGrid(bool v) noexcept { showGrid_ = v; }
+
+    bool showGizmo() const noexcept { return showGizmo_; }
+    void setShowGizmo(bool v) noexcept { showGizmo_ = v; }
+
+    int showWireframe() const noexcept { return showWireframe_; }
+    void setShowWireframe(int v) noexcept { showWireframe_ = v; }
+
+    bool isViewing() const noexcept { return isViewing_; }
+    void setIsViewing(bool v) noexcept { isViewing_ = v; }
+
+    glm::vec2& lastMousePos() noexcept { return lastMousePos_; }
+    const glm::vec2& lastMousePos() const noexcept { return lastMousePos_; }
+
+    // Game state
+    bool isPlaying() const noexcept { return isPlaying_; }
+    void setPlaying(bool v) noexcept { isPlaying_ = v; }
+
+    bool wasPlaying() const noexcept { return wasPlaying_; }
+    void setWasPlaying(bool v) noexcept { wasPlaying_ = v; }
+
+    float gameSpeed() const noexcept { return gameSpeed_; }
+    void setGameSpeed(float s) noexcept { gameSpeed_ = s; }
+
+    float fps() const noexcept { return fps_; }
+    void setFps(float f) noexcept { fps_ = f; }
+
+    int frameCount() const noexcept { return frameCount_; }
+    void setFrameCount(int c) noexcept { frameCount_ = c; }
+
+    float lastRenderTime() const noexcept { return lastRenderTime_; }
+    void setLastRenderTime(float t) noexcept { lastRenderTime_ = t; }
+
+    bool shouldClose() const noexcept { return shouldClose_; }
+    void setShouldClose(bool v) noexcept { shouldClose_ = v; }
+
+    bool showAbout() const noexcept { return showAbout_; }
+    void setShowAbout(bool v) noexcept { showAbout_ = v; }
+    bool& showAboutRef() noexcept { return showAbout_; }
+
+    // Public sub-state structs (kept public to reduce churn; gradually migrate to private)
+    struct UIState {
         char searchBuffer[128] = "";
         char pathBuffer[256] = "/Game/Assets";
         int leftPanelTab = 0;
         int bottomPanelTab = 0;
-
-        // Flexible panel dimensions (as percentage of window, or fixed minimum)
         float leftPanelWidth = 280.0f;
         float rightPanelWidth = 300.0f;
         float bottomPanelHeight = 180.0f;
@@ -72,8 +132,6 @@ struct EditorState {
         float maxPanelWidth = 600.0f;
         float minBottomHeight = 100.0f;
         float maxBottomHeight = 400.0f;
-
-        // Panel visibility
         bool showOutliner = true;
         bool showDetails = true;
         bool showToolbox = true;
@@ -85,48 +143,59 @@ struct EditorState {
         bool showPreferences = false;
         bool showModelLoader = false;
     } uiState;
-    
-    // Game state
-    bool isPlaying = false;
-    bool wasPlaying = false;
-    float gameSpeed = 1.0f;
-    
-    // Debug
-    struct {
+
+    EditorUI::ScenePanelConfig scenePanelConfig;
+    int scenePanelActiveTab = 0;
+    UI::GeoPanelState geoPanelState;
+
+    struct DebugConfig {
         bool verbose = true;
     } debugConfig;
-    
-    // Framebuffer
-    struct Framebuffer {
-        GLuint fbo = 0;
-        GLuint colorTex = 0;
-        GLuint rbo = 0;
-        int width = 1280;
-        int height = 720;
-        
-        void init(int w, int h);
-        void resize(int w, int h);
-        void cleanup();
-        void bind();
-        void unbind();
-    } viewportFB;
-    
-    // FPS tracking
-    float fps = 0.0f;
-    int frameCount = 0;
-    float lastRenderTime = 0;
-    
-    // About dialog
-    bool showAbout = false;
-    
-    // Window close
-    bool shouldClose = false;
+
+private:
+    bool initialized_ = false;
+
+    ecs::World world_;
+    Renderer renderer_;
+    ecs::RenderSystem renderSystem_;
+    ecs::ModelRenderSystem modelRenderSystem_;
+    ecs::GeospatialSystem geospatialSystem_;
+    ecs::GeoTerrainSystem geoTerrainSystem_;
+    GeoTerrainRenderer geoTerrainRenderer_;
+
+    std::unique_ptr<flyCamera> camera_;
+    ViewportFramebuffer viewportFB_;
+    EntityCache entityCache_;
+
+    ecs::EntityID selectedEntity_ = ecs::INVALID_ENTITY_ID;
+    GizmoRenderer::GizmoType gizmoType_ = GizmoRenderer::GizmoType::Translate;
+    GizmoRenderer::SpaceType spaceType_ = GizmoRenderer::SpaceType::World;
+    GizmoRenderer::GizmoAxis hoveredAxis_ = GizmoRenderer::GizmoAxis::None;
+
+    bool showGrid_ = true;
+    bool showGizmo_ = true;
+    int showWireframe_ = 0;
+    bool isViewing_ = false;
+    glm::vec2 lastMousePos_{0.0f, 0.0f};
+
+    bool isPlaying_ = false;
+    bool wasPlaying_ = false;
+    float gameSpeed_ = 1.0f;
+
+    float fps_ = 0.0f;
+    int frameCount_ = 0;
+    float lastRenderTime_ = 0.0f;
+
+    bool shouldClose_ = false;
+    bool showAbout_ = false;
 };
 
-// Global editor state
-extern EditorState g_editor;
+} // namespace Editor
 
-// Initialize/cleanup editor
+// Legacy global accessor. New code should prefer dependency injection.
+extern Editor::Editor g_editor;
+
+// Legacy free functions preserved for compatibility.
 void InitEditor();
 void CleanupEditor();
 

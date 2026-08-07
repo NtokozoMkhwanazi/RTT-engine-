@@ -47,6 +47,9 @@
 <img width="1366" height="768" alt="screen3" src="https://github.com/user-attachments/assets/1328b559-cbe9-4242-93af-6f3bc89dea0c" />
 <img width="1366" height="768" alt="2" src="https://github.com/user-attachments/assets/f3413e3f-f0d7-4970-8f61-9c3048d2344c" />
 
+
+## 📸 GIFs
+
 **Test Demo GIF**
 <img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/fb9adf56-fb97-4cd9-b99e-fe698d9a6212" />
 

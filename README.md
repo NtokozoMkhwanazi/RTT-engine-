@@ -42,10 +42,12 @@
 <img width="1366" height="768" alt="uui" src="https://github.com/user-attachments/assets/cb065b90-c4a0-4c64-8faa-54824de23281" />
 
 **FBX/GLFT etc characters/models**
-<img width="1366" height="768" alt="T-pose" src="https://github.com/user-attachments/assets/fb9d43b1-72b3-4a21-82b4-f63889d07845" />
+<img width="1366" height="768" alt="snipp" src="https://github.com/user-attachments/assets/8a345144-085d-4570-96bd-60d47398c15c" />
+<img width="1366" height="768" alt="screen1" src="https://github.com/user-attachments/assets/18aff4b6-0d23-4250-b933-265198c2544c" />
+
 <img width="1366" height="768" alt="snip" src="https://github.com/user-attachments/assets/fb06a506-05c5-4fff-9830-b11a07839c84" />
 <img width="1366" height="768" alt="screen3" src="https://github.com/user-attachments/assets/1328b559-cbe9-4242-93af-6f3bc89dea0c" />
-<img width="1366" height="768" alt="2" src="https://github.com/user-attachments/assets/f3413e3f-f0d7-4970-8f61-9c3048d2344c" />
+
 
 
 ## 📸 GIFs

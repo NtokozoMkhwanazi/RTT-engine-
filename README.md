@@ -17,6 +17,7 @@
 ## 📸 GIFs
 
 **CAM/SKYBOX ON VIEWPORT Test  Demo GIF**
+<img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/fb9adf56-fb97-4cd9-b99e-fe698d9a6212" />
 
 ## 📸 Screenshots
 
@@ -27,7 +28,6 @@
 <img width="1366" height="768" alt="snip" src="https://github.com/user-attachments/assets/fb06a506-05c5-4fff-9830-b11a07839c84" />
 <img width="1366" height="768" alt="screen3" src="https://github.com/user-attachments/assets/1328b559-cbe9-4242-93af-6f3bc89dea0c" />
 
-<img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/fb9adf56-fb97-4cd9-b99e-fe698d9a6212" />
 
 
 ## 📊 Architecture diagrams (ECS Overview)

@@ -14,6 +14,22 @@
 
 **Advanced lightweight** 3D game engine project built for **scalability and high-performance systems** for animation systems , 3D software simulation systems and real-time rendering using the **power and speed** of the C++ Language. openGL graphics API for relative ease of use compared to Vulkan. Dear imgui UI/UX editor for its seemless integration with th C++ language and backend API openGL . This project contains comprehensive documentation and a clear codebase structure. This project is **actively under-development and maintained**. This is a project that encourages learn by building, meant for curious minds.  
 
+## 📸 GIFs
+
+**CAM/SKYBOX ON VIEWPORT Test  Demo GIF**
+
+## 📸 Screenshots
+
+**FBX/GLFT etc characters/models**
+<img width="1366" height="768" alt="snipp" src="https://github.com/user-attachments/assets/8a345144-085d-4570-96bd-60d47398c15c" />
+<img width="1366" height="768" alt="screen1" src="https://github.com/user-attachments/assets/18aff4b6-0d23-4250-b933-265198c2544c" />
+
+<img width="1366" height="768" alt="snip" src="https://github.com/user-attachments/assets/fb06a506-05c5-4fff-9830-b11a07839c84" />
+<img width="1366" height="768" alt="screen3" src="https://github.com/user-attachments/assets/1328b559-cbe9-4242-93af-6f3bc89dea0c" />
+
+<img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/fb9adf56-fb97-4cd9-b99e-fe698d9a6212" />
+
+
 ## 📊 Architecture diagrams (ECS Overview)
 
 - **System** 
@@ -35,25 +51,10 @@
 - **ECS**
   <img width="2562" height="824" alt="mermaid-diagram(3)" src="https://github.com/user-attachments/assets/80346fea-d0ce-42d7-bae4-f1ca803893df" />
 
-## 📸 Screenshots
-
-**Dear imGui UI editor**
-<img width="1366" height="768" alt="uui2" src="https://github.com/user-attachments/assets/f1a4dd17-d816-4132-953f-731588fec1d4" />
-<img width="1366" height="768" alt="uui" src="https://github.com/user-attachments/assets/cb065b90-c4a0-4c64-8faa-54824de23281" />
-
-**FBX/GLFT etc characters/models**
-<img width="1366" height="768" alt="snipp" src="https://github.com/user-attachments/assets/8a345144-085d-4570-96bd-60d47398c15c" />
-<img width="1366" height="768" alt="screen1" src="https://github.com/user-attachments/assets/18aff4b6-0d23-4250-b933-265198c2544c" />
-
-<img width="1366" height="768" alt="snip" src="https://github.com/user-attachments/assets/fb06a506-05c5-4fff-9830-b11a07839c84" />
-<img width="1366" height="768" alt="screen3" src="https://github.com/user-attachments/assets/1328b559-cbe9-4242-93af-6f3bc89dea0c" />
 
 
 
-## 📸 GIFs
 
-**CAM/SKYBOX ON VIEWPORT Test  Demo GIF**
-<img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/fb9adf56-fb97-4cd9-b99e-fe698d9a6212" />
 
 
 ## 🎯 Features

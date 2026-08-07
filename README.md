@@ -2,6 +2,7 @@
 
 
 
+
 # RTT Engine - 3D Game Engine
 
 ![GitHub stars](https://img.shields.io/github/stars/NtokozoMkhwanazi/RTT-engine-?style=social)
@@ -39,15 +40,16 @@
 **Dear imGui UI editor**
 <img width="1366" height="768" alt="uui2" src="https://github.com/user-attachments/assets/f1a4dd17-d816-4132-953f-731588fec1d4" />
 <img width="1366" height="768" alt="uui" src="https://github.com/user-attachments/assets/cb065b90-c4a0-4c64-8faa-54824de23281" />
-https://github.com/user-attachments/assets/ccc8782c-8bc2-4a55-a71d-cd9c1a92965d
-https://github.com/user-attachments/assets/eaadf42e-e399-4e20-a975-9c7c83d3738b
-
 
 **FBX/GLFT etc characters/models**
 <img width="1366" height="768" alt="T-pose" src="https://github.com/user-attachments/assets/fb9d43b1-72b3-4a21-82b4-f63889d07845" />
 <img width="1366" height="768" alt="snip" src="https://github.com/user-attachments/assets/fb06a506-05c5-4fff-9830-b11a07839c84" />
 <img width="1366" height="768" alt="screen3" src="https://github.com/user-attachments/assets/1328b559-cbe9-4242-93af-6f3bc89dea0c" />
 <img width="1366" height="768" alt="2" src="https://github.com/user-attachments/assets/f3413e3f-f0d7-4970-8f61-9c3048d2344c" />
+
+**Test Demo GIF**
+<img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/fb9adf56-fb97-4cd9-b99e-fe698d9a6212" />
+
 
 ## 🎯 Features
 

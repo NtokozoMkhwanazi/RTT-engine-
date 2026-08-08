@@ -32,16 +32,6 @@
 
 <img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/e2c13e2a-4fa5-41ad-9679-0c0f924f71bb" />
 
-## 📸 Screenshots
-
-**FBX/GLFT etc characters/models**
-<img width="1366" height="768" alt="snipp" src="https://github.com/user-attachments/assets/8a345144-085d-4570-96bd-60d47398c15c" />
-<img width="1366" height="768" alt="screen1" src="https://github.com/user-attachments/assets/18aff4b6-0d23-4250-b933-265198c2544c" />
-
-<img width="1366" height="768" alt="snip" src="https://github.com/user-attachments/assets/fb06a506-05c5-4fff-9830-b11a07839c84" />
-<img width="1366" height="768" alt="screen3" src="https://github.com/user-attachments/assets/1328b559-cbe9-4242-93af-6f3bc89dea0c" />
-
-
 
 ## 📊 Architecture diagrams (ECS Overview)
 

@@ -17,8 +17,19 @@
 ## 📸 GIFs
 
 **CAM/SKYBOX ON VIEWPORT Test**
+
+
+
 <img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/fb9adf56-fb97-4cd9-b99e-fe698d9a6212" />
+
+
+
+
 **Bot ANIMATION Test**
+
+
+
+
 <img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/e2c13e2a-4fa5-41ad-9679-0c0f924f71bb" />
 
 ## 📸 Screenshots

@@ -25,12 +25,40 @@
 
 
 
-**ANIMATION Test 1**
+**Animation Test 1**
 
 
 
 
 <img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/e2c13e2a-4fa5-41ad-9679-0c0f924f71bb" />
+
+**Animation Test 2**
+
+
+
+
+
+
+<img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/5ec8a99c-2006-4f65-9dc4-d4b4a7f04fe6" />
+
+
+
+
+
+
+
+
+
+**Animation Test 3**
+
+
+
+
+
+
+
+
+<img width="480" height="270" alt="output" src="https://github.com/user-attachments/assets/098cabf7-6dad-4f10-9938-09c2a255a06e" />
 
 
 ## 📊 Architecture diagrams (ECS Overview)

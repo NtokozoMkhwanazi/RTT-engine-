@@ -16,7 +16,7 @@
 
 ## 📸 GIFs
 
-**CAM/SKYBOX ON VIEWPORT Test**
+**CAM/SKYBOX Test**
 
 
 
@@ -25,7 +25,7 @@
 
 
 
-**Bot ANIMATION Test**
+**ANIMATION Test 1**
 
 
 

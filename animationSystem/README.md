@@ -162,6 +162,23 @@ mmConfig.databaseSize = 10000;     // Max clips in database
 | **GPU Skinning** | ~0.01ms | ~0.1ms | Low |
 | **Foot IK** | ~0.2ms | - | Low |
 
+## 🛠️ Build & Test
+
+The animation system compiles as part of the main engine build. From the repository root:
+
+```bash
+make            # build the test runner
+make test       # run the full unit-test suite (494 tests)
+make run        # self-check tests, then boot the engine
+make run-headless  # bounded headless engine run (CI-friendly)
+```
+
+Blending, layers, FSM, root motion, foot IK, and motion-matching pose search are covered
+by `make test-motion-matching` and `make test-integration`, plus `make test` with the
+`--gtest_filter=Animation*` filter. The engine boots straight into a motion-matching
+play-mode character. See the [root README](../README.md) for prerequisites and engine
+controls.
+
 ## 🐛 Debugging
 
 See documentation in `docs/animation/`:
@@ -172,4 +189,4 @@ See documentation in `docs/animation/`:
 ---
 
 **Status:** ✅ Production Ready
-**Last Updated:** March 27, 2025
+**Last Updated:** August 2026

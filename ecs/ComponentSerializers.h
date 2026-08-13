@@ -11,6 +11,7 @@
 #include "components/Components.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <cstring>
 
 namespace ecs {
 
@@ -105,21 +106,27 @@ inline void registerDefaultComponentSerializers() {
         [](const MeshComponent& m) -> Json::Value {
             Json::Value json;
             json["meshID"] = m.meshID;
+            json["meshType"] = static_cast<int>(m.meshType);
             json["visible"] = m.visible;
-            json["castShadows"] = m.castShadows;
-            json["receiveShadows"] = m.receiveShadows;
-            json["materialID"] = m.materialID;
-            json["layer"] = m.layer;
+            json["castShadows"] = m.castShadow;
+            json["receiveShadows"] = m.receiveShadow;
+            json["color"] = JsonHelpers::toJson(m.color);
+            json["metallic"] = m.metallic;
+            json["roughness"] = m.roughness;
+            json["alpha"] = m.alpha;
             return json;
         },
         [](const Json::Value& json) -> MeshComponent {
             MeshComponent m;
             m.meshID = json["meshID"].asInt();
+            m.meshType = static_cast<MeshType>(json["meshType"].asInt());
             m.visible = json["visible"].asBool();
-            m.castShadows = json["castShadows"].asBool();
-            m.receiveShadows = json["receiveShadows"].asBool();
-            m.materialID = json["materialID"].asInt();
-            m.layer = json["layer"].asUInt();
+            m.castShadow = json["castShadows"].asBool();
+            m.receiveShadow = json["receiveShadows"].asBool();
+            m.color = JsonHelpers::fromJsonVec3(json["color"]);
+            m.metallic = json["metallic"].asFloat();
+            m.roughness = json["roughness"].asFloat();
+            m.alpha = json["alpha"].asFloat();
             return m;
         }
     );
@@ -197,8 +204,8 @@ inline void registerDefaultComponentSerializers() {
             json["farPlane"] = c.farPlane;
             json["aspectRatio"] = c.aspectRatio;
             json["isActive"] = c.isActive;
-            json["orthographic"] = c.orthographic;
-            json["orthographicSize"] = c.orthographicSize;
+            json["orthographic"] = c.isOrthographic;
+            json["orthographicSize"] = c.orthoSize;
             return json;
         },
         [](const Json::Value& json) -> CameraComponent {
@@ -208,8 +215,8 @@ inline void registerDefaultComponentSerializers() {
             c.farPlane = json["farPlane"].asFloat();
             c.aspectRatio = json["aspectRatio"].asFloat();
             c.isActive = json["isActive"].asBool();
-            c.orthographic = json["orthographic"].asBool();
-            c.orthographicSize = json["orthographicSize"].asFloat();
+            c.isOrthographic = json["orthographic"].asBool();
+            c.orthoSize = json["orthographicSize"].asFloat();
             return c;
         }
     );
@@ -223,9 +230,9 @@ inline void registerDefaultComponentSerializers() {
             json["color"] = JsonHelpers::toJson(l.color);
             json["intensity"] = l.intensity;
             json["range"] = l.range;
-            json["spotAngle"] = l.spotAngle;
+            json["spotAngle"] = l.spotInnerAngle;
             json["spotOuterAngle"] = l.spotOuterAngle;
-            json["shadowsEnabled"] = l.shadowsEnabled;
+            json["shadowsEnabled"] = l.castShadows;
             return json;
         },
         [](const Json::Value& json) -> LightComponent {
@@ -235,9 +242,9 @@ inline void registerDefaultComponentSerializers() {
             l.color = JsonHelpers::fromJsonVec3(json["color"]);
             l.intensity = json["intensity"].asFloat();
             l.range = json["range"].asFloat();
-            l.spotAngle = json["spotAngle"].asFloat();
+            l.spotInnerAngle = json["spotAngle"].asFloat();
             l.spotOuterAngle = json["spotOuterAngle"].asFloat();
-            l.shadowsEnabled = json["shadowsEnabled"].asBool();
+            l.castShadows = json["shadowsEnabled"].asBool();
             return l;
         }
     );
@@ -275,7 +282,9 @@ inline void registerDefaultComponentSerializers() {
         },
         [](const Json::Value& json) -> TagComponent {
             TagComponent t;
-            t.tag = json["tag"].asString();
+            const std::string tag = json["tag"].asString();
+            std::strncpy(t.tag, tag.c_str(), MAX_TAG_LENGTH - 1);
+            t.tag[MAX_TAG_LENGTH - 1] = '\0';
             return t;
         }
     );

@@ -259,6 +259,31 @@ public:
 
     size_t getGeospatialEntityCount() const { return geospatialEntities.size(); }
 
+    /**
+     * Build UI-facing snapshots of every tracked entity. Feeds the Geo tracking
+     * panel's entity table (geo::GeoAPI::syncFrom).
+     */
+    std::vector<geo::EntitySnapshot> getEntitySnapshots() const {
+        std::vector<geo::EntitySnapshot> snaps;
+        snaps.reserve(entityStates.size());
+        for (const auto& s : entityStates) {
+            if (!s.isActive || !s.geo) continue;
+            geo::EntitySnapshot snap{};
+            snap.id = static_cast<uint32_t>(s.id);
+            snap.latitude = s.geo->latitude;
+            snap.longitude = s.geo->longitude;
+            snap.altitude = s.geo->altitude;
+            snap.accuracy = s.geo->horizontalAccuracy;
+            snap.timestamp = s.geo->timestamp;
+            snap.isValid = true;
+            snap.hasPrediction = (s.prediction != nullptr);
+            if (s.prediction) snap.predictionConfidence =
+                static_cast<float>(s.prediction->confidence);
+            snaps.push_back(snap);
+        }
+        return snaps;
+    }
+
     void setPredictionInterval(float interval) { predictionInterval = interval; }
     float getPredictionInterval() const { return predictionInterval; }
 

@@ -154,12 +154,12 @@ void HybridAnimGraph::BuildDatabases() {
     std::cout << "[HybridAnimGraph] Databases built successfully!\n";
 }
 
-void HybridAnimGraph::AddTransition(const HybridTransition& transition) {
+void HybridAnimGraph::AddTransition(const HybridGraphTransition& transition) {
     transitions.push_back(transition);
 }
 
 void HybridAnimGraph::AddTransition(HybridState from, HybridState to, float duration, std::function<bool()> condition) {
-    HybridTransition t;
+    HybridGraphTransition t;
     t.fromState = from;
     t.toState = to;
     t.blendDuration = duration;

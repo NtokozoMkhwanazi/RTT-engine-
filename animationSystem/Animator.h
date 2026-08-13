@@ -22,6 +22,7 @@ public:
 
     void Play(Animation *animation);
     void BlendTo(Animation *animation, float duration);
+    void BlendToAt(Animation *animation, float time, float duration);
     void BlendToWithWeight(Animation *animation, float targetWeight, float duration);
     void BlendTwoAnimations(Animation *anim1, float weight1, Animation *anim2, float weight2, float dt);
     void AddAnimationLayer(Animation *animation, float weight = 1.0f, float blendDuration = 0.3f);
@@ -59,6 +60,7 @@ public:
     void SetFootIKEnabled(bool enabled);
     void SetFootIKSettings(const FootIKSettings& settings);
     void SetFloorHeight(float height);
+    void SetIKWorldScale(float scale);
     void SetFootBones(int leftFoot, int rightFoot, int leftToe = -1, int rightToe = -1);
     void UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMoving = false);  // isMoving disables foot lock
     void DebugDrawFootIK();  // Call after rendering to debug
@@ -138,6 +140,8 @@ public:
     // Animation state queries (for testing and debugging)
     Animation* GetCurrentAnimation() const;
     int GetActiveAnimationLayerCount() const { return (int)activeAnimations.size(); }
+    struct AnimationLayer;
+    const AnimationLayer* GetActiveLayer(int index) const;
     float GetActiveAnimationTime(int layerIndex = 0) const;
 
     // Animation Events
@@ -328,7 +332,8 @@ private:
 
     // Root motion control
     bool rootMotionEnabled = true;
-    bool lockRootPosition = false;  // When true, root bone position is locked to bind pose
+    bool lockRootPosition = false;
+    float ikWorldScale = 1.0f;  // When true, root bone position is locked to bind pose
 
     void EvaluateNode(
         const AssimpNodeData &node,

@@ -64,14 +64,14 @@ inline std::string HybridStateToString(HybridState state) {
 /**
  * Hybrid State Transition Rule
  */
-struct HybridTransition {
+struct HybridGraphTransition {
     HybridState fromState;
     HybridState toState;
     float blendDuration = 0.2f;
     std::function<bool()> condition;  // When to trigger this transition
 
-    HybridTransition() = default;
-    HybridTransition(HybridState from, HybridState to, float duration = 0.2f)
+    HybridGraphTransition() = default;
+    HybridGraphTransition(HybridState from, HybridState to, float duration = 0.2f)
         : fromState(from), toState(to), blendDuration(duration) {}
 };
 
@@ -275,7 +275,7 @@ public:
     /**
      * Add transition rule
      */
-    void AddTransition(const HybridTransition& transition);
+    void AddTransition(const HybridGraphTransition& transition);
 
     /**
      * Add transition with condition
@@ -402,7 +402,7 @@ private:
     // State machine
     HybridState currentState{HybridState::LOCOMOTION_GROUNDED};
     HybridState previousState{HybridState::LOCOMOTION_GROUNDED};
-    std::vector<HybridTransition> transitions;
+    std::vector<HybridGraphTransition> transitions;
     bool isTransitioning{false};
     float transitionProgress{0.0f};
     float transitionDuration{0.0f};

@@ -18,15 +18,18 @@
 #include "PredictiveModel.h"
 #include <glm/glm.hpp>
 #include <vector>
+#include <string>
 #include <string_view>
 #include <cstdint>
 #include <optional>
+#include <mutex>
 
 // Forward declare ECS components
 namespace ecs {
     struct GeospatialComponent;
     struct TransformComponent;
     struct PredictionComponent;
+    class GeoIngestionSystem;  // facade pushes GPS config down to the pipeline
 }
 
 namespace geo {
@@ -34,6 +37,18 @@ namespace geo {
 // ============================================================================
 // Lightweight data snapshots (no string allocs, POD-friendly)
 // ============================================================================
+
+// A live-entity position fed in as the GPS source ("track the bot"): the
+// playable character's world position converted to WGS84, like a real GPS
+// receiver consuming satellite measurements.
+struct ExternalFix {
+    double latitude = 0.0;
+    double longitude = 0.0;
+    double altitude = 0.0;
+    double speed = 0.0;
+    double heading = 0.0;
+    double accuracy = 0.0;
+};
 
 struct EntitySnapshot {
     uint32_t id;
@@ -68,6 +83,21 @@ struct GeoStats {
     float predictionInterval;
     double ingestionRate;   // points per second
     double lastUpdateTime;
+};
+
+// A data point drained from feeds registered through this facade (polled in
+// the background by the DataFeedManager). GeospatialSystem feeds these into
+// the live ingestion -> storage -> prediction pipeline each frame.
+struct FeedDataPoint {
+    double latitude = 0.0;
+    double longitude = 0.0;
+    double altitude = 0.0;
+    double timestamp = 0.0;
+    double speed = 0.0;
+    double heading = 0.0;
+    double accuracy = 0.0;
+    std::string sourceId;
+    bool isValid = false;
 };
 
 struct GeoConfig {
@@ -128,6 +158,30 @@ public:
     void setPredictionInterval(float seconds);
     void setPredictionHorizon(double seconds, int points);
 
+    // ---- Track a live entity (e.g. the playable character) ----
+    // When tracking is enabled, the GPS fix is driven by pushExternalFix()
+    // (fed each frame by the main loop from the entity's world position)
+    // instead of the internal simulation.
+    void setTrackEntity(bool on);
+    bool isTrackingEntity() const;
+    void pushExternalFix(const ExternalFix& fix);
+    bool hasExternalFix() const;
+    ExternalFix takeExternalFix();
+
+    // ---- Facade sync (called once per frame by the GeospatialSystem) ----
+    // Pushes real fix/snapshot/stats data into this facade so the status bar,
+    // panels and terminal read live values.
+    void syncFrom(const GPSFix& fix, std::vector<EntitySnapshot> snapshots,
+                  const GeoStats& stats);
+    // Applies facade GPS config (mode/speed/noise) to the live pipeline when
+    // it changed - connects the UI controls to the real ingestion system.
+    void syncTo(ecs::GeoIngestionSystem& ingestion);
+
+    // Feed observations into the facade's own predictive model (used by
+    // requestPrediction for on-demand queries).
+    void addObservation(double lat, double lon, double timestamp,
+                        double speed = 0.0, double heading = 0.0);
+
     // ---- Coordinate conversion ----
     glm::vec3 geoToLocal(double lat, double lon, double alt) const;
     glm::dvec3 localToGeo(const glm::vec3& local) const;
@@ -142,9 +196,18 @@ public:
     void requestPrediction(double horizon = 60.0, int points = 50);
 
     // ---- Data feed management ----
+    // Registers a real polling feed (REST default; "WebSocket"/"ws" selects
+    // the WebSocket slot). Returns false for an empty URL. Polled in the
+    // background; parsed points are drained by GeospatialSystem::update and
+    // fed into the live pipeline.
     bool addFeed(std::string_view url, std::string_view type = "REST");
     void removeFeed(size_t index);
     size_t getFeedCount() const;
+    // Description of the feed at index (for UI listing); empty when out of
+    // range.
+    DataFeedManager::FeedInfo getFeedInfo(size_t index) const;
+    // Atomically drain feed points received since the last call (main thread).
+    std::vector<FeedDataPoint> drainFeedData();
 
     // ---- Direct subsystem access (for advanced use) ----
     GeospatialConverter& getConverter();
@@ -190,18 +253,32 @@ private:
     double m_predictionHorizon = 60.0;
     int m_predictionPoints = 50;
 
+    // Track-a-live-entity state
+    bool m_trackEntity = false;
+    bool m_externalFixValid = false;
+    ExternalFix m_externalFix;
+
+    // Latest real fix from the pipeline (fed by syncFrom)
+    GPSFix m_lastFix{};
+
+    // Last config pushed down to the pipeline (change detection)
+    GPSTracker::Mode m_lastPushedMode = GPSTracker::Mode::DISABLED;
+    double m_lastPushedSpeed = -1.0;
+    double m_lastPushedNoise = -1.0;
+
     // Cached trajectory (lazy)
     std::vector<TimeSeriesPoint> m_cachedTrajectory;
     bool m_trajectoryDirty = true;
 
     // Stats cache
-    GeoStats m_statsCache;
+    GeoStats m_statsCache{};
     float m_statsRefreshTimer = 0.0f;
 
     // System time
     float m_systemTime = 0.0f;
 
-    // Internal ingestion buffer
+    // Internal ingestion buffer (fed by feed-poll threads; drained on the
+    // main thread by GeospatialSystem::update).
     struct IngestedData {
         std::string entityId;
         double latitude, longitude, altitude;
@@ -209,6 +286,7 @@ private:
         bool isValid;
     };
     std::vector<IngestedData> m_ingestionBuffer;
+    mutable std::mutex m_feedMutex;
 };
 
 } // namespace geo

@@ -4,6 +4,8 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <vector>
 #include <algorithm>
+#include <cmath>
+#include <functional>
 
 /**
  * Third-Person Camera - State-Aware Follow System
@@ -45,6 +47,10 @@ public:
     // Collision
     bool isColliding;
     float idealDistance;  // Distance before collision
+
+    // Optional terrain-height callback. When set, the camera is clamped so it
+    // never sinks below the floor (Unreal-style ground clamp).
+    std::function<float(float, float)> groundHeightFn;
     
     /**
      * Constructor
@@ -82,34 +88,43 @@ public:
      * @param aspectRatio Aspect ratio for projection matrix
      */
     void update(float dt, const CameraInput& input, float aspectRatio = 16.0f/9.0f) {
+        if (dt <= 0.0f) { updateOutput(aspectRatio); return; }
+
         previousState = currentState;
         currentState = input.animState;
-        
+
         // Update target follow smooth based on state
         targetFollowSmooth = config.getFollowSmoothForState(currentState);
-        
-        // Smoothly transition follow smooth value
+
+        // Smoothly transition follow smooth value (frame-rate independent)
         currentFollowSmooth = glm::mix(
-            currentFollowSmooth, 
-            targetFollowSmooth, 
-            config.smoothTransitionRate * dt
+            currentFollowSmooth,
+            targetFollowSmooth,
+            1.0f - std::exp(-config.smoothTransitionRate * dt)
         );
-        
+
         // Update pivot (look-at point)
         updatePivot(dt, input.characterPosition);
-        
+
         // Calculate ideal camera position
         glm::vec3 idealPosition = calculateIdealPosition(input);
-        
+
         // Handle collision avoidance
         if (config.collisionEnabled) {
             idealPosition = handleCollision(input.characterPosition, idealPosition);
         }
-        
-        // Smooth camera follow (state-aware)
-        position = glm::mix(position, idealPosition, currentFollowSmooth * dt);
+
+        // Unreal-style ground clamp: never let the camera sink below the floor.
+        if (groundHeightFn) {
+            const float minY = groundHeightFn(idealPosition.x, idealPosition.z) + config.groundClearance;
+            if (idealPosition.y < minY) idealPosition.y = minY;
+        }
+
+        // Smooth camera follow (state-aware, frame-rate independent exponential).
+        const float alpha = 1.0f - std::exp(-currentFollowSmooth * dt);
+        position = glm::mix(position, idealPosition, alpha);
         target = pivot;
-        
+
         // Update output
         updateOutput(aspectRatio);
     }
@@ -196,29 +211,32 @@ private:
      */
     void updatePivot(float dt, const glm::vec3& charPos) {
         glm::vec3 targetPivot = charPos + glm::vec3(0.0f, config.pivotHeight, 0.0f);
-        pivot = glm::mix(pivot, targetPivot, config.pivotSmooth * dt);
+        const float alpha = 1.0f - std::exp(-config.pivotSmooth * dt);
+        pivot = glm::mix(pivot, targetPivot, alpha);
     }
     
     /**
      * Calculate ideal camera position (without collision)
      */
     glm::vec3 calculateIdealPosition(const CameraInput& input) {
-        // Use yaw and pitch for orbit control
+        // Use yaw and pitch for orbit control. Positive pitch raises the camera
+        // ABOVE the character's chest and looks down at it (Unreal-style).
         float yawRad = glm::radians(yaw);
         float pitchRad = glm::radians(pitch);
-        
-        // Calculate direction from yaw and pitch
+
+        // Calculate direction from yaw and pitch (pitch sign: +pitch = above)
         glm::vec3 direction;
-        direction.x = cos(yawRad) * cos(pitchRad);
-        direction.y = sin(pitchRad);
-        direction.z = sin(yawRad) * cos(pitchRad);
+        direction.x = std::cos(yawRad) * std::cos(pitchRad);
+        direction.y = -std::sin(pitchRad);   // NEGATED: +pitch now = camera above
+        direction.z = std::sin(yawRad) * std::cos(pitchRad);
         direction = glm::normalize(direction);
-        
-        // Calculate position behind character
-        glm::vec3 idealPos = input.characterPosition 
-                           - direction * config.distance 
-                           + glm::vec3(0.0f, config.height * 0.3f, 0.0f);
-        
+
+        // Camera orbits the character's chest at `distance`, slightly raised.
+        glm::vec3 pivotPos = input.characterPosition
+                           + glm::vec3(0.0f, config.pivotHeight, 0.0f);
+        glm::vec3 idealPos = pivotPos - direction * config.distance;
+        idealPos.y += config.height * 0.35f;  // shoulder-level camera height
+
         return idealPos;
     }
     
@@ -308,8 +326,9 @@ public:
      */
     void configureThirdPerson() {
         camera->config.setBalanced();
-        camera->config.distance = 15.0f;
-        camera->config.height = 5.0f;
+        camera->config.distance = 4.0f;
+        camera->config.height = 1.6f;
+        camera->config.pivotHeight = 1.3f;
     }
     
     /**
@@ -319,16 +338,17 @@ public:
         camera->config.setSnappy();
         camera->config.distance = 2.0f;
         camera->config.height = 1.5f;
-        camera->config.pivotHeight = 1.7f;
+        camera->config.pivotHeight = 1.6f;
     }
     
     /**
      * Configure for orbit mode
      */
     void configureOrbit() {
-        camera->config.distance = 20.0f;
-        camera->config.height = 10.0f;
-        camera->config.pivotSmooth = 2.0f;
+        camera->config.distance = 5.5f;
+        camera->config.height = 2.0f;
+        camera->config.pivotHeight = 1.3f;
+        camera->config.pivotSmooth = 6.0f;
     }
     
     /**
@@ -336,8 +356,9 @@ public:
      */
     void configureCinematic() {
         camera->config.setCinematic();
-        camera->config.distance = 25.0f;
-        camera->config.height = 8.0f;
+        camera->config.distance = 7.0f;
+        camera->config.height = 2.5f;
+        camera->config.pivotHeight = 1.3f;
     }
     
     /**

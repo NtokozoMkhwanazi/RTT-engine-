@@ -94,7 +94,16 @@ public:
      * @param parentID The new parent (INVALID_ENTITY_ID to remove parent)
      */
     void setParent(EntityID entityID, EntityID parentID) {
+        // First, remove the entity from its OLD parent's children list so a
+        // reparent or orphan doesn't leave a stale entry behind.
         auto it = m_relationships.find(entityID);
+        if (it != m_relationships.end() && it->second.parent != INVALID_ENTITY_ID
+            && it->second.parent != parentID) {
+            auto oldParentIt = m_relationships.find(it->second.parent);
+            if (oldParentIt != m_relationships.end()) {
+                oldParentIt->second.removeChild(entityID);
+            }
+        }
         
         if (it == m_relationships.end()) {
             // Create new relationship

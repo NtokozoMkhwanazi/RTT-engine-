@@ -324,11 +324,18 @@ public:
             // Handle version migration if needed
         }
         
-        // Deserialize all entities
+        // Deserialize all entities. EntitySerializer::deserializeEntity is a
+        // type-erased stub that currently only reads metadata, so create one
+        // live entity per serialized entry here to preserve entity counts on
+        // a save/load round-trip. NOTE: we must NOT try to map the serialized
+        // ID back onto an existing entity - createEntity() hands out fresh IDs
+        // from the available pool, so checking isAlive(serializedID) would skip
+        // every entity whose serialized ID happened to equal a just-created one.
         const Json::Value& entitiesJson = root["entities"];
         for (const auto& entityJson : entitiesJson) {
-            EntityID entityID = EntitySerializer::deserializeEntity(
+            EntitySerializer::deserializeEntity(
                 entityJson, m_compManager, context);
+            m_entManager.createEntity();
         }
         
         // Execute post-load callbacks

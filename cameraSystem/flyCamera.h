@@ -50,7 +50,7 @@ public:
               float pitch = 20.0f,
               float distance = 8.0f)
         : WorldUp(up), Yaw(yaw), Pitch(pitch),
-          FieldOfView(45.0f), Zoom(45.0f),
+          FieldOfView(60.0f), Zoom(60.0f),
           MouseSensitivity(0.2f),
           DistanceToTarget(distance), MinDistance(1.0f), MaxDistance(50.0f)
     {
@@ -123,11 +123,12 @@ public:
         updateCameraVectors();
     }
 
-    // Scroll zoom
+    // Scroll zoom (applies immediately by repositioning around the target)
     void ProcessMouseScroll(float yoffset) {
         DistanceToTarget -= yoffset;
         if (DistanceToTarget < MinDistance) DistanceToTarget = MinDistance;
         if (DistanceToTarget > MaxDistance) DistanceToTarget = MaxDistance;
+        updateCameraVectors();
     }
 
     // Camera shake effect
@@ -206,6 +207,13 @@ public:
         updateCameraVectors();
     }
 
+    // Reposition the orbit camera around its current target (Orbit/ThirdPerson
+    // modes). Keeps yaw/pitch/distance and heals a degenerate WorldUp.
+    void RepositionOrbit() {
+        if (glm::length(WorldUp) < 1e-6f) WorldUp = glm::vec3(0.0f, 1.0f, 0.0f);
+        updateCameraVectors();
+    }
+
     // Mouse rotation - takes absolute positions from GLFW (PUBLIC)
     void ProcessMouseMovementAbsolute(float xpos, float ypos) {
         if (FirstMouse) { LastX = xpos; LastY = ypos; FirstMouse = false; }
@@ -234,6 +242,9 @@ private:
     float collisionDistance = 0.5f;
 
     void updateCameraVectors() {
+        // Heal a degenerate WorldUp (the NaN-poisoning bug): fall back to +Y.
+        if (glm::length(WorldUp) < 1e-6f) WorldUp = glm::vec3(0.0f, 1.0f, 0.0f);
+
         // Calculate new position based on Yaw, Pitch, and DistanceToTarget
         // Yaw=-90 means looking down +Z, Pitch=0 means level
         float cosPitch = cos(glm::radians(Pitch));
@@ -248,8 +259,10 @@ private:
 
         Position = Target - offset;
 
-        // Calculate right and up vectors
-        glm::vec3 front = glm::normalize(Target - Position);
+        // Calculate right and up vectors (guard against a NaN front vector).
+        glm::vec3 front = Target - Position;
+        if (glm::length(front) < 1e-6f) front = glm::vec3(0.0f, 0.0f, -1.0f);
+        front = glm::normalize(front);
         Right = glm::normalize(glm::cross(front, WorldUp));
         Up = glm::normalize(glm::cross(Right, front));
     }

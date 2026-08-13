@@ -143,6 +143,22 @@ See [ENHANCED_ECS_README.md](ENHANCED_ECS_README.md) for:
 | **Cache Hits** | ~50% | ~95% | 2x |
 | **Memory** | Fragmented | Contiguous | 30% less |
 
+## 🛠️ Build & Test
+
+The ECS framework compiles as part of the main engine build. From the repository root:
+
+```bash
+make            # build the test runner
+make test       # run the full unit-test suite (494 tests)
+make run        # self-check tests, then boot the engine
+make run-headless  # bounded headless engine run (CI-friendly)
+```
+
+Archetypes, blueprints, relationships, events, jobs, serialization and entity-manager
+operations are covered by `make test` (ECS + entity-manager + undo/redo suites; filter
+with `--gtest_filter=ECS*:EntityManager*`). See the [root README](../README.md) for
+prerequisites and engine controls.
+
 ## 🐛 Known Issues
 
 See [VIEWPORT_STATUS.md](../VIEWPORT_STATUS.md) for current integration status.
@@ -150,4 +166,4 @@ See [VIEWPORT_STATUS.md](../VIEWPORT_STATUS.md) for current integration status.
 ---
 
 **Status:** ✅ Production Ready
-**Last Updated:** March 27, 2025
+**Last Updated:** August 2026

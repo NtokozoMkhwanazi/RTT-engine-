@@ -137,6 +137,15 @@ public:
      * Check if SSBO is supported on this hardware
      */
     static bool IsSSBOSupported();
+    
+    // Pure upload decision: skip only when NOT forced, NOT dirty, and the
+    // bone count is unchanged. This used to be inline in Update() and caused
+    // the "skeleton animates but mesh frozen in Idle" bug - animated callers
+    // must pass forceUpdate=true.
+    static bool ShouldSkipUpload(bool forceUpdate, bool needsUpdate,
+                                 size_t currentCount, size_t newCount) {
+        return !forceUpdate && !needsUpdate && (currentCount == newCount);
+    }
 
     // =========================================================================
     // STATISTICS

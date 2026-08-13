@@ -114,7 +114,11 @@ public:
         if (!escaped) return {};
         encodedQuery = escaped;
         curl_free(escaped);
-        std::string queryUrl = url + "/query?db=" + database + "&q=" + encodedQuery;
+        // epoch=ns makes InfluxDB return the time column as integer nanoseconds
+        // instead of an RFC3339 string. Without it, std::stoull() on the
+        // string time throws and every row gets row.time = 0 (all trajectory
+        // points appear with timestamp 0 in the UI / live feed).
+        std::string queryUrl = url + "/query?db=" + database + "&epoch=ns&q=" + encodedQuery;
 
         std::string response;
         CURL* curl = curl_easy_init();

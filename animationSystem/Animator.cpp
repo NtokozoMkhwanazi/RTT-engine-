@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <map>
 
@@ -203,6 +204,29 @@ void Animator::BlendTo(Animation *anim, float duration)
     std::cout << "[BlendTo] Reset root motion state for transition\n";
 }
 
+void Animator::BlendToAt(Animation *anim, float time, float duration)
+{
+    if (!anim) {
+        std::cout << "[BlendToAt] NULL animation!\n";
+        return;
+    }
+
+    // First do the blend
+    BlendTo(anim, duration);
+    
+    // Then set the time to start at the specified position
+    SetCurrentTime(time);
+    
+    // Set the time on the layer(s) that actually play this animation.
+    // BlendTo appends the incoming animation at the end of the layer list,
+    // so indexing [0] would hit the OLD animation instead.  Match by pointer.
+    for (auto& layer : activeAnimations) {
+        if (layer.animation == anim) {
+            layer.time = time;
+        }
+    }
+}
+
 void Animator::Update(float dt)
 {
     if (!skeleton)
@@ -217,9 +241,11 @@ void Animator::Update(float dt)
     // Save previous positions BEFORE overwriting
     prevBoneWorldPos = currBoneWorldPos;
 
-    // CRITICAL FIX: Clear IK offsets at start of each frame
-    // They accumulate in UpdateFootIK() if not cleared
-    std::fill(ikOffsets.begin(), ikOffsets.end(), glm::vec3(0.0f));
+    // NOTE: IK offsets are NOT cleared here anymore. UpdateFootIK() SETS the
+    // foot offsets every frame (it no longer accumulates), and AddIKOffset()
+    // also uses set semantics, so user-set offsets (e.g. HybridMMFSM root
+    // snap) persist correctly across frames instead of being wiped before
+    // the skeleton is evaluated.
 
     // Update animation times and blend weights
     if (!DEBUG_PAUSE_ANIM)
@@ -318,44 +344,87 @@ void Animator::Update(float dt)
                     {
                         size_t numBones = finalBoneMatrices.size();
                         
-                        // Start with bind pose TRS
+                        // Weighted TRS average across the active layers ONLY.
+                        // (Never seed the blend with the bind pose - that leaked
+                        // the T-pose into every crossfade.)
                         std::vector<BoneTRS> blendedTRS(numBones);
                         {
-                            // Evaluate bind pose
-                            std::vector<BoneTRS> bindTRS;
-                            EvaluateNodeTRS(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f, bindTRS);
-                            if (bindTRS.size() <= numBones) {
-                                blendedTRS = bindTRS;
-                            }
-                        }
-                        
-                        // Apply each animation layer with normalized weight using TRS blending
-                        for (const auto& layer : activeAnimations) {
-                            if (layer.animation && layer.enabled && layer.weight > 0.0f) {
-                                float normalizedWeight = layer.weight / totalWeight;
+                            std::vector<glm::vec3> accTrans(numBones, glm::vec3(0.0f));
+                            std::vector<glm::vec3> accScale(numBones, glm::vec3(0.0f));
+                            std::vector<glm::quat> accRot(numBones, glm::quat(0.0f, 0.0f, 0.0f, 0.0f));
+                            std::vector<float> accW(numBones, 0.0f);
+                            
+                            for (const auto& layer : activeAnimations) {
+                                if (!layer.animation || !layer.enabled || layer.weight <= 0.0f) continue;
                                 
                                 // Evaluate this animation directly to TRS (no matrix decompose needed)
                                 std::vector<BoneTRS> animTRS;
                                 EvaluateNodeTRS(skeleton->rootNode, glm::mat4(1.0f), layer.animation, layer.time, animTRS);
                                 
-                                // Blend TRS directly (avoid decomposeMatrix per bone per layer)
                                 size_t blendCount = std::min(numBones, animTRS.size());
                                 for (size_t j = 0; j < blendCount; j++) {
-                                    blendedTRS[j] = BlendTRS(blendedTRS[j], animTRS[j], normalizedWeight);
+                                    // Keep quaternion accumulation coherent (nlerp over the sphere)
+                                    if (accW[j] > 0.0f && glm::dot(accRot[j], animTRS[j].rotation) < 0.0f) {
+                                        animTRS[j].rotation = -animTRS[j].rotation;
+                                    }
+                                    accTrans[j] += layer.weight * animTRS[j].translation;
+                                    accScale[j] += layer.weight * animTRS[j].scale;
+                                    accRot[j] += layer.weight * animTRS[j].rotation;
+                                    accW[j] += layer.weight;
                                 }
+                            }
+                            
+                            for (size_t j = 0; j < numBones; j++) {
+                                if (accW[j] > 0.0f) {
+                                    blendedTRS[j].translation = accTrans[j] / accW[j];
+                                    blendedTRS[j].scale = accScale[j] / accW[j];
+                                    blendedTRS[j].rotation = glm::normalize(accRot[j]);
+                                    // Guard against a zero-length accumulated quaternion (NaNs)
+                                    if (!std::isfinite(blendedTRS[j].rotation.w) ||
+                                        !std::isfinite(blendedTRS[j].rotation.x)) {
+                                        blendedTRS[j].rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+                                    }
+                                }
+                                // Bones not covered by the node hierarchy keep BoneTRS defaults.
                             }
                         }
                         
-                        // Compose TRS to final bone matrices ONCE (not per layer)
-                        for (size_t j = 0; j < numBones && j < skeleton->bones.size(); j++) {
-                            glm::mat4 globalTransform =
-                                glm::translate(glm::mat4(1.0f), blendedTRS[j].translation) *
-                                glm::mat4_cast(blendedTRS[j].rotation) *
-                                glm::scale(glm::mat4(1.0f), blendedTRS[j].scale);
-                            
-                            globalBoneMatrices[j] = globalTransform;
-                            finalBoneMatrices[j] = globalTransform * skeleton->bones[j].offset;
-                        }
+                        // Compose the blended LOCAL TRS through the skeleton hierarchy,
+                        // applying each bone's IK offset to its global BEFORE propagating
+                        // to children - identical semantics to EvaluateNode.
+                        std::function<void(const AssimpNodeData&, const glm::mat4&)> composeHierarchy;
+                        composeHierarchy = [&](const AssimpNodeData& node, const glm::mat4& parentGlobal) {
+                            int bIdx = node.boneIndex;
+                            if (bIdx >= 0 && bIdx < static_cast<int>(numBones)) {
+                                const BoneTRS& trs = blendedTRS[bIdx];
+                                glm::mat4 local =
+                                    glm::translate(glm::mat4(1.0f), trs.translation) *
+                                    glm::mat4_cast(trs.rotation) *
+                                    glm::scale(glm::mat4(1.0f), trs.scale);
+                                
+                                glm::mat4 global = parentGlobal * local;
+                                
+                                glm::mat4 finalGlobal = global;
+                                if (static_cast<size_t>(bIdx) < ikOffsets.size() &&
+                                    ikOffsets[bIdx] != glm::vec3(0.0f)) {
+                                    glm::mat4 ikOffsetMat =
+                                        glm::translate(glm::mat4(1.0f), ikOffsets[bIdx]);
+                                    finalGlobal = global * ikOffsetMat;
+                                }
+                                
+                                globalBoneMatrices[bIdx] = finalGlobal;
+                                finalBoneMatrices[bIdx] = finalGlobal * skeleton->bones[bIdx].offset;
+                                
+                                for (const auto& child : node.children) {
+                                    composeHierarchy(child, finalGlobal);
+                                }
+                            } else {
+                                for (const auto& child : node.children) {
+                                    composeHierarchy(child, parentGlobal);
+                                }
+                            }
+                        };
+                        composeHierarchy(skeleton->rootNode, glm::mat4(1.0f));
                         
                         dominantLayerIdx = 0;
                     }
@@ -385,7 +454,7 @@ void Animator::Update(float dt)
                           << " weight=" << layer.weight << "\n";
                 
                 // Print a sample bone transform to verify animation is changing
-                if (!finalBoneMatrices.empty()) {
+                if (finalBoneMatrices.size() > 55) {
                     glm::mat4& boneMat = finalBoneMatrices[55];  // rightupleg
                     std::cout << "  [Bone55] pos=(" << boneMat[3].x << "," << boneMat[3].y << "," << boneMat[3].z << ")\n";
                 }
@@ -748,7 +817,7 @@ void Animator::AddIKOffset(int bone, const glm::vec3 &offset, float weight)
 {
     if (bone < 0 || bone >= (int)ikOffsets.size())
         return;
-    ikOffsets[bone] += offset * weight;
+    ikOffsets[bone] = offset * weight;
 }
 
 glm::vec3 Animator::ConsumeRootMotion()
@@ -831,6 +900,11 @@ float Animator::GetActiveAnimationTime(int layerIndex) const
         return 0.0f;
     }
     return activeAnimations[layerIndex].time;
+}
+
+const Animator::AnimationLayer* Animator::GetActiveLayer(int index) const {
+    if (index < 0 || index >= static_cast<int>(activeAnimations.size())) return nullptr;
+    return &activeAnimations[index];
 }
 
 void Animator::BlendToWithWeight(Animation *anim, float targetWeight, float duration)
@@ -1097,12 +1171,21 @@ void Animator::UpdateAnimationBlending(float dt)
     {
         if (!layer.animation || !layer.enabled) continue;
 
-        // Update blend progress and interpolate weight
-        if (layer.blendProgress < 1.0f && layer.blendDuration > 0.0f)
+        // Update blend progress and interpolate weight.
+        // The ramp must also run for layers that already finished their fade-IN
+        // (blendProgress == 1.0) but now have a new targetWeight to fade OUT to
+        // (a newer clip was blended over them) - otherwise old clips wedge at
+        // full weight forever.
+        if (layer.blendDuration > 0.0f)
         {
-            layer.blendProgress = glm::min(1.0f, layer.blendProgress + (dt / layer.blendDuration));
+            if (layer.blendProgress < 1.0f)
+            {
+                layer.blendProgress = glm::min(1.0f, layer.blendProgress + (dt / layer.blendDuration));
+            }
+
             float blendSpeed = 1.0f / layer.blendDuration;
-            layer.weight = glm::mix(layer.weight, layer.targetWeight, blendSpeed * dt);
+            float rampT = glm::clamp(blendSpeed * dt, 0.0f, 1.0f);
+            layer.weight = glm::mix(layer.weight, layer.targetWeight, rampT);
 
             if (layer.blendProgress >= 1.0f) {
                 layer.weight = layer.targetWeight;
@@ -1477,6 +1560,11 @@ void Animator::SetFootBones(int leftFoot, int rightFoot, int leftToe, int rightT
     footIKSettings.rightFootBone = rightFoot;
     footIKSettings.leftToeBone = leftToe;
     footIKSettings.rightToeBone = rightToe;
+}
+
+void Animator::SetIKWorldScale(float scale)
+{
+    ikWorldScale = scale;
 }
 
 void Animator::UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMoving)

@@ -8,6 +8,8 @@
 #include "JobSystem.h"
 #include "RelationshipManager.h"
 #include "EventSystem.h"
+#include "Serialization.h"
+#include "Blueprint.h"
 #include <vector>
 #include <memory>
 #include <algorithm>
@@ -155,6 +157,10 @@ public:
         // Remove from relationship manager
         m_relationshipManager.removeEntity(entity.id);
         
+        // Remove from archetype storage so stale component data can't be
+        // rediscovered by name/forEach after destruction.
+        m_archetypeManager.removeEntity(entity.id);
+        
         m_entityManager.destroyEntity(entity);
     }
 
@@ -212,12 +218,17 @@ public:
      */
     template<typename T>
     T* getComponent(Entity entity) {
-        return m_componentManager.getComponent<T>(entity.id);
+        if (T* c = m_componentManager.getComponent<T>(entity.id)) return c;
+        // Archetype storage is the primary path for createEntityWithComponents;
+        // fall back to it so archetype-created entities expose their components
+        // through the legacy getComponent API as well.
+        return m_archetypeManager.getComponent<T>(entity.id);
     }
 
     template<typename T>
     const T* getComponent(Entity entity) const {
-        return m_componentManager.getComponent<T>(entity.id);
+        if (const T* c = m_componentManager.getComponent<T>(entity.id)) return c;
+        return m_archetypeManager.getComponent<T>(entity.id);
     }
 
     /**
@@ -225,7 +236,10 @@ public:
      */
     template<typename T>
     bool hasComponent(Entity entity) const {
-        return m_componentManager.hasComponent<T>(entity.id);
+        if (m_componentManager.hasComponent<T>(entity.id)) return true;
+        // Archetype storage is the primary path for createEntityWithComponents;
+        // fall back to it so archetype-created entities report their components.
+        return m_archetypeManager.hasComponent<T>(entity.id);
     }
 
     // ========================================================================
@@ -489,7 +503,10 @@ public:
      * Check if an entity is an ancestor of another
      */
     bool isAncestorOf(Entity entity, Entity potentialAncestor) const {
-        return m_relationshipManager.isAncestorOf(potentialAncestor.id, entity.id);
+        // entity is the candidate ancestor, potentialAncestor is the entity
+        // being tested: entity is an ancestor of potentialAncestor iff
+        // potentialAncestor is a descendant of entity.
+        return m_relationshipManager.isDescendantOf(potentialAncestor.id, entity.id);
     }
 
     // ========================================================================
@@ -547,6 +564,73 @@ public:
      */
     EventSystem& getEventSystem() { return m_eventSystem; }
     const EventSystem& getEventSystem() const { return m_eventSystem; }
+
+    // ========================================================================
+    // Serialization Operations
+    // ========================================================================
+
+    /**
+     * Serialize the world to a JSON string
+     */
+    std::string serializeToString() {
+        WorldSerializer<ComponentManager, EntityManager> serializer(
+            m_componentManager, m_entityManager);
+        return serializer.serializeToString();
+    }
+
+    /**
+     * Deserialize the world from a JSON string
+     */
+    void deserializeFromString(const std::string& jsonString) {
+        WorldSerializer<ComponentManager, EntityManager> serializer(
+            m_componentManager, m_entityManager);
+        DeserializeContext context;
+        serializer.deserializeFromString(jsonString, context);
+    }
+
+    // ========================================================================
+    // Blueprint Operations
+    // ========================================================================
+
+    /**
+     * Register a blueprint
+     */
+    void registerBlueprint(std::unique_ptr<Blueprint> blueprint) {
+        if (!blueprint) return;
+        m_blueprints[blueprint->getName()] = std::move(blueprint);
+    }
+
+    /**
+     * Unregister a blueprint
+     */
+    void unregisterBlueprint(const std::string& name) {
+        m_blueprints.erase(name);
+    }
+
+    /**
+     * Get a blueprint by name
+     */
+    Blueprint* getBlueprint(const std::string& name) {
+        auto it = m_blueprints.find(name);
+        return it != m_blueprints.end() ? it->second.get() : nullptr;
+    }
+
+    const Blueprint* getBlueprint(const std::string& name) const {
+        auto it = m_blueprints.find(name);
+        return it != m_blueprints.end() ? it->second.get() : nullptr;
+    }
+
+    /**
+     * Get the names of all registered blueprints
+     */
+    std::vector<std::string> getBlueprintNames() const {
+        std::vector<std::string> names;
+        names.reserve(m_blueprints.size());
+        for (const auto& [name, bp] : m_blueprints) {
+            names.push_back(name);
+        }
+        return names;
+    }
 
     // ========================================================================
     // Multi-threading Configuration
@@ -674,6 +758,8 @@ private:
     void onEntityDestroyed(EntityID entityID) {
         // Components are automatically cleaned up by ComponentManager
         m_relationshipManager.removeEntity(entityID);
+        // Remove archetype storage so render systems stop drawing it
+        m_archetypeManager.removeEntity(entityID);
     }
 
     // Core managers (legacy signature-based)
@@ -690,6 +776,9 @@ private:
     // Configuration
     bool m_parallelExecution = false;
     bool m_initialized = false;
+
+    // Blueprints
+    std::unordered_map<std::string, std::unique_ptr<Blueprint>> m_blueprints;
 };
 
 } // namespace ecs

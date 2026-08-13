@@ -40,32 +40,35 @@ inline std::string CameraStateToString(CameraState state) {
  * - Jump/Fall: Balanced for vertical movement
  */
 struct CameraConfig {
-    // Base configuration
-    float distance = 15.0f;         // Camera distance from character
-    float height = 5.0f;            // Camera height offset
-    float fov = 45.0f;              // Field of view
+    // Base configuration (Unreal-style third-person tuning for a ~1.8m character)
+    float distance = 4.0f;          // Camera distance from character
+    float height = 1.6f;            // Camera height offset
+    float fov = 60.0f;              // Field of view (wider, game-standard)
     
     // Pivot configuration
-    float pivotHeight = 2.0f;       // Look-at height (character upper body)
-    float pivotSmooth = 4.0f;       // Pivot follow smoothing
+    float pivotHeight = 1.3f;       // Look-at height (character chest)
+    float pivotSmooth = 8.0f;       // Pivot follow smoothing
     
     // State-aware follow smoothing
     // Higher = snappier, Lower = smoother/more lag
-    float idleFollowSmooth = 8.0f;    // Snappy when idle (precise control)
-    float walkFollowSmooth = 5.0f;    // Balanced when walking
-    float runFollowSmooth = 10.0f;    // Very smooth when running (catches up)
-    float jumpFollowSmooth = 6.0f;    // Balanced for jump
-    float fallFollowSmooth = 7.0f;    // Smooth for landing
-    float crouchFollowSmooth = 4.0f;  // Smooth when crouching
+    float idleFollowSmooth = 10.0f;   // Snappy when idle (precise control)
+    float walkFollowSmooth = 7.0f;    // Balanced when walking
+    float runFollowSmooth = 12.0f;    // Responsive when running
+    float jumpFollowSmooth = 8.0f;    // Balanced for jump
+    float fallFollowSmooth = 9.0f;    // Smooth for landing
+    float crouchFollowSmooth = 6.0f;  // Smooth when crouching
     
     // Transition configuration
     float smoothTransitionRate = 5.0f;  // How fast to transition between smooth values
     
     // Limits
-    float minDistance = 5.0f;
-    float maxDistance = 30.0f;
-    float minPitch = -89.0f;
-    float maxPitch = 89.0f;
+    float minDistance = 2.0f;
+    float maxDistance = 12.0f;
+    float minPitch = -30.0f;   // keep the camera above the floor
+    float maxPitch = 55.0f;
+    
+    // Ground clearance: camera is never pushed below terrain+this margin
+    float groundClearance = 0.4f;
     
     // Collision avoidance
     bool collisionEnabled = true;
@@ -91,10 +94,10 @@ struct CameraConfig {
      * Configure for snappy response (action games)
      */
     void setSnappy() {
-        idleFollowSmooth = 12.0f;
-        walkFollowSmooth = 8.0f;
-        runFollowSmooth = 15.0f;
-        pivotSmooth = 6.0f;
+        idleFollowSmooth = 14.0f;
+        walkFollowSmooth = 10.0f;
+        runFollowSmooth = 16.0f;
+        pivotSmooth = 10.0f;
     }
     
     /**
@@ -103,18 +106,18 @@ struct CameraConfig {
     void setCinematic() {
         idleFollowSmooth = 4.0f;
         walkFollowSmooth = 3.0f;
-        runFollowSmooth = 6.0f;
-        pivotSmooth = 2.0f;
+        runFollowSmooth = 5.0f;
+        pivotSmooth = 3.0f;
     }
     
     /**
      * Configure for balanced (default)
      */
     void setBalanced() {
-        idleFollowSmooth = 8.0f;
-        walkFollowSmooth = 5.0f;
-        runFollowSmooth = 10.0f;
-        pivotSmooth = 4.0f;
+        idleFollowSmooth = 10.0f;
+        walkFollowSmooth = 7.0f;
+        runFollowSmooth = 12.0f;
+        pivotSmooth = 8.0f;
     }
 };
 

@@ -8,14 +8,15 @@ layout (location = 4) in vec3  aBitangent;
 layout (location = 5) in ivec4 aBoneIDs;
 layout (location = 6) in vec4  aWeights;
 
-// Instanced model matrix (set via glVertexAttribDivisor) - locations 7-10
-// Disabled for bot viewport test: these attributes are not supplied by Mesh::Draw
-// and can cause GL_INVALID_OPERATION on drivers that require all declared
-// vertex attributes to be sourced from a buffer.
-// layout (location = 7) in vec4 instanceModelRow0;
-// layout (location = 8) in vec4 instanceModelRow1;
-// layout (location = 9) in vec4 instanceModelRow2;
-// layout (location = 10) in vec4 instanceModelRow3;
+// Instanced model matrix (set via glVertexAttribDivisor) - locations 7-10.
+// Used by instanced draws (world objects) only; Mesh::Draw (characters) sets
+// uDisableInstancing=1 so the uniform `model` is used instead and the VAO's
+// missing instance attributes are never read (attributes stay disabled in
+// that VAO, so no GL_INVALID_OPERATION on strict drivers).
+layout (location = 7) in vec4 instanceModelRow0;
+layout (location = 8) in vec4 instanceModelRow1;
+layout (location = 9) in vec4 instanceModelRow2;
+layout (location = 10) in vec4 instanceModelRow3;
 
 out vec2 TexCoords;
 out vec3 FragPos;
@@ -69,17 +70,14 @@ void main()
 
     // Build model matrix from instance attributes (or use uniform if instancing disabled)
     mat4 mdl = model;
-    // Instancing path disabled for bot viewport test.
-    // if (uDisableInstancing == 0) {
-    //     mdl = mat4(
-    //         instanceModelRow0,
-    //         instanceModelRow1,
-    //         instanceModelRow2,
-    //         instanceModelRow3
-    //     );
-    // } else {
-    //     mdl = model;
-    // }
+    if (uDisableInstancing == 0) {
+        mdl = mat4(
+            instanceModelRow0,
+            instanceModelRow1,
+            instanceModelRow2,
+            instanceModelRow3
+        );
+    }
 
     // ---------- NORMALIZE WEIGHTS ----------
     float sum = aWeights.x + aWeights.y + aWeights.z + aWeights.w;

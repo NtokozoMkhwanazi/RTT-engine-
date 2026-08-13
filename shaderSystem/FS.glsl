@@ -10,6 +10,9 @@ uniform sampler2D texture_diffuse1;
 uniform vec3 lightPos = vec3(10.0, 10.0, 10.0);
 uniform vec3 viewPos;
 uniform int uShowDebug;
+// Ambient term (default 0.2 matches the old hardcoded value). Characters can
+// raise it (AnimatedCharacter sets uAmbient) so dark materials stay visible.
+uniform float uAmbient = 0.2f;
 
 void main()
 {
@@ -27,7 +30,7 @@ void main()
         texColor = vec3(0.8, 0.6, 0.4);
     }
     
-    vec3 litColor = (diff + 0.2) * texColor;
+    vec3 litColor = (diff + uAmbient) * texColor;
     
     // Use lit color normally, debug color for visualization
     if (uShowDebug == 1) {

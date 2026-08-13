@@ -23,6 +23,7 @@ public:
     // Initialization
     bool initialize();
     void shutdown();
+    bool isInitialized() const { return m_initialized; }
 
     // Drawing
     void beginFrame(const glm::mat4& view, const glm::mat4& projection);

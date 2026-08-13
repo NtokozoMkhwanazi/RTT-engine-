@@ -155,6 +155,19 @@ profiler.SetHistorySize(120);  // 2 seconds at 60 FPS
 profiler.SetExportPath("profile.csv");
 ```
 
+## 🛠️ Build & Test
+
+The renderer compiles as part of the main engine build. From the repository root:
+
+```bash
+make            # build the test runner
+make test       # run the full unit-test suite (494 tests)
+make run        # self-check tests, then boot the engine
+make run-headless  # bounded headless engine run (CI-friendly)
+```
+
+See the [root README](../README.md) for prerequisites, build modes, and engine controls.
+
 ## 🐛 Known Issues
 
 See [VIEWPORT_STATUS.md](../VIEWPORT_STATUS.md) for current integration status.
@@ -162,4 +175,4 @@ See [VIEWPORT_STATUS.md](../VIEWPORT_STATUS.md) for current integration status.
 ---
 
 **Status:** ✅ Production Ready
-**Last Updated:** March 27, 2025
+**Last Updated:** August 2026

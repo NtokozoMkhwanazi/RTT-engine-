@@ -93,13 +93,13 @@ protected:
             std::cout << "[TEST] Loaded: " << name << " - " 
                       << result.boneCount << " bones, " 
                       << result.meshCount << " meshes\n";
-            return true;
         } else {
             failedModels.push_back(name);
             std::cout << "[TEST] FAILED: " << name << " - " 
                       << result.errorMessage << "\n";
-            return false;
         }
+        delete result.model;  // Test only inspects counts - release the model
+        return result.success;
     }
     
     void initializeMotionMatching(Model* model) {
@@ -165,6 +165,8 @@ TEST_F(FBXAnimationIntegrationTest, ModelPropertiesAreValid) {
     std::cout << "Bot size: " << Vec3ToString(botResult.size) << "\n";
     EXPECT_GT(botResult.size.y, 0.1f) << "Height should be positive";
     EXPECT_LT(botResult.size.y, 200.0f) << "Height should be reasonable (model is ~180 units tall)";
+
+    delete botResult.model;
 }
 
 // ============================================================================
@@ -244,7 +246,8 @@ TEST_F(FBXAnimationIntegrationTest, MotionMatchingDatabaseIsPopulated) {
     for (const auto& [name, path] : animations) {
         Animation* anim = LoadAnimationFromFile(path);
         if (anim) {
-            matcher->LoadAnimation(name, std::shared_ptr<Animation>(anim, [](Animation*){}));
+            // MotionDatabase takes shared_ptr ownership; default deleter frees the animation
+            matcher->LoadAnimation(name, std::shared_ptr<Animation>(anim));
             loadedCount++;
             std::cout << "[TEST] Loaded: " << name << "\n";
         }

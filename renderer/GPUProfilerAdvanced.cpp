@@ -92,8 +92,16 @@ bool AdvancedGPUProfiler::initialize() {
 }
 
 void AdvancedGPUProfiler::shutdown() {
-    if (m_frameStartQuery != 0) glDeleteQueries(1, &m_frameStartQuery);
-    if (m_frameEndQuery != 0) glDeleteQueries(1, &m_frameEndQuery);
+    if (!m_initialized) return;
+
+    if (m_frameStartQuery != 0) {
+        glDeleteQueries(1, &m_frameStartQuery);
+        m_frameStartQuery = 0;
+    }
+    if (m_frameEndQuery != 0) {
+        glDeleteQueries(1, &m_frameEndQuery);
+        m_frameEndQuery = 0;
+    }
     m_queryPool.cleanup();
     m_initialized = false;
 }

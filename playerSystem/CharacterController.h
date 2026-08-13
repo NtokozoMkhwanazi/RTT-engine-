@@ -6,8 +6,7 @@
 
 class CharacterController {
 public:
-    CharacterController(const std::shared_ptr<RigidBody>& body,
-                        PhysicsWorld* world);
+    CharacterController(RigidBody* body, PhysicsWorld* world);
 
     // --- Input ---
     void setMoveInput(const glm::vec3& dir); // XZ direction
@@ -19,10 +18,10 @@ public:
     // --- Update ---
     // 🔥 ROOT MOTION AWARE UPDATE
     void update(float dt, const glm::vec3& rootMotion);
-    void applyRootMotion(const std::shared_ptr<RigidBody>& playerBody, const glm::vec3& delta, float dt);
+    void applyRootMotion(RigidBody* playerBody, const glm::vec3& delta, float dt);
     
     // --- State queries ---
-    bool isGrounded() const { return body->onGround; }
+    bool isGrounded() const { return body && body->onGround; }
     bool isCrouching() const { return isCrouched; }
     bool isCurrentlySliding() const { return isSlidingState; }
     bool isCurrentlySprinting() const { return isSprintingState; }
@@ -38,7 +37,7 @@ public:
     void setSlideSpeed(float speed) { slideSpeed = speed; }
 
 private:
-    std::shared_ptr<RigidBody> body;
+    RigidBody* body = nullptr;
     PhysicsWorld* world = nullptr;
 
     // Movement tuning

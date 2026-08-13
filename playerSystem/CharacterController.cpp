@@ -6,13 +6,15 @@
 // ---------------- Constructor ----------------
 
 CharacterController::CharacterController(
-    const std::shared_ptr<RigidBody>& b,
+    RigidBody* b,
     PhysicsWorld* w)
     : body(b), world(w)
 {
-    body->isPlayer = true;
-    body->restitution = 0.0f;
-    body->friction = 0.9f;
+    if (body) {
+        body->isPlayer = true;
+        body->restitution = 0.0f;
+        body->friction = 0.9f;
+    }
 }
 
 // ---------------- Input ----------------
@@ -26,7 +28,7 @@ void CharacterController::setMoveInput(const glm::vec3& dir) {
 }
 
 void CharacterController::jump() {
-    if (!body->onGround) return;
+    if (!body || !body->onGround) return;
 
     body->velocity.y = jumpSpeed;
     body->onGround = false;
@@ -46,6 +48,7 @@ void CharacterController::crouch(bool crouched) {
 }
 
 void CharacterController::slide() {
+    if (!body) return;
     if (body->onGround && glm::length(moveInput) > 0.1f) {
         isSlidingState = true;
         // Apply a burst of speed in the movement direction
@@ -62,6 +65,7 @@ void CharacterController::setSprint(bool sprinting) {
 
 void CharacterController::update(float dt, const glm::vec3& rootMotion)
 {
+    if (!body) return;
     // Root motion drives the body
     body->position += glm::vec3(rootMotion.x, 0.0f, rootMotion.z);
 
@@ -90,7 +94,7 @@ void CharacterController::update(float dt, const glm::vec3& rootMotion)
     }
 }
 
-void CharacterController::applyRootMotion(const std::shared_ptr<RigidBody>& playerBody, const glm::vec3& delta, float dt)
+void CharacterController::applyRootMotion(RigidBody* playerBody, const glm::vec3& delta, float dt)
 {
     // Simply move the player body
     if(playerBody)

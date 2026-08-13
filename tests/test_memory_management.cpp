@@ -493,6 +493,10 @@ TEST_F(MemoryManagementTest, Integration_ArenaWithPool) {
     
     // Arena tracks the pool allocation
     EXPECT_GT(arena.getUsedSize(), 0);
+
+    // Explicitly destroy the pool so its heap-allocated blocks are freed
+    // (MemoryArena only reclaims its own buffer; it does not call object destructors)
+    pool->~MemoryPool<int>();
 }
 
 /**

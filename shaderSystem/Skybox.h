@@ -27,7 +27,7 @@ private:
     unsigned int vao = 0, vbo = 0;
     unsigned int dayTexture = 0, nightTexture = 0;
     float blend = 0.0f;
-    bool debugSolid = false;
+    bool debugSolid = false;  // if true, fragment shader outputs solid magenta (debug only)
 
     Shader* shader = nullptr;
 

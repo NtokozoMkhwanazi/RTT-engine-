@@ -20,6 +20,14 @@
 // ============================================================================
 // Camera System Types
 // ============================================================================
+// NOTE: these mock types intentionally mirror the real engine camera API, but
+// they must NOT share names with the engine's ThirdPersonCamera/CameraConfig/
+// CharacterState/CameraState symbols. When linked into the engine test runner
+// (which also compiles cameraSystem/ThirdPersonCamera.h and motionMatching),
+// the duplicate global names violate the one-definition rule and corrupt
+// memory (observed as "stack smashing" in SetUp). Anonymous namespace keeps
+// these mocks internal to this translation unit.
+namespace {
 
 enum class CameraState {
     IDLE,
@@ -31,7 +39,7 @@ enum class CameraState {
     TRANSITIONING
 };
 
-std::string CameraStateToString(CameraState state) {
+[[maybe_unused]] std::string CameraStateToString(CameraState state) {
     switch (state) {
         case CameraState::IDLE: return "Idle";
         case CameraState::WALK: return "Walk";
@@ -167,6 +175,8 @@ public:
         return glm::length(position - charPos);
     }
 };
+
+} // namespace (mock camera types - avoid ODR clash with the engine camera system)
 
 // ============================================================================
 // Test Fixture

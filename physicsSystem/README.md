@@ -136,6 +136,20 @@ charConfig.jumpForce = 5.0f;
 | **Constraint Solver** | O(n * iterations) | ~0.2ms |
 | **Character Update** | O(colliders) | ~0.1ms |
 
+## 🛠️ Build & Test
+
+The physics system compiles as part of the main engine build. From the repository root:
+
+```bash
+make            # build the test runner
+make test       # run the full unit-test suite (494 tests)
+make run        # self-check tests, then boot the engine
+make run-headless  # bounded headless engine run (CI-friendly)
+```
+
+Collision detection (GJK/EPA), gravity, restitution, friction, and raycasts are covered
+by `make test-physics`. See the [root README](../README.md) for prerequisites and engine controls.
+
 ## 🐛 Debugging
 
 See documentation in `docs/physics/`:
@@ -144,4 +158,4 @@ See documentation in `docs/physics/`:
 ---
 
 **Status:** ✅ Production Ready
-**Last Updated:** March 27, 2025
+**Last Updated:** August 2026

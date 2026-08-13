@@ -9,6 +9,7 @@
  */
 
 #include "Renderer.h"
+#include "../editor/gl_context_lifecycle.h"
 #include <iostream>
 #include <cstring>
 
@@ -333,6 +334,8 @@ Renderer::~Renderer() {
 }
 
 void Renderer::Initialize() {
+    if (m_initialized) return;
+
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
@@ -352,14 +355,27 @@ void Renderer::Initialize() {
     // Initialize Multi-Draw Indirect
     InitializeMDI();
     
+    m_initialized = true;
     std::cout << "[Renderer] Initialized with UBO and batch sorting\n";
 }
 
 void Renderer::Shutdown() {
+    if (!m_initialized) return;
+
+    // Defense in depth: even if m_initialized is somehow still true at static
+    // destruction time (e.g., Init was called but explicit Shutdown was missed),
+    // do not issue GL calls on a dead context.
+    if (!glctx::isAlive()) {
+        // Still flip m_initialized so ~Renderer() doesn't re-enter.
+        m_initialized = false;
+        return;
+    }
+
     bufferPool.Shutdown();
     
     if (cameraUBO) {
         glDeleteBuffers(1, &cameraUBO);
+        cameraUBO = 0;
     }
     
     if (mdiIndirectBuffer) {
@@ -376,8 +392,14 @@ void Renderer::Shutdown() {
         mdiVertexArray = 0;
     }
     
+    if (defaultTexture) {
+        glDeleteTextures(1, &defaultTexture);
+        defaultTexture = 0;
+    }
+
     batches.clear();
     batchIndices.clear();
+    m_initialized = false;
 }
 
 void Renderer::SetCameraMatrices(const glm::mat4& view, const glm::mat4& projection) {
@@ -413,7 +435,8 @@ void Renderer::AddRenderable(GLuint VAO, GLuint VBO, GLuint EBO, GLsizei vertexC
                             float metallic,
                             float roughness,
                             const glm::vec3& bboxMin,
-                            const glm::vec3& bboxMax) {
+                            const glm::vec3& bboxMax,
+                            GLuint textureID) {
     // Frustum culling - skip if not visible
     if (frustumCullingEnabled && !transforms.empty()) {
         glm::vec3 center = (bboxMin + bboxMax) * 0.5f;
@@ -435,12 +458,18 @@ void Renderer::AddRenderable(GLuint VAO, GLuint VBO, GLuint EBO, GLsizei vertexC
     batch.primitiveType = primitiveType;
     batch.shaderProgram = shaderProgram;
     batch.instanceCount = static_cast<GLsizei>(transforms.size());
-    batch.textureID = 0;
+    batch.textureID = textureID;
     batch.albedo = color;
     batch.metallic = metallic;
     batch.roughness = roughness;
     batch.bboxMin = bboxMin;
     batch.bboxMax = bboxMax;
+    // The batched path draws each batch with a uniform model matrix (the
+    // instanced attribute path can't carry per-batch transforms when several
+    // batches share a VAO).
+    if (!transforms.empty()) {
+        batch.modelMatrix = transforms[0];
+    }
 
     // Compute sort key for efficient sorting
     batch.ComputeSortKey();
@@ -520,7 +549,12 @@ void Renderer::Render() {
                 glUseProgram(batch.shaderProgram);
                 lastShader = batch.shaderProgram;
                 BindCameraUBO(batch.shaderProgram);
+                SetCommonShaderUniforms(batch.shaderProgram);
             }
+            
+            // Feed this batch's transform through the model uniform (same
+            // contract as the playable character's Model::Draw path).
+            SetModelUniform(batch.shaderProgram, batch.modelMatrix);
             
             // Set material uniforms using explicit layout locations from the shader
             glUniform3f(0, batch.albedo.r, batch.albedo.g, batch.albedo.b);
@@ -731,11 +765,15 @@ void Renderer::ExecuteMultiDraw() {
         renderOrder = &fallbackOrder;
     }
 
-    // Group batches by shader+VAO for MDI (same shader+VAO = one multi-draw call)
+    // Group batches by shader+VAO+texture for MDI (one multi-draw call per
+    // group). The texture is part of the key because a multi-draw group shares
+    // a single texture bind - meshes with different albedo maps must not be
+    // batched together.
     struct MDIGroup {
         GLuint shaderProgram;
         GLuint VAO;
         GLuint EBO;
+        GLuint textureID;
         GLsizei vertexCount;      // Same for all in group (same mesh)
         GLenum primitiveType;
         GLsizei instanceCount;    // Max instance count in group
@@ -753,12 +791,13 @@ void Renderer::ExecuteMultiDraw() {
         bool useIndexed = (batch.elementBuffer != 0);
         if (!useIndexed) continue;  // MDI path only handles indexed draws for now
 
-        // Find or create group for this shader+VAO combination
+        // Find or create group for this shader+VAO+texture combination
         bool found = false;
         for (auto& group : groups) {
             if (group.shaderProgram == batch.shaderProgram &&
                 group.VAO == batch.vertexArrayObject &&
-                group.EBO == batch.elementBuffer) {
+                group.EBO == batch.elementBuffer &&
+                group.textureID == batch.textureID) {
                 group.batchIndices.push_back(idx);
                 group.instanceCount = std::max(group.instanceCount, batch.instanceCount);
                 found = true;
@@ -771,6 +810,7 @@ void Renderer::ExecuteMultiDraw() {
             newGroup.shaderProgram = batch.shaderProgram;
             newGroup.VAO = batch.vertexArrayObject;
             newGroup.EBO = batch.elementBuffer;
+            newGroup.textureID = batch.textureID;
             newGroup.vertexCount = batch.vertexCount;
             newGroup.primitiveType = batch.primitiveType;
             newGroup.instanceCount = std::max((GLsizei)1, batch.instanceCount);
@@ -786,8 +826,67 @@ void Renderer::ExecuteMultiDraw() {
         // Set shader and material state once per group
         glUseProgram(group.shaderProgram);
         BindCameraUBO(group.shaderProgram);
+        SetCommonShaderUniforms(group.shaderProgram);
         glBindVertexArray(group.VAO);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, group.EBO);
+
+        // Material uniforms from the first batch (shared shader state)
+        const auto& firstBatch = batches[group.batchIndices[0]];
+        glUniform3f(0, firstBatch.albedo.r, firstBatch.albedo.g, firstBatch.albedo.b);
+        glUniform1f(1, firstBatch.metallic);
+        glUniform1f(2, firstBatch.roughness);
+        glUniform1f(3, firstBatch.ao);
+        glUniform3f(4, firstBatch.emissive.r, firstBatch.emissive.g, firstBatch.emissive.b);
+
+        GLint useAlbedoMapLoc = GetCachedUniformLocation(group.shaderProgram, "useAlbedoMap");
+        if (useAlbedoMapLoc != -1) {
+            bool hasTexture = (firstBatch.textureID != 0);
+            glUniform1i(useAlbedoMapLoc, hasTexture ? 1 : 0);
+            if (hasTexture) {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, firstBatch.textureID);
+            }
+        }
+
+        // A multi-draw group shares ONE uniform state, so it can only batch
+        // together batches that use the SAME model matrix. Batches that share
+        // a VAO but carry different transforms (e.g. several entities using
+        // the same model, or the 6 physics crates that share one cube VAO)
+        // must be drawn one at a time with their own uModel - otherwise the
+        // per-VAO instanced-attribute setup leaves only the LAST batch's
+        // transform for every command in the group, and the rest render with
+        // garbage matrices (the "models look like broken lines" bug).
+        bool sameTransform = true;
+        for (size_t i = 1; i < group.batchIndices.size(); ++i) {
+            if (batches[group.batchIndices[i]].modelMatrix != firstBatch.modelMatrix) {
+                sameTransform = false;
+                break;
+            }
+        }
+
+        if (!sameTransform) {
+            // Per-batch draw: each batch gets its own model + material uniforms.
+            for (size_t idx : group.batchIndices) {
+                const auto& batch = batches[idx];
+                glUniform3f(0, batch.albedo.r, batch.albedo.g, batch.albedo.b);
+                glUniform1f(1, batch.metallic);
+                glUniform1f(2, batch.roughness);
+                glUniform1f(3, batch.ao);
+                glUniform3f(4, batch.emissive.r, batch.emissive.g, batch.emissive.b);
+                SetModelUniform(group.shaderProgram, batch.modelMatrix);
+                if (batch.instanceCount > 0) {
+                    glDrawElementsInstanced(group.primitiveType, batch.vertexCount,
+                                            GL_UNSIGNED_INT, 0, batch.instanceCount);
+                } else {
+                    glDrawElements(group.primitiveType, batch.vertexCount, GL_UNSIGNED_INT, 0);
+                }
+            }
+            continue;
+        }
+
+        // All batches in the group share the same transform: one model uniform
+        // and a single multi-draw call for all of them.
+        SetModelUniform(group.shaderProgram, firstBatch.modelMatrix);
 
         if (mdiSupported && useMultiDraw) {
             // === PATH 1: Full Multi-Draw Indirect (OpenGL 4.3+) ===
@@ -811,26 +910,6 @@ void Renderer::ExecuteMultiDraw() {
                 commands[i].baseInstance = 0;
             }
 
-            // Set material uniforms for first batch (shared shader state)
-            if (!group.batchIndices.empty()) {
-                const auto& firstBatch = batches[group.batchIndices[0]];
-                glUniform3f(0, firstBatch.albedo.r, firstBatch.albedo.g, firstBatch.albedo.b);
-                glUniform1f(1, firstBatch.metallic);
-                glUniform1f(2, firstBatch.roughness);
-                glUniform1f(3, firstBatch.ao);
-                glUniform3f(4, firstBatch.emissive.r, firstBatch.emissive.g, firstBatch.emissive.b);
-
-                GLint useAlbedoMapLoc = GetCachedUniformLocation(group.shaderProgram, "useAlbedoMap");
-                if (useAlbedoMapLoc != -1) {
-                    bool hasTexture = (firstBatch.textureID != 0);
-                    glUniform1i(useAlbedoMapLoc, hasTexture ? 1 : 0);
-                    if (hasTexture) {
-                        glActiveTexture(GL_TEXTURE0);
-                        glBindTexture(GL_TEXTURE_2D, firstBatch.textureID);
-                    }
-                }
-            }
-
             // Single multi-draw call for all batches in this group
             if (glMultiDrawElementsIndirectPtr) {
                 glMultiDrawElementsIndirectPtr(group.primitiveType, GL_UNSIGNED_INT,
@@ -851,5 +930,35 @@ void Renderer::ExecuteMultiDraw() {
             glMultiDrawElements(group.primitiveType, counts.data(), GL_UNSIGNED_INT,
                                 offsets.data(), static_cast<GLsizei>(cmdCount));
         }
+    }
+}
+
+// ============================================================================
+// Uniform Helpers for the Batched Draw Path
+// ============================================================================
+
+void Renderer::SetCommonShaderUniforms(GLuint shaderProgram) {
+    // Shaders that use plain camera uniforms (VS.glsl style) get them from
+    // here; the editor's main shader reads the CameraBlock UBO instead, so
+    // these lookups simply return -1 for it (harmless).
+    GLint viewLoc = GetCachedUniformLocation(shaderProgram, "view");
+    if (viewLoc >= 0) glUniformMatrix4fv(viewLoc, 1, GL_FALSE, &cameraData.view[0][0]);
+    GLint projLoc = GetCachedUniformLocation(shaderProgram, "projection");
+    if (projLoc >= 0) glUniformMatrix4fv(projLoc, 1, GL_FALSE, &cameraData.projection[0][0]);
+
+    // The batched path feeds transforms through uniforms, not the instanced
+    // attribute - the mesh VAOs only define attributes 0-6.
+    GLint instLoc = GetCachedUniformLocation(shaderProgram, "uInstanced");
+    if (instLoc >= 0) glUniform1i(instLoc, 0);
+}
+
+void Renderer::SetModelUniform(GLuint shaderProgram, const glm::mat4& model) {
+    GLint modelLoc = GetCachedUniformLocation(shaderProgram, "uModel");
+    if (modelLoc >= 0) glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
+
+    // Cover shaders that still name it "model" (VS.glsl style).
+    GLint legacyLoc = GetCachedUniformLocation(shaderProgram, "model");
+    if (legacyLoc >= 0 && legacyLoc != modelLoc) {
+        glUniformMatrix4fv(legacyLoc, 1, GL_FALSE, &model[0][0]);
     }
 }

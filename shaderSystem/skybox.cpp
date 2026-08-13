@@ -120,51 +120,11 @@ void Skybox::render(const glm::mat4& view, const glm::mat4& projection) {
         std::cerr << "[Skybox::render] ABORT: shader is null" << std::endl;
         return;
     }
-    static int renderCallCount = 0;
-    renderCallCount++;
-    
+
     // Ensure VAO exists (recreate if needed)
     if (vao == 0) {
         initCube();
         std::cerr << "[Skybox] Re-initialized cube (vao was 0)\n" << std::endl;
-    }
-    
-    // Diagnostic: print shader/VAO info on first few frames
-    if (renderCallCount <= 5) {
-        GLuint shaderProg = shader ? shader->ID : 0;
-        GLint linked = 0;
-        if (shaderProg) glGetProgramiv(shaderProg, GL_LINK_STATUS, &linked);
-        
-        GLint boundVao = 0;
-        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &boundVao);
-        
-        GLint viewport[4];
-        glGetIntegerv(GL_VIEWPORT, viewport);
-        
-        GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
-        GLint scissorBox[4] = {0,0,0,0};
-        if (scissor) glGetIntegerv(GL_SCISSOR_BOX, scissorBox);
-        
-        std::cerr << "[Skybox-diag] call=" << renderCallCount
-                  << " shaderProg=" << shaderProg
-                  << " linked=" << (linked ? "yes" : "no")
-                  << " vao=" << vao
-                  << " viewport=(" << viewport[0] << "," << viewport[1] << "," << viewport[2] << "," << viewport[3] << ")"
-                  << " scissor=" << (scissor ? "enabled (" + std::to_string(scissorBox[0]) + "," + std::to_string(scissorBox[1]) + "," + std::to_string(scissorBox[2]) + "," + std::to_string(scissorBox[3]) + ")" : "disabled")
-                  << std::endl;
-    }
-
-    if (renderCallCount % 60 == 1) {
-        int boundFbo = 0;
-        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &boundFbo);
-        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        std::cerr << "[Skybox::render] call=" << renderCallCount
-                  << " boundFbo=" << boundFbo
-                  << " fboStatus=0x" << std::hex << status << std::dec
-                  << " shader=" << (shader ? "ok" : "null")
-                  << " dayTex=" << dayTexture
-                  << " nightTex=" << nightTexture
-                  << std::endl;
     }
 
     glDepthFunc(GL_LEQUAL);
@@ -189,17 +149,6 @@ void Skybox::render(const glm::mat4& view, const glm::mat4& projection) {
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLES, 0, 36);
         glBindVertexArray(0);
-    } else {
-        // Fallback: draw a colored quad using fixed-function
-        glDisable(GL_DEPTH_TEST);
-        // ...
-    }
-    GLenum drawErr = glGetError();
-
-    if (renderCallCount % 60 == 1) {
-        std::cerr << "[Skybox::render] draw call done, glGetError=" << drawErr
-                  << " (0=no err, 0x500=invalid enum, 0x502=invalid op, 0x501=invalid value)"
-                  << std::endl;
     }
 
     glDepthFunc(GL_LESS);

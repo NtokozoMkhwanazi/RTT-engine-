@@ -37,6 +37,8 @@ TEST(FBXLoaderTest, BotModelLoads) {
     EXPECT_TRUE(result.success) << "Bot model should load successfully";
     EXPECT_GT(result.boneCount, 0) << "Bot should have bones";
     EXPECT_GT(result.meshCount, 0) << "Bot should have meshes";
+
+    delete result.model;
 }
 
 // ============================================================================
@@ -67,6 +69,8 @@ TEST(FBXLoaderTest, DatsunModelLoads) {
     } else {
         std::cout << "[INFO] Datsun not found (optional)\n";
     }
+
+    delete result.model;
 }
 
 // ============================================================================

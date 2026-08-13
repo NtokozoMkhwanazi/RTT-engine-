@@ -17,7 +17,14 @@
 
 // ============================================================================
 // Mock Animation System (simplified for integration testing)
+//
+// NOTE: these mocks live in an anonymous namespace so they can't collide with
+// engine types of the same name at link time (e.g. physicsSystem's RigidBody
+// defines onGround=false in the global namespace, which was overriding the
+// test's onGround=true default in the full test binary).
 // ============================================================================
+
+namespace {
 
 enum class AnimationState {
     IDLE, WALK, RUN, JUMP, FALL, CROUCH, CROUCH_WALK, NONE
@@ -198,6 +205,8 @@ struct GameInput {
         verticalVelocity = controller.body->velocity.y;
     }
 };
+
+}  // namespace (mocks)
 
 // ============================================================================
 // Integration Test Fixture

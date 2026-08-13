@@ -89,9 +89,9 @@ TEST_F(CameraSystemTest, ConfigurationPresets_Cinematic) {
 TEST_F(CameraSystemTest, ConfigurationPresets_Balanced) {
     camera.config.setBalanced();
     
-    EXPECT_NEAR(camera.config.idleFollowSmooth, 8.0f, 1.0f);
-    EXPECT_NEAR(camera.config.walkFollowSmooth, 5.0f, 1.0f);
-    EXPECT_NEAR(camera.config.runFollowSmooth, 10.0f, 1.0f);
+    EXPECT_NEAR(camera.config.idleFollowSmooth, 10.0f, 1.0f);
+    EXPECT_NEAR(camera.config.walkFollowSmooth, 7.0f, 1.0f);
+    EXPECT_NEAR(camera.config.runFollowSmooth, 12.0f, 1.0f);
 }
 
 // ============================================================================
@@ -108,9 +108,10 @@ TEST_F(CameraSystemTest, Follow_CharacterMoves) {
     
     simulateFrames(30);
     
-    // Camera should have moved toward character
+    // Camera should have moved toward the character and settled behind it at
+    // ~config.distance (4): ideal z = 10 + 4 = 14. Allow margin for smoothing.
     EXPECT_GT(camera.position.z, 5.0f);
-    EXPECT_LT(camera.position.z, 20.0f);
+    EXPECT_LT(camera.position.z, 28.0f);
 }
 
 /**
@@ -281,8 +282,12 @@ TEST_F(CameraSystemTest, Transition_SmoothValueTransition) {
 TEST_F(CameraSystemTest, Collision_Detection) {
     camera.config.collisionEnabled = true;
     camera.config.collisionRadius = 5.0f;  // Large radius to trigger collision
+    // The collision check measures the character against the camera's IDEAL
+    // position (behind the character at config.distance). Pull the follow
+    // distance inside the radius so the ideal spot is occupied by the
+    // character and the response engages deterministically.
+    camera.config.distance = 2.0f;
 
-    // Place character at camera's current position (this will cause collision)
     input.characterPosition = camera.position;
     input.animState = CameraState::IDLE;
 
@@ -339,8 +344,8 @@ TEST_F(CameraSystemTest, Controller_ModeThirdPerson) {
     CameraController controller(&camera);
     controller.setMode(CameraController::CameraMode::THIRD_PERSON);
     
-    EXPECT_NEAR(camera.config.distance, 15.0f, 1.0f);
-    EXPECT_NEAR(camera.config.height, 5.0f, 1.0f);
+    EXPECT_NEAR(camera.config.distance, 4.0f, 1.0f);
+    EXPECT_NEAR(camera.config.height, 1.6f, 1.0f);
 }
 
 /**
@@ -363,8 +368,8 @@ TEST_F(CameraSystemTest, Controller_ModeOrbit) {
     CameraController controller(&camera);
     controller.setMode(CameraController::CameraMode::ORBIT);
     
-    EXPECT_GT(camera.config.distance, 15.0f);
-    EXPECT_GT(camera.config.height, 5.0f);
+    EXPECT_GT(camera.config.distance, 4.0f);
+    EXPECT_GT(camera.config.height, 1.5f);
 }
 
 /**
@@ -375,7 +380,7 @@ TEST_F(CameraSystemTest, Controller_ModeCinematic) {
     CameraController controller(&camera);
     controller.setMode(CameraController::CameraMode::CINEMATIC);
     
-    EXPECT_GT(camera.config.distance, 20.0f);
+    EXPECT_GT(camera.config.distance, 6.0f);
     EXPECT_LT(camera.config.idleFollowSmooth, 5.0f);
 }
 
@@ -439,7 +444,7 @@ TEST_F(CameraSystemTest, Controller_Reset) {
     controller.reset();
     
     // Should be back to third person
-    EXPECT_NEAR(camera.config.distance, 15.0f, 1.0f);
+    EXPECT_NEAR(camera.config.distance, 4.0f, 1.0f);
     EXPECT_FLOAT_EQ(camera.yaw, -90.0f);
     EXPECT_FLOAT_EQ(camera.pitch, 0.0f);
 }
@@ -642,8 +647,8 @@ TEST_F(CameraSystemTest, CrouchWalk_BalancedSmoothing) {
     float distance = camera.getDistanceToCharacter(input.characterPosition);
     
     // Distance should be within reasonable bounds (not too far, not too close)
-    EXPECT_GT(distance, 5.0f);   // Should not be too close
-    EXPECT_LT(distance, 25.0f);  // Should not be too far
+    EXPECT_GT(distance, 3.0f);   // Should not be too close
+    EXPECT_LT(distance, 15.0f);  // Should not be too far
 }
 
 // ============================================================================

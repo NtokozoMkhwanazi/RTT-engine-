@@ -29,6 +29,11 @@
 #define CAMERA_UBO_BINDING 0
 #define LIGHT_UBO_BINDING 1
 #define MATERIAL_UBO_BINDING 2
+// Bone matrix UBO/SSBO used to live at binding = 0 alongside CAMERA_UBO_BINDING.
+// That collision is now resolved — bone buffers own binding point 3.
+// VS.glsl must declare layout(std140, binding = 3) uniform BoneMatricesUBO {...}
+// and BoneMatrixBuffer::Bind() must be called with BONE_BUFFER_BINDING.
+#define BONE_BUFFER_BINDING 3
 
 // ============================================================================
 // Explicit Uniform Locations (no glGetUniformLocation needed)
@@ -108,6 +113,13 @@ public:
         // Bounding box for frustum culling
         glm::vec3 bboxMin{-1,-1,-1};
         glm::vec3 bboxMax{1,1,1};
+        
+        // Model matrix for this batch. Fed to the shader via the uModel/model
+        // uniform (the mesh VAOs only define attributes 0-6, so the instanced
+        // attribute path cannot carry per-batch transforms reliably when
+        // several batches share a VAO - the playable character's draw path
+        // renders correctly for the same reason: it uses a uniform matrix).
+        glm::mat4 modelMatrix{1.0f};
         
         void ComputeSortKey() {
             // Sort by: shader (high bits) -> texture (mid) -> VAO (low)
@@ -200,7 +212,8 @@ public:
                       float metallic = 0.0f,
                       float roughness = 0.5f,
                       const glm::vec3& bboxMin = glm::vec3(-1),
-                      const glm::vec3& bboxMax = glm::vec3(1));
+                      const glm::vec3& bboxMax = glm::vec3(1),
+                      GLuint textureID = 0);  // albedo map (useAlbedoMap=1)
 
     // Submit all batches for rendering (with sorting)
     void SubmitBatches();
@@ -242,6 +255,7 @@ public:
     std::vector<RenderBatch> batches;
 
 private:
+    bool m_initialized = false;
     // UBO
     GLuint cameraUBO = 0;
     CameraUBO cameraData;
@@ -282,6 +296,14 @@ private:
     void UpdateCameraUBO();
     void BindCameraUBO(GLuint shaderProgram);
     int GetCachedUniformLocation(GLuint shaderProgram, const std::string& name);
+
+    // Uniform helpers for the batched draw path. The batched path must
+    // replicate what Model::Draw does with its Shader wrapper (set the model
+    // matrix + camera uniforms), or every batched mesh renders with the
+    // shader's default zero matrices - degenerate geometry that reads as
+    // scattered lines.
+    void SetCommonShaderUniforms(GLuint shaderProgram);
+    void SetModelUniform(GLuint shaderProgram, const glm::mat4& model);
 };
 
 // ============================================================================

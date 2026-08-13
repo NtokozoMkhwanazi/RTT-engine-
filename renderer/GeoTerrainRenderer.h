@@ -17,6 +17,7 @@
 #include "../ecs/components/GeospatialComponent.h"
 #include "../ecs/systems/GeoTerrainSystem.h"
 #include "../geospatial/GeospatialConverter.h"
+#include "../editor/gl_context_lifecycle.h"
 #include <glm/glm.hpp>
 #include <vector>
 #include <queue>
@@ -33,8 +34,14 @@ public:
                            mapShader(0), gridVAO(0), gridVBO(0), running(false) {}
 
     ~GeoTerrainRenderer() {
+        // stopTerrainThread is purely CPU-safe; it joins the worker. safe even
+        // after the GL context is gone.
         stopTerrainThread();
-        cleanup();
+        // cleanup() issues GL calls. Only run it if the context is still alive;
+        // otherwise the OS-level GL calls after glfwTerminate() will crash.
+        if (glctx::isAlive()) {
+            cleanup();
+        }
     }
 
     /**
@@ -235,6 +242,12 @@ public:
                   << gridWidth << "x" << gridHeight << " vertices\n";
     }
 
+    void shutdown() {
+        stopTerrainThread();
+        cleanup();
+        initialized = false;
+    }
+
     const char* getName() const { return "GeoTerrainRenderer"; }
 
 private:
@@ -357,11 +370,16 @@ private:
     }
 
     void cleanup() {
-        if (terrainVAO) glDeleteVertexArrays(1, &terrainVAO);
-        if (terrainVBO) glDeleteBuffers(1, &terrainVBO);
-        if (terrainEBO) glDeleteBuffers(1, &terrainEBO);
-        if (gridVAO) glDeleteVertexArrays(1, &gridVAO);
-        if (gridVBO) glDeleteBuffers(1, &gridVBO);
-        if (mapShader) glDeleteProgram(mapShader);
+        // Belt-and-suspenders: if a caller reaches us after the GL context
+        // has been torn down (e.g., shutdown() called twice, or destructor
+        // running after glfwTerminate), skip every GL call here.
+        if (!glctx::isAlive()) return;
+
+        if (terrainVAO) { glDeleteVertexArrays(1, &terrainVAO); terrainVAO = 0; }
+        if (terrainVBO) { glDeleteBuffers(1, &terrainVBO); terrainVBO = 0; }
+        if (terrainEBO) { glDeleteBuffers(1, &terrainEBO); terrainEBO = 0; }
+        if (gridVAO) { glDeleteVertexArrays(1, &gridVAO); gridVAO = 0; }
+        if (gridVBO) { glDeleteBuffers(1, &gridVBO); gridVBO = 0; }
+        if (mapShader) { glDeleteProgram(mapShader); mapShader = 0; }
     }
 };

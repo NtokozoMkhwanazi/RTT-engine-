@@ -114,10 +114,12 @@ void EngineUI::render() {
 void EngineUI::renderMenuBar() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Save", "Ctrl+S")) { }
-            if (ImGui::MenuItem("Load", "Ctrl+O")) { }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Exit", "Alt+F4")) { }
+            // Wire-or-remove: Save/Load had empty handlers (no scene API wired
+            // to this legacy UI), so only Exit remains - and it is wired to
+            // actually close the window.
+            if (ImGui::MenuItem("Exit", "Alt+F4")) {
+                if (m_window) glfwSetWindowShouldClose(m_window, GLFW_TRUE);
+            }
             ImGui::EndMenu();
         }
         
@@ -131,13 +133,8 @@ void EngineUI::renderMenuBar() {
             ImGui::EndMenu();
         }
         
-        if (ImGui::BeginMenu("Tools")) {
-            if (ImGui::MenuItem("Run Tests")) { }
-            if (ImGui::MenuItem("Profile Frame")) { }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Reset Layout")) { }
-            ImGui::EndMenu();
-        }
+        // Tools menu removed - every item (Run Tests / Profile Frame /
+        // Reset Layout) had an empty handler and did nothing.
         
         // FPS display
         auto& profiler = AdvancedGPUProfiler::getInstance();
@@ -224,30 +221,12 @@ void EngineUI::renderGPUProfilerWindow() {
 void EngineUI::renderHierarchyWindow() {
     ImGui::Begin("Hierarchy", &m_config.showHierarchy, ImGuiWindowFlags_None);
     
-    // Search box
-    static char searchBuffer[256] = "";
-    ImGui::InputTextWithHint("##Search", "Search entities...", searchBuffer, IM_ARRAYSIZE(searchBuffer));
-    
-    ImGui::Separator();
-    
-    // Entity tree (stub - would integrate with ECS)
-    if (ImGui::TreeNode("Scene")) {
-        if (ImGui::Selectable("Camera", false)) { }
-        if (ImGui::Selectable("Directional Light", false)) { }
-        
-        if (ImGui::TreeNode("Entities")) {
-            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No entities (ECS integration pending)");
-            ImGui::TreePop();
-        }
-        
-        ImGui::TreePop();
-    }
-    
-    // Add entity button
-    ImGui::Separator();
-    if (ImGui::Button("Add Entity", ImVec2(-1, 0))) {
-        UI_LOG_INFO("Add entity clicked", "Hierarchy");
-    }
+    // Wire-or-remove: the search box filtered nothing and the stub tree was a
+    // set of decorative selectables. This legacy UI is not wired to the ECS,
+    // so it states that honestly instead of pretending to list entities.
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                       "No entities (ECS integration pending)");
+    ImGui::TextDisabled("Use the main editor's Scene Outliner instead.");
     
     ImGui::End();
 }
@@ -255,34 +234,13 @@ void EngineUI::renderHierarchyWindow() {
 void EngineUI::renderInspectorWindow() {
     ImGui::Begin("Inspector", &m_config.showInspector, ImGuiWindowFlags_None);
     
-    // Selected entity info (stub)
+    // Wire-or-remove: the transform widgets edited dead static floats and the
+    // Add Component popup had empty handlers. No entity is wired to this
+    // legacy UI, so it says so instead of faking an inspector.
     ImGui::Text("Selected: None");
     ImGui::Separator();
-    
-    // Transform component (example)
-    if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
-        static float position[3] = {0.0f, 0.0f, 0.0f};
-        static float rotation[3] = {0.0f, 0.0f, 0.0f};
-        static float scale[3] = {1.0f, 1.0f, 1.0f};
-        
-        ImGui::InputFloat3("Position", position);
-        ImGui::InputFloat3("Rotation", rotation);
-        ImGui::InputFloat3("Scale", scale);
-    }
-    
-    // Add component button
-    ImGui::Separator();
-    if (ImGui::Button("Add Component", ImVec2(-1, 0))) {
-        ImGui::OpenPopup("AddComponentPopup");
-    }
-    
-    if (ImGui::BeginPopup("AddComponentPopup")) {
-        if (ImGui::MenuItem("RigidBody")) { }
-        if (ImGui::MenuItem("Mesh")) { }
-        if (ImGui::MenuItem("Camera")) { }
-        if (ImGui::MenuItem("Light")) { }
-        ImGui::EndPopup();
-    }
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                       "No entity selected (legacy inspector not wired to ECS).");
     
     ImGui::End();
 }

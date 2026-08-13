@@ -13,6 +13,16 @@
 // ============================================================================
 
 struct CharacterState {
+    // WORLD-space character state (in the caller's chosen units - the pose
+    // database's feature space; the editor character feeds source units).
+    //
+    // velocity is the world-space XZ velocity, plus the vertical term in .y.
+    // The matcher internally rotates it into the CLIP/root frame with
+    // R(-rotation) and negates it, so a character moving along its LOCAL
+    // FORWARD (-Z, the engine's model convention) produces a clip-frame
+    // velocity along the clips' +Z root motion. Callers feeding velocities
+    // that are already in the clip frame would be double-transformed - feed
+    // world-space velocity and let the matcher convert.
     glm::vec3 position{0.0f};
     glm::vec3 velocity{0.0f};
     float rotation{0.0f};  // Yaw in radians
@@ -79,6 +89,30 @@ public:
      */
     void SetConfig(const MotionMatchingConfig& config) { this->config = config; }
     const MotionMatchingConfig& GetConfig() const { return config; }
+
+    /**
+     * Live-tune the KD-tree pose-search feature weights.
+     *
+     * The KD-tree is built on feature VALUES, so weights only reshape the
+     * distance metric - changes apply immediately with no index rebuild.
+     * trajectoryScale multiplies the near->far trajectory falloff
+     * {4, 2.5, 1.5, 1.0} uniformly.
+     */
+    void SetSearchWeights(float speed, float velX, float velZ, float direction,
+                          float footPlant, float trajectoryScale,
+                          float verticalVelocity = 2.0f) {
+        searchTree.SetSpeedWeight(speed);
+        searchTree.SetVelocityWeights(velX, velZ);
+        searchTree.SetDirectionWeight(direction);
+        searchTree.SetFootPlantWeight(footPlant);
+        searchTree.SetVerticalVelocityWeight(verticalVelocity);
+        float w[kTrajectorySteps];
+        for (int i = 0; i < kTrajectorySteps; ++i) {
+            // Scale the shared near->far default falloff uniformly.
+            w[i] = MotionKDTree::kDefaultTrajectoryWeights[i] * trajectoryScale;
+        }
+        searchTree.SetTrajectoryWeights(w);
+    }
 
     /**
      * Set current motion database
@@ -184,6 +218,18 @@ public:
      */
     std::string GetDatabaseStats() const;
 
+    /**
+     * Does the current database contain airborne (Jump/Fall) poses?
+     *
+     * The character controller uses this to decide whether the pose search can
+     * represent a jump arc (and drive it through MM) or whether it must fall
+     * back to the legacy one-shot Jump override.
+     */
+    bool HasAirbornePoses() const {
+        const MotionDatabase* db = currentDatabaseRef ? currentDatabaseRef : database.get();
+        return db && db->HasAirbornePoses();
+    }
+
     // =========================================================================
     // DATABASE SWITCHING (for Hybrid MM+FSM system)
     // =========================================================================
@@ -201,6 +247,26 @@ public:
      * @param blendDuration How long to blend between databases (0 = instant)
      */
     void SetDatabase(std::unique_ptr<MotionDatabase> newDatabase, float blendDuration = 0.2f);
+
+    /**
+     * Non-owning overload: switch to a database the caller continues to own.
+     *
+     * Use this when the database is owned by an external container (e.g., a
+     * map of state-specific databases that the caller needs to keep populated).
+     * The MotionMatcher holds only a raw pointer and reads from the external
+     * storage every frame. The caller MUST keep the referenced database alive
+     * for as long as the MotionMatcher is using it (or call SetDatabase again
+     * with a different owner).
+     *
+     * Semantically equivalent to SetDatabase(unique_ptr, ...) but without the
+     * ownership transfer — fixes a class of use-after-move bugs where the
+     * external container's slot got emptied by std::move and could never be
+     * used again.
+     *
+     * @param newDatabase Database to switch to (caller retains ownership)
+     * @param blendDuration How long to blend between databases (0 = instant)
+     */
+    void SetDatabase(const MotionDatabase& newDatabase, float blendDuration = 0.2f);
 
     /**
      * Get current database name
@@ -246,6 +312,34 @@ public:
     void SetStaticRootFallback(bool enabled) { enableStaticRootFallback = enabled; }
     bool GetStaticRootFallback() const { return enableStaticRootFallback; }
 
+    /**
+     * Enable/disable verbose console logging.
+     *
+     * The matcher logs per-frame chatter (Update ENTER, query speed, animation
+     * switches). Editor character controllers silence their own matcher while
+     * standalone tools keep the diagnostics. Default: enabled.
+     */
+    void SetVerbose(bool enabled) { verbose = enabled; }
+    bool GetVerbose() const { return verbose; }
+
+    /**
+     * Set the world-space floor height used by foot IK.
+     *
+     * Defaults to 0.0f (flat floor). Set it to the terrain height under the
+     * character each frame so planted feet lock at the ground level instead of
+     * y=0.
+     */
+    void SetFloorHeight(float height) { m_floorHeight = height; }
+    float GetFloorHeight() const { return m_floorHeight; }
+
+    // World-space transform of the character (translate * rotate * scale),
+    // used by the foot IK. The IK must evaluate feet in WORLD space: in model
+    // space a planted foot slides backward under a walking body (the root
+    // advances), which defeated every stationary/plant check. With the world
+    // transform, a planted foot is genuinely stationary and the lock engages.
+    void SetCharacterModelMatrix(const glm::mat4& m) { m_modelMatrix = m; }
+    const glm::mat4& GetCharacterModelMatrix() const { return m_modelMatrix; }
+
 private:
     // Core systems (using unique_ptr for proper ownership)
     std::unique_ptr<MotionDatabase> database;
@@ -265,9 +359,6 @@ private:
     bool initialized{false};
     int currentPoseIndex{-1};
     float currentAnimTime{0.0f};
-    float blendProgress{0.0f};
-    int blendFromPose{-1};
-    int blendToPose{-1};
 
     // Character state
     glm::vec3 characterPosition{0.0f};
@@ -276,21 +367,31 @@ private:
     glm::vec2 moveDirection{0.0f, 1.0f};
     bool isGrounded{true};
     bool isCrouching{false};
+    bool isJumping{false};  // Airborne this frame (UE-style state gate input)
 
     // Debug
     MotionMatchingDebug debug;
 
     // Database switching (for hybrid MM+FSM)
     std::string currentDatabaseName{"Default"};
-    std::unique_ptr<MotionDatabase> pendingDatabase;  // Database being blended to
+    std::unique_ptr<MotionDatabase> pendingDatabase;  // Database being blended to (owning path)
+    const MotionDatabase* pendingDatabaseRef{nullptr};  // Database being blended to (non-owning path)
     float databaseBlendProgress{0.0f};
     float databaseBlendDuration{0.0f};
     bool isBlendingDatabases{false};
+    bool pendingDatabaseIsRef{false};  // Which pending slot is active
 
     // Static root detection
     float staticRootThreshold{0.1f};  // Velocity below this is considered "static"
     bool enableStaticRootFallback{false};  // DISABLED - always search for best pose
     bool hasStaticRoot{false};  // Current pose has static root
+
+    // Verbose per-frame logging + world-space floor height for foot IK
+    bool verbose{true};
+    float m_floorHeight{0.0f};
+    // World-space character transform for the foot IK (identity until the
+    // caller provides it via SetCharacterModelMatrix).
+    glm::mat4 m_modelMatrix{1.0f};
 
     // Track current animation to avoid redundant Play() calls
     Animation* currentAnimationPtr{nullptr};

@@ -6,6 +6,7 @@
 #include <vector>
 #include <unordered_map>
 #include <iostream>
+#include <filesystem>
 
 #include "Model.h"
 
@@ -54,6 +55,17 @@ public:
     
     ModelHandle load(const std::string& path) {
         if (path.empty()) return {};
+        
+        // The Model ctor silently produces an empty model for files that
+        // cannot be opened (0 meshes). Reject missing paths up front so
+        // callers get an invalid handle instead of a broken empty entity.
+        // (error_code overload: a permission-denied path degrades to a clean
+        // invalid handle instead of throwing filesystem_error.)
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+            std::cout << "[ModelRegistry] Load failed (file not found): " << path << "\n";
+            return {};
+        }
         
         auto it = m_pathIndex.find(path);
         if (it != m_pathIndex.end()) {

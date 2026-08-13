@@ -266,12 +266,17 @@ public:
      * 
      * @param query Query features
      * @param trajectory Trajectory to match
+     * @param maxCandidates How many candidates to return
+     * @param airborneFilter Optional state gate: -1 = any pose, 0 = grounded
+     *                       poses only, 1 = airborne poses only (UE-style
+     *                       "match within the current movement state").
      * @return Array of candidate indices sorted by score
      */
     std::vector<std::pair<int, float>> SearchCacheOptimized(
         const MotionFeatures& query,
         const Trajectory& trajectory,
-        int maxCandidates = 10) const;
+        int maxCandidates = 10,
+        int airborneFilter = -1) const;
 
     // =========================================================================
     // POSE ACCESS
@@ -296,6 +301,27 @@ public:
      * Get animation by name
      */
     std::shared_ptr<Animation> GetAnimation(const std::string& name) const;
+
+    /**
+     * Get the REGISTERED name of the animation at index (the name passed to
+     * AddAnimation, e.g. "Jump"), not the raw FBX channel name ("mixamo.com"
+     * for Mixamo rigs - identical across clips).
+     */
+    std::string GetAnimationName(size_t index) const {
+        if (index >= animations.size()) return std::string();
+        return animations[index].name;
+    }
+
+    /**
+     * Does this database contain airborne (Jump/Fall) poses?
+     *
+     * The matcher gates the pose search by airborne state only when airborne
+     * clips exist - a locomotion-only database keeps its current behavior.
+     */
+    bool HasAirbornePoses() const { 
+        for (const auto& p : poses) if (p.features.isAirborne) return true;
+        return false;
+    }
 
     /**
      * Get cache-friendly motion data (for optimized search)
@@ -334,7 +360,7 @@ private:
     // Traditional AoS storage (for compatibility)
     std::vector<PoseSample> poses;
 
-    // NEW: Cache-friendly SoA storage (for fast search)
+    // Cache-friendly SoA storage (for fast search)
     CacheFriendlyMotionData motionData;
 
     // Animation references (database OWNS animations via shared_ptr)

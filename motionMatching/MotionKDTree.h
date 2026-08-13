@@ -28,6 +28,16 @@ struct KDTreeNode {
     int poseIndex{-1};              // Index into pose database (-1 for internal nodes)
     int splitAxis{0};               // Which feature dimension we split on
     float splitValue{0.0f};         // Split point value
+
+    // ALL pose indices contained in this leaf (leaf nodes only). The tree
+    // used to store a single representative pose (indices[0]) per leaf, which
+    // made the kNN search evaluate ~1 pose per visited leaf instead of every
+    // pose in it - the returned "nearest" set was arbitrary (whatever pose
+    // happened to sort first in each leaf) and clip-biased. That is what made
+    // the matcher re-select Idle while moving, leak Jump/Fall poses into
+    // grounded queries, and pick CrouchWalk at sprint. Storing the full leaf
+    // makes the search exact kNN over all poses.
+    std::vector<int> leafIndices;
     
     std::unique_ptr<KDTreeNode> left;   // Left subtree (smaller values)
     std::unique_ptr<KDTreeNode> right;  // Right subtree (larger values)
@@ -55,6 +65,18 @@ struct KDTSearchResult {
  */
 class MotionKDTree {
 public:
+    // Number of dimensions in feature space:
+    //   0 speed, 1-2 velocity(XZ), 3 moveAngle, 4-5 foot plants,
+    //   6 vertical root velocity (airborne ascent/descent discrimination),
+    //   7..7+2*kTrajectorySteps-1 root-local future path (x,z per point)
+    static constexpr int NUM_FEATURES = 7 + 2 * kTrajectorySteps;
+
+    // Default near->far trajectory falloff (motion matching weights nearer
+    // future points more). Shared by the runtime member initializer and by
+    // MotionMatcher::SetSearchWeights so the tuned scale is defined once.
+    static constexpr float kDefaultTrajectoryWeights[kTrajectorySteps] =
+        { 4.0f, 2.5f, 1.5f, 1.0f };
+
     MotionKDTree();
     ~MotionKDTree();
     
@@ -132,6 +154,32 @@ public:
     // DEBUG
     // =========================================================================
     
+    // =========================================================================
+    // SEARCH WEIGHTS (live-tunable)
+    // =========================================================================
+    // The tree structure is built on feature VALUES; the weights only shape the
+    // distance metric at search time, so they can be changed at runtime with no
+    // index rebuild (the Character menu exposes them as sliders).
+
+    void SetSpeedWeight(float w) { weights.speed = w; }
+    void SetVelocityWeights(float x, float z) { weights.velocityX = x; weights.velocityZ = z; }
+    void SetDirectionWeight(float w) { weights.direction = w; }
+    void SetFootPlantWeight(float w) { weights.footPlant = w; }
+    void SetVerticalVelocityWeight(float w) { weights.verticalVelocity = w; }
+    void SetTrajectoryWeights(const float w[kTrajectorySteps]) {
+        for (int i = 0; i < kTrajectorySteps; ++i) trajectoryWeights[i] = w[i];
+    }
+
+    float GetSpeedWeight() const { return weights.speed; }
+    float GetVelocityXWeight() const { return weights.velocityX; }
+    float GetVelocityZWeight() const { return weights.velocityZ; }
+    float GetDirectionWeight() const { return weights.direction; }
+    float GetFootPlantWeight() const { return weights.footPlant; }
+    float GetVerticalVelocityWeight() const { return weights.verticalVelocity; }
+    float GetTrajectoryWeight(int point) const {
+        return (point >= 0 && point < kTrajectorySteps) ? trajectoryWeights[point] : 0.0f;
+    }
+
     /**
      * Get tree statistics
      */
@@ -172,8 +220,8 @@ private:
 
     // SAH-based tree building with binning
     struct BinBounds {
-        float minBounds[5];  // Min value per feature dimension
-        float maxBounds[5];  // Max value per feature dimension
+        float minBounds[NUM_FEATURES];  // Min value per feature dimension
+        float maxBounds[NUM_FEATURES];  // Max value per feature dimension
     };
 
     struct SAHSplit {
@@ -228,11 +276,24 @@ private:
         float velocityX = 1.0f;       // Lower - direction less important
         float velocityZ = 1.0f;       // Lower - direction less important
         float direction = 0.5f;       // Low - direction can be corrected by blending
-        float footPlant = 1.0f;       // Weight for foot plant state
+        // UE-style motion phase: a full foot-contact mismatch costs (1)^2 * w.
+        // Raised from 1.0 so the query's carried foot-plant state (added in
+        // MotionMatcher::SearchAndBlend) actually steers the search toward
+        // same-gait-phase poses - previously planted poses were PENALIZED by
+        // the (1-0)^2 term while the query always read both-feet-unplanted,
+        // which is footskating.
+        float footPlant = 2.0f;       // Weight for foot plant state
+        float verticalVelocity = 2.0f; // Airborne ascent/descent discrimination
     };
 
     FeatureWeights weights;
 
-    // Constants
-    static constexpr int NUM_FEATURES = 5;  // Number of dimensions in feature space
+    // Weights for the root-local trajectory dims: nearer future points matter
+    // more than far ones (Unreal-style). Indexed by trajectory point 0..N-1.
+    // Runtime-mutable via SetTrajectoryWeights (defaults match the tuned
+    // near->far falloff).
+    float trajectoryWeights[kTrajectorySteps] = {
+        kDefaultTrajectoryWeights[0], kDefaultTrajectoryWeights[1],
+        kDefaultTrajectoryWeights[2], kDefaultTrajectoryWeights[3]
+    };
 };

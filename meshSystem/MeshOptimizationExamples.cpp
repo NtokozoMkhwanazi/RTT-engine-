@@ -12,6 +12,8 @@
 
 namespace MeshOptimizationExamples
 {
+
+        std::vector<Mesh> GenerateLODLevels(const Mesh& originalMesh);
     // ========================================================================
     // Example 1: Basic Triangle Reordering (Cache Optimization)
     // ========================================================================
@@ -75,47 +77,49 @@ namespace MeshOptimizationExamples
 
     // ========================================================================
     // Example 4: LOD Generation
-    // ========================================================================
+   // ========================================================================
     // Create multiple LOD levels for a mesh
     std::vector<Mesh> GenerateLODLevels(const Mesh& originalMesh)
-    {
+    {   
         std::vector<Mesh> lodLevels;
+        // Reserve space to prevent reallocation overhead 
+        lodLevels.reserve(4);
         
         // LOD 0: Original quality (just reordered)
-        Mesh lod0 = originalMesh;
+        Mesh lod0(originalMesh.vertices, originalMesh.indices, originalMesh.textures);
         MeshUtils::MeshOptimizationConfig config0;
         config0.reorderTriangles = true;
         config0.clusterVertices = false;
         MeshUtils::OptimizeMeshForRendering(lod0, config0);
-        lodLevels.push_back(lod0);
+        lodLevels.push_back(std::move(lod0)); // Transfer ownership using std::move
         
         // LOD 1: Medium quality (25% reduction)
-        Mesh lod1 = originalMesh;
+        Mesh lod1(originalMesh.vertices, originalMesh.indices, originalMesh.textures);
         MeshUtils::MeshOptimizationConfig config1;
         config1.reorderTriangles = true;
         config1.clusterVertices = true;
         config1.clusterCellSize = 0.15f;  // Larger cells = more reduction
         MeshUtils::OptimizeMeshForRendering(lod1, config1);
-        lodLevels.push_back(lod1);
+        lodLevels.push_back(std::move(lod1));
         
         // LOD 2: Low quality (50% reduction)
-        Mesh lod2 = originalMesh;
+        Mesh lod2(originalMesh.vertices, originalMesh.indices, originalMesh.textures);
         MeshUtils::MeshOptimizationConfig config2;
         config2.reorderTriangles = true;
         config2.clusterVertices = true;
         config2.clusterCellSize = 0.25f;
         MeshUtils::OptimizeMeshForRendering(lod2, config2);
-        lodLevels.push_back(lod2);
+        lodLevels.push_back(std::move(lod2));
         
         // LOD 3: Lowest quality (75% reduction)
-        Mesh lod3 = originalMesh;
+        Mesh lod3(originalMesh.vertices, originalMesh.indices, originalMesh.textures);
         MeshUtils::MeshOptimizationConfig config3;
         config3.reorderTriangles = true;
         config3.clusterVertices = true;
         config3.clusterCellSize = 0.5f;
         MeshUtils::OptimizeMeshForRendering(lod3, config3);
-        lodLevels.push_back(lod3);
-        
+        lodLevels.push_back(std::move(lod3));
+    
         // Print statistics
         std::cout << "\nLOD Levels Generated:\n";
         for (size_t i = 0; i < lodLevels.size(); i++)
@@ -124,8 +128,8 @@ namespace MeshOptimizationExamples
                       << lodLevels[i].vertices.size() << " vertices, "
                       << lodLevels[i].indices.size() / 3 << " triangles\n";
         }
-        
-        return lodLevels;
+    
+        return lodLevels; // RVO (Return Value Optimisation) will move the vector out smoothly
     }
 
     // ========================================================================

@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <chrono>
+#include <limits>
 
 MotionMatcher::MotionMatcher() 
     : database(nullptr)
@@ -9,9 +10,6 @@ MotionMatcher::MotionMatcher()
     , animator(nullptr)
     , currentPoseIndex(-1)
     , currentAnimTime(0.0f)
-    , blendProgress(0.0f)
-    , blendFromPose(-1)
-    , blendToPose(-1)
     , characterPosition(0.0f)
     , characterVelocity(0.0f)
     , characterRotation(0.0f)
@@ -133,7 +131,9 @@ void MotionMatcher::SetCurrentDatabase(const MotionDatabase& newDatabase) {
 void MotionMatcher::Update(float dt,
                             const CharacterInput& input,
                             const CharacterState& charState) {
-    std::cout << "[MotionMatcher::Update] ENTER dt=" << dt << " input.mag=" << input.moveMagnitude << "\n";
+    if (verbose)
+        std::cout << "[MotionMatcher::Update] ENTER dt=" << dt
+                  << " input.mag=" << input.moveMagnitude << "\n";
     
     if (!initialized) return;
 
@@ -144,8 +144,11 @@ void MotionMatcher::Update(float dt,
     moveDirection = charState.moveDirection;
     isGrounded = charState.grounded;
     isCrouching = charState.crouching;
+    isJumping = charState.jumping;
 
-    std::cout << "[MotionMatcher::Update] charVelocity=(" << characterVelocity.x << "," << characterVelocity.z << ") speed=" << glm::length(characterVelocity) << "\n";
+    if (verbose)
+        std::cout << "[MotionMatcher::Update] charVelocity=(" << characterVelocity.x
+                  << "," << characterVelocity.z << ") speed=" << glm::length(characterVelocity) << "\n";
 
     // 1. Predict future trajectory
     UpdateTrajectory();
@@ -172,6 +175,7 @@ void MotionMatcher::Update(float dt, const CharacterState& charState) {
     moveDirection = charState.moveDirection;
     isGrounded = charState.grounded;
     isCrouching = charState.crouching;
+    isJumping = charState.jumping;
     
     // 1. Predict future trajectory
     UpdateTrajectory();
@@ -207,16 +211,9 @@ void MotionMatcher::Update(float dt,
 }
 
 void MotionMatcher::UpdateTrajectory() {
-    // Build motion query from current state
-    MotionFeatures query;
-    query.rootVelocity = characterVelocity;
-    query.speed = glm::length(characterVelocity);
-    query.moveDirection = moveDirection;
-    query.facingAngle = characterRotation;
-    query.isGrounded = isGrounded;
-    query.isCrouching = isCrouching;
-    
-    // Predict future trajectory
+    // Predict future trajectory. The pose-search query itself is built inside
+    // SearchAndBlend() each frame - this is only the predicted path (used both
+    // for the KD-tree future-path feature and the debug overlay).
     debug.predictedTrajectory = trajectoryPredictor.Predict(
         characterPosition,
         characterVelocity,
@@ -236,21 +233,82 @@ void MotionMatcher::SearchAndBlend(float dt) {
     // Start timing
     auto startTime = std::chrono::high_resolution_clock::now();
 
-    // Build motion query
+    // Build motion query.
+    //
+    // ROOT-FRAME TRANSFORM: the database stores every pose's velocity,
+    // moveAngle and future path in the CLIP's own frame (raw root space,
+    // forward = +Z). The query's velocity is world-space, and the character's
+    // local forward is -Z - the OPPOSITE of the clips' +Z root motion. So the
+    // world velocity is rotated into clip space (R(-heading)) and negated,
+    // making all three features heading-independent. Without this the velocity
+    // sign flipped when moving in -Z and the matcher re-selected Idle
+    // (footskate) while +Z movement worked by coincidence.
     MotionFeatures query;
-    query.rootVelocity = characterVelocity;
-    query.speed = glm::length(characterVelocity);
+    const float cosR = std::cos(-characterRotation);
+    const float sinR = std::sin(-characterRotation);
+    const glm::vec3 clipVel(
+        -(characterVelocity.x * cosR - characterVelocity.z * sinR),
+        characterVelocity.y,   // vertical kept as-is (airborne ascent/descent)
+        -(characterVelocity.x * sinR + characterVelocity.z * cosR));
+    query.rootVelocity = clipVel;
+    // XZ-only speed (vertical velocity must not inflate the speed feature).
+    query.speed = glm::length(glm::vec2(clipVel.x, clipVel.z));
     query.moveDirection = moveDirection;
     query.facingAngle = characterRotation;
+    // Movement-vs-facing angle (strafing/backpedal discrimination): atan2 of
+    // the clip-frame velocity - the same reference the database stores.
+    query.moveAngle = std::atan2(clipVel.x, clipVel.z);
     query.isGrounded = isGrounded;
     query.isCrouching = isCrouching;
+    query.isAirborne = isJumping || !isGrounded;
 
-    // Debug: print query speed every 30 frames
+    // Root-local future path (Unreal-style trajectory feature): the predicted
+    // world trajectory expressed as offsets from the character's root, rotated
+    // into the clip frame (and negated, same as the velocity) - identical to
+    // how the database stores each pose's trajectory, so the search ranks
+    // same-speed poses by their future path (turns/stops/strafes), not just
+    // current velocity.
+    query.futureCount = kTrajectorySteps;
+    for (int k = 1; k <= kTrajectorySteps; ++k) {
+        const glm::vec3 wp =
+            debug.predictedTrajectory.getPositionAt(k * kTrajectoryStepTime);
+        const glm::vec3 rel = wp - characterPosition;
+        query.futureLocal[k - 1] =
+            glm::vec2(-(rel.x * cosR - rel.z * sinR),
+                      -(rel.x * sinR + rel.z * cosR));
+    }
+
+    // UE-style gait-phase continuity: carry the CURRENT pose's foot-contact
+    // state into the query so the search prefers poses in the same gait phase
+    // (planted stays planted, swing stays swing). Before this the query's
+    // foot-plant features defaulted to false, so the KD-tree distance added
+    // (1-0)^2 * footPlantWeight per planted foot - it systematically penalized
+    // planted poses and preferred mid-swing poses, which is footskating. The
+    // FootPlantingSystem already feeds the plant/lift detection; this makes
+    // the POSE SEARCH respect it (UE's motion-phase feature).
+    //
+    // Read from the SAME effective database the search tree was built from
+    // (currentDatabaseRef when a non-owning switch is active, else the owned
+    // database) - the tree indices refer to that pose array, so the phase
+    // lookup must use it too.
+    const MotionDatabase* effectiveDb =
+        currentDatabaseRef ? currentDatabaseRef : database.get();
+    if (effectiveDb && currentPoseIndex >= 0 &&
+        currentPoseIndex < static_cast<int>(effectiveDb->GetPoseCount())) {
+        const PoseSample& curPose = effectiveDb->GetPose(currentPoseIndex);
+        query.leftFootPlanted = curPose.features.leftFootPlanted;
+        query.rightFootPlanted = curPose.features.rightFootPlanted;
+    }
+
+    // Debug: print query speed every 30 frames (gated by verbose so the
+    // editor character doesn't flood the log)
     static int frameCount = 0;
-    if (++frameCount % 30 == 0) {
+    if (verbose && ++frameCount % 30 == 0) {
         std::cout << "[MM Query] speed=" << query.speed
                   << " vel=(" << query.rootVelocity.x << "," << query.rootVelocity.z << ")\n";
     }
+
+
 
     // Handle static root fallback
     if (isStatic && enableStaticRootFallback) {
@@ -276,13 +334,105 @@ void MotionMatcher::SearchAndBlend(float dt) {
     results.totalSearched = searchTree.GetPoseCount();
 
     if (searchTree.IsBuilt()) {
-        // Find top 3 nearest neighbors
-        auto kdResults = searchTree.FindKNearest(query, 3);
+        // Ask for enough candidates to cover the best pose in the CURRENT clip
+        // and the best pose in any OTHER clip (persistence needs both).
+        auto kdResults = searchTree.FindKNearest(query, 8);
 
-        if (!kdResults.empty()) {
-            // Best match
-            results.best.poseIndex = kdResults[0].poseIndex;
-            results.best.score = kdResults[0].score;
+        // UE-style movement-state gate: an airborne query may only match
+        // airborne poses (Jump/Fall), a grounded query only grounded poses.
+        // This is what lets takeoff and landing route through the pose search
+        // - without it an airborne query's near-zero XZ speed would match Idle
+        // and the character would freeze mid-air. Only enforced when the
+        // database actually contains airborne poses (a locomotion-only DB
+        // keeps its current behavior). If gating empties the top-k (rare - it
+        // needs every near pose to come from the wrong state), re-search the
+        // full database restricted to the required state instead of silently
+        // using the wrong-state set; a Jump/Fall pose must never play while
+        // the character is grounded (footskate) and vice versa (freeze).
+        const bool airborneQuery = isJumping || !isGrounded;
+        bool usedFilteredFallback = false;
+        if (database->HasAirbornePoses() && !kdResults.empty()) {
+            std::vector<KDTSearchResult> gated;
+            gated.reserve(kdResults.size());
+            for (const auto& r : kdResults) {
+                const bool poseAirborne =
+                    database->GetPose(r.poseIndex).features.isAirborne;
+                if (poseAirborne == airborneQuery) gated.push_back(r);
+            }
+            if (!gated.empty()) {
+                kdResults = std::move(gated);
+            } else {
+                // Rare: every top-k candidate is in the wrong movement state.
+                // Re-search the full database restricted to the required state.
+                // NOTE: the scores returned here use the database's internal
+                // metric (speed weight ~2, not the KD tree's 15), so
+                // r.distance is NOT comparable to KD distances below. That is
+                // fine: the persistence hysteresis is skipped on this path
+                // (usedFilteredFallback), so the metric mix never feeds the
+                // 0.85-fraction clip-switch comparison.
+                auto filtered = database->SearchCacheOptimized(
+                    query, debug.predictedTrajectory, 8,
+                    airborneQuery ? 1 : 0);
+                if (!filtered.empty()) {
+                    kdResults.clear();
+                    kdResults.reserve(filtered.size());
+                    for (const auto& f : filtered) {
+                        KDTSearchResult r;
+                        r.poseIndex = f.first;
+                        r.distance = f.second;
+                        r.score = 1.0f / (1.0f + f.second);
+                        kdResults.push_back(r);
+                    }
+                    usedFilteredFallback = true;
+                }
+            }
+        }
+
+        int bestIdx = kdResults.empty() ? -1 : kdResults[0].poseIndex;
+        float bestDist = kdResults.empty() ? std::numeric_limits<float>::max()
+                                           : kdResults[0].distance;
+
+        // Unreal-style persistence: when the best candidate is in a DIFFERENT
+        // clip than the one playing, only switch if it is clearly better than
+        // the best candidate in the CURRENT clip. Without this hysteresis the
+        // matcher flickers between clips with overlapping feature
+        // neighborhoods (idle<->crouch at rest, walk<->run near the band).
+        if (bestIdx >= 0 && !usedFilteredFallback && currentPoseIndex >= 0 &&
+            currentPoseIndex < (int)database->GetPoseCount()) {
+            const int curAnimIdx = database->GetPose(currentPoseIndex).animationIndex;
+            int bestSameIdx = -1;
+            float bestSameDist = std::numeric_limits<float>::max();
+            int bestOtherIdx = -1;
+            float bestOtherDist = std::numeric_limits<float>::max();
+            for (const auto& r : kdResults) {
+                const int ai = database->GetPose(r.poseIndex).animationIndex;
+                if (ai == curAnimIdx) {
+                    if (r.distance < bestSameDist) {
+                        bestSameDist = r.distance;
+                        bestSameIdx = r.poseIndex;
+                    }
+                } else {
+                    if (r.distance < bestOtherDist) {
+                        bestOtherDist = r.distance;
+                        bestOtherIdx = r.poseIndex;
+                    }
+                }
+            }
+            // A different clip must beat the current clip by 15% (or be the
+            // only candidate) before we switch - stay put otherwise.
+            if (bestOtherIdx >= 0 &&
+                (bestSameIdx < 0 || bestOtherDist < bestSameDist * 0.85f)) {
+                bestIdx = bestOtherIdx;
+                bestDist = bestOtherDist;
+            } else if (bestSameIdx >= 0) {
+                bestIdx = bestSameIdx;  // pose-follow in the current clip
+                bestDist = bestSameDist;
+            }
+        }
+
+        if (bestIdx >= 0) {
+            results.best.poseIndex = bestIdx;
+            results.best.score = 1.0f / (1.0f + bestDist);
             results.best.blendWeight = 1.0f;
 
             // Second best (for blending)
@@ -293,12 +443,28 @@ void MotionMatcher::SearchAndBlend(float dt) {
             }
         }
     } else {
-        // Fallback to brute force if tree not built
+        // Fallback to brute force if tree not built. Apply the same movement-
+        // state gate as the KD path so airborne queries can't match Idle.
+        const bool airborneQuery = isJumping || !isGrounded;
         results = database->SearchWithBlending(
             query,
             debug.predictedTrajectory,
             config
         );
+        if (database->HasAirbornePoses() && results.best.isValid()) {
+            const bool poseAirborne =
+                database->GetPose(results.best.poseIndex).features.isAirborne;
+            if (poseAirborne != airborneQuery) {
+                // Re-search restricted to the required state.
+                auto gated = database->SearchCacheOptimized(
+                    query, debug.predictedTrajectory,
+                    config.maxSearchResults, airborneQuery ? 1 : 0);
+                if (!gated.empty()) {
+                    results.best.poseIndex = gated[0].first;
+                    results.best.score = gated[0].second;
+                }
+            }
+        }
     }
 
     // End timing
@@ -322,112 +488,79 @@ void MotionMatcher::SearchAndBlend(float dt) {
             sameAnimation = (targetPose.animationIndex == currentAnimIndex);
         }
 
-        // Update current animation time
-        if (blendFromPose < 0 || blendProgress >= 1.0f) {
-            if (sameAnimation && currentPoseIndex >= 0 && currentPoseIndex < (int)database->GetPoseCount()) {
-                // STAYING in same animation - read time from animator, don't fight with it!
-                // Animator::Update() advances time naturally via UpdateAnimationBlending()
-                
-                const PoseSample& currentPose = database->GetPose(currentPoseIndex);
-                std::shared_ptr<Animation> currentAnim = database->GetAnimation(currentPose.animationIndex);
+        if (sameAnimation && currentPoseIndex >= 0 &&
+            currentPoseIndex < (int)database->GetPoseCount()) {
+            // STAYING in the same clip - pose following: advance the matcher's
+            // own clip clock and track the nearest database pose. The animator
+            // layer started at this same time (Play/BlendToAt) and advances on
+            // its own, so we never fight it with SetCurrentTime. We also don't
+            // read GetCurrentTime() here: mid-crossfade that would return the
+            // fading layer's time and desync the pose tracker.
+            const PoseSample& currentPose = database->GetPose(currentPoseIndex);
+            std::shared_ptr<Animation> currentAnim =
+                database->GetAnimation(currentPose.animationIndex);
 
-                if (currentAnim) {
-                    // Get current time from animator (it's advancing time correctly)
-                    float animatorTime = animator->GetCurrentTime();
-                    
-                    // Use animator's time for pose selection
-                    currentAnimTime = animatorTime;
-
-                    // Check if animation looped (for foot plant release and pose index reset)
-                    bool aboutToLoop = (currentAnimTime > currentAnim->duration * 0.95f);
-
-                    // Handle looping - reset our internal pose tracker
-                    if (aboutToLoop) {
-                        // Animation is about to loop - reset pose index to start
-                        for (size_t i = 0; i < database->GetPoseCount(); i++) {
-                            const PoseSample& p = database->GetPose(i);
-                            if (p.animationIndex == currentPose.animationIndex) {
-                                currentPoseIndex = static_cast<int>(i);
-                                break;
-                            }
-                        }
-                    } else {
-                        // Normal case - advance to next pose based on time
-                        // Find the pose that matches current animator time
-                        float targetTime = currentAnimTime;
-                        int bestPoseIdx = currentPoseIndex;
-                        float bestTimeDiff = 999999.0f;
-                        
-                        // Search nearby poses for best time match
-                        for (int searchDir = 0; searchDir <= 1; searchDir++) {
-                            int searchPoseIdx = searchDir == 0 ? currentPose.nextFrameIndex : 
-                                                                 currentPose.prevFrameIndex;
-                            
-                            while (searchPoseIdx >= 0 && searchPoseIdx < (int)database->GetPoseCount()) {
-                                const PoseSample& searchPose = database->GetPose(searchPoseIdx);
-                                if (searchPose.animationIndex != currentPose.animationIndex) break;
-                                
-                                float timeDiff = std::abs(searchPose.timeInSeconds - targetTime);
-                                if (timeDiff < bestTimeDiff) {
-                                    bestTimeDiff = timeDiff;
-                                    bestPoseIdx = searchPoseIdx;
-                                }
-                                
-                                searchPoseIdx = searchDir == 0 ? searchPose.nextFrameIndex : 
-                                                                 searchPose.prevFrameIndex;
-                            }
-                        }
-                        
-                        currentPoseIndex = bestPoseIdx;
+            if (currentAnim) {
+                // Resync the clip clock with the animator whenever the single
+                // authoritative layer IS this clip (no crossfade in flight).
+                // This heals any desync left by jump/crouch/rest overrides or
+                // preview clips that drove the animator directly. Mid-
+                // crossfade (2+ layers) we advance locally, because
+                // GetCurrentTime() would return the fading layer's time.
+                if (animator &&
+                    animator->GetActiveAnimationLayerCount() <= 1 &&
+                    animator->GetCurrentAnimation() == currentAnim.get()) {
+                    currentAnimTime = animator->GetCurrentTime();
+                } else {
+                    const float speedMul =
+                        currentAnim->speed > 0.0f ? currentAnim->speed : 1.0f;
+                    currentAnimTime += dt * speedMul;
+                    if (currentAnimTime >= currentAnim->duration) {
+                        currentAnimTime = fmod(currentAnimTime, currentAnim->duration);
                     }
                 }
-            } else {
-                // SWITCHING to new animation - jump to target pose
-                currentPoseIndex = results.best.poseIndex;
-                currentAnimTime = targetPose.timeInSeconds;
-                blendFromPose = -1;
-                blendToPose = -1;
-                blendProgress = 1.0f;
 
-                if (targetAnim) {
-                    // Set animation speed ONCE when switching (not every frame!)
-                    // Use 1.0 for real-time playback (animator dt already handles timing)
-                    // DON'T use extractionFps/ticksPerSecond - that's for pose extraction, not playback
-                    if (targetAnim->speed <= 0.0f || targetAnim->speed > 10.0f) {
-                        targetAnim->speed = 1.0f;  // Real-time playback
-                    }
-
-                    // Only call Play() if this is a different animation
-                    if (currentAnimationPtr != targetAnim.get()) {
-                        animator->Play(targetAnim.get());
-                        currentAnimationPtr = targetAnim.get();
-                        // Set time directly when switching
-                        animator->SetCurrentTime(currentAnimTime);
-                        std::cout << "[MotionMatcher] Switched to: " << targetAnim->name 
-                                  << " @ " << currentAnimTime << "s (speed=" << targetAnim->speed << ")\n";
-                    } else {
-                        // Same animation but jumped to different time (e.g., from blend)
-                        animator->SetCurrentTime(currentAnimTime);
+                // Nearest database pose to the current clip time.
+                float bestTimeDiff = std::numeric_limits<float>::max();
+                int bestPoseIdx = currentPoseIndex;
+                for (size_t i = 0; i < database->GetPoseCount(); ++i) {
+                    const PoseSample& p = database->GetPose(i);
+                    if (p.animationIndex != currentPose.animationIndex) continue;
+                    const float d = std::abs(p.timeInSeconds - currentAnimTime);
+                    if (d < bestTimeDiff) {
+                        bestTimeDiff = d;
+                        bestPoseIdx = static_cast<int>(i);
                     }
                 }
+                currentPoseIndex = bestPoseIdx;
             }
-        } else {
-            // Blending - interpolate
-            blendProgress += dt / config.blendDuration;
+        } else if (targetAnim) {
+            // SWITCHING to a different clip - crossfade (Unreal-style): the
+            // animator fades the old pose out while the newly matched pose
+            // fades in at its matched time. The hard Play() that popped on
+            // every switch is gone.
+            currentPoseIndex = results.best.poseIndex;
+            currentAnimTime = targetPose.timeInSeconds;
 
-            if (blendProgress >= 1.0f) {
-                // Blend complete
-                currentPoseIndex = blendToPose;
-                currentAnimTime = targetPose.timeInSeconds;
-                blendFromPose = -1;
-                blendToPose = -1;
-                blendProgress = 1.0f;
+            // Set animation speed ONCE when switching (not every frame!)
+            // Use 1.0 for real-time playback (animator dt already handles
+            // timing); extractionFps/ticksPerSecond are for pose extraction,
+            // not playback.
+            if (targetAnim->speed <= 0.0f || targetAnim->speed > 10.0f) {
+                targetAnim->speed = 1.0f;  // Real-time playback
+            }
+
+            if (currentAnimationPtr != targetAnim.get()) {
+                // Crossfade into the matched pose instead of Play()-popping.
+                animator->BlendToAt(targetAnim.get(), currentAnimTime,
+                                    glm::max(config.blendDuration, 0.05f));
+                currentAnimationPtr = targetAnim.get();
+                if (verbose)
+                    std::cout << "[MotionMatcher] Switched to: " << targetAnim->name
+                              << " @ " << currentAnimTime << "s (speed=" << targetAnim->speed << ")\n";
             } else {
-                // Still blending - interpolate animation time
-                const PoseSample& fromPose = database->GetPose(blendFromPose);
-                float fromTime = fromPose.timeInSeconds;
-                float toTime = targetPose.timeInSeconds;
-                currentAnimTime = fromTime + (toTime - fromTime) * blendProgress;
+                // Same animation but jumped to a different time
+                animator->SetCurrentTime(currentAnimTime);
             }
         }
     }
@@ -451,24 +584,36 @@ void MotionMatcher::ApplyFootIK(float dt) {
         return;
     }
 
-    // Get foot positions in world space (using identity model matrix for now)
-    glm::mat4 modelMatrix(1.0f);
-    glm::vec3 leftFootPos = animator->GetBoneWorldPosition(leftFootBone, modelMatrix);
-    glm::vec3 rightFootPos = animator->GetBoneWorldPosition(rightFootBone, modelMatrix);
+    // WORLD-space foot IK. The character's model matrix (translate * rotate *
+    // scale, set each frame by the caller) maps the model-space bone positions
+    // into world space where a planted foot is genuinely stationary while the
+    // body walks over it - in model space it slides backward at the body's
+    // speed and every stationary/plant check failed, so no foot ever locked
+    // (visible footskating).
+    const glm::mat4 modelMatrix = m_modelMatrix;
+    const float modelScale =
+        glm::max(glm::length(glm::vec3(modelMatrix[0])), 0.0001f);
 
-    // Calculate foot velocities from position delta
-    glm::vec3 leftFootVel = leftFootPos - glm::vec3(0.0f);  // Will be set properly below
-    glm::vec3 rightFootVel = rightFootPos - glm::vec3(0.0f);
+    // Foot world positions (this frame's pose) + velocities vs last frame.
+    const glm::vec3 leftFootPos =
+        animator->GetBoneWorldPosition(leftFootBone, modelMatrix);
+    const glm::vec3 rightFootPos =
+        animator->GetBoneWorldPosition(rightFootBone, modelMatrix);
 
-    // Use animator's previous bone positions for velocity calculation
+    glm::vec3 leftFootVel(0.0f);
+    glm::vec3 rightFootVel(0.0f);
     if (leftFootBone < (int)animator->prevBoneWorldPos.size() &&
         rightFootBone < (int)animator->prevBoneWorldPos.size()) {
-        leftFootVel = leftFootPos - animator->prevBoneWorldPos[leftFootBone];
-        rightFootVel = rightFootPos - animator->prevBoneWorldPos[rightFootBone];
+        const glm::vec3 leftPrev =
+            glm::vec3(modelMatrix * glm::vec4(animator->prevBoneWorldPos[leftFootBone], 1.0f));
+        const glm::vec3 rightPrev =
+            glm::vec3(modelMatrix * glm::vec4(animator->prevBoneWorldPos[rightFootBone], 1.0f));
+        leftFootVel = leftFootPos - leftPrev;
+        rightFootVel = rightFootPos - rightPrev;
     }
 
-    // Update foot planting system
-    footPlanting.Update(leftFootPos, rightFootPos, leftFootVel, rightFootVel, 0.0f, config);
+    // Update foot planting system (world space + world floor height).
+    footPlanting.Update(leftFootPos, rightFootPos, leftFootVel, rightFootVel, m_floorHeight, config);
 
     // Apply foot IK through animator
     // The animator has a complete foot IK system - we just need to enable it
@@ -476,20 +621,30 @@ void MotionMatcher::ApplyFootIK(float dt) {
         // Configure foot IK if not already enabled
         Animator::FootIKSettings ikSettings;
         ikSettings.enabled = true;
-        ikSettings.floorHeight = 0.0f;
+        ikSettings.floorHeight = m_floorHeight;  // world-space terrain height
         ikSettings.ikStrength = 1.0f;
         ikSettings.footLockBlend = 5.0f;  // Fast lock when planted
         ikSettings.footLockReleaseSpeed = 3.0f;  // Fast release when lifting
-        ikSettings.maxIKDistance = 0.15f;  // Max 15cm correction
+        // Max ~40cm world-space correction (the foot lock offsets are now
+        // computed in world units, so 0.4 m is the right scale).
+        ikSettings.maxIKDistance = 0.4f;
         ikSettings.leftFootBone = leftFootBone;
         ikSettings.rightFootBone = rightFootBone;
         animator->SetFootIKSettings(ikSettings);
     }
 
+    // Push the live floor height every frame - it was only written on first
+    // enable, so a corrected floor never reached the plant check.
+    animator->SetFloorHeight(m_floorHeight);
+
+    // Tell the animator the world scale so the world-space offsets it computes
+    // can be converted back to model space for the skinning matrices.
+    animator->SetIKWorldScale(modelScale);
+
     // Determine if character is moving (for foot lock release)
     bool isMoving = (glm::length(characterVelocity) > 0.1f);
 
-    // Update animator's foot IK system
+    // Update animator's foot IK system (world-space foot evaluation)
     animator->UpdateFootIK(dt, modelMatrix, isMoving);
 }
 
@@ -498,8 +653,12 @@ void MotionMatcher::UpdateDebugInfo() {
         database->GetPose(currentPoseIndex).animationIndex : -1;
     debug.currentAnimationTime = currentAnimTime;
 
-    auto anim = GetCurrentAnimation();
-    debug.currentAnimationName = anim ? anim->name : "None";
+    // Use the REGISTERED clip name ("Jump") not the raw FBX channel name
+    // ("mixamo.com" - identical across Mixamo clips).
+    debug.currentAnimationName = currentPoseIndex >= 0
+        ? database->GetAnimationName(
+              database->GetPose(currentPoseIndex).animationIndex)
+        : "None";
 
     debug.leftFootPlanted = footPlanting.IsLeftFootPlanted();
     debug.rightFootPlanted = footPlanting.IsRightFootPlanted();
@@ -555,12 +714,47 @@ void MotionMatcher::SetDatabase(std::unique_ptr<MotionDatabase> newDatabase, flo
         currentDatabaseName = "New";
         databaseBlendProgress = 0.0f;
         isBlendingDatabases = false;
+        pendingDatabaseIsRef = false;
+        pendingDatabaseRef = nullptr;
 
         // Rebuild search index
         BuildSearchIndex();
     } else {
         // Blended switch - store pending database
         pendingDatabase = std::move(newDatabase);
+        pendingDatabaseRef = nullptr;
+        pendingDatabaseIsRef = false;
+        databaseBlendDuration = blendDuration;
+        databaseBlendProgress = 0.0f;
+        isBlendingDatabases = true;
+    }
+}
+
+void MotionMatcher::SetDatabase(const MotionDatabase& newDatabase, float blendDuration) {
+    if (!initialized) {
+        std::cerr << "[MotionMatcher] ERROR: Not initialized!\n";
+        return;
+    }
+
+    std::cout << "[MotionMatcher] Switching database (non-owning): " << currentDatabaseName
+              << " -> External (blend=" << blendDuration << "s)\n";
+
+    if (blendDuration <= 0.0f) {
+        // Instant switch — point currentDatabaseRef at the external storage.
+        // The external owner retains ownership; we just read through the pointer.
+        currentDatabaseRef = &newDatabase;
+        currentDatabaseName = "External";
+        databaseBlendProgress = 0.0f;
+        isBlendingDatabases = false;
+        pendingDatabaseIsRef = false;
+        pendingDatabaseRef = nullptr;
+    } else {
+        // Blended switch — store a raw pointer to the external database and
+        // adopt it into currentDatabaseRef when the blend timer elapses.
+        // The caller MUST keep `newDatabase` alive until then.
+        pendingDatabaseRef = &newDatabase;
+        pendingDatabase.reset();
+        pendingDatabaseIsRef = true;
         databaseBlendDuration = blendDuration;
         databaseBlendProgress = 0.0f;
         isBlendingDatabases = true;
@@ -622,9 +816,24 @@ void MotionMatcher::UpdateDatabaseBlend(float dt) {
     databaseBlendProgress += dt / databaseBlendDuration;
 
     if (databaseBlendProgress >= 1.0f) {
-        // Blend complete
-        database = std::move(pendingDatabase);
-        currentDatabaseName = "Blended";
+        // Blend complete. There are TWO pending paths: the owning one moves
+        // pendingDatabase into `database`, and the non-owning one (external
+        // storage owned by the caller, e.g. the crouch DB in stateDatabases)
+        // adopts pendingDatabaseRef into currentDatabaseRef. Before, only the
+        // owning path was handled: with a ref pending, `pendingDatabase` is
+        // null, so `database = std::move(pendingDatabase)` nulled the ONLY
+        // database and the next search dereferenced a null pointer (crash
+        // once the crouch blend finished).
+        if (pendingDatabaseIsRef && pendingDatabaseRef) {
+            currentDatabaseRef = pendingDatabaseRef;
+            currentDatabaseName = "External";
+            pendingDatabaseRef = nullptr;
+            pendingDatabaseIsRef = false;
+        } else if (pendingDatabase) {
+            database = std::move(pendingDatabase);
+            currentDatabaseName = "Blended";
+        }
+        pendingDatabase.reset();
         databaseBlendProgress = 0.0f;
         isBlendingDatabases = false;
 

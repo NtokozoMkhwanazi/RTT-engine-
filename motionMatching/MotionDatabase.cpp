@@ -53,9 +53,13 @@ glm::vec3 Trajectory::getVelocityAt(float timeOffset) const {
 }
 
 float Trajectory::getDifference(const Trajectory& other) const {
-    float diff = 0.0f;
     int comparePoints = std::min(numPoints, other.numPoints);
+    // Guard against empty trajectories (no points yet, or only the root-local
+    // feature populated): an empty comparison must contribute 0, never NaN
+    // (diff / 0), which would poison every score in a brute-force search.
+    if (comparePoints <= 0) return 0.0f;
 
+    float diff = 0.0f;
     for (int i = 0; i < comparePoints; i++) {
         glm::vec3 posDiff = positions[i] - other.positions[i];
         diff += glm::length(posDiff);
@@ -133,8 +137,10 @@ void MotionDatabase::AddAnimation(const std::string& name, std::shared_ptr<Anima
         return;
     }
 
-    // Validate animation
-    if (anim->duration <= 0.0f || anim->duration > 10.0f) {
+    // Validate animation. Durations are real seconds now (loader converts
+    // Assimp ticks); the generous upper bound keeps long ambient clips (e.g.
+    // a 16s Idle) usable - frame extraction is capped by MAX_FRAMES anyway.
+    if (anim->duration <= 0.0f || anim->duration > 60.0f) {
         std::cerr << "[MotionDatabase] ERROR: Invalid duration " << anim->duration << "s for " << name << "\n";
         return;
     }
@@ -147,9 +153,12 @@ void MotionDatabase::AddAnimation(const std::string& name, std::shared_ptr<Anima
     std::cout << "[MotionDatabase::AddAnimation] Adding: " << name
               << " (" << anim->duration << "s, " << anim->boneAnimations.size() << " bones)\n";
 
-    // Create animation entry (database takes ownership via shared_ptr)
+    // Create animation entry (database takes ownership via shared_ptr).
+    // Use the REGISTERED name (what the caller asked for, e.g. "Jump") rather
+    // than anim->name - the raw FBX channel name ("mixamo.com" for Mixamo
+    // rigs) is identical across clips and useless for debug/HUD output.
     AnimationEntry entry;
-    entry.name = anim->name;
+    entry.name = name;
     entry.animation = anim;
     entry.startPoseIndex = poses.size();
 
@@ -171,6 +180,18 @@ void MotionDatabase::AddAnimation(const std::string& name, std::shared_ptr<Anima
     }
 
     std::cout << "  Extracting " << numFrames << " frames at " << fps << "fps (HIGH RES for gait cycle)\n";
+
+    // UE-style airborne tagging: clips whose name suggests a jump/fall arc are
+    // flagged per-pose so the matcher can gate the pose search by movement
+    // state (airborne queries only match Jump/Fall poses; grounded queries
+    // only match locomotion poses). This is what lets takeoff/landing blend
+    // through the pose search instead of hard overrides.
+    std::string lowerName = name;
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    const bool airborneClip =
+        lowerName.find("jump") != std::string::npos ||
+        lowerName.find("fall") != std::string::npos;
 
     // Pre-reserve memory (prevents reallocations)
     size_t expectedPoses = poses.size() + numFrames;
@@ -201,6 +222,10 @@ void MotionDatabase::AddAnimation(const std::string& name, std::shared_ptr<Anima
 
         // Extract motion features for this frame
         ExtractPoseFeatures(poses.size() - 1, anim, time, skeleton);
+
+        // Tag the movement state on the pose (airborne = Jump/Fall clip).
+        poses.back().features.isAirborne = airborneClip;
+        poses.back().features.isGrounded = !airborneClip;
 
         // CRITICAL: Also add to cache-friendly SoA storage
         motionData.AddPose(poses.back());
@@ -265,6 +290,38 @@ void MotionDatabase::ExtractPoseFeatures(size_t poseIndex, std::shared_ptr<Anima
     // Store root position and rotation
     pose.rootPosition = rootPos;
     pose.rootRotationY = 0.0f;
+
+    // =========================================================================
+    // ROOT-RELATIVE FUTURE TRAJECTORY (Unreal-style pose feature)
+    // =========================================================================
+    // Sample the root bone k*0.1s ahead and store the offset from the current
+    // root in the clip's own space (XZ). This lets the pose search rank
+    // same-speed poses by their future path (turns, stops, strafes). The
+    // matcher builds the identical feature from its predicted trajectory.
+    //
+    // CRITICAL: the offsets are stored UNROTATED (raw clip space). The matcher
+    // expresses its query path relative to the CHARACTER heading, and since the
+    // render transform is R(heading) applied on top of clip space, the query's
+    // R(-heading) exactly reproduces clip space. Rotating the DB side by the
+    // root yaw here would only match when the root yaw is exactly 0 - for any
+    // constant nonzero yaw the two spaces would fight and the turn-refinement
+    // feature would degrade to noise.
+    if (rootBoneAnim) {
+        pose.trajectory.localNumPoints = kTrajectorySteps;
+        for (int k = 1; k <= kTrajectorySteps; ++k) {
+            // Wrap the sample time into the clip so poses near the loop point
+            // predict the root's actual loop-back position (the root does NOT
+            // stop at the clip end - it snaps back to the start on wrap). This
+            // keeps the trajectory feature consistent across the loop seam,
+            // which is where the matcher used to mis-predict stops.
+            float sampleT = time + k * kTrajectoryStepTime;
+            sampleT = fmod(sampleT, anim->duration);
+            const glm::vec3 futurePos = rootBoneAnim->InterpolatePosition(sampleT);
+            const glm::vec3 rel = futurePos - rootPos;
+            pose.trajectory.localPositions[k - 1] =
+                glm::vec3(rel.x, 0.0f, rel.z);
+        }
+    }
 
     // Calculate speed from root velocity (XZ plane only)
     float speed = glm::length(glm::vec3(rootVel.x, 0.0f, rootVel.z));
@@ -390,7 +447,6 @@ SearchResults MotionDatabase::SearchWithBlending(const MotionFeatures& query,
 
     // Find top N candidates using cache-optimized search
     auto candidates = SearchCacheOptimized(query, trajectory, config.maxSearchResults);
-
     // Get best and second best for blending
     if (candidates.size() > 0) {
         results.best.poseIndex = candidates[0].first;
@@ -410,7 +466,8 @@ SearchResults MotionDatabase::SearchWithBlending(const MotionFeatures& query,
 std::vector<std::pair<int, float>> MotionDatabase::SearchCacheOptimized(
     const MotionFeatures& query,
     const Trajectory& trajectory,
-    int maxCandidates) const {
+    int maxCandidates,
+    int airborneFilter) const {
     
     std::vector<std::pair<int, float>> candidates;
     candidates.reserve(maxCandidates);
@@ -419,6 +476,14 @@ std::vector<std::pair<int, float>> MotionDatabase::SearchCacheOptimized(
     
     // Search using SoA layout (cache-friendly)
     for (size_t i = 0; i < poseCount; i++) {
+        // UE-style state gate: skip poses outside the requested movement state
+        // (airborneFilter = 0 -> grounded only, 1 -> airborne only). The AoS
+        // `poses` vector stays in sync with the SoA storage, so the state tag
+        // lives in one place; this is only evaluated when filtering is active.
+        if (airborneFilter >= 0 && poses[i].features.isAirborne != (airborneFilter == 1)) {
+            continue;
+        }
+
         // Calculate score using cache-optimized method
         float score = CalculatePoseScoreCacheOptimized(i, query, trajectory, MotionMatchingConfig());
 

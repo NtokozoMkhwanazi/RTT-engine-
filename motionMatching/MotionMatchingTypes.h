@@ -5,6 +5,22 @@
 #include <cstdint>
 
 // ============================================================================
+// TRAJECTORY FEATURE CONSTANTS (Unreal-style root-relative future path)
+// ============================================================================
+//
+// Unreal's pose search doesn't just match current speed - it matches WHERE the
+// character is going. Each pose stores its own future root path expressed in
+// the root's LOCAL space (offsets from the root, rotated by the root yaw). The
+// query builds the same local-space path from the predicted trajectory. Two
+// poses at the same speed are then ranked by how well their future path
+// matches the player's turn/stop - this is what makes clip selection look
+// intentional instead of speed-only.
+// ============================================================================
+
+constexpr int kTrajectorySteps = 4;         // Future points per pose/query
+constexpr float kTrajectoryStepTime = 0.1f; // Seconds between points (0.1..0.4s)
+
+// ============================================================================
 // MOTION MATCHING - CORE TYPES
 // ============================================================================
 // 
@@ -44,6 +60,12 @@ struct MotionFeatures {
     glm::vec3 rightFootPos{0.0f};       // Right foot position (world space)
     glm::vec3 leftFootVel{0.0f};        // Left foot velocity
     glm::vec3 rightFootVel{0.0f};       // Right foot velocity
+
+    // Root-relative future trajectory (Unreal-style pose feature). Matches the
+    // per-pose Trajectory.localPositions; the query fills these from its
+    // predicted future path so the KD-tree can rank by "where am I going".
+    glm::vec2 futureLocal[kTrajectorySteps]{glm::vec2(0.0f)};
+    int futureCount{0};                 // Valid points (0 = feature disabled)
     
     // Animation metadata
     float animationTime{0.0f};          // Current time in animation
@@ -71,6 +93,12 @@ struct Trajectory {
     glm::vec3 velocities[MAX_POINTS];   // Future velocities
     float directions[MAX_POINTS];       // Future movement angles
     int numPoints{0};                   // How many points are valid
+    
+    // Root-relative future path (Unreal-style feature). localPositions[k] is
+    // the root position k*0.1s in the future, expressed as an offset from the
+    // current root position rotated into the root's local space (XZ only, y=0).
+    glm::vec3 localPositions[MAX_POINTS]{glm::vec3(0.0f)};
+    int localNumPoints{0};              // How many local points are valid
     
     /**
      * Get trajectory point at time offset

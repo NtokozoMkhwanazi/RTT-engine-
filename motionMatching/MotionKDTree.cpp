@@ -23,25 +23,49 @@ void MotionKDTree::Clear() {
 std::vector<float> MotionKDTree::GetFeatureVector(const PoseSample& pose) const {
     // Extract key features for KD-Tree search
     // These dimensions are chosen for good search performance
-    return {
-        pose.features.speed,                          // 0: Speed (0-8 m/s)
+    std::vector<float> vec = {
+        pose.features.speed,                          // 0: Speed
         pose.features.rootVelocity.x,                 // 1: X velocity
         pose.features.rootVelocity.z,                 // 2: Z velocity
         pose.features.moveAngle,                      // 3: Movement direction
         pose.features.leftFootPlanted ? 1.0f : 0.0f,  // 4: Left foot planted
-        pose.features.rightFootPlanted ? 1.0f : 0.0f  // 5: Right foot planted
+        pose.features.rightFootPlanted ? 1.0f : 0.0f, // 5: Right foot planted
+        pose.features.rootVelocity.y                  // 6: Vertical velocity (airborne)
     };
+    // 7..: root-relative future path (x,z per point) - the Unreal-style feature
+    // that ranks same-speed poses by where they're going.
+    for (int k = 0; k < kTrajectorySteps; ++k) {
+        if (pose.trajectory.localNumPoints > k) {
+            vec.push_back(pose.trajectory.localPositions[k].x);
+            vec.push_back(pose.trajectory.localPositions[k].z);
+        } else {
+            vec.push_back(0.0f);
+            vec.push_back(0.0f);
+        }
+    }
+    return vec;
 }
 
 std::vector<float> MotionKDTree::GetFeatureVector(const MotionFeatures& features) const {
-    return {
+    std::vector<float> vec = {
         features.speed,
         features.rootVelocity.x,
         features.rootVelocity.z,
         features.moveAngle,
         features.leftFootPlanted ? 1.0f : 0.0f,
-        features.rightFootPlanted ? 1.0f : 0.0f
+        features.rightFootPlanted ? 1.0f : 0.0f,
+        features.rootVelocity.y
     };
+    for (int k = 0; k < kTrajectorySteps; ++k) {
+        if (features.futureCount > k) {
+            vec.push_back(features.futureLocal[k].x);
+            vec.push_back(features.futureLocal[k].y);
+        } else {
+            vec.push_back(0.0f);
+            vec.push_back(0.0f);
+        }
+    }
+    return vec;
 }
 
 // ============================================================================
@@ -65,9 +89,11 @@ std::unique_ptr<KDTreeNode> MotionKDTree::BuildRecursive(
     
     // If few enough poses, make this a leaf
     if (static_cast<int>(indices.size()) <= maxLeafSize) {
-        // Store all indices in this leaf (we'll just use the first one for simplicity)
+        // CRITICAL: store ALL poses in the leaf. The search evaluates every
+        // one, which is what makes FindKNearest an exact kNN search.
+        node->leafIndices = indices;
         if (!indices.empty()) {
-            node->poseIndex = indices[0];
+            node->poseIndex = indices[0];  // kept for stats/debug
         }
         return node;
     }
@@ -228,8 +254,11 @@ std::unique_ptr<KDTreeNode> MotionKDTree::BuildWithSAHRecursive(
     
     // If few enough primitives, make this a leaf
     if (static_cast<int>(indices.size()) <= maxLeafSize) {
+        // CRITICAL: store ALL poses in the leaf so the search evaluates every
+        // one (exact kNN) instead of a single arbitrary representative.
+        node->leafIndices = indices;
         if (!indices.empty()) {
-            node->poseIndex = indices[0];
+            node->poseIndex = indices[0];  // kept for stats/debug
         }
         return node;
     }
@@ -237,19 +266,35 @@ std::unique_ptr<KDTreeNode> MotionKDTree::BuildWithSAHRecursive(
     // Find best split using SAH with binning
     SAHSplit split = FindBestSplit(indices, maxLeafSize);
     
-    // If no valid split found, make this a leaf
+    // If no valid split found (e.g. a subtree whose poses have identical
+    // features), make this a leaf - and store ALL its poses. The search
+    // evaluates leafIndices; leaving it empty here made such poses invisible
+    // to the nearest-neighbor search.
     if (split.bestAxis < 0) {
+        node->leafIndices = indices;
+        if (!indices.empty()) {
+            node->poseIndex = indices[0];  // kept for stats/debug
+        }
+        return node;
+    }
+    
+    // Recompute the ACTUAL bounds of this index set. FindBestSplit bins from
+    // the real data, so splitValue must use those same bounds; otherwise the
+    // partition below can push every pose onto one side and recurse forever.
+    BinBounds actualBounds = ComputeBounds(indices);
+    node->splitAxis = split.bestAxis;
+    float axisMin = actualBounds.minBounds[split.bestAxis];
+    float axisMax = actualBounds.maxBounds[split.bestAxis];
+    float axisRange = axisMax - axisMin;
+    if (axisRange < 1e-6f) {
+        // Degenerate along the chosen axis: bail out to a leaf.
+        node->leafIndices = indices;
         if (!indices.empty()) {
             node->poseIndex = indices[0];
         }
         return node;
     }
-    
-    // Set split parameters
-    node->splitAxis = split.bestAxis;
-    float axisMin = bounds.minBounds[split.bestAxis];
-    float axisMax = bounds.maxBounds[split.bestAxis];
-    float binWidth = (axisMax - axisMin) / numBins;
+    float binWidth = axisRange / numBins;
     node->splitValue = axisMin + split.bestBin * binWidth;
     node->poseIndex = -1;  // Internal node
     
@@ -265,6 +310,20 @@ std::unique_ptr<KDTreeNode> MotionKDTree::BuildWithSAHRecursive(
         } else {
             rightIndices.push_back(idx);
         }
+    }
+    
+    // Guard against a no-progress split (one child holds everything).
+    // Without this the recursion can go infinite on duplicate/degenerate
+    // feature vectors.
+    if (leftIndices.empty() || rightIndices.empty() ||
+        leftIndices.size() == indices.size() ||
+        rightIndices.size() == indices.size()) {
+        node->leafIndices = indices;
+        if (!indices.empty()) {
+            node->poseIndex = indices[0];
+        }
+        node->splitAxis = -1;
+        return node;
     }
     
     // Compute child bounds
@@ -381,15 +440,15 @@ void MotionKDTree::SearchRecursive(
     
     if (!node) return;
 
-    // If leaf, check distance
+    // If leaf, check EVERY pose it contains (exact nearest-neighbor search).
     if (node->isLeaf()) {
-        if (node->poseIndex >= 0 && node->poseIndex < static_cast<int>(poseData.size())) {
-            auto poseVec = GetFeatureVector(poseData[node->poseIndex]);
+        for (int pi : node->leafIndices) {
+            if (pi < 0 || pi >= static_cast<int>(poseData.size())) continue;
+            auto poseVec = GetFeatureVector(poseData[pi]);
             float dist = CalculateDistance(query, poseVec);
-
             if (dist < bestDist) {
                 bestDist = dist;
-                bestIndex = node->poseIndex;
+                bestIndex = pi;
             }
         }
         return;
@@ -438,14 +497,17 @@ void MotionKDTree::SearchKNearestRecursive(
     
     if (!node) return;
     
-    // If leaf, add to results
+    // If leaf, evaluate EVERY pose it contains (exact kNN - the old code only
+    // looked at a single representative pose per leaf, which made the result
+    // set arbitrary and clip-biased).
     if (node->isLeaf()) {
-        if (node->poseIndex >= 0 && node->poseIndex < static_cast<int>(poseData.size())) {
-            auto poseVec = GetFeatureVector(poseData[node->poseIndex]);
+        for (int pi : node->leafIndices) {
+            if (pi < 0 || pi >= static_cast<int>(poseData.size())) continue;
+            auto poseVec = GetFeatureVector(poseData[pi]);
             float dist = CalculateDistance(query, poseVec);
             
             KDTSearchResult result;
-            result.poseIndex = node->poseIndex;
+            result.poseIndex = pi;
             result.distance = dist;
             result.score = 1.0f / (1.0f + dist);  // Convert distance to score
             
@@ -517,6 +579,24 @@ void MotionKDTree::SearchRadiusRecursive(
     
     if (!node) return;
     
+    // Evaluate every pose in a leaf (the old code checked only the leaf's
+    // single representative pose, missing poses that were nearer).
+    if (node->isLeaf()) {
+        for (int pi : node->leafIndices) {
+            if (pi < 0 || pi >= static_cast<int>(poseData.size())) continue;
+            auto poseVec = GetFeatureVector(poseData[pi]);
+            float dist = CalculateDistance(query, poseVec);
+            if (dist <= radius) {
+                KDTSearchResult result;
+                result.poseIndex = pi;
+                result.distance = dist;
+                result.score = 1.0f / (1.0f + dist);
+                results.push_back(result);
+            }
+        }
+        return;
+    }
+    
     // Check this point
     if (node->poseIndex >= 0 && node->poseIndex < static_cast<int>(poseData.size())) {
         auto poseVec = GetFeatureVector(poseData[node->poseIndex]);
@@ -566,11 +646,18 @@ float MotionKDTree::CalculateDistance(
         float weight = 1.0f;
         
         // Apply weights based on feature type
-        if (i == 0) weight = weights.speed;        // Speed
-        else if (i == 1) weight = weights.velocityX;  // Velocity X
-        else if (i == 2) weight = weights.velocityZ;  // Velocity Z
-        else if (i == 3) weight = weights.direction;  // Direction
-        else if (i >= 4) weight = weights.footPlant;  // Foot plant
+        if (i == 0) weight = weights.speed;                 // Speed
+        else if (i == 1) weight = weights.velocityX;        // Velocity X
+        else if (i == 2) weight = weights.velocityZ;        // Velocity Z
+        else if (i == 3) weight = weights.direction;        // Direction
+        else if (i == 4 || i == 5) weight = weights.footPlant;  // Foot plants
+        else if (i == 6) weight = weights.verticalVelocity; // Vertical velocity
+        else if (i < 7 + 2 * kTrajectorySteps) {
+            // Root-local future path point k (two dims share one weight):
+            // nearer points are more predictive than far ones.
+            const int point = static_cast<int>((i - 7) / 2);
+            weight = trajectoryWeights[point];
+        }
         
         dist += (diff * diff) * weight;
     }

@@ -136,6 +136,21 @@ material.doubleSided = false;
 | **LOD Switch** | ~0.001ms | - |
 | **GPU Skinning** | ~0.1ms | Low |
 
+## 🛠️ Build & Test
+
+The model system compiles as part of the main engine build. From the repository root:
+
+```bash
+make            # build the test runner
+make test       # run the full unit-test suite (494 tests)
+make run        # self-check tests, then boot the engine
+make run-headless  # bounded headless engine run (CI-friendly)
+```
+
+FBX loading, skeleton extraction, and motion-matching database population are covered
+by `make test` (FBX animation + play-mode suites; filter with `--gtest_filter=FBX*`).
+See the [root README](../README.md) for prerequisites and engine controls.
+
 ## 🐛 Known Issues
 
 See [MODEL_SYSTEM_IMPROVEMENTS.md](../docs/general/MODEL_SYSTEM_IMPROVEMENTS.md)
@@ -143,4 +158,4 @@ See [MODEL_SYSTEM_IMPROVEMENTS.md](../docs/general/MODEL_SYSTEM_IMPROVEMENTS.md)
 ---
 
 **Status:** ✅ Production Ready
-**Last Updated:** March 27, 2025
+**Last Updated:** August 2026

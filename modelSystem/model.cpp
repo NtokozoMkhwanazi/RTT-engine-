@@ -6,6 +6,7 @@
 #include "shaderSystem/load_texture_image.h"
 #include "boneSystem/BoneName.h"
 #include "renderer/DefaultTexture.h"
+#include "renderer/Renderer.h"
 #include "TextureCompression.h"
 
 #include <iostream>
@@ -24,6 +25,9 @@
 // Utility
 // =====================================================
 
+// Forward declaration - defined near the hierarchy builders below.
+static void BuildCollapsedHierarchyStatic(AssimpNodeData &dest, const aiNode *src);
+
 std::unordered_map<std::string, int>
 BuildNormalizedBoneMap(const Skeleton &skeleton)
 {
@@ -38,7 +42,10 @@ void Model::BuildNodeBoneMap(
     AssimpNodeData &node,
     const std::unordered_map<std::string, int> &normBoneMap)
 {
-    auto it = normBoneMap.find(node.name);
+    // The map is normalized ("hips") but the hierarchy stores raw names
+    // ("mixamorig:Hips") - normalize the lookup or every boneIndex stays -1
+    // and the animator can never write the bone matrices (frozen bind pose).
+    auto it = normBoneMap.find(NormalizeBoneName(node.name));
     node.boneIndex = (it != normBoneMap.end()) ? it->second : -1;
 
     for (auto &child : node.children)
@@ -203,8 +210,23 @@ Model::AsyncLoadHandle Model::LoadAsync(const std::string& path)
     auto dataPtr = std::make_shared<float>(0.0f);
     
     handle.future = std::async(std::launch::async, [path, dataPtr]() -> std::unique_ptr<AsyncModelData> {
-        auto result = LoadModelData(path, dataPtr.get());
-        return result;
+        try {
+            auto result = LoadModelData(path, dataPtr.get());
+            if (!result->success && result->error.empty()) {
+                result->error = "Assimp returned no scene or no root node";
+            }
+            return result;
+        } catch (const std::exception& e) {
+            auto result = std::make_unique<AsyncModelData>();
+            result->success = false;
+            result->error = std::string("Exception: ") + e.what();
+            return result;
+        } catch (...) {
+            auto result = std::make_unique<AsyncModelData>();
+            result->success = false;
+            result->error = "Unknown exception during async loading";
+            return result;
+        }
     });
     
     return handle;
@@ -239,9 +261,12 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
 
     if (outProgress) *outProgress = 0.2f;
 
-    // Step 2: Build skeleton hierarchy
-    ReadHierarchyStatic(data->rootNode, scene->mRootNode);
-    data->skeleton.rootNode = data->rootNode;
+    // Step 2: Build skeleton hierarchy (boneIndex is filled in Step 5, then
+    // copied into the Skeleton so the animator sees the node->bone map).
+    // Use the COLLAPSING builder (same as the sync Model() path) - the raw
+    // ReadHierarchyStatic keeps $AssimpFbx$ helper nodes, which doubles every
+    // animated bone position (deformed legs/hands on the play character).
+    BuildCollapsedHierarchyStatic(data->rootNode, scene->mRootNode);
 
     if (outProgress) *outProgress = 0.3f;
 
@@ -401,6 +426,10 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
     // Step 5: Build bone maps
     auto normMap = BuildNormalizedBoneMap(data->skeleton);
     BuildNodeBoneMapStatic(data->rootNode, normMap);
+    // Copy the hierarchy (with boneIndex filled in) into the skeleton - this
+    // must happen AFTER BuildNodeBoneMapStatic or the animator sees -1 on
+    // every node and never writes the bone matrices (frozen bind pose).
+    data->skeleton.rootNode = data->rootNode;
     data->skeleton.rootBoneIndex = FindRootBoneIndex(data->skeleton);
     data->rootBoneIndex = data->skeleton.rootBoneIndex;
     
@@ -421,7 +450,17 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
 
     // Step 7: Optimize meshes (CPU only)
     for (auto& mesh : data->meshes) {
-        MeshUtils::OptimizeTriangleOrderingForsyth(mesh.indices, mesh.vertices.size());
+        // Validate indices before optimization
+        bool indicesValid = true;
+        for (unsigned int idx : mesh.indices) {
+            if (idx >= mesh.vertices.size()) {
+                indicesValid = false;
+                break;
+            }
+        }
+        if (indicesValid && mesh.indices.size() >= 3 && mesh.vertices.size() > 0) {
+            MeshUtils::OptimizeTriangleOrderingForsyth(mesh.indices, mesh.vertices.size());
+        }
     }
 
     if (outProgress) *outProgress = 0.9f;
@@ -449,45 +488,82 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
     return data;
 }
 
-Model* Model::CreateFromAsync(AsyncLoadHandle& handle)
+Model* Model::CreateFromAsync(AsyncLoadHandle& handle, std::string* outError)
 {
     if (!handle.isValid()) {
-        std::cerr << "[Model::CreateFromAsync] Invalid async handle\n";
+        if (outError) *outError = "Invalid async handle";
         return nullptr;
     }
     
     // Block until loading is complete
     auto data = handle.future.get();
     
+    if (!data) {
+        if (outError) *outError = "Async loading returned null data";
+        return nullptr;
+    }
+    
     if (!data->success) {
-        std::cerr << "[Model::CreateFromAsync] Loading failed: " << data->error << "\n";
-        Model* model = new Model("");
-        return model;
+        if (outError) *outError = "Loading failed: " + data->error;
+        return nullptr;
     }
     
     // Create model on main thread (GL resources)
-    Model* model = new Model("");
-    model->setupFromAsyncData(std::move(data));
-    
-    return model;
+    try {
+        Model* model = new Model("");
+        std::string setupError;
+        model->setupFromAsyncData(std::move(data), setupError);
+        if (!setupError.empty()) {
+            if (outError) *outError = setupError;
+            delete model;
+            return nullptr;
+        }
+        return model;
+    } catch (const std::exception& e) {
+        if (outError) *outError = std::string("Exception during GL setup: ") + e.what();
+        return nullptr;
+    } catch (...) {
+        if (outError) *outError = "Unknown exception during GL setup";
+        return nullptr;
+    }
 }
 
-void Model::setupFromAsyncData(std::unique_ptr<AsyncModelData> data)
+void Model::setupFromAsyncData(std::unique_ptr<AsyncModelData> data, std::string& outError)
 {
+    if (!data) { outError = "null data"; return; }
+    std::cout << "[setupFromAsyncData] meshes=" << data->meshes.size() << " textures=" << data->textures.size() << " materials=" << data->meshMaterials.size() << "\n";
     // This MUST be called on the main thread (GL context required)
     meshes.reserve(data->meshes.size());
     meshMaterials = std::move(data->meshMaterials);
+    if (meshMaterials.size() < data->meshes.size()) {
+        meshMaterials.resize(data->meshes.size());
+    }
     
     // Create meshes with GL resources
     for (size_t i = 0; i < data->meshes.size(); ++i) {
         auto& rawMesh = data->meshes[i];
+        std::cout << "[setupFromAsyncData] Creating mesh " << i << " v=" << rawMesh.vertices.size() << " idx=" << rawMesh.indices.size() << "\n";
         
-        // Create mesh (SetupMesh is called in constructor - GL thread)
-        Mesh mesh(rawMesh.vertices, rawMesh.indices);
-        mesh.CalculateBoundingVolumes();
-        mesh.stats.Calculate(mesh.vertices, mesh.indices, mesh.textures);
+        // Validate mesh data
+        if (rawMesh.vertices.empty()) {
+            std::cout << "[setupFromAsyncData] Skipping mesh " << i << ": no vertices\n";
+            continue;
+        }
+        if (rawMesh.indices.empty()) {
+            std::cout << "[setupFromAsyncData] Skipping mesh " << i << ": no indices\n";
+            continue;
+        }
         
-        meshes.push_back(std::move(mesh));
+        try {
+            Mesh mesh(rawMesh.vertices, rawMesh.indices);
+            mesh.CalculateBoundingVolumes();
+            mesh.stats.Calculate(mesh.vertices, mesh.indices, mesh.textures);
+            meshes.push_back(std::move(mesh));
+        } catch (const std::exception& e) {
+            std::cerr << "[setupFromAsyncData] Exception creating mesh " << i << ": " << e.what() << "\n";
+            outError = std::string("Failed to create mesh ") + std::to_string(i) + ": " + e.what();
+            return;
+        }
     }
     
     // Upload textures to GL
@@ -547,6 +623,24 @@ void Model::setupFromAsyncData(std::unique_ptr<AsyncModelData> data)
         if (!mat.hasMetallicMap) { mat.metallicMap = DefaultTexture::GetGreyTexture(); mat.hasMetallicMap = true; }
         if (!mat.hasRoughnessMap) { mat.roughnessMap = DefaultTexture::GetGreyTexture(); mat.hasRoughnessMap = true; }
         if (!mat.hasAOMap) { mat.aoMap = DefaultTexture::GetGreyTexture(); mat.hasAOMap = true; }
+    }
+
+    // CRITICAL FIX: propagate the loaded albedo texture into the mesh's
+    // texture list. Mesh::Draw binds meshes[i].textures as texture_diffuse1
+    // (the FS samples it), but the meshes were created above WITHOUT textures,
+    // so animated models drew with zero bound textures and the fragment
+    // shader sampled whatever was still on unit 0 - the terrain heightmap
+    // (GL_R32F = red) - which is why the bot rendered solid red instead of
+    // its real material.
+    for (size_t meshIdx = 0; meshIdx < meshes.size() && meshIdx < meshMaterials.size(); ++meshIdx) {
+        const auto& mat = meshMaterials[meshIdx];
+        if (mat.albedoMap != 0) {
+            Texture tex;
+            tex.id = mat.albedoMap;
+            tex.type = "diffuse";
+            tex.textureType = Texture::Type::DIFFUSE;
+            meshes[meshIdx].textures.push_back(tex);
+        }
     }
     
     // Copy skeleton and animation data
@@ -629,7 +723,8 @@ void Model::ReadHierarchyStatic(AssimpNodeData& dest, const aiNode* src)
 
 void Model::BuildNodeBoneMapStatic(AssimpNodeData& node, const std::unordered_map<std::string, int>& normBoneMap)
 {
-    auto it = normBoneMap.find(node.name);
+    // Same normalized-lookup fix as BuildNodeBoneMap (see above).
+    auto it = normBoneMap.find(NormalizeBoneName(node.name));
     node.boneIndex = (it != normBoneMap.end()) ? it->second : -1;
     
     for (auto& child : node.children) {
@@ -703,11 +798,16 @@ void Model::Draw(Shader &shader, Animator &animator)
     // Use SSBO/UBO for bone matrices (fast path)
     if (!finalBones.empty()) {
         if (!boneBuffer.IsInitialized()) {
-            boneBuffer.Initialize(finalBones.size() * 2); // Double capacity for growth
+            boneBuffer.Initialize(finalBones.size()); // UBO-friendly capacity (<=256)
         }
-        boneBuffer.Update(finalBones);
-        boneBuffer.Bind(0); // Bind to binding point 0
-        shader.setInt("uBoneBufferBinding", 0);
+        // forceUpdate=true: the bone matrices CHANGE every frame for an
+        // animated character, and BoneMatrixBuffer::Update() short-circuits
+        // after the first upload (needsUpdate->false). Without the force the
+        // GPU mesh renders frame-1's pose (Idle) forever while the CPU animator
+        // advances - the "skeleton animates but the model is stuck" bug.
+        boneBuffer.Update(finalBones, /*forceUpdate=*/true);
+        boneBuffer.Bind(BONE_BUFFER_BINDING); // Bind to shader layout binding point 3
+        shader.setInt("uBoneBufferBinding", BONE_BUFFER_BINDING);
         shader.setInt("uBoneBufferEnabled", 1);
     } else {
         shader.setInt("uBoneBufferEnabled", 0);
@@ -754,11 +854,12 @@ void Model::DrawLOD(Shader &shader, Animator &animator, const glm::vec3& cameraP
     // Use SSBO/UBO for bone matrices (fast path)
     if (!finalBones.empty()) {
         if (!boneBuffer.IsInitialized()) {
-            boneBuffer.Initialize(finalBones.size() * 2);
+            boneBuffer.Initialize(finalBones.size()); // UBO-friendly capacity (<=256)
         }
-        boneBuffer.Update(finalBones);
-        boneBuffer.Bind(0);
-        shader.setInt("uBoneBufferBinding", 0);
+        // forceUpdate=true - bone matrices change every frame (see Draw()).
+        boneBuffer.Update(finalBones, /*forceUpdate=*/true);
+        boneBuffer.Bind(BONE_BUFFER_BINDING);
+        shader.setInt("uBoneBufferBinding", BONE_BUFFER_BINDING);
         shader.setInt("uBoneBufferEnabled", 1);
     } else {
         shader.setInt("uBoneBufferEnabled", 0);
@@ -805,11 +906,12 @@ void Model::DrawInstanced(Shader& shader, Animator& animator, const std::vector<
     // Use SSBO/UBO for bone matrices (fast path)
     if (!finalBones.empty()) {
         if (!boneBuffer.IsInitialized()) {
-            boneBuffer.Initialize(finalBones.size() * 2);
+            boneBuffer.Initialize(finalBones.size()); // UBO-friendly capacity (<=256)
         }
-        boneBuffer.Update(finalBones);
-        boneBuffer.Bind(0);
-        shader.setInt("uBoneBufferBinding", 0);
+        // forceUpdate=true - bone matrices change every frame (see Draw()).
+        boneBuffer.Update(finalBones, /*forceUpdate=*/true);
+        boneBuffer.Bind(BONE_BUFFER_BINDING);
+        shader.setInt("uBoneBufferBinding", BONE_BUFFER_BINDING);
         shader.setInt("uBoneBufferEnabled", 1);
     } else {
         shader.setInt("uBoneBufferEnabled", 0);
@@ -980,11 +1082,32 @@ Mesh Model::processMesh(aiMesh *mesh, const aiScene *scene)
         aiMaterial *material = scene->mMaterials[mesh->mMaterialIndex];
         PBRMaterial pbrMat = processMaterial(material, directory);
         meshMaterials.push_back(pbrMat);
+        // CRITICAL FIX: Mesh::Draw binds meshes[i].textures as texture_diffuse1
+        // (the FS samples it). Without this the mesh draws with zero bound
+        // textures and the fragment shader samples whatever is still on unit 0
+        // (the terrain heightmap, GL_R32F = red) - the "red bot" bug.
+        if (pbrMat.albedoMap != 0) {
+            Texture tex;
+            tex.id = pbrMat.albedoMap;
+            tex.type = "diffuse";
+            tex.textureType = Texture::Type::DIFFUSE;
+            textures.push_back(tex);
+        }
     }
     else
     {
         // Default material
-        meshMaterials.push_back(PBRMaterial());
+        PBRMaterial pbrMat;
+        pbrMat.albedoMap = DefaultTexture::GetGreyTexture();
+        pbrMat.hasAlbedoMap = true;
+        meshMaterials.push_back(pbrMat);
+        if (pbrMat.albedoMap != 0) {
+            Texture tex;
+            tex.id = pbrMat.albedoMap;
+            tex.type = "diffuse";
+            tex.textureType = Texture::Type::DIFFUSE;
+            textures.push_back(tex);
+        }
     }
 
     return Mesh(vertices, indices, textures);
@@ -1156,6 +1279,19 @@ PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory
 // =====================================================
 unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
 {
+    // Per-model cache: glTF/FBX assets commonly share one texture file across
+    // many meshes. Decoding + CPU-compressing a 4K image per mesh is wasteful
+    // (minutes for a single plant model), so return the already-uploaded id.
+    // Failed paths are cached as 0 to avoid re-trying them per mesh too.
+    // Keyed by path + type because the normal-map upload differs (NEAREST
+    // filter, GL_RG/BC5 packing) from diffuse/metallic/ao - reusing the wrong
+    // type's GL object would silently apply the wrong sampling state.
+    const std::string key = path + "\n" + std::to_string((int)type);
+    auto cacheIt = m_textureCache.find(key);
+    if (cacheIt != m_textureCache.end()) {
+        return cacheIt->second;
+    }
+
     // Check if OpenGL context is available
     if (!glGenTextures) {
         std::cerr << "[Model] WARNING: No OpenGL context available, skipping texture: " << path << "\n";
@@ -1197,6 +1333,45 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
 
     if (data)
     {
+        // Cap huge (4K+) textures to 1024 before CPU BC1 compression. Decoding
+        // + box-filtering a 16M-pixel RGBA buffer is microseconds; compressing
+        // it to BC1 is the expensive part (seconds per texture), and 4K maps
+        // on small plant meshes gain nothing visually. Box-average downsample.
+        const int kMaxTexSize = 1024;
+        bool ownedByStbi = true;
+        if (width > kMaxTexSize || height > kMaxTexSize) {
+            const int newW = std::min(width, kMaxTexSize);
+            const int newH = std::min(height, kMaxTexSize);
+            const int c = nrComponents > 0 ? nrComponents : 4;
+            const int sx = std::max(1, width / newW);
+            const int sy = std::max(1, height / newH);
+            m_resizedTexBuffer.assign((size_t)newW * newH * c, 0);
+            for (int y = 0; y < newH; ++y) {
+                for (int x = 0; x < newW; ++x) {
+                    int r = 0, g = 0, b = 0, a = 0, n = 0;
+                    for (int j = 0; j < sy; ++j) {
+                        const int yy = std::min(height - 1, y * sy + j);
+                        for (int i = 0; i < sx; ++i) {
+                            const int xx = std::min(width - 1, x * sx + i);
+                            const unsigned char* p = data + ((size_t)yy * width + xx) * c;
+                            r += p[0]; if (c > 1) g += p[1]; if (c > 2) b += p[2]; if (c > 3) a += p[3];
+                            ++n;
+                        }
+                    }
+                    unsigned char* d = &m_resizedTexBuffer[((size_t)y * newW + x) * c];
+                    d[0] = (unsigned char)(r / n);
+                    if (c > 1) d[1] = (unsigned char)(g / n);
+                    if (c > 2) d[2] = (unsigned char)(b / n);
+                    if (c > 3) d[3] = (unsigned char)(a / n);
+                }
+            }
+            stbi_image_free(data);   // free the ORIGINAL stbi buffer
+            data = m_resizedTexBuffer.data(); // borrow from the member vector
+            ownedByStbi = false;
+            width = newW;
+            height = newH;
+        }
+
         bool isNormalMap = (type == aiTextureType_NORMALS);
         bool useCompression = (width >= 4 && height >= 4); // Skip compression for tiny textures
 
@@ -1240,13 +1415,16 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
             glGenerateMipmap(GL_TEXTURE_2D);
         }
 
-        stbi_image_free(data);
+        if (ownedByStbi) {
+            stbi_image_free(data);
+        }
     }
     else
     {
         std::cerr << "Texture failed to load at path: " << path << std::endl;
     }
 
+    m_textureCache[key] = textureID;
     return textureID;
 }
 
@@ -1311,6 +1489,61 @@ static void ProcessNodeRecursive(
         newNode.children = std::move(childNodes);
         
         outChildren.push_back(std::move(newNode));
+    }
+}
+
+// Static collapsing-hierarchy builder for the async loading path.
+// Mirrors ReadHierarchyRecursive(dest, src, identity): collapses
+// $AssimpFbx$ helper nodes and accumulates their transforms so the skeleton
+// hierarchy matches the sync Model() path. WITHOUT this the async skeleton
+// (used by AnimatedCharacter) keeps the raw FBX helper nodes, and every
+// animated bone position is computed ~2x too large - legs/hands visibly
+// deformed (the "idle pose blown up" bug).
+static void BuildCollapsedHierarchyStatic(AssimpNodeData &dest, const aiNode *src)
+{
+    std::string srcName = src->mName.C_Str();
+    bool isHelper = IsAssimpHelperNode(srcName);
+
+    glm::mat4 srcTransform = AiMat4ToGlm(src->mTransformation);
+    glm::mat4 newAccumulated = srcTransform;
+
+    if (isHelper) {
+        std::vector<AssimpNodeData> rootChildren;
+        for (unsigned i = 0; i < src->mNumChildren; ++i) {
+            ProcessNodeRecursive(src->mChildren[i], newAccumulated, rootChildren);
+        }
+        if (rootChildren.size() == 1) {
+            dest = std::move(rootChildren[0]);
+        } else if (rootChildren.size() > 1) {
+            dest.name = "root";
+            dest.transform = glm::mat4(1.0f);
+            dest.boneIndex = -1;
+            dest.children = std::move(rootChildren);
+        } else {
+            dest.name = "root";
+            dest.transform = glm::mat4(1.0f);
+            dest.boneIndex = -1;
+            dest.children.clear();
+        }
+    } else {
+        dest.name = NormalizeBoneName(srcName);
+        dest.transform = newAccumulated;
+        dest.boneIndex = -1;
+        dest.children.clear();
+        for (unsigned i = 0; i < src->mNumChildren; ++i) {
+            AssimpNodeData child;
+            std::vector<AssimpNodeData> childNodes;
+            ProcessNodeRecursive(src->mChildren[i], glm::mat4(1.0f), childNodes);
+            if (childNodes.size() == 1) {
+                child = std::move(childNodes[0]);
+            } else if (childNodes.size() > 1) {
+                child.name = NormalizeBoneName(src->mChildren[i]->mName.C_Str());
+                child.transform = AiMat4ToGlm(src->mChildren[i]->mTransformation);
+                child.boneIndex = -1;
+                child.children = std::move(childNodes);
+            }
+            dest.children.push_back(std::move(child));
+        }
     }
 }
 
@@ -1587,7 +1820,7 @@ void Model::generateLODLevels()
     {
         // LOD 0: Original mesh with Forsyth triangle reordering only
         {
-            Mesh lodMesh = meshes[i];
+            Mesh lodMesh(meshes[i].vertices, meshes[i].indices, meshes[i].textures);
             MeshUtils::MeshOptimizationConfig config;
             config.reorderTriangles = true;
             config.clusterVertices = false;
@@ -1598,7 +1831,7 @@ void Model::generateLODLevels()
         
         // LOD 1: Medium quality (light vertex clustering)
         {
-            Mesh lodMesh = meshes[i];
+            Mesh lodMesh(meshes[i].vertices, meshes[i].indices, meshes[i].textures);
             float cellSize = glm::max(0.05f, meshes[i].boundingBox.Radius() * 0.05f);
             MeshUtils::MeshOptimizationConfig config;
             config.reorderTriangles = true;
@@ -1612,7 +1845,7 @@ void Model::generateLODLevels()
         
         // LOD 2: Low quality (moderate vertex clustering)
         {
-            Mesh lodMesh = meshes[i];
+            Mesh lodMesh(meshes[i].vertices, meshes[i].indices, meshes[i].textures);
             float cellSize = glm::max(0.1f, meshes[i].boundingBox.Radius() * 0.1f);
             MeshUtils::MeshOptimizationConfig config;
             config.reorderTriangles = true;
@@ -1626,7 +1859,7 @@ void Model::generateLODLevels()
         
         // LOD 3: Lowest quality (aggressive vertex clustering)
         {
-            Mesh lodMesh = meshes[i];
+            Mesh lodMesh(meshes[i].vertices, meshes[i].indices, meshes[i].textures);
             float cellSize = glm::max(0.2f, meshes[i].boundingBox.Radius() * 0.2f);
             MeshUtils::MeshOptimizationConfig config;
             config.reorderTriangles = true;

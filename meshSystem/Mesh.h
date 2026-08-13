@@ -262,6 +262,12 @@ public:
          std::vector<Texture> textures = {});
     
     Mesh() = default;
+
+    // Move-only: OpenGL handles are not copyable
+    Mesh(Mesh&& other) noexcept;
+    Mesh& operator=(Mesh&& other) noexcept;
+    Mesh(const Mesh&) = delete;
+    Mesh& operator=(const Mesh&) = delete;
     
     // Destructor
     ~Mesh();

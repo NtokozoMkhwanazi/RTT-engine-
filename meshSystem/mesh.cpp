@@ -9,6 +9,56 @@
 // ============================================================
 // Constructor
 // ============================================================
+Mesh::Mesh(Mesh&& other) noexcept
+    : vertices(std::move(other.vertices))
+    , indices(std::move(other.indices))
+    , textures(std::move(other.textures))
+    , bonePalette(std::move(other.bonePalette))
+    , flags(other.flags)
+    , stats(other.stats)
+    , boundingBox(other.boundingBox)
+    , boundingSphere(other.boundingSphere)
+    , VAO(other.VAO)
+    , VBO(other.VBO)
+    , EBO(other.EBO)
+    , instanceVBO(other.instanceVBO)
+    , setupDone(other.setupDone)
+{
+    other.VAO = 0;
+    other.VBO = 0;
+    other.EBO = 0;
+    other.instanceVBO = 0;
+    other.setupDone = false;
+}
+
+Mesh& Mesh::operator=(Mesh&& other) noexcept
+{
+    if (this != &other) {
+        Clear();
+
+        vertices = std::move(other.vertices);
+        indices = std::move(other.indices);
+        textures = std::move(other.textures);
+        bonePalette = std::move(other.bonePalette);
+        flags = other.flags;
+        stats = other.stats;
+        boundingBox = other.boundingBox;
+        boundingSphere = other.boundingSphere;
+        VAO = other.VAO;
+        VBO = other.VBO;
+        EBO = other.EBO;
+        instanceVBO = other.instanceVBO;
+        setupDone = other.setupDone;
+
+        other.VAO = 0;
+        other.VBO = 0;
+        other.EBO = 0;
+        other.instanceVBO = 0;
+        other.setupDone = false;
+    }
+    return *this;
+}
+
 Mesh::Mesh(std::vector<Vertex> vertices,
            std::vector<unsigned int> indices,
            std::vector<Texture> textures)
@@ -160,11 +210,15 @@ void Mesh::SetupVertexAttributes()
 // ============================================================
 void Mesh::SetupInstanceAttributes()
 {
+    if (VAO == 0) return;
+
     // Check if OpenGL context is available
     if (!glGenBuffers) {
         std::cerr << "[Mesh] WARNING: No OpenGL context available, skipping instance setup.\n";
         return;
     }
+
+    glBindVertexArray(VAO);
 
     if (instanceVBO == 0)
     {
@@ -196,6 +250,7 @@ void Mesh::SetupInstanceAttributes()
     glVertexAttribDivisor(11, 1);
 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
 }
 
 // ============================================================
@@ -215,7 +270,22 @@ void Mesh::Draw(Shader& shader)
         return;
     }
 
+    static int dbg = 0;
+    bool print = ++dbg <= 6;
+    if (print) {
+        std::cout << "[Mesh::Draw] VAO=" << VAO << " VBO=" << VBO << " EBO=" << EBO
+                  << " verts=" << vertices.size() << " indices=" << indices.size()
+                  << " textures=" << textures.size()
+                  << " isVAO=" << glIsVertexArray(VAO) << "\n";
+    }
+
+    while (glGetError() != GL_NO_ERROR) {}
     glBindVertexArray(VAO);
+    GLenum e1 = glGetError();
+    if (print && e1 != GL_NO_ERROR) {
+        std::cerr << "[Mesh::Draw] glBindVertexArray(" << VAO << ") failed: 0x"
+                  << std::hex << e1 << std::dec << "\n";
+    }
 
     // Bind textures (skip if texture ID is 0 - invalid)
     for (size_t i = 0; i < textures.size(); i++)
@@ -226,12 +296,20 @@ void Mesh::Draw(Shader& shader)
             glBindTexture(GL_TEXTURE_2D, textures[i].id);
         }
     }
+    GLenum e2 = glGetError();
 
     // Draw
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indices.size()), GL_UNSIGNED_INT, 0);
+    GLenum e3 = glGetError();
 
     glBindVertexArray(0);
     glActiveTexture(GL_TEXTURE0);
+
+    if (print) {
+        std::cout << "[Mesh::Draw] errBindVAO=0x" << std::hex << e1
+                  << " errBindTex=0x" << e2
+                  << " errDraw=0x" << e3 << std::dec << "\n";
+    }
 }
 
 // ============================================================
@@ -971,9 +1049,10 @@ namespace MeshUtils
                 {
                     // Vertex not in cache - add it
                     // Remove oldest vertex if cache is full
-                    if (cachePosition[cache[cacheSize - 1]] >= 0)
+                    unsigned int oldest = cache[cacheSize - 1];
+                    if (oldest != static_cast<unsigned int>(-1) && oldest < vertexCount && cachePosition[oldest] >= 0)
                     {
-                        cachePosition[cache[cacheSize - 1]] = -1;
+                        cachePosition[oldest] = -1;
                     }
 
                     // Shift cache

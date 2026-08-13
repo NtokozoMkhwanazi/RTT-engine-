@@ -21,7 +21,13 @@ Trajectory TrajectoryPredictor::Predict(
     inputDir.x = moveDirection.x;
     inputDir.y = 0.0f;
     inputDir.z = moveDirection.y;
-    inputDir = glm::normalize(inputDir);
+    const float inputLen = glm::length(inputDir);
+    // CRITICAL: normalizing a zero vector yields NaN, which then poisons every
+    // KD-tree distance (dist = sqrt(NaN) = NaN) and silently breaks the pose
+    // search whenever the player lets go of the stick (moveDirection == 0).
+    // Guard it: no input -> no intended direction.
+    if (inputLen > 1e-6f) inputDir /= inputLen;
+    else inputDir = glm::vec3(0.0f);
     
     // Rotate input direction by character rotation
     float cosRot = cos(currentRotation);
@@ -36,9 +42,18 @@ Trajectory TrajectoryPredictor::Predict(
     glm::vec3 predictedPos = currentPosition;
     
     for (int i = 0; i < config.trajectoryPoints; i++) {
-        // Apply input acceleration (simplified model)
-        float inputMagnitude = glm::length(moveDirection);
-        predictedVel = glm::mix(predictedVel, worldInputDir * 6.0f * inputMagnitude, 0.1f);
+        // Turn toward the input direction at the CURRENT speed (simplified
+        // model). The old code mixed the velocity toward a hardcoded
+        // "worldInputDir * 6.0f units/s" - meaningless in the source-unit
+        // feature space the matcher searches - so the predicted path collapsed
+        // toward a standstill at locomotion speeds and every fast pose was
+        // mis-ranked by its trajectory feature. Blending the direction at the
+        // current speed keeps the magnitude (turning, not braking).
+        const float inputMagnitude = glm::length(moveDirection);
+        if (inputMagnitude > 1e-6f) {
+            const float curSpeed = glm::length(predictedVel);
+            predictedVel = glm::mix(predictedVel, worldInputDir * curSpeed, 0.15f);
+        }
         
         // Integrate position
         predictedPos += predictedVel * dt;
@@ -103,7 +118,10 @@ Trajectory TrajectoryPredictor::PredictCurve(
     glm::vec3 horizontalDir = endPosition - startPosition;
     horizontalDir.y = 0.0f;
     float horizontalDist = glm::length(horizontalDir);
-    horizontalDir = glm::normalize(horizontalDir);
+    // Guard against the same NaN normalize-on-zero as Predict(): a zero-length
+    // arc would otherwise poison every trajectory feature.
+    if (horizontalDist > 1e-6f) horizontalDir /= horizontalDist;
+    else horizontalDir = glm::vec3(0.0f);
     
     for (int i = 0; i < config.trajectoryPoints; i++) {
         float t = static_cast<float>(i) / (config.trajectoryPoints - 1);

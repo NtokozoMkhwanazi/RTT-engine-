@@ -103,10 +103,10 @@ void FootPlantingSystem::ApplyFootIK(Animator* animator,
     
     // Apply IK if feet are planted
     if (leftFoot.planted) {
-        // animator->SetBoneIK(leftFoot.footBone, leftFoot.plantPosition);
+       // animator->SetBoneIK(leftFoot.footBone, leftFoot.plantPosition);
     }
     if (rightFoot.planted) {
-        // animator->SetBoneIK(rightFoot.footBone, rightFoot.plantPosition);
+        //animator->SetBoneIK(rightFoot.footBone, rightFoot.plantPosition);
     }
 }
 

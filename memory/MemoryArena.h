@@ -178,14 +178,23 @@ private:
     };
 
     void grow(size_t count) {
-        size_t bytes = count * sizeof(T);
+        // Each block carries a Block* (the free-list link) in addition to the
+        // T payload, so the stride must cover BOTH. Using sizeof(T) alone
+        // underflows for small types (e.g. MemoryPool<int>): the last block's
+        // `next` write overran the allocation by 4 bytes and corrupted the
+        // heap ("free(): invalid size"). The stride is also rounded up to a
+        // multiple of alignof(T) so placement-new of over-aligned types stays
+        // aligned.
+        size_t stride = sizeof(Block) > sizeof(T) ? sizeof(Block) : sizeof(T);
+        stride = ((stride + alignof(T) - 1) / alignof(T)) * alignof(T);
+        size_t bytes = count * stride;
         Block* newBlock = reinterpret_cast<Block*>(new uint8_t[bytes]);
         allBlocks.push_back(newBlock);
 
         // Add all new blocks to free list
         for (size_t i = 0; i < count; ++i) {
             Block* block = reinterpret_cast<Block*>(
-                reinterpret_cast<uint8_t*>(newBlock) + i * sizeof(T)
+                reinterpret_cast<uint8_t*>(newBlock) + i * stride
             );
             block->next = freeList;
             freeList = block;

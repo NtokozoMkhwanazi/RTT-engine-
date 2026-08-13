@@ -171,7 +171,7 @@ public:
 
     // Async loading factory methods
     static AsyncLoadHandle LoadAsync(const std::string& path);
-    static Model* CreateFromAsync(AsyncLoadHandle& handle);
+    static Model* CreateFromAsync(AsyncLoadHandle& handle, std::string* outError = nullptr);
     static std::unique_ptr<AsyncModelData> LoadModelData(const std::string& path, float* outProgress = nullptr);
 
     // Debug methods for programmatic mesh creation
@@ -214,6 +214,7 @@ public:
     // Materials
     void SetMeshMaterial(size_t meshIndex, const PBRMaterial& material);
     const PBRMaterial& GetMeshMaterial(size_t meshIndex) const;
+    size_t GetMeshMaterialCount() const { return meshMaterials.size(); }
     
     // LOD
     void AddLODLevel(const std::string& lodModelPath, float distanceThreshold);
@@ -234,6 +235,19 @@ private:
     std::vector<Mesh> meshes;
     std::vector<PBRMaterial> meshMaterials;
     std::string directory;
+    
+    // Per-model texture cache: many glTF assets have dozens of meshes that
+    // reference the SAME texture file. Without this, each mesh re-decodes the
+    // (often 4K) image and re-runs CPU BC1 compression - minutes of redundant
+    // work per model. Path -> GL texture id (0 = failed, cached to avoid
+    // repeating the lookup).
+    std::unordered_map<std::string, unsigned int> m_textureCache;
+    
+    // Scratch buffer that keeps downsampled texture pixels alive for the
+    // duration of loadTexture() when a 4K+ map is reduced to 1024 before
+    // CPU BC1 compression. Owned by the model so the raw pointer stays valid
+    // until the upload + compression finish.
+    std::vector<unsigned char> m_resizedTexBuffer;
     
     Assimp::Importer importer;
     const aiScene* scene = nullptr;
@@ -266,7 +280,7 @@ private:
     // Loading
     void loadModel(const std::string& path);
     void calculateBoundingVolumes();
-    void setupFromAsyncData(std::unique_ptr<AsyncModelData> data);
+    void setupFromAsyncData(std::unique_ptr<AsyncModelData> data, std::string& outError);
     unsigned int uploadTextureFromPixels(const TexturePixelData& texData);
     
     // Hierarchy

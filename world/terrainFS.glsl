@@ -35,7 +35,7 @@ void main() {
     
     // Distance fog for atmosphere
     float dist = distance(cameraPos, FragPos);
-    float fogDensity = 0.003;
+    float fogDensity = 0.5;
     float fogFactor = 1.0 / exp(dist * dist * fogDensity * fogDensity);
     fogFactor = clamp(fogFactor, 0.0, 1.0);
     

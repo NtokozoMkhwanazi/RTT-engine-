@@ -3,6 +3,8 @@
 #include <glm/glm.hpp>
 #include <vector>
 #include <memory>
+#include <unordered_map>
+#include <string>
 
 // Simple model instance
 struct SimpleModelInstance {
@@ -25,6 +27,10 @@ public:
     
     // Remove instances beyond max distance
     void cullDistant(const glm::vec3& cameraPos, float maxDist);
+
+    // Model dimensions (bounding-box size) for placement scaling. Returns a
+    // sane non-zero size even for degenerate models.
+    glm::vec3 getModelSize(int modelId) const;
     
     // Render all instances
     void render(const glm::mat4& view, const glm::mat4& projection);
@@ -35,4 +41,8 @@ public:
 private:
     std::vector<SimpleModelInstance> m_instances;
     std::vector<std::shared_ptr<Model>> m_models;
+
+    // Path -> model id, so loading the same asset (e.g. all three tree
+    // variants sharing quiver_tree/q.gltf) reuses one Model + its textures.
+    std::unordered_map<std::string, int> m_modelByPath;
 };

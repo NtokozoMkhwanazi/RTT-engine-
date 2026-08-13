@@ -145,8 +145,6 @@ void VegetationSystem::cleanupInstanceBuffers() {
 
 void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,
                                          const std::vector<float>& heights, int heightmapSize) {
-    clear();
-    
     float worldStartX = chunkX * chunkSize;
     float worldStartZ = chunkY * chunkSize;
     
@@ -167,14 +165,18 @@ void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,
         pos.z = worldStartZ + posDist(m_rng);
         
         // Get height at position
-        float hx = pos.x / heightmapSize;
-        float hz = pos.z / heightmapSize;
-        int hxInt = std::clamp((int)hx, 0, heightmapSize - 1);
-        int hzInt = std::clamp((int)hz, 0, heightmapSize - 1);
-        pos.y = heights[hzInt * heightmapSize + hxInt];
+        if (!heights.empty() && heightmapSize > 0) {
+            float hx = pos.x / heightmapSize;
+            float hz = pos.z / heightmapSize;
+            int hxInt = std::clamp((int)hx, 0, heightmapSize - 1);
+            int hzInt = std::clamp((int)hz, 0, heightmapSize - 1);
+            pos.y = heights[hzInt * heightmapSize + hxInt];
+        } else {
+            pos.y = 0.0f;
+        }
         
         // Check if valid (not too steep, not underwater)
-        if (isValidPosition(pos, heights, heightmapSize, 3.0f)) {
+        if (heights.empty() || isValidPosition(pos, heights, heightmapSize, 3.0f)) {
             Tree tree;
             tree.position = pos;
             tree.height = heightDist(m_rng);
@@ -193,14 +195,18 @@ void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,
         pos.x = worldStartX + posDist(m_rng);
         pos.z = worldStartZ + posDist(m_rng);
         
-        float hx = pos.x / heightmapSize;
-        float hz = pos.z / heightmapSize;
-        int hxInt = std::clamp((int)hx, 0, heightmapSize - 1);
-        int hzInt = std::clamp((int)hz, 0, heightmapSize - 1);
-        pos.y = heights[hzInt * heightmapSize + hxInt];
+        if (!heights.empty() && heightmapSize > 0) {
+            float hx = pos.x / heightmapSize;
+            float hz = pos.z / heightmapSize;
+            int hxInt = std::clamp((int)hx, 0, heightmapSize - 1);
+            int hzInt = std::clamp((int)hz, 0, heightmapSize - 1);
+            pos.y = heights[hzInt * heightmapSize + hxInt];
+        } else {
+            pos.y = 0.0f;
+        }
         
         // Rocks prefer higher elevations and steep areas
-        if (pos.y > 15.0f || isValidPosition(pos, heights, heightmapSize, 20.0f)) {
+        if (heights.empty() || pos.y > 15.0f || isValidPosition(pos, heights, heightmapSize, 20.0f)) {
             Rock rock;
             rock.position = pos;
             rock.scale = glm::vec3(scaleDist(m_rng), scaleDist(m_rng) * 0.6f, scaleDist(m_rng));
@@ -209,10 +215,44 @@ void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,
             m_rocks.push_back(rock);
         }
     }
+
+    // Generate ground plants (grass clusters + low desert flora).
+    // grassDensity is a per-m2 value that is typically tiny (0.001), so scale
+    // it up for small clusters: ~10-25 plants per 80m chunk, capped so the
+    // terrain isn't littered. Low plants belong on gentle, dry ground.
+    const int rawPlants = (int)(chunkSize * chunkSize * m_config.grassDensity * 1.0f);
+    int numPlants = std::clamp(rawPlants, 12, 40);
+    std::uniform_int_distribution<int> plantTypeDist(0, 2);
+    std::uniform_real_distribution<float> plantScaleDist(0.6f, 1.4f);
+
+    for (int i = 0; i < numPlants; i++) {
+        glm::vec3 pos;
+        pos.x = worldStartX + posDist(m_rng);
+        pos.z = worldStartZ + posDist(m_rng);
+        if (!heights.empty() && heightmapSize > 0) {
+            float hx = pos.x / heightmapSize;
+            float hz = pos.z / heightmapSize;
+            int hxInt = std::clamp((int)hx, 0, heightmapSize - 1);
+            int hzInt = std::clamp((int)hz, 0, heightmapSize - 1);
+            pos.y = heights[hzInt * heightmapSize + hxInt];
+        } else {
+            pos.y = 0.0f;
+        }
+        if (heights.empty() || isValidPosition(pos, heights, heightmapSize, 4.0f)) {
+            Plant plant;
+            plant.position = pos;
+            plant.scale = plantScaleDist(m_rng);
+            plant.rotation = rotDist(m_rng);
+            plant.type = plantTypeDist(m_rng);
+            m_plants.push_back(plant);
+        }
+    }
 }
 
 bool VegetationSystem::isValidPosition(const glm::vec3& pos, const std::vector<float>& heights,
                                         int heightmapSize, float heightThreshold) const {
+    if (heights.empty() || heightmapSize <= 0) return true;
+    
     // Check slope (don't place on steep cliffs)
     float delta = 2.0f;
     float hL = 0, hR = 0, hD = 0, hU = 0;

@@ -1,23 +1,56 @@
+// ============================================================================
+//  test.cpp - RTT Engine + Editor Application
+// ============================================================================
+//  The single engine entry point. Two phases:
+//
+//    1. SELF-CHECK: runs the complete Google Test suite (494 tests across 53
+//       suites) to validate every engine system headlessly.
+//    2. ENGINE + EDITOR APP: boots the full application - GLFW window, OpenGL
+//       context, ImGui editor (menu bar, toolbar, outliner/details/bottom
+//       panels, live viewport, status bar), terrain world, physics floor,
+//       cinematic camera intro, and a play mode with the motion-matching
+//       character (bot.fbx), third-person follow camera and play-mode HUD.
+//
+//  Headless mode (--headless): hidden window, bounded frame budget with a fixed
+//  60 Hz timestep, auto-enters play mode with the scripted cinematic demo and
+//  prints an engine summary before exiting 0. No OpenGL context at all falls
+//  back to a GL-free logic simulation of the character + matcher core.
+//
+//  Build & run:   make run           (tests, then the editor app)
+//                 make run-headless  (bounded automated run)
+// ============================================================================
+
+#include <gtest/gtest.h>
+
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
-#include <iostream>
-#include <vector>
-#include <string>
-#include <memory>
+
+#include <algorithm>
+#include <cmath>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
 #include <execinfo.h>
 #include <cxxabi.h>
-#include <cstring>
-#include <cstdio>
+
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
 
 #include "ecs/ECS.h"
 #include "ecs/components/Components.h"
 #include "ecs/systems/Systems.h"
 #include "renderer/Renderer.h"
 #include "cameraSystem/flyCamera.h"
+#include "cameraSystem/ThirdPersonCamera.h"
 #include "shaderSystem/Shader.h"
 #include "modelSystem/Model.h"
 #include "editor/render_pipeline.h"
@@ -25,164 +58,418 @@
 #include "editor/editor_state.h"
 #include "editor/config.h"
 #include "editor/input_manager.h"
+#include "editor/ui_config.h"
 #include "editor/editor_application.h"
 #include "editor/ui.h"
 #include "editor/phosphor_imgui.h"
+#include "editor/editor_theme.h"
+#include "editor/fa_imgui.h"
 #include "editor/gl_context_lifecycle.h"
+#include "editor/undo_redo.h"
+#include "editor/scene_manager.h"
+#include "editor/entity_manager.h"
+#include "editor/PlayModeController.h"
+#include "animationSystem/AnimationStateMachine.h"
+#include "cameraSystem/CinematicDemo.h"
+#include "demo/DemoRecorder.h"
+#include "geospatial/GeoAPI.h"
+#include "geospatial/GPSTracker.h"
 #include "renderer/GPUProfilerAdvanced.h"
 
-#include <imgui.h>
-#include <imgui_impl_glfw.h>
-#include <imgui_impl_opengl3.h>
+// ============================================================================
+// Options
+// ============================================================================
+struct AppOptions {
+    bool skipTests = false;   // --skip-tests   / RTT_SKIP_TESTS=1
+    bool headless  = false;   // --headless     / RTT_HEADLESS=1
+    bool help      = false;
+    int  frames    = 900;     // --frames N     / RTT_FRAMES=N  (headless bound)
+};
 
-// Set to 0 to silence per-frame diagnostic prints once the blank-UI issue is diagnosed.
-#define DEBUG_FRAME_LOG 0
+static const char* kUsage =
+    "Usage: engine [options]\n"
+    "  --skip-tests      Skip the Google Test self-check phase\n"
+    "  --headless        Bounded run with a hidden window (auto-exit; no display\n"
+    "                    falls back to a GL-free logic sim)\n"
+    "  --frames N        Headless frame budget (default 900)\n"
+    "  --help            Show this help\n"
+    "\n"
+    "Editor controls: mouse look (right-drag), WASD fly, F5 play/pause mode,\n"
+    "WASD/Space/Ctrl/Shift move the character in play mode, F9 cinematic demo\n"
+    "script, 1-4 switch play camera (follow/orbit/top-down/first-person),\n"
+    "Esc / window close quits.\n";
+
+static AppOptions parseOptions(int argc, char** argv) {
+    AppOptions o;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--skip-tests") o.skipTests = true;
+        else if (a == "--headless") o.headless = true;
+        else if (a == "--help") o.help = true;
+        else if (a == "--frames" && i + 1 < argc) { o.frames = std::atoi(argv[++i]); if (o.frames < 1) o.frames = 1; }
+    }
+    if (const char* e = std::getenv("RTT_SKIP_TESTS")) o.skipTests = (std::atoi(e) != 0);
+    if (const char* e = std::getenv("RTT_HEADLESS"))   o.headless  = (std::atoi(e) != 0);
+    if (const char* e = std::getenv("RTT_FRAMES"))     o.frames    = std::max(1, std::atoi(e));
+    return o;
+}
 
 // ============================================================================
-// Crash Handler
+// Crash handler (demangled backtrace -> crash.log)
 // ============================================================================
 static void crashHandler(int signal) {
-    // Attempt to write to crash.log
     FILE* f = fopen("crash.log", "w");
     if (f) {
-        fprintf(f, "=== CRASH LOG ===\n");
-        fprintf(f, "Signal: %d\n", signal);
-
-        // Capture backtrace. backtrace() itself is async-signal-safe and
-        // backtrace_symbols_fd() writes directly via the fd without malloc.
+        fprintf(f, "=== CRASH LOG ===\nSignal: %d\n", signal);
         void* array[64];
         int size = backtrace(array, 64);
-
-        // Write the raw (mangled) frame lines straight to crash.log.
         fprintf(f, "\nBacktrace (%d frames):\n", size);
         backtrace_symbols_fd(array, size, fileno(f));
 
-        // Now demangle symbols for human-readable output. This path does
-        // allocate (backtrace_symbols + __cxa_demangle), but the original
-        // handler already called fopen/fprintf/fclose, so we keep that
-        // pattern for consistency. We avoid std::cerr inside the loop.
         char** symbols = backtrace_symbols(array, size);
         if (symbols) {
             fprintf(f, "\nDemangled frames:\n");
             for (int i = 0; i < size; ++i) {
                 char* sym = symbols[i];
                 if (!sym) continue;
-
-                // Frame strings look like:  ./app(_ZN5WorldC2Ev+0x4a) [0x55...]
-                // Extract the mangled name between '(' and '+'.
-                // Find the trailing address: "[0x...]" — used for addr2line-style frame lines.
                 const char* addr_start = strrchr(sym, '[');
-                unsigned long addr = 0;
-                if (addr_start) {
-                    addr = strtoul(addr_start + 1, nullptr, 16);
-                }
-
-                // Frame string format from backtrace_symbols: "./app(_ZN...+0x4a) [0x...]"
-                // We extract the mangled name between '(' and '+' for demangling.
+                unsigned long addr = addr_start ? strtoul(addr_start + 1, nullptr, 16) : 0;
                 char* open_paren = strchr(sym, '(');
                 char* plus = open_paren ? strchr(open_paren, '+') : nullptr;
                 if (!open_paren || !plus) {
-                    // Fallback: still emit an addr2line-style line so verify regex matches.
                     fprintf(f, "#%d 0x%lx %s\n", i, addr, sym);
                     continue;
                 }
-
                 *plus = '\0';
-                const char* mangled = open_paren + 1;
                 size_t len = 0;
                 int status = 0;
-                char* demangled = abi::__cxa_demangle(mangled, nullptr, &len, &status);
-                // addr2line-style line: "#N 0xADDR human_readable_name"
-                if (status == 0 && demangled) {
-                    fprintf(f, "#%d 0x%lx %s\n", i, addr, demangled);
-                    free(demangled);
-                } else {
-                    fprintf(f, "#%d 0x%lx %s\n", i, addr, mangled);
-                }
+                char* demangled = abi::__cxa_demangle(open_paren + 1, nullptr, &len, &status);
+                fprintf(f, "#%d 0x%lx %s\n", i, addr,
+                        (status == 0 && demangled) ? demangled : open_paren + 1);
+                free(demangled);
                 *plus = '+';
             }
             free(symbols);
         }
-
         fclose(f);
     }
-
     std::cerr << "\n*** CRASH: Signal " << signal << " ***\n";
     _exit(128 + signal);
 }
 
 // ============================================================================
-// Main Entry Point
+// System inventory (module -> test suite -> description)
 // ============================================================================
-int main() {
-    // Register crash handlers
-    signal(SIGSEGV, crashHandler);
-    signal(SIGABRT, crashHandler);
-    signal(SIGFPE, crashHandler);
-    
-    std::cout << "=== RTT Engine Editor ===\n";
-    std::cout << "Using modular architecture with optimized rendering\n";
-    
-    // Initialize GLFW
+static const struct { const char* name; const char* suite; const char* desc; } kInventory[] = {
+    {"ECS / Archetypes",   "ECS*Archetype*Blueprint*Relationship*", "Archetypes, blueprints, relationships, events, jobs, serialization"},
+    {"Physics",            "PhysicsTest*",                          "GJK/EPA collision, constraints, rigid bodies, gravity, floor"},
+    {"Camera System",      "Camera*",                               "Third-person follow, modes, collision, smoothing, NaN regression"},
+    {"Animation & FSM",    "Animation*Animator*FSM*",               "Blending, layers, events, crossfade, locomotion FSM"},
+    {"Motion Matching",    "MotionMatching*MMGaitPhase*",           "Pose search, gait phase, trajectory prediction, foot planting"},
+    {"Character",          "Character*PlayModeController*",         "PlayModeController + AnimatedCharacter input->movement->snap"},
+    {"FBX / Models",       "FBX*Model*",                            "Assimp FBX loading, skeletons, skinning, bone buffers"},
+    {"Terrain / World",    "TerrainTest*WorldTest*SceneManager*",   "Heightmaps, chunks, LOD, normals, scene save/load"},
+    {"Memory",             "Memory*",                               "Arenas, pools, stack allocators, asset handles"},
+    {"Geo / GPS",          "Geo*",                                  "GeoAPI, HTTP server, NMEA feeds, GPS modes"},
+    {"Editor & UI",        "EditorClass*UI*ImGui*UndoRedo*EntityManager*Viewport*", "Panels, undo/redo, entity ops, viewport FBO, ImGui safety"},
+    {"Demo / Playback",    "Playback*CinematicDemo*",               "Demo recorder/player, cinematic script"},
+    {"Integration",        "IntegrationTest*",                      "Input -> FSM -> motion matching -> pose sync"},
+};
+
+static void printSystemInventory() {
+    std::cout << "\n  System inventory wired into this run:\n"
+              << "  ------------------------------------------------------------------\n";
+    for (const auto& m : kInventory) {
+        std::printf("   %-24s %-32s %s\n", m.name, m.suite, m.desc);
+    }
+    std::cout << "  ------------------------------------------------------------------\n\n";
+}
+
+// ============================================================================
+// Phase 1 - Google Test self-check
+// ============================================================================
+static int runTestPhase(int argc, char** argv) {
+    std::cout << "\n============================================================\n"
+              << "  PHASE 1/2 - SELF-CHECK: running the full test suite\n"
+              << "  (494 tests across 53 suites)\n"
+              << "============================================================\n";
+    ::testing::InitGoogleTest(&argc, argv);
+    const int result = RUN_ALL_TESTS();
+    std::cout << "\n============================================================\n"
+              << "  SELF-CHECK " << (result == 0 ? "PASSED" : "FAILED")
+              << " (" << result << " failing test groups)\n"
+              << "============================================================\n";
+    return result;
+}
+
+// ============================================================================
+// GL-free logic simulation (fallback when no OpenGL context is available)
+// ============================================================================
+static int runLogicSim(const AppOptions& opts) {
+    std::cout << "\n[Engine] No OpenGL context available - running GL-free logic\n"
+              << "         simulation of the character + motion-matching core.\n";
+
+    Editor::PlayModeController ctrl;
+    if (!ctrl.load("assets/bot.fbx", "assets")) {
+        std::cerr << "[Engine] FAILED to load assets/bot.fbx - is the working dir the repo root?\n";
+        return 1;
+    }
+
+    auto terrain = [](float, float) -> float { return 0.0f; };
+    const float dt = 1.0f / 60.0f;
+    double t = 0.0;
+    int lastPhase = -1;
+    float maxSpeed = 0.0f;
+    float distance = 0.0f;
+    glm::vec3 start = ctrl.character().position;
+
+    for (int frame = 0; frame < opts.frames; ++frame) {
+        const int phase = CinematicDemo::PhaseAt(t);
+        const bool edge = (phase != lastPhase);
+        lastPhase = phase;
+        const CinematicDemo::Input cd = CinematicDemo::At(t, edge);
+        CharacterInput in;
+        in.moveDirection = cd.moveDirection;
+        in.moveMagnitude = 1.0f;
+        in.sprint = cd.sprint;
+        in.jump = cd.jump;
+        in.crouch = false;
+        in.grounded = true;
+        in.verticalVelocity = 0.0f;
+        ctrl.update(dt, in, terrain);
+        const glm::vec3 pos = ctrl.character().position;
+        distance += glm::length(pos - start);
+        start = pos;
+        maxSpeed = std::max(maxSpeed, ctrl.character().currentSpeed());
+        t += dt;
+    }
+
+    const auto& cc = ctrl.character();
+    const auto diag = ctrl.debugPoseDiag();
+    std::cout << "\n[Engine] Logic sim complete (" << opts.frames << " frames, "
+              << (opts.frames * dt) << "s simulated)\n"
+              << "  final position : " << cc.position.x << ", " << cc.position.y << ", " << cc.position.z << "\n"
+              << "  distance moved : " << distance << " units\n"
+              << "  max speed      : " << maxSpeed << " m/s\n"
+              << "  final state    : " << AnimationStateToString(cc.state()) << "\n"
+              << "  matcher clip   : " << diag.matcherClip << "\n"
+              << "  motion match   : " << (cc.isMotionMatchingActive() ? "ACTIVE" : "off") << "\n";
+    std::cout << "[Engine] Logic sim OK.\n";
+    return 0;
+}
+
+// ============================================================================
+// Helpers shared by the play-mode loop
+// ============================================================================
+static CameraState AnimStateToCamState(AnimationState s) {
+    switch (s) {
+        case AnimationState::IDLE:        return CameraState::IDLE;
+        case AnimationState::WALK:        return CameraState::WALK;
+        case AnimationState::RUN:         return CameraState::RUN;
+        case AnimationState::JUMP:        return CameraState::JUMP;
+        case AnimationState::FALL:        return CameraState::FALL;
+        case AnimationState::CROUCH:
+        case AnimationState::CROUCH_WALK: return CameraState::CROUCH;
+        default:                          return CameraState::IDLE;
+    }
+}
+
+// ============================================================================
+// Viewport camera modes - Free / Follow / Orbit / Top-down / First-person
+// ============================================================================
+// Mode ids match editor.uiState.playCameraMode, the Camera menu and the
+// World Settings combo. 0 = Free (fly camera), 1-4 orbit the bot. Keys 0-4
+// switch modes, right-drag orbits/tilts, scroll wheel zooms.
+static const char* kPlayCameraModeNames[] = {"Free", "Follow", "Orbit", "Top-Down", "First-Person"};
+static constexpr int kPlayCameraModeCount = 5;
+
+static void UpdatePlayCamera(int mode, ThirdPersonCamera& cam,
+                             const AnimatedCharacter& cc, float dt, float aspect,
+                             const Input::InputState& in, bool& firstInit,
+                             int prevMode, float& fpPitch) {
+    const glm::vec3 charPos = cc.position;
+    const float heading = cc.heading;
+    const bool drag = in.isMouseButtonDown(Input::MouseButton::RIGHT);
+
+    CameraInput camIn;
+    camIn.characterPosition = charPos;
+    camIn.characterVelocity = cc.velocity;
+    camIn.moveMagnitude = cc.currentSpeed();
+    camIn.isGrounded = cc.grounded;
+    camIn.characterForward = glm::vec3(-std::sin(heading), 0.0f, -std::cos(heading));
+    camIn.animState = AnimStateToCamState(cc.state());
+
+    // ---- First-person: camera at head height, look follows heading + pitch --
+    if (mode == 3) {
+        if (prevMode != 3) fpPitch = 0.0f;
+        if (drag) fpPitch = std::clamp(fpPitch + in.mouseDelta.y * 0.1f, -75.0f, 75.0f);
+        const float p = glm::radians(fpPitch);
+        const glm::vec3 fwd = glm::normalize(
+            glm::vec3(-std::sin(heading) * std::cos(p),
+                       std::sin(p),
+                       -std::cos(heading) * std::cos(p)));
+        cam.position = charPos + glm::vec3(0.0f, 1.55f, 0.0f);  // eye height
+        cam.target = cam.position + fwd * 10.0f;
+        return;
+    }
+
+    // ---- Follow / Orbit / Top-down share the state-aware follow camera ------
+    if (firstInit) {
+        // Start slightly above and behind the character, chest-level target.
+        cam.position = charPos + glm::vec3(0.0f, 2.2f, 3.5f);
+        cam.target = charPos + glm::vec3(0.0f, 1.3f, 0.0f);
+        cam.currentState = camIn.animState;
+        cam.yaw = -90.0f;
+        cam.pitch = 10.0f;
+        cam.config.distance = 4.0f;
+        cam.config.height = 1.6f;
+        firstInit = false;
+    }
+
+    if (mode == 1) {  // Orbit: free mouse orbit + scroll zoom
+        if (drag) {
+            cam.yaw -= in.mouseDelta.x ;
+            // Drag up = camera higher (Unreal orbit convention)
+            cam.pitch = std::clamp(cam.pitch - in.mouseDelta.y * 0.3f,
+                                   cam.config.minPitch, cam.config.maxPitch);
+        }
+        cam.config.distance = std::clamp(cam.config.distance - in.scrollDelta.y * 1.5f, 2.0f, 10.0f);
+    } else if (mode == 2) {  // Top-down: aerial overview, rotate around the character
+        if (drag) cam.yaw -= in.mouseDelta.x;
+        cam.pitch = 80.0f;
+        cam.config.distance = 9.0f;
+    } else {  // Follow: auto-face the bot's heading, right-drag tilts, scroll zooms
+        const float targetYaw = glm::degrees(std::atan2(-std::cos(heading), -std::sin(heading)));
+        float dy = targetYaw - cam.yaw;
+        while (dy > 180.0f) dy -= 360.0f;
+        while (dy < -180.0f) dy += 360.0f;
+        cam.yaw += dy * std::min(1.0f, 1.0f - std::exp(-6.0f * dt));
+        if (drag) {
+            // Drag up = look from higher (Unreal convention)
+            cam.pitch = std::clamp(cam.pitch - in.mouseDelta.y ,
+                                   -20.0f, 55.0f);
+        } else {
+            cam.pitch = glm::mix(cam.pitch, 10.0f, std::min(1.0f, 1.0f - std::exp(-3.0f * dt)));
+        }
+        cam.config.distance = std::clamp(cam.config.distance - in.scrollDelta.y * 1.5f, 2.0f, 9.0f);
+    }
+
+    cam.update(dt, camIn, aspect);
+}
+
+static CharacterInput KeyboardInput(const Input::InputState& ks) {
+    CharacterInput input;
+    glm::vec2 move(0.0f);
+    if (ks.isKeyDown(GLFW_KEY_W)) move.y -= 1.0f;
+    if (ks.isKeyDown(GLFW_KEY_S)) move.y += 1.0f;
+    if (ks.isKeyDown(GLFW_KEY_A)) move.x += 1.0f;
+    if (ks.isKeyDown(GLFW_KEY_D)) move.x -= 1.0f;
+    const float len = glm::length(move);
+    if (len > 0.001f) move /= len;
+    input.moveDirection = move;
+    input.moveMagnitude = std::min(1.0f, len);
+    input.jump = ks.isKeyDown(GLFW_KEY_SPACE);
+    input.crouch = ks.isKeyDown(GLFW_KEY_LEFT_CONTROL) || ks.isKeyDown(GLFW_KEY_C);
+    input.sprint = ks.isKeyDown(GLFW_KEY_LEFT_SHIFT) || ks.isKeyDown(GLFW_KEY_RIGHT_SHIFT);
+    input.grounded = true;
+    input.verticalVelocity = 0.0f;
+    return input;
+}
+
+static void RenderPlayCharacter(Editor::PlayModeController& play, Model* playModel,
+                                Render::RenderPipeline& pipeline,
+                                const glm::mat4& view, const glm::mat4& proj,
+                                const glm::vec3& cameraPos) {
+    if (!playModel || !play.isLoaded()) return;
+    Shader* shader = pipeline.getModelShader();
+    if (!shader) return;
+
+    AnimatedCharacter& cc = play.character();
+    glm::mat4 model(1.0f);
+    model = glm::translate(model, cc.position);
+    model = glm::rotate(model, cc.heading, glm::vec3(0.0f, 1.0f, 0.0f));
+    model = glm::scale(model, glm::vec3(cc.scale));
+
+    shader->use();
+    shader->setMat4("projection", proj);
+    shader->setMat4("view", view);
+    shader->setMat4("model", model);
+    shader->setVec3("lightPos", glm::vec3(10.0f, 15.0f, 10.0f));
+    shader->setVec3("viewPos", cameraPos);
+    shader->setInt("uDisableInstancing", 1);
+    shader->setInt("uDisableSkinning", 0);
+    shader->setInt("uPaletteSize", 256);
+    shader->setInt("uShowDebug", 0);
+
+    Animator* animator = cc.animator();
+    if (animator) playModel->Draw(*shader, *animator);
+    else playModel->DrawStatic(*shader);
+}
+
+// ============================================================================
+// Phase 2 - full engine + editor application
+// ============================================================================
+static int runEditorApp(const AppOptions& opts) {
+    std::cout << "\n============================================================\n"
+              << "  PHASE 2/2 - ENGINE + EDITOR APP\n"
+              << "============================================================\n";
+
+    // ---- GLFW --------------------------------------------------------------
     if (!glfwInit()) {
-        std::cerr << "ERROR: Failed to initialize GLFW\n";
-        return -1;
+        std::cerr << "[Engine] glfwInit failed" << std::endl;
+        return runLogicSim(opts);
     }
-    
-    // Check for headless environment
-    bool isHeadless = (getenv("DISPLAY") == nullptr);
-    if (isHeadless) {
-        std::cout << "Headless environment detected (no DISPLAY), using hidden window\n";
-        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-    }
-    
+
+    const bool hidden = opts.headless || (std::getenv("DISPLAY") == nullptr);
+    glfwWindowHint(GLFW_VISIBLE, hidden ? GLFW_FALSE : GLFW_TRUE);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    
-    // Create window with config-based dimensions
+    glfwWindowHint(GLFW_SAMPLES, 4);
+
     auto& renderConfig = Config::getRenderConfig();
-    GLFWwindow* window = glfwCreateWindow(
-        renderConfig.defaultWindowWidth,
-        renderConfig.defaultWindowHeight,
-        "RTT Engine Editor",
-        nullptr, nullptr
-    );
-    
+    GLFWwindow* window = glfwCreateWindow(renderConfig.defaultWindowWidth,
+                                          renderConfig.defaultWindowHeight,
+                                          "RTT Engine - Editor", nullptr, nullptr);
     if (!window) {
-        std::cerr << "ERROR: Failed to create GLFW window\n";
+        std::cerr << "[Engine] Failed to create GLFW window" << std::endl;
         glfwTerminate();
-        return -1;
+        return runLogicSim(opts);
     }
-    
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(renderConfig.vsync ? 1 : 0);
-    
-    // Initialize GLAD
+    glfwSwapInterval(hidden ? 0 : 1);
+
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        std::cerr << "ERROR: Failed to initialize GLAD\n";
+        std::cerr << "[Engine] Failed to initialize GLAD" << std::endl;
         glfwDestroyWindow(window);
         glfwTerminate();
-        return -1;
+        return runLogicSim(opts);
     }
-    
-    std::cout << "OpenGL: " << glGetString(GL_VERSION) << "\n";
-
-    // Mark the GL context as alive. Destructors that fire during static
-    // destruction AFTER glfwTerminate() will early-out instead of issuing
-    // GL calls on a dead context (the cause of the previous exit-time crash).
+    std::cout << "[Engine] OpenGL: " << glGetString(GL_VERSION)
+              << " | " << glGetString(GL_RENDERER) << "\n";
     glctx::setAlive(true);
 
-    // Initialize global editor state (handles systems, renderer, shaders, camera)
-    std::cout << "Initializing Editor..." << std::endl;
+    // ---- Editor state (shaders, meshes, grid, ECS world, camera) -----------
+    std::cout << "[Engine] Initializing editor..." << std::endl;
     InitEditor();
-    std::cout << "Editor initialized." << std::endl;
-    
-    // Initialize ImGui
-    std::cout << "Initializing ImGui..." << std::endl;
-    // Delete stale engine_ui.ini so panels reset to default positions/sizes
-    // and stale off-screen coordinates from prior interactive runs don't
-    // leave the editor UI blank.
+    std::cout << "[Engine] Editor initialized." << std::endl;
+
+    // Bring the GeoAPI facade (used by the Geo tracking panel + status bar) in
+    // sync with the ECS geospatial pipeline's origin, then seed the panel state.
+    {
+        auto& geoApi = g_editor.geospatialSystem().getGeoAPI();
+        geoApi.initialize(-33.8568, 151.2153, 50.0);   // Sydney origin (matches ECS)
+        geoApi.setGPSMode(GPSTracker::Mode::SIMULATED_WALK);
+        const geo::GeoConfig geoCfg = geoApi.getConfig();
+        g_editor.geoPanelState.originLat = geoCfg.originLat;
+        g_editor.geoPanelState.originLon = geoCfg.originLon;
+        g_editor.geoPanelState.originAlt = geoCfg.originAlt;
+        // Keep the panel's mode selector in sync with the running pipeline
+        // (mode enum: 0=DISABLED, 1=STATIC, 2=WALK, 3=VEHICLE, 4=AIRCRAFT).
+        g_editor.geoPanelState.gpsModeIndex = (int)geoCfg.gpsMode;
+    }
+
+    // ---- ImGui + Phosphor icons ---------------------------------------------
     std::remove("engine_ui.ini");
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -191,384 +478,534 @@ int main() {
     io.IniFilename = "engine_ui.ini";
     io.ConfigWindowsMoveFromTitleBarOnly = true;
     io.ConfigWindowsResizeFromEdges = true;
-    
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 450");
-    std::cout << "ImGui initialized." << std::endl;
-    
-    // Load Phosphor icons
-    std::cout << "Loading Phosphor icons..." << std::endl;
+
+    // Editor look & feel: JetBrains Mono UI font (default), then the Phosphor
+    // + FontAwesome6 icon fonts, then the modern theme painted onto ImGui.
+    EditorTheme::LoadEditorFonts(io);
     if (!PhosphorImGui::Load(io, 14.0f)) {
         std::cerr << "[WARN] Failed to load Phosphor icons\n";
     }
-    std::cout << "Phosphor icons loaded." << std::endl;
-    
-    // Override default camera position for this test
+    FaImGui::Load(io);
+
+    // Restore persisted UI preferences (panel toggles + theme mode) from
+    // ui_panel.cfg, then paint the chosen theme.
+    UIConfig::LoadConfig(&g_editor.uiState.showOutliner, &g_editor.uiState.showDetails);
+    EditorTheme::SetThemeMode(UIConfig::gThemeMode == 1 ? EditorTheme::ThemeMode::Light
+                                                        : EditorTheme::ThemeMode::Dark);
+    EditorTheme::ApplyTheme();
+
     flyCamera* cam = g_editor.camera();
     if (cam) {
         cam->Position = glm::vec3(0.0f, 10.0f, 20.0f);
         cam->Target = glm::vec3(0.0f, 0.0f, 0.0f);
     }
-    
-    // Initialize Input Manager
+
+    // ---- Input manager -------------------------------------------------------
     Input::InputManager& inputManager = Input::InputManager::getInstance();
     inputManager.initialize(window);
-    
-    // Initialize Render Pipeline
+
+    // ---- Render pipeline (viewport FBO + skybox + batched renderer) ----------
     Render::RenderPipeline& renderPipeline = Render::RenderPipeline::getInstance();
     if (!renderPipeline.initialize()) {
-        std::cerr << "ERROR: Failed to initialize render pipeline\n";
-        return -1;
+        std::cerr << "[Engine] Failed to initialize render pipeline\n";
+        glctx::setAlive(false);
+        CleanupEditor();
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return 1;
     }
-    
-    // Initialize World Manager with optimized configuration
+
+    // ---- World manager (terrain + physics floor + world objects) -------------
     World::WorldManager& worldManager = World::WorldManager::getInstance();
     Config::TerrainConfig terrainConfig = Config::getTerrainConfig();
     Config::VegetationConfig vegConfig = Config::getVegetationConfig();
-    
-    // Apply performance optimizations
     terrainConfig.viewDistance = 2;
-    terrainConfig.lodDistance = Config::getRenderConfig().terrainLODDistance;
-    vegConfig.vegetationDrawDistance = Config::getRenderConfig().vegetationLODDistance;
-    
+    terrainConfig.lodDistance = renderConfig.terrainLODDistance;
+    vegConfig.vegetationDrawDistance = renderConfig.vegetationLODDistance;
     if (!worldManager.initialize(terrainConfig, vegConfig)) {
-        std::cerr << "WARNING: World manager initialization had issues\n";
+        std::cerr << "[Engine] World manager initialization had issues\n";
     }
-    
-    // Initialize global GeospatialSystem (needed for UI status bar)
-#ifndef DISABLE_GEOSPATIAL
-    g_editor.geospatialSystem().initialize(-33.8568, 151.2153, 50.0);
-    g_editor.geospatialSystem().setGPSMode(GPSTracker::Mode::SIMULATED_WALK);
-#endif
-    
-    // Reference world from g_editor
+
     ecs::World& world = g_editor.world();
-    
-    // Main loop timing
+
+    // ---- Play mode state ------------------------------------------------------
+    Editor::PlayModeController play;
+    std::unique_ptr<Model> playModel;
+    ThirdPersonCamera followCam;
+    bool followCamInit = false;
+    int lastCamMode = -1;
+    float fpPitch = 0.0f;
+    bool playWasActive = false;
+    double demoTime = 0.0;
+    int lastPhase = -1;
+
+    // ---- The bot lives in the viewport permanently -----------------------------
+    // Load the character + its locomotion clips once at startup so it stands
+    // (idle animation) in the editor viewport. Play mode hands the player
+    // control; camera modes 1-4 orbit it.
+    if (!play.load("assets/bot.fbx", "assets")) {
+        std::cerr << "[Engine] Failed to load character\n";
+    }
+    playModel = std::make_unique<Model>("assets/bot.fbx");
+    if (playModel->GetMeshCount() == 0) playModel.reset();
+
+    // ---- Timing ----------------------------------------------------------------
     float lastTime = static_cast<float>(glfwGetTime());
     float fpsTimer = 0.0f;
     int frames = 0;
     float fps = 0.0f;
-#if DEBUG_FRAME_LOG
-    int frameDiagCounter = 0;
-    int uiDrawCalls = 0;
-#endif
-    
-    // UI State
+    int frameCount = 0;
+    float maxSpeed = 0.0f;
+    glm::vec3 startPos(0.0f);
+    bool haveStart = false;
+
+    // ---- Cinematic camera intro (skipped in headless) --------------------------
+    double cinematicStart = -1.0;
+    bool cinematicActive = !opts.headless;
+    constexpr double CINEMATIC_DURATION = 6.0;
+    constexpr float CINEMATIC_RADIUS = 32.0f;
+    constexpr float CINEMATIC_HEIGHT = 14.0f;
+    if (cinematicActive && cam) {
+        cinematicStart = glfwGetTime();
+        cam->Position = glm::vec3(-CINEMATIC_RADIUS, CINEMATIC_HEIGHT * 1.5f, 0.0f);
+        cam->Target = glm::vec3(0.0f, 1.5f, 0.0f);
+    }
+
     EntityCache entityCache;
     entityCache.dirty = true;
-    
-    // Main game loop
+
+    // ---- Main loop --------------------------------------------------------------
     while (!glfwWindowShouldClose(window)) {
-        // Calculate delta time
+        // Headless: fixed 60 Hz timestep for a deterministic bounded run.
         float now = static_cast<float>(glfwGetTime());
-        float dt = now - lastTime;
+        float dt = opts.headless ? (1.0f / 60.0f) : (now - lastTime);
         lastTime = now;
-        
-        // Cap dt to avoid spikes
         if (dt > 0.1f) dt = 0.1f;
-        
-        // FPS counter
-        frames++;
+        if (dt < 0.0f) dt = 0.0f;
+
+        ++frameCount;
+        ++frames;
         fpsTimer += dt;
         if (fpsTimer >= 1.0f) {
-            fps = static_cast<float>(frames);
+            fps = static_cast<float>(frames) / fpsTimer;
             frames = 0;
-            fpsTimer = 0;
+            fpsTimer = 0.0f;
         }
 
-#if DEBUG_FRAME_LOG
-        // Per-frame diagnostic: confirms the main loop is alive and that
-        // ImGui is producing draw lists. Useful for diagnosing blank UI.
-        frameDiagCounter++;
-        if (frameDiagCounter % 60 == 0) {
-            printf("[diag] frame=%d dt=%.3f ui_draw_calls=%d\n",
-                   frameDiagCounter, dt, uiDrawCalls);
-            fflush(stdout);
-        }
-#endif
-
-        // Update input
         inputManager.update();
         const Input::InputState& inputState = inputManager.getInputState();
-        
-        // Skip input processing if ImGui wants capture
         bool wantCaptureKeyboard = io.WantCaptureKeyboard;
         bool wantCaptureMouse = io.WantCaptureMouse;
+        // When the cursor is over the viewport panel (and nothing - menu,
+        // modal, other panel - is stacked on top of it), hand the mouse +
+        // keyboard to the camera (orbit / zoom / fly / bot control) instead
+        // of ImGui swallowing it. Without this, io.WantCaptureKeyboard/Mouse
+        // are true whenever the cursor is over ANY ImGui window - including
+        // the viewport - which silently kills WASD + trackpad/mouse control.
+        // Clicking the viewport also latches KEYBOARD ownership, so WASD keeps
+        // flying even if the cursor drifts over a panel edge (the mouse itself
+        // stays with the panel it is over; text fields / active widgets still
+        // keep ImGui's keyboard capture).
+        static bool s_viewportFocused = false;
+        const bool overViewport = UI::IsViewport3DHovered() && !io.WantTextInput;
+        if (inputState.isMouseButtonPressed(Input::MouseButton::LEFT) || io.MouseClicked[0]) {
+            s_viewportFocused = overViewport;
+        }
+        if (overViewport) wantCaptureMouse = false;
+        // Keyboard goes to the game (camera / bot) when the viewport is hovered
+        // or focused, and ALWAYS during play mode - so WASD drives the bot even
+        // when the cursor sits over a panel. Active widgets (sliders, combos)
+        // and text fields keep ImGui's keyboard capture.
+        const bool cameraOwnsKeyboard =
+            (overViewport || s_viewportFocused || g_editor.isPlaying()) &&
+            !ImGui::IsAnyItemActive() && !io.WantTextInput;
+        if (cameraOwnsKeyboard) wantCaptureKeyboard = false;
         inputManager.setImGuiCapture(wantCaptureKeyboard, wantCaptureMouse);
-        
-        // Get window dimensions
+
+        // Camera mode keys 0-4 (Free / Follow / Orbit / Top-down / First-person).
+        // Mode is shared with the Camera menu + World Settings combo via uiState.
+        if (!wantCaptureKeyboard) {
+            if (inputState.isKeyPressed(GLFW_KEY_0)) g_editor.uiState.playCameraMode = 0;
+            else if (inputState.isKeyPressed(GLFW_KEY_1)) g_editor.uiState.playCameraMode = 1;
+            else if (inputState.isKeyPressed(GLFW_KEY_2)) g_editor.uiState.playCameraMode = 2;
+            else if (inputState.isKeyPressed(GLFW_KEY_3)) g_editor.uiState.playCameraMode = 3;
+            else if (inputState.isKeyPressed(GLFW_KEY_4)) g_editor.uiState.playCameraMode = 4;
+        }
+        const int camMode = std::clamp(g_editor.uiState.playCameraMode, 0, kPlayCameraModeCount - 1);
+
         int windowW, windowH;
         glfwGetWindowSize(window, &windowW, &windowH);
         if (windowH == 0) windowH = 1;
 
-        // ===== Cinematic camera startup =====
-        // For the first CINEMATIC_DURATION seconds after the editor becomes interactive,
-        // slowly orbit the camera around the world origin and pull it down toward a
-        // hero angle. Any keyboard/mouse input from the user ends the cinematic early.
-        static double cinematicStart = -1.0;
-        static bool cinematicActive = true;
-        static glm::vec3 cinematicStartPos = glm::vec3(0.0f);
-        static glm::vec3 cinematicEndPos = glm::vec3(0.0f);
-        static glm::vec3 cinematicTarget = glm::vec3(0.0f);
-        constexpr double CINEMATIC_DURATION = 6.0;
-        constexpr float CINEMATIC_RADIUS = 32.0f;
-        constexpr float CINEMATIC_HEIGHT = 14.0f;
-
-        flyCamera* cinematicCam = g_editor.camera();
-        if (cinematicStart < 0.0 && cinematicCam) {
-            cinematicStart = glfwGetTime();
-            cinematicStartPos = glm::vec3(-CINEMATIC_RADIUS, CINEMATIC_HEIGHT * 1.5f, 0.0f);
-            cinematicEndPos = glm::vec3(CINEMATIC_RADIUS * 0.8f, CINEMATIC_HEIGHT * 0.6f, CINEMATIC_RADIUS * 0.8f);
-            cinematicTarget = glm::vec3(0.0f, 1.5f, 0.0f);
-            cinematicCam->Position = cinematicStartPos;
-            cinematicCam->Target = cinematicTarget;
+        // ---- Play mode toggles (toolbar button sets g_editor state) -------------
+        if (!opts.headless && !wantCaptureKeyboard && inputState.isKeyDown(GLFW_KEY_F5)) {
+            g_editor.setPlaying(!g_editor.isPlaying());
+        }
+        // F8 toggles the Geo tracking panel (signature feature - live GPS feeds,
+        // trajectory prediction and storage).
+        if (!opts.headless && !wantCaptureKeyboard && inputState.isKeyDown(GLFW_KEY_F8)) {
+            g_editor.uiState.showGameMode = !g_editor.uiState.showGameMode;
+            // Geo tab is index 3 in the fixed tab bar {Outliner, Layers, World, Geo}.
+            if (g_editor.uiState.showGameMode) g_editor.scenePanelConfig.activeTabIndex = 3;
         }
 
-        if (cinematicActive && cinematicCam) {
+        // ---- Editor keyboard shortcuts (Ctrl combos + Delete) ----------------
+        if (!opts.headless && !wantCaptureKeyboard) {
+            const bool ctrl = inputState.isKeyDown(GLFW_KEY_LEFT_CONTROL) ||
+                              inputState.isKeyDown(GLFW_KEY_RIGHT_CONTROL);
+            if (ctrl && inputState.isKeyPressed(GLFW_KEY_Z)) {
+                UndoRedo::Undo();
+                g_editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
+            }
+            if (ctrl && inputState.isKeyPressed(GLFW_KEY_Y)) {
+                UndoRedo::Redo();
+                g_editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
+            }
+            if (ctrl && inputState.isKeyDown(GLFW_KEY_S)) {
+                SceneManager::SaveScene(g_editor.uiState.sceneFile, g_editor.world());
+            }
+            if (ctrl && inputState.isKeyDown(GLFW_KEY_D)) {
+                ecs::EntityID dup = EntityManager::DuplicateEntity(g_editor.selectedEntity());
+                if (dup != ecs::INVALID_ENTITY_ID) g_editor.setSelectedEntity(dup);
+            }
+            if (ctrl && inputState.isKeyDown(GLFW_KEY_N)) {
+                g_editor.world().shutdown();
+                g_editor.world().init();
+                UndoRedo::Clear();
+                g_editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
+            }
+            if (ctrl && inputState.isKeyDown(GLFW_KEY_O)) {
+                g_editor.uiState.showOpenScene = true;
+            }
+            if (inputState.isKeyPressed(GLFW_KEY_DELETE) ||
+                inputState.isKeyPressed(GLFW_KEY_BACKSPACE)) {
+                EntityManager::DeleteEntity(g_editor.selectedEntity());
+                g_editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
+            }
+        }
+        const bool playing = g_editor.isPlaying();
+        // The bot is always present in the viewport (loaded at startup). Play
+        // mode just hands the player control; exiting keeps the bot visible.
+        if (playing && !playWasActive) {
+            followCamInit = false;
+            std::cout << "[Engine] Entering play mode\n";
+        } else if (!playing && playWasActive) {
+            std::cout << "[Engine] Exiting play mode\n";
+        }
+        playWasActive = playing;
+
+        // Headless: auto-enter play mode and drive the scripted cinematic demo.
+        if (opts.headless && !playing) {
+            g_editor.setPlaying(true);
+            continue;  // re-run this frame with play mode active
+        }
+
+       // ---- Cinematic camera intro -------------------------------------------
+      /*  if (cinematicActive && cam) {
             double elapsed = glfwGetTime() - cinematicStart;
-            // End early on any user input
             bool userInput = inputState.isKeyDown(GLFW_KEY_W) || inputState.isKeyDown(GLFW_KEY_S) ||
                              inputState.isKeyDown(GLFW_KEY_A) || inputState.isKeyDown(GLFW_KEY_D) ||
                              inputState.isMouseButtonDown(Input::MouseButton::RIGHT) ||
-                             inputState.isMouseButtonDown(Input::MouseButton::LEFT) ||
-                             io.WantCaptureMouse; // (any click ends cinematic)
+                             inputState.isMouseButtonDown(Input::MouseButton::LEFT);
             if (userInput || elapsed >= CINEMATIC_DURATION) {
                 cinematicActive = false;
             } else {
                 float t = (float)(elapsed / CINEMATIC_DURATION);
-                // Ease-in-out cubic for a smooth feel
                 float ease = t < 0.5f ? 4.0f * t * t * t
                                       : 1.0f - (float)std::pow(-2.0 * t + 2.0, 3.0) * 0.5f;
-                glm::vec3 pos = glm::mix(cinematicStartPos, cinematicEndPos, ease);
-                // Continuous orbit during the cinematic
-                float angle = (float)elapsed * 18.0f; // ~18 deg/sec
+                float angle = (float)elapsed * 18.0f;
                 float yawRad = glm::radians(angle);
-                pos.x = glm::cos(yawRad) * CINEMATIC_RADIUS;
-                pos.z = glm::sin(yawRad) * CINEMATIC_RADIUS;
-                // Smoothly settle height from high to mid
+                glm::vec3 pos(glm::cos(yawRad) * CINEMATIC_RADIUS, 0.0f, glm::sin(yawRad) * CINEMATIC_RADIUS);
                 pos.y = glm::mix(CINEMATIC_HEIGHT * 1.5f, CINEMATIC_HEIGHT * 0.6f, ease);
-                cinematicCam->Position = pos;
-                cinematicCam->Target = cinematicTarget;
+                cam->Position = pos;
+                cam->Target = glm::vec3(0.0f, 1.5f, 0.0f);
+                (void)ease;
+            }
+        }*/
+
+        // ---- Camera (fly / follow) ---------------------------------------------
+        // Mode 0 (Free) uses the fly camera: WASD + right-drag look. Modes 1-4
+        // orbit the bot via UpdatePlayCamera below.
+        if (camMode == 0) {
+            if (!wantCaptureKeyboard) {
+                float moveSpeed = 10.0f * dt;
+                if (cam) {
+                    glm::vec3 forward = glm::normalize(cam->Target + cam->Position);
+                    glm::vec3 right = glm::normalize(glm::cross(forward, cam->WorldUp));
+                    if (inputState.isKeyDown(GLFW_KEY_W)) { cam->Position -= forward * moveSpeed; cam->Target -= forward * moveSpeed; }
+                    if (inputState.isKeyDown(GLFW_KEY_S)) { cam->Position += forward * moveSpeed; cam->Target -= forward * moveSpeed; }
+                    if (inputState.isKeyDown(GLFW_KEY_A)) { cam->Position += right * moveSpeed; cam->Target -= right * moveSpeed; }
+                    if (inputState.isKeyDown(GLFW_KEY_D)) { cam->Position -= right * moveSpeed; cam->Target += right * moveSpeed; }
+                }
+            }
+            // Orbit: hold right mouse (or trackpad right-button) and drag.
+            // ProcessMouseMovement expects ABSOLUTE cursor positions (it
+            // computes the delta internally) - passing mouseDelta would only
+            // produce second-order jitter and make the orbit feel dead.
+            if (!wantCaptureMouse) {
+                if (cam) cam->ProcessMouseMovement(inputState.mousePosition.x, inputState.mousePosition.y);
+            }
+            // Zoom: scroll wheel / trackpad two-finger scroll.
+            if (!wantCaptureMouse && inputState.scrollDelta.y != 0.0f) {
+                if (cam) cam->ProcessMouseScroll(inputState.scrollDelta.y);
             }
         }
 
-        // Process camera input
-        if (!wantCaptureKeyboard) {
-            float moveSpeed = 10.0f * dt;
-            flyCamera* cam = g_editor.camera();
-            if (cam) {
-                glm::vec3 forward = glm::normalize(cam->Target - cam->Position);
-                glm::vec3 right = glm::normalize(glm::cross(forward, cam->WorldUp));
-                
-                if (inputState.isKeyDown(GLFW_KEY_W)) { cam->Position += forward * moveSpeed; cam->Target += forward * moveSpeed; }
-                if (inputState.isKeyDown(GLFW_KEY_S)) { cam->Position -= forward * moveSpeed; cam->Target -= forward * moveSpeed; }
-                if (inputState.isKeyDown(GLFW_KEY_A)) { cam->Position -= right * moveSpeed; cam->Target -= right * moveSpeed; }
-                if (inputState.isKeyDown(GLFW_KEY_D)) { cam->Position += right * moveSpeed; cam->Target += right * moveSpeed; }
+        // ---- Simulate ------------------------------------------------------------
+        // The bot always runs in the viewport: outside play mode it gets zero
+        // input (idle loop), in play mode it reads the keyboard / cinematic demo.
+        const float aspect = (float)windowW / (float)std::max(1, windowH);
+        if (play.isLoaded()) {
+            CharacterInput in;
+            if (playing) {
+                if (opts.headless) {
+                    const int phase = CinematicDemo::PhaseAt(demoTime);
+                    const bool edge = (phase != lastPhase);
+                    lastPhase = phase;
+                    const CinematicDemo::Input cd = CinematicDemo::At(demoTime, edge);
+                    in.moveDirection = cd.moveDirection;
+                    in.moveMagnitude = 1.0f;
+                    in.sprint = cd.sprint;
+                    in.jump = cd.jump;
+                    in.crouch = false;
+                    in.grounded = true;
+                    in.verticalVelocity = 0.0f;
+                    demoTime += dt;
+                } else {
+                    in = KeyboardInput(inputState);
+                }
+            }
+            // else: zero input -> the character idles in place
+
+            auto terrain = [&worldManager](float x, float z) -> float {
+                return worldManager.getHeightAt(x, z);
+            };
+            play.update(dt, in, terrain);
+
+            const AnimatedCharacter& cc = play.character();
+
+            // Unreal-style ground clamp: the follow camera never sinks below
+            // the terrain (no more "under the floor" view).
+            followCam.groundHeightFn = terrain;
+
+            // Camera modes 1-4 (Follow/Orbit/Top-down/First-person) orbit the
+            // bot; mode 0 (Free) uses the fly camera above. camMode is already
+            // clamped + driven by keys 0-4 / the Camera menu / World Settings.
+            if (camMode >= 1) {
+                UpdatePlayCamera(camMode - 1, followCam, cc, dt, aspect, inputState,
+                                 followCamInit, lastCamMode, fpPitch);
+                lastCamMode = camMode - 1;
+            } else {
+                lastCamMode = -1;
+            }
+
+            if (!haveStart) { startPos = cc.position; haveStart = true; }
+            maxSpeed = std::max(maxSpeed, cc.currentSpeed());
+
+            // ---- Frame the bot once it has snapped to the terrain -------------
+            // The camera starts aimed at the world origin, but the bot stands at
+            // terrain height (y can be ~12+), so it used to be clipped off-frame
+            // at the top edge. One-shot: point the free camera at the bot's chest
+            // from a comfortable distance (the user can still fly away later).
+            static bool s_cameraFramed = false;
+            if (!s_cameraFramed && camMode == 0 && cam) {
+                s_cameraFramed = true;
+                // Unreal-style framing: chest-level target, ~5 units back.
+                cam->Target = cc.position + glm::vec3(0.0f, 1.3f, 0.0f);
+                cam->Position = cc.position + glm::vec3(0.0f, 2.0f, 5.0f);
             }
         }
-        
-        if (!wantCaptureMouse && inputState.isMouseButtonDown(Input::MouseButton::RIGHT)) {
-            flyCamera* cam = g_editor.camera();
-            if (cam) cam->ProcessMouseMovement(inputState.mouseDelta.x, inputState.mouseDelta.y);
-        }
-        
-        glm::vec3 cameraPosition = g_editor.camera() ? g_editor.camera()->Position : glm::vec3(0.0f);
+
+        glm::vec3 cameraPosition = (camMode >= 1 && play.isLoaded())
+                                       ? followCam.position
+                                       : (cam ? cam->Position : glm::vec3(0.0f));
         worldManager.update(cameraPosition, dt);
         world.update(dt);
-        
-        // Render scene to viewport framebuffer
-        glBindFramebuffer(GL_FRAMEBUFFER, renderPipeline.getFramebuffer());
-        glViewport(0, 0, renderPipeline.getViewportWidth(), renderPipeline.getViewportHeight());
-        
-        // Diagnostic clear color: if the viewport shows red, the FBO is being
-        // displayed but the skybox/scene are not drawing into it.
-        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        
-        renderPipeline.beginFrame();
-        
-        // Setup camera matrices
-        flyCamera* cam = g_editor.camera();
-        glm::mat4 view = cam ? cam->GetViewMatrix() : glm::mat4(1.0f);
-        glm::mat4 projection = glm::perspective(
-            glm::radians(45.0f),
-            (float)renderPipeline.getViewportWidth() / (float)std::max(1, renderPipeline.getViewportHeight()),
-            renderConfig.nearPlane,
-            renderConfig.farPlane
-        );
-        
-        // Render 3D scene
-        renderPipeline.renderScene(view, projection, cameraPosition, 45.0f);
-        worldManager.render(view, projection, cameraPosition);
 
-        // Diagnostic: verify the viewport FBO actually contains pixels
-        static int frameCount = 0;
-        frameCount++;
-        if (frameCount <= 5 || frameCount % 60 == 0) {
-            int fbW = renderPipeline.getViewportWidth();
-            int fbH = renderPipeline.getViewportHeight();
-            if (fbW > 0 && fbH > 0) {
-                std::vector<unsigned char> px(4, 0);
-                glReadPixels(fbW / 2, fbH / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-                printf("[viewport-diag] frame=%d fbo=%u size=%dx%d center_pixel=(%d,%d,%d,%d)\n",
-                       frameCount, renderPipeline.getFramebuffer(), fbW, fbH,
-                       px[0], px[1], px[2], px[3]);
+        // ---- Geo pipeline <-> UI bridge -------------------------------------------
+        // Push the live ECS geospatial pipeline state into the GeoAPI facade so the
+        // Geo tracking panel + status bar show real GPS data, and push back any
+        // panel-driven GPS config changes (mode/speed/noise).
+        {
+            auto& geoSystem = g_editor.geospatialSystem();
+            auto& geoApi = geoSystem.getGeoAPI();
+            geoApi.syncTo(geoSystem.getIngestionSystem());
+            geo::GeoStats stats{};
+            stats.trackedEntityCount = geoSystem.getGeospatialEntityCount();
+            stats.totalPointsStored = geoSystem.getTimeSeriesDB().size();
+            stats.ingestionRate = 0.0;
+            stats.lastUpdateTime = glfwGetTime();
+            geoApi.syncFrom(geoSystem.getCurrentGPSFix(),
+                            geoSystem.getEntitySnapshots(), stats);
+            if (opts.headless && frameCount == 120) {
+                const geo::GPSStatus gs = geoApi.getGPSStatus();
+                printf("[geo-diag] frame=%d fix=%s lat=%.6f lon=%.6f alt=%.1f speed=%.1f\n",
+                       frameCount, gs.isValid ? "VALID" : "none",
+                       gs.latitude, gs.longitude, gs.altitude, gs.speed);
                 fflush(stdout);
             }
         }
-        
-        // Return to default framebuffer for UI
+
+        // ---- Render scene into the viewport FBO ----------------------------------
+        // beginFrame()/renderScene() do not clear, so clear color + depth first or
+        // the FBO keeps stale/undefined contents (blank viewport).
+        glBindFramebuffer(GL_FRAMEBUFFER, renderPipeline.getFramebuffer());
+        glViewport(0, 0, renderPipeline.getViewportWidth(), renderPipeline.getViewportHeight());
+        glClearColor(0.08f, 0.09f, 0.12f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glm::mat4 view = cam ? cam->GetViewMatrix() : glm::mat4(1.0f);
+        if (camMode >= 1 && play.isLoaded()) view = followCam.getViewMatrix();
+        const float kCamFov = (camMode >= 1 && play.isLoaded())
+                                  ? followCam.config.fov : 60.0f;
+        glm::mat4 projection = glm::perspective(
+            glm::radians(kCamFov),
+            (float)renderPipeline.getViewportWidth() / (float)std::max(1, renderPipeline.getViewportHeight()),
+            renderConfig.nearPlane, renderConfig.farPlane);
+
+        renderPipeline.beginFrame();
+        renderPipeline.renderScene(view, projection, cameraPosition, kCamFov);
+        worldManager.render(view, projection, cameraPosition);
+        // The bot is always in the viewport (idle outside play mode).
+        if (play.isLoaded()) RenderPlayCharacter(play, playModel.get(), renderPipeline, view, projection, cameraPosition);
+
+
+        // ---- ImGui editor UI on top of the viewport texture ----------------------
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0, 0, windowW, windowH);
-        
-        // Setup ImGui frame
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-#if DEBUG_FRAME_LOG
-        // Per-frame diagnostic: capture all display/viewport state to find why panels appear blank
-        if (frameDiagCounter % 60 == 0) {
-            int fbW = 0, fbH = 0;
-            glfwGetFramebufferSize(window, &fbW, &fbH);
-            int curFBO = 0;
-            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &curFBO);
-            GLint vp[4] = {0,0,0,0};
-            glGetIntegerv(GL_VIEWPORT, vp);
-            printf("[diag] fb_size=%dx%d win_size=%dx%d io.DisplaySize=%.1fx%.1f io.DisplayFramebufferScale=%.2fx%.2f curFBO=%d glViewport=%d,%d %dx%d\n",
-                   fbW, fbH, windowW, windowH,
-                   io.DisplaySize.x, io.DisplaySize.y,
-                   io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y,
-                   curFBO, vp[0], vp[1], vp[2], vp[3]);
-            fflush(stdout);
-        }
-#endif
-
-        // ====================================================================
-        // FULL MODULAR EDITOR UI
-        // ====================================================================
-        if (g_editor.entityCache().dirty) {
-            UI::RebuildEntityCache(g_editor.entityCache(), g_editor.world());
+        if (entityCache.dirty) {
+            UI::RebuildEntityCache(entityCache, world);
         }
 
-        UI::RenderMenuBar(g_editor, "");
+        UI::RenderMenuBar(g_editor, g_editor.uiState.sceneFile);
         if (g_editor.shouldClose()) glfwSetWindowShouldClose(window, true);
+        UI::RenderSceneDialogs(g_editor);
         UI::RenderToolbar(g_editor);
-
         UI::RenderLeftPanel(g_editor);
         UI::RenderRightPanel(g_editor);
-
         UI::RenderBottomPanel(g_editor, fps);
-
-        UI::RenderViewport(g_editor, renderPipeline.getFramebufferTexture(), windowW, windowH, window, io, projection);
-
-        UI::RenderStatusBar(g_editor.world().getEntityCount(), g_editor.selectedEntity(), fps, g_editor.isPlaying(), g_editor.wasPlaying(), windowW, windowH);
+        // Pass the active view camera (fly in Free mode, follow cam in modes
+        // 1-4) so the viewport overlay + gizmo/grid reflect what is rendered.
+        const glm::vec3* activeCamPos = (camMode >= 1 && play.isLoaded())
+                                            ? &followCam.position
+                                            : (cam ? &cam->Position : nullptr);
+        const glm::vec3* activeCamTarget = (camMode >= 1 && play.isLoaded())
+                                               ? &followCam.target
+                                               : (cam ? &cam->Target : nullptr);
+        UI::RenderViewport(g_editor, renderPipeline.getFramebufferTexture(), windowW, windowH, window, &io,
+                           projection, view,
+                           play.isLoaded() ? kPlayCameraModeNames[camMode] : nullptr,
+                           activeCamPos, activeCamTarget);
+        if (playing && play.isLoaded()) UI::RenderPlayModeHUD(play, kPlayCameraModeNames[camMode]);
+        UI::RenderStatusBar(world.getEntityCount(), g_editor.selectedEntity(), fps,
+                            g_editor.isPlaying(), g_editor.wasPlaying(), windowW, windowH);
         UI::RenderAboutDialog(g_editor.showAboutRef());
-        
-        // Render ImGui
+
         ImGui::Render();
-#if DEBUG_FRAME_LOG
-        uiDrawCalls = ImGui::GetDrawData() ? (int)ImGui::GetDrawData()->CmdLists.Size : 0;
-        // One-time dump at frame 60: print draw list contents to verify what ImGui actually generated
-        if (frameDiagCounter == 60 && ImGui::GetDrawData()) {
-            const ImDrawData* dd = ImGui::GetDrawData();
-            fprintf(stderr, "[diag-drawlist] cmd_lists=%d total_idx=%d total_vtx=%d\n",
-                    dd->CmdLists.Size, dd->TotalIdxCount, dd->TotalVtxCount);
-            for (int n = 0; n < dd->CmdLists.Size && n < 5; n++) {
-                const ImDrawList* cl = dd->CmdLists[n];
-                fprintf(stderr, "[diag-drawlist] list[%d]: vtx=%d idx=%d cmds=%d\n",
-                        n, cl->VtxBuffer.Size, cl->IdxBuffer.Size, cl->CmdBuffer.Size);
-                for (int c = 0; c < cl->CmdBuffer.Size && c < 5; c++) {
-                    const ImDrawCmd& cmd = cl->CmdBuffer[c];
-                    fprintf(stderr, "[diag-drawlist]   cmd[%d]: clip=(%.0f,%.0f,%.0f,%.0f) idx_count=%d tex=%p\n",
-                            c, cmd.ClipRect.x, cmd.ClipRect.y, cmd.ClipRect.z, cmd.ClipRect.w,
-                            cmd.ElemCount, (void*)(intptr_t)cmd.GetTexID());
-                }
-            }
-            // Print font atlas info
-            fprintf(stderr, "[diag-fonts] count=%d default_font_size=%.1f\n",
-                    io.Fonts->Fonts.Size, ImGui::GetFontSize());
-            fflush(stderr);
-        }
-#endif
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        
+
         renderPipeline.renderUI();
         renderPipeline.endFrame();
-        
-        // Swap buffers and poll events
+
         glfwSwapBuffers(window);
         glfwPollEvents();
 
-#if DEBUG_FRAME_LOG
-        // Pixel capture at frame 60: read back the framebuffer to verify ImGui
-        // is producing visible pixels. Runs once at frame 60, after swap, so
-        // we sample what was just presented. We can't read the front buffer
-        // portably, but on the typical desktop GL stack the swap doesn't
-        // invalidate the back buffer contents immediately, so this still
-        // reflects what the renderer drew this frame.
-        if (frameDiagCounter == 60) {
-            int fbW = windowW, fbH = windowH;
-            glfwGetFramebufferSize(window, &fbW, &fbH);
-            if (fbW > 0 && fbH > 0) {
-                std::vector<unsigned char> pixels(static_cast<size_t>(fbW) * fbH * 4, 0);
-                glReadPixels(0, 0, fbW, fbH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-
-                // Count non-background pixels (anything not close to dark gray-blue).
-                // Background clear color is (0.1, 0.1, 0.15) -> ~(25, 25, 38) in 8-bit.
-                int nonBg = 0;
-                int samples = 0;
-                const int totalPx = fbW * fbH;
-                // Sample every 10th pixel for speed.
-                for (int i = 0; i < totalPx; i += 10) {
-                    unsigned char r = pixels[i * 4 + 0];
-                    unsigned char g = pixels[i * 4 + 1];
-                    unsigned char b = pixels[i * 4 + 2];
-                    samples++;
-                    const int ri = static_cast<int>(r);
-                    const int gi = static_cast<int>(g);
-                    const int bi = static_cast<int>(b);
-                    if ((ri - 25 > 20 || ri - 25 < -20) ||
-                        (gi - 25 > 20 || gi - 25 < -20) ||
-                        (bi - 38 > 20 || bi - 38 < -20)) {
-                        nonBg++;
-                    }
-                }
-                float pct = (samples > 0) ? (100.0f * nonBg / static_cast<float>(samples)) : 0.0f;
-                printf("[diag] pixel_capture: fb=%dx%d samples=%d non_bg_pixels=%d (%.1f%%)\n",
-                       fbW, fbH, samples, nonBg, pct);
-                fflush(stdout);
-            } else {
-                printf("[diag] pixel_capture: skipped, fb=%dx%d\n", fbW, fbH);
-                fflush(stdout);
-            }
+        // ---- Headless bound -------------------------------------------------------
+        if (hidden && frameCount >= opts.frames) {
+            glfwSetWindowShouldClose(window, true);
         }
-#endif
+
+
     }
-    
-    // Cleanup
-    std::cout << "Shutting down...\n";
 
+    // ---- Summary ------------------------------------------------------------------
+    std::cout << "\n[Engine] Main loop ended after " << frameCount << " frames\n";
+    if (play.isLoaded()) {
+        const auto& cc = play.character();
+        const auto diag = play.debugPoseDiag();
+        const float dist = glm::length(cc.position - startPos);
+        std::cout << "  character final : " << cc.position.x << ", " << cc.position.y
+                  << ", " << cc.position.z << "\n"
+                  << "  distance moved  : " << dist << " units\n"
+                  << "  max speed       : " << maxSpeed << " m/s\n"
+                  << "  final state     : " << AnimationStateToString(cc.state()) << "\n"
+                  << "  matcher clip    : " << diag.matcherClip << "\n"
+                  << "  active clip     : " << cc.activeClipName() << "\n"
+                  << "  motion matching : " << (cc.isMotionMatchingActive() ? "ACTIVE" : "off") << "\n"
+                  << "  foot IK         : L=" << (diag.leftLocked ? "LOCK" : "free")
+                  << " R=" << (diag.rightLocked ? "LOCK" : "free") << "\n";
+    }
+    std::cout << "  average fps     : " << (frameCount > 0 ? (float)frameCount / std::max(0.001f, lastTime - 0.0f) : 0.0f) << "\n";
+
+    // ---- Cleanup --------------------------------------------------------------------
+    // Tear down play-mode GPU resources while the GL context is still alive
+    // (Model's destructor issues GL calls via BoneMatrixBuffer::Shutdown).
+    play.shutdown();
+    playModel.reset();
     CleanupEditor();
-
-    // Mark context dead BEFORE we tear down GLFW. Anything still holding GL
-    // resources and surviving to static-destruction time will no-op its
-    // destructor instead of dereferencing a dead GL context.
     glctx::setAlive(false);
-    
-    // Shutdown managers
     renderPipeline.shutdown();
     inputManager.shutdown();
     worldManager.shutdown();
-    
+
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
-    
+
     glfwDestroyWindow(window);
     glfwTerminate();
-    
-    std::cout << "Goodbye!\n";
+
+    std::cout << "[Engine] Shutdown complete.\n";
     return 0;
+}
+
+// ============================================================================
+// main
+// ============================================================================
+int main(int argc, char** argv) {
+    signal(SIGSEGV, crashHandler);
+    signal(SIGABRT, crashHandler);
+    signal(SIGFPE, crashHandler);
+
+    const AppOptions opts = parseOptions(argc, argv);
+
+    std::cout << "\n"
+              << "  ============================================================\n"
+              << "    RTT ENGINE - ENGINE + EDITOR APPLICATION\n"
+              << "    tests: 535 | systems: ECS, physics, animation, motion\n"
+              << "    matching, camera, terrain, memory, geo, editor UI, demo\n"
+              << "  ============================================================\n";
+
+    if (opts.help) {
+        std::cout << kUsage;
+        return 0;
+    }
+
+    printSystemInventory();
+
+    if (!opts.skipTests) {
+        const int testResult = runTestPhase(argc, argv);
+        if (testResult != 0) {
+            std::cerr << "\n[Engine] Self-check FAILED - not booting the editor app.\n"
+                      << "[Engine] Fix the failing tests, or re-run with --skip-tests\n"
+                      << "[Engine] to force-boot anyway.\n";
+            return testResult;
+        }
+        std::cout << "\n[Engine] All tests passed - booting the editor app.\n";
+    } else {
+        std::cout << "\n[Engine] Self-check skipped (--skip-tests) - booting the editor app.\n";
+    }
+
+    if (opts.headless) {
+        std::cout << "\n[Engine] Headless mode: bounded run of " << opts.frames << " frames.\n";
+    }
+
+    return runEditorApp(opts);
 }

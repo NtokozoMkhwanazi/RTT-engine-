@@ -71,9 +71,18 @@ private:
     SimpleWorldRenderer m_renderer;
     std::map<WorldObjectType, int> m_modelIds;  // Map type to loaded model ID
     std::map<WorldObjectType, WorldObjectConfig> m_configs;
+
+    // Normalization: each raw asset is scaled so its Y extent maps to a
+    // reference height in meters (see referenceHeight()), letting the
+    // vegetation placement scales (heights in meters) render at sane sizes
+    // regardless of how big the source model is.
+    std::map<WorldObjectType, float> m_modelBaseScale;
+
     bool m_initialized = false;
     bool m_shadowsEnabled = true;
     
     // Generate random scale for object type
     float randomScale(WorldObjectType type) const;
+    // Reference height in meters for a type (placement param 1.0 == this height)
+    float referenceHeight(WorldObjectType type) const;
 };

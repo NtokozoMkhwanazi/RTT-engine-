@@ -1,5 +1,6 @@
 #include "WorldObjectManager.h"
 #include <iostream>
+#include <chrono>
 #include <random>
 
 WorldObjectManager::WorldObjectManager() {
@@ -11,21 +12,24 @@ WorldObjectManager::~WorldObjectManager() {
 void WorldObjectManager::initialize(const std::string& assetDir) {
     std::cout << "[WorldObjectManager] Initializing...\n";
 
-    // Define default object configurations
-    // Trees
+    // Real assets. The trees/boulders are glTF models living next to the
+    // World_objects dir (quiver_tree/q.gltf, boulder/BOULDER.gltf); the small
+    // plant glTF sets cover bushes, grass and flower patches. Rock FBXs stay
+    // local to World_objects. The 60MB grass/flowers FBX files are NOT used -
+    // the glTF variants load in milliseconds.
     m_configs[WorldObjectType::TREE_PINE] = {
-        assetDir + "pine_tree.fbx", 0.8f, 1.5f, {15.0f, 40.0f, 80.0f}
+        assetDir + "../quiver_tree/q.gltf", 0.8f, 1.5f, {15.0f, 40.0f, 80.0f}
     };
     m_configs[WorldObjectType::TREE_OAK] = {
-        assetDir + "oak_tree.fbx", 0.9f, 1.3f, {20.0f, 50.0f, 100.0f}
+        assetDir + "../quiver_tree/q.gltf", 0.9f, 1.3f, {20.0f, 50.0f, 100.0f}
     };
     m_configs[WorldObjectType::TREE_BIRCH] = {
-        assetDir + "birch_tree.fbx", 0.85f, 1.2f, {15.0f, 45.0f, 90.0f}
+        assetDir + "../quiver_tree/q.gltf", 0.85f, 1.2f, {15.0f, 45.0f, 90.0f}
     };
 
-    // Rocks
+    // Rocks / boulders
     m_configs[WorldObjectType::ROCK_BOULDER] = {
-        assetDir + "Rock0.fbx", 0.5f, 2.0f, {10.0f, 30.0f, 60.0f}
+        assetDir + "../boulder/BOULDER.gltf", 0.5f, 2.0f, {10.0f, 30.0f, 60.0f}
     };
     m_configs[WorldObjectType::ROCK_STONE] = {
         assetDir + "stone.fbx", 0.3f, 0.8f, {8.0f, 20.0f, 40.0f}
@@ -34,32 +38,38 @@ void WorldObjectManager::initialize(const std::string& assetDir) {
         assetDir + "Rock1.fbx", 1.0f, 3.0f, {30.0f, 80.0f, 150.0f}
     };
 
-
-    // Vegetation - Use actual files from assets/World_objects/
+    // Vegetation - real glTF plants (tiny vs. the 60MB grass/flowers FBX).
     m_configs[WorldObjectType::GRASS_CLUSTER] = {
-        assetDir + "grass.fbx", 0.6f, 1.0f, {5.0f, 15.0f, 30.0f}
+        assetDir + "../grass/grass.gltf", 0.6f, 1.0f, {5.0f, 15.0f, 30.0f}
     };
     m_configs[WorldObjectType::FLOWER_PATCH] = {
-        assetDir + "flowers.fbx", 0.5f, 0.8f, {5.0f, 12.0f, 25.0f}
+        assetDir + "../periwinkle/periwinkle_plant_4k.gltf", 0.5f, 0.8f, {5.0f, 12.0f, 25.0f}
     };
     m_configs[WorldObjectType::BUSH] = {
-        assetDir + "stone.fbx", 0.7f, 1.2f, {10.0f, 25.0f, 50.0f}
+        assetDir + "../othonna/othonna.gltf", 0.7f, 1.2f, {10.0f, 25.0f, 50.0f}
     };
 
-    // Props - Bear and Datsun models
+    // Props
     m_configs[WorldObjectType::LOG] = {
         assetDir + "Bear_DEMO.fbx", 0.8f, 1.5f, {15.0f, 40.0f, 80.0f}
     };
     m_configs[WorldObjectType::STUMP] = {
-        assetDir + "datsun.fbx", 0.6f, 1.0f, {10.0f, 30.0f, 60.0f}
+        assetDir + "Rock3.fbx", 0.6f, 1.0f, {10.0f, 30.0f, 60.0f}
     };
     
-    // Load all models
+    // Load all models, normalizing each to its reference height so the
+    // vegetation placement scales (heights in meters) render at sane sizes
+    // no matter how big the raw asset is.
+    m_modelBaseScale.clear();
     for (const auto& [type, config] : m_configs) {
         int modelId = m_renderer.loadModel(config.modelPath);
         if (modelId >= 0) {
             m_modelIds[type] = modelId;
-            std::cout << "  Loaded " << config.modelPath << " (ID: " << modelId << ")\n";
+            const float modelH = m_renderer.getModelSize(modelId).y;
+            m_modelBaseScale[type] = referenceHeight(type) / modelH;
+            std::cout << "  Loaded " << config.modelPath << " (ID: " << modelId
+                      << ", modelH=" << modelH << "m, baseScale="
+                      << m_modelBaseScale[type] << ")\n";
         } else {
             std::cout << "  [Optional] " << config.modelPath << " (not found, will use fallback)\n";
         }
@@ -105,6 +115,11 @@ void WorldObjectManager::placeObject(WorldObjectType type, const glm::vec3& posi
     if (scale <= 0.0f) {
         scale = randomScale(type);
     }
+
+    // Normalize: placement scales are meters-referenced; the raw model may be
+    // any size, so convert via the per-type base scale.
+    auto bs = m_modelBaseScale.find(type);
+    if (bs != m_modelBaseScale.end() && bs->second > 0.0f) scale *= bs->second;
     
     m_renderer.addInstance(it->second, position, scale, rotationY);
 }
@@ -152,4 +167,25 @@ float WorldObjectManager::randomScale(WorldObjectType type) const {
     std::uniform_real_distribution<float> dist(it->second.minScale, 
                                                 it->second.maxScale);
     return dist(gen);
+}
+
+float WorldObjectManager::referenceHeight(WorldObjectType type) const {
+    switch (type) {
+        case WorldObjectType::TREE_PINE:
+        case WorldObjectType::TREE_OAK:
+        case WorldObjectType::TREE_BIRCH:
+            return 5.0f;              // placement 1.0 == 5m tree
+        case WorldObjectType::ROCK_BOULDER:
+            return 2.0f;
+        case WorldObjectType::ROCK_CLIFF:
+            return 2.5f;
+        case WorldObjectType::ROCK_STONE:
+            return 0.8f;
+        case WorldObjectType::GRASS_CLUSTER:
+        case WorldObjectType::FLOWER_PATCH:
+        case WorldObjectType::BUSH:
+            return 1.0f;
+        default:
+            return 1.0f;
+    }
 }

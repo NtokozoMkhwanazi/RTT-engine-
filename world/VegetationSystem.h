@@ -31,6 +31,15 @@ public:
         int type;  // 0=boulder, 1=stone, 2=cliff
     };
 
+    // Ground plants: grass clusters / flower patches (celandine, periwinkle) /
+    // succulents (othonna) - low vegetation snapped to the terrain surface.
+    struct Plant {
+        glm::vec3 position;
+        float scale;
+        float rotation;
+        int type;  // 0=grass, 1=flower (periwinkle), 2=succulent (othonna)
+    };
+
     // Instance data for GPU (tightly packed for performance)
     struct TreeInstance {
         glm::vec3 position;
@@ -56,6 +65,7 @@ public:
     // Get trees for rendering
     const std::vector<Tree>& getTrees() const { return m_trees; }
     const std::vector<Rock>& getRocks() const { return m_rocks; }
+    const std::vector<Plant>& getPlants() const { return m_plants; }
 
     // Clear vegetation (for chunk unloading)
     void clear();
@@ -86,6 +96,7 @@ private:
     VegetationConfig m_config;
     std::vector<Tree> m_trees;
     std::vector<Rock> m_rocks;
+    std::vector<Plant> m_plants;
     std::mt19937 m_rng;
 
     // Instance buffers for GPU

@@ -1,147 +1,189 @@
 # ============================================================
-#  3D Simulation Engine Makefile (Industry-Style)
-#  - Debug / Release builds
+#  RTT-Engine 3D Game Engine Makefile
+#  - Debug / Release / ASan builds
 #  - Object files in build/
-#  - Executable in bin/
+#  - Test runner with Google Test
 #  - Auto-detects source files
-#  - Unit testing with Google Test
 # ============================================================
 
 CXX       := g++
-CXXFLAGS  := -std=c++17 -Wall -Wextra -Wno-unused-parameter
+CXXFLAGS  := -std=c++17 -Wall -Wextra -Wno-unused-parameter -MMD -MP
 
-# --- Optional: disable geospatial subsystem for faster iteration ---
-ifdef DISABLE_GEOSPATIAL
-    CXXFLAGS += -DDISABLE_GEOSPATIAL
-endif
+# The header-dependency files are -include'd below, and their rules (one per
+# object) would otherwise become make's default goal before 'all' is seen.
+# Pin the default goal so a bare `make` builds the test runner (bin/test_runner).
+.DEFAULT_GOAL := all
 
 # --- Build mode ---
 MODE ?= debug
 
 # --- Output names ---
-TARGET    := app
 TEST_TARGET := test_runner
-BUILD_DIR := build
-TEST_DIR  := tests
+BUILD_DIR   := build
+TEST_DIR    := tests
+BIN_DIR     := bin
 
 # --- Include paths ---
-INCLUDES := -I. -Isrc -IcameraSystem -ImotionMatching -IanimationSystem -IboneSystem -IshaderSystem -ImeshSystem -ImodelSystem -IphysicsSystem -IplayerSystem -Irenderer -Ilighting -Imemory -Iworld -Idemo -Iutils -IanimationSystem -Irenderer -Iutils -ImeshSystem -Iecs -Ieditor -Igeospatial -I/usr/include/jsoncpp -I/usr/include/eigen3
+INCLUDES := -I. \
+            -Iinclude \
+            -Iinclude/glad \
+            -Isrc \
+            -IanimationSystem \
+            -IboneSystem \
+            -IcameraSystem \
+            -Icomponents \
+            -Idemo \
+            -Iecs \
+            -Ieditor \
+            -Igeospatial \
+            -Ilighting \
+            -Imemory \
+            -ImeshSystem \
+            -ImodelSystem \
+            -ImotionMatching \
+            -IphysicsSystem \
+            -IplayerSystem \
+            -Irenderer \
+            -IshaderSystem \
+            -Iworld \
+            -Iutils \
+            -Iexternal/imgui \
+            -Iexternal/imgui/backends \
+            -IIconFontCppHeaders-main \
+            -I/usr/include/jsoncpp \
+            -I/usr/include/eigen3
 
-# ImGui support (optional)
-IMGUI_DIR := external/imgui
-IMGUI_INCLUDES := -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
-IMGUI_CHECK := $(wildcard $(IMGUI_DIR)/imgui.h)
-ifneq ($(IMGUI_CHECK),)
-    INCLUDES += $(IMGUI_INCLUDES)
-    IMGUI_ENABLED := 1
-    $(info Dear ImGui found - UI system enabled!)
-else
-    IMGUI_ENABLED := 0
-    $(warning Dear ImGui not found - UI system will use stubs)
-    $(warning Run: git clone https://github.com/ocornut/imgui.git external/imgui)
-endif
-
-# --- Libraries (your engine dependencies) ---
+# --- Libraries ---
 LIBS := -lassimp -lopenal -lz -ldl -lglfw -lGL -lX11 -lGLEW -ljsoncpp -pthread -lcurl
 
-# --- Google Test (installed via apt) ---
-GTEST_LIBS := -lgtest -lgtest_main -pthread
+# --- Google Test ---
+# gtest_main provides the main() used by the test runner only. The engine
+# entry point (test.cpp) owns main() itself and links against plain gtest.
+GTEST_LIBS := -lgtest -lgtest_main -lpthread
+GTEST_LIBS_NO_MAIN := -lgtest -lpthread
 
 # --- Mode flags ---
 ifeq ($(MODE),release)
 	CXXFLAGS += -O2 -DNDEBUG
-	LDFLAGS := 
+	LDFLAGS :=
 else ifeq ($(MODE),asan)
 	CXXFLAGS += -g -O0 -DDEBUG -fsanitize=address -fno-omit-frame-pointer
 	LDFLAGS := -fsanitize=address -rdynamic
 else
 	CXXFLAGS += -g -O0 -DDEBUG
-	LDFLAGS := 
+	LDFLAGS :=
 endif
 
 # --- Source files (auto collect) ---
 SRC_CPP := \
 	$(wildcard animationSystem/*.cpp) \
 	$(wildcard boneSystem/*.cpp) \
-	$(wildcard meshSystem/*.cpp) \
-	$(wildcard modelSystem/*.cpp) \
-	$(wildcard physicsSystem/*.cpp) \
-	$(wildcard playerSystem/*.cpp) \
-	$(wildcard shaderSystem/*.cpp) \
-	$(wildcard renderer/*.cpp) \
-	$(wildcard lighting/*.cpp) \
-	$(wildcard memory/*.cpp) \
-	$(wildcard world/*.cpp) \
-	$(wildcard motionMatching/*.cpp) \
+	$(wildcard components/*.cpp) \
 	$(wildcard demo/*.cpp) \
+	$(wildcard ecs/*.cpp) \
 	$(wildcard editor/*.cpp) \
 	$(wildcard geospatial/*.cpp) \
-	$(wildcard ecs/systems/*.cpp) \
-	ComponentRegistry.cpp \
-	ecs/ComponentTypeID.cpp \
-	test.cpp
+	$(wildcard lighting/*.cpp) \
+	$(wildcard memory/*.cpp) \
+	$(wildcard meshSystem/*.cpp) \
+	$(wildcard modelSystem/*.cpp) \
+	$(wildcard motionMatching/*.cpp) \
+	$(wildcard physicsSystem/*.cpp) \
+	$(wildcard playerSystem/*.cpp) \
+	$(wildcard renderer/*.cpp) \
+	$(wildcard shaderSystem/*.cpp) \
+	$(wildcard world/*.cpp) \
+	$(wildcard utils/*.cpp)
 
-# --- Optional: drop geospatial sources when DISABLE_GEOSPATIAL=1 ---
-ifdef DISABLE_GEOSPATIAL
-    SRC_CPP := $(filter-out editor/geo_config_panel.cpp,$(SRC_CPP))
-endif
+# ImGui source files (compiled from local copy)
+IMGUI_SRC := \
+	external/imgui/imgui.cpp \
+	external/imgui/imgui_demo.cpp \
+	external/imgui/imgui_draw.cpp \
+	external/imgui/imgui_tables.cpp \
+	external/imgui/imgui_widgets.cpp \
+	external/imgui/backends/imgui_impl_glfw.cpp \
+	external/imgui/backends/imgui_impl_opengl3.cpp
 
-# ImGui source files (if enabled)
-ifeq ($(IMGUI_ENABLED),1)
-    IMGUI_SRC := \
-        $(IMGUI_DIR)/imgui.cpp \
-        $(IMGUI_DIR)/imgui_demo.cpp \
-        $(IMGUI_DIR)/imgui_draw.cpp \
-        $(IMGUI_DIR)/imgui_tables.cpp \
-        $(IMGUI_DIR)/imgui_widgets.cpp \
-        $(IMGUI_DIR)/backends/imgui_impl_glfw.cpp \
-        $(IMGUI_DIR)/backends/imgui_impl_opengl3.cpp
-    
-    SRC_CPP += $(IMGUI_SRC)
-endif
+SRC_CPP += $(IMGUI_SRC)
 
-# Note: test.cpp is the main ECS-based executable
-# Old test files moved to legacy/old_tests/
+# C source files
+SRC_C := src/glad.c
 
-# Auto-detect all cpp files in world/
+# --- Test source files (all tests; individually excluded if broken) ---
+ALL_TESTS := $(wildcard $(TEST_DIR)/*.cpp)
 
-# Exclude original implementations (keeping only .original backups)
-# Enhanced versions are now the default (mesh.cpp and model.cpp)
+# Standalone apps (have their own main())
+STANDALONE_TESTS := $(TEST_DIR)/bot_viewport_minimal.cpp $(TEST_DIR)/test_geoterrain.cpp
 
-SRC_C := \
-	src/glad.c
+# Excluded files that need deeper implementation work (none currently):
+EXCLUDED_TESTS :=
 
-# --- Test source files ---
-TEST_SRC := \
-	$(wildcard $(TEST_DIR)/*.cpp)
+TEST_SRC := $(filter-out $(STANDALONE_TESTS) $(EXCLUDED_TESTS),$(ALL_TESTS))
+
+# Standalone test app names
+BOT_VIEWPORT_TEST  := bot_viewport_test
+GEOTERRAIN_TEST    := geoterrain_test
+EDITOR_APP        := editor_app
+ENGINE_APP        := engine
+
+# Engine binary object set: all engine objects + every test object except
+# test_main.cpp (which owns main(); test.cpp replaces that role here).
+# NOTE: recursive (=) on purpose - TEST_OBJ is defined later in the file.
+ENGINE_TEST_OBJ = $(filter-out $(BUILD_DIR)/tests/test_main.o,$(TEST_OBJ))
 
 # --- Object files ---
 OBJ_CPP := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRC_CPP))
 OBJ_C   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRC_C))
 TEST_OBJ := $(patsubst $(TEST_DIR)/%.cpp,$(BUILD_DIR)/tests/%.o,$(TEST_SRC))
-# Exclude test.o from library objects (has main(), only for executable)
-OBJS    := $(filter-out build/test.o,$(OBJ_CPP)) $(OBJ_C)
+OBJS    := $(OBJ_CPP) $(OBJ_C)
 
-# --- Final output ---
-OUTPUT := $(TARGET)
+# --- Header dependency files (from -MMD -MP) ---
+# Auto-included so any header change triggers a rebuild of the objects that
+# include it (directly or transitively). Dep files live next to their .o.
+DEP_FILES := $(OBJS:.o=.d) $(TEST_OBJ:.o=.d) \
+             $(BUILD_DIR)/test.d $(BUILD_DIR)/src/editor_main.d
+-include $(DEP_FILES)
 
 # ============================================================
 #  Default target
 # ============================================================
-all: dirs copy-fonts $(OUTPUT)
+all: dirs $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Build complete! Run: make test"
+	@echo "========================================"
 
 # ============================================================
-#  Link
+#  Directories
 # ============================================================
-$(OUTPUT): $(OBJS) build/test.o
-	$(CXX) $(CXXFLAGS) $(OBJS) build/test.o -o $@ $(LIBS) $(LDFLAGS)
+dirs:
+	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(BIN_DIR)
+
+# ============================================================
+#  Link test runner
+# ============================================================
+$(BIN_DIR)/$(TEST_TARGET): dirs $(OBJS) $(TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $(OBJS) $(TEST_OBJ) -o $@ $(LIBS) $(GTEST_LIBS) $(LDFLAGS)
 
 # ============================================================
 #  Compile C++
 # ============================================================
-$(BUILD_DIR)/%.o: %.cpp
+# Compile C++ to object files. Each object depends on its generated
+# dependency file (.d), so header changes ALWAYS trigger a rebuild of the
+# dependents - missing/stale .d files previously let stale objects link
+# against the wrong class layout (Terrain.h heap-corruption bug).
+$(BUILD_DIR)/%.o: %.cpp $(BUILD_DIR)/%.d
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# Regenerate missing/outdated header-dependency files (preprocessor only -
+# cheap, no codegen). The compiler's -MMD output is reused when the object is
+# actually rebuilt.
+$(BUILD_DIR)/%.d: %.cpp
+	@mkdir -p $(dir $@)
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -MM -MP -MT $(@:.d=.o) $< -MF $@.tmp && mv $@.tmp $@
 
 # ============================================================
 #  Compile C
@@ -151,29 +193,184 @@ $(BUILD_DIR)/%.o: %.c
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # ============================================================
-#  Create output directories
+#  Standalone Test Apps
 # ============================================================
-dirs:
-	@mkdir -p $(BUILD_DIR)
+$(BIN_DIR)/$(BOT_VIEWPORT_TEST): dirs $(OBJS) build/tests/bot_viewport_minimal.o
+	$(CXX) $(CXXFLAGS) $(OBJS) build/tests/bot_viewport_minimal.o -o $@ $(LIBS) $(LDFLAGS)
+
+$(BIN_DIR)/$(GEOTERRAIN_TEST): dirs $(OBJS) build/tests/test_geoterrain.o
+	$(CXX) $(CXXFLAGS) $(OBJS) build/tests/test_geoterrain.o -o $@ $(LIBS) $(LDFLAGS)
+
+# --- Editor application (own main, not part of the test runner) ---
+$(BIN_DIR)/$(EDITOR_APP): dirs $(OBJS) build/src/editor_main.o
+	$(CXX) $(CXXFLAGS) $(OBJS) build/src/editor_main.o -o $@ $(LIBS) $(LDFLAGS)
+
+# --- Full engine entry point (test.cpp): runs the whole test suite as a
+#     self-check, then boots the entire engine. ---
+$(BIN_DIR)/$(ENGINE_APP): dirs $(OBJS) $(BUILD_DIR)/test.o $(ENGINE_TEST_OBJ)
+	$(CXX) $(CXXFLAGS) $(OBJS) $(BUILD_DIR)/test.o $(ENGINE_TEST_OBJ) -o $@ $(LIBS) $(GTEST_LIBS_NO_MAIN) $(LDFLAGS)
+
+.PHONY: editor
+
+editor: $(BIN_DIR)/$(EDITOR_APP)
+	@echo ""
+	@echo "========================================"
+	@echo "  Editor app built: $(BIN_DIR)/$(EDITOR_APP)"
+	@echo "========================================"
+
+engine: $(BIN_DIR)/$(ENGINE_APP)
+	@echo ""
+	@echo "========================================"
+	@echo "  Full engine built: $(BIN_DIR)/$(ENGINE_APP)"
+	@echo "  Run with: make run   (or make run-headless)"
+	@echo "========================================"
 
 # ============================================================
-#  Copy required fonts to bin
+#  Run the whole engine (self-check tests, then engine boot)
 # ============================================================
-copy-fonts: dirs
-	@echo "Copying fonts..."
-	@cp -n phosphor-icons/Fonts/regular/Phosphor.ttf . 2>/dev/null || true
-	@cp -n devicon-master/fonts/devicon.ttf . 2>/dev/null || true
-	@echo "Fonts copied."
+run: $(BIN_DIR)/$(ENGINE_APP)
+	@echo ""
+	@echo "========================================"
+	@echo "  Running the full engine..."
+	@echo "  (all tests first, then the engine main loop)"
+	@echo "========================================"
+	./$(BIN_DIR)/$(ENGINE_APP)
+
+# Bounded, windowless run - safe for CI/headless boxes. Pass FRAMES=N to
+# control the number of simulated frames.
+run-headless: $(BIN_DIR)/$(ENGINE_APP)
+	@echo ""
+	@echo "========================================"
+	@echo "  Running the full engine headless..."
+	@echo "========================================"
+	./$(BIN_DIR)/$(ENGINE_APP) --headless --frames $(or $(FRAMES),900)
+
+bot-viewport-test: $(BIN_DIR)/$(BOT_VIEWPORT_TEST)
+	@echo ""
+	@echo "========================================"
+	@echo "  Bot Viewport Test"
+	@echo "========================================"
+	./$(BIN_DIR)/$(BOT_VIEWPORT_TEST)
+
+geoterrain-test: $(BIN_DIR)/$(GEOTERRAIN_TEST)
+	@echo ""
+	@echo "========================================"
+	@echo "  GeoTerrain Test"
+	@echo "========================================"
+	./$(BIN_DIR)/$(GEOTERRAIN_TEST)
 
 # ============================================================
-#  Run
+#  Run tests
 # ============================================================
-run: all copy-fonts
-	./$(TARGET)
+test: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Running Unit Tests..."
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_print_time=1
 
-# Run with ECS debug
-run-ecs: all copy-fonts
-	./$(OUTPUT)
+# ============================================================
+#  Individual test targets
+# ============================================================
+test-physics: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Physics System Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="PhysicsTest.*" --gtest_print_time=1
+
+test-motion-matching: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Motion Matching Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="MotionMatching*" --gtest_print_time=1
+
+test-memory: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Memory Management Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Memory*" --gtest_print_time=1
+
+test-math: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Math Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Math*" --gtest_print_time=1
+
+test-character: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Character Controller Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Character*" --gtest_print_time=1
+
+test-play-mode: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Play Mode Controller Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="PlayModeController.*" --gtest_print_time=1
+
+test-camera: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Camera System Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Camera*" --gtest_print_time=1
+
+test-world: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  World/Terrain Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="TerrainTest.*:WorldTest.*" --gtest_print_time=1
+
+test-terrain-pipeline: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Terrain GPU Pipeline Tests"
+	@echo "  (heightfield sampling, texel mapping, RVT baking)"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="TerrainHeightfieldTest.*:TerrainPipelineGLTest.*" --gtest_print_time=1
+
+test-integration: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Integration Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Integration*" --gtest_print_time=1
+
+test-quick: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Quick Tests (excluding slow)"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="-*.PERF_*:-*Integration*:-*Terrain*" --gtest_print_time=1
+
+test-list: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  Available Tests"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_list_tests
+
+# ============================================================
+#  Memory Debug Build (AddressSanitizer)
+# ============================================================
+test-memory-debug: clean
+	@echo ""
+	@echo "========================================"
+	@echo "  Building with Memory Sanitizers"
+	@echo "========================================"
+	$(MAKE) MODE=asan test
+	@echo ""
+	@echo "========================================"
+	@echo "  Running Tests with Memory Debug"
+	@echo "========================================"
+	ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1" ./$(BIN_DIR)/$(TEST_TARGET) --gtest_print_time=1
 
 # ============================================================
 #  Clean
@@ -184,7 +381,7 @@ clean:
 # ============================================================
 #  Rebuild
 # ============================================================
-rebuild: clean all copy-fonts
+rebuild: clean all
 
 # ============================================================
 #  Release build
@@ -193,175 +390,11 @@ release:
 	$(MAKE) MODE=release
 
 # ============================================================
-#  Unit Tests
+#  Phony targets
 # ============================================================
-test: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Running Unit Tests..."
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET)
-
-# Link tests with engine objects and libraries
-$(BIN_DIR)/$(TEST_TARGET): $(TEST_OBJ) $(OBJS) | dirs
-	$(CXX) $(CXXFLAGS) $(TEST_OBJ) $(OBJS) -o $@ $(LIBS) $(GTEST_LIBS) $(LDFLAGS)
-
-$(BUILD_DIR)/tests/%.o: $(TEST_DIR)/%.cpp
-	@mkdir -p $(BUILD_DIR)/tests
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-# ============================================================
-#  System-Specific Test Applications (Real-time testing)
-# ============================================================
-
-# Physics test application
-physics_test: $(OBJS)
-	@echo "\n========================================"
-	@echo "  Building Physics Test Application"
-	@echo "========================================\n"
-	$(CXX) $(CXXFLAGS) $(OBJS) physics_test.cpp -o $(BIN_DIR)/physics_test $(LIBS) $(LDFLAGS)
-	@echo "Run with: ./bin/physics_test"
-
-# Animation test application
-animation_test: $(OBJS)
-	@echo "\n========================================"
-	@echo "  Building Animation Test Application"
-	@echo "========================================\n"
-	$(CXX) $(CXXFLAGS) $(OBJS) animation_test.cpp -o $(BIN_DIR)/animation_test $(LIBS) $(LDFLAGS)
-	@echo "Run with: ./bin/animation_test"
-
-# World/Terrain test application
-world_test: $(OBJS)
-	@echo "\n========================================"
-	@echo "  Building World Test Application"
-	@echo "========================================\n"
-	$(CXX) $(CXXFLAGS) $(OBJS) world_test.cpp -o $(BIN_DIR)/world_test $(LIBS) $(LDFLAGS)
-	@echo "Run with: ./bin/world_test"
-
-# Viewport debug test application (standalone - no engine objects needed)
-viewport-test:
-	@echo "\n========================================"
-	@echo "  Building Viewport Debug Test"
-	@echo "========================================\n"
-	$(CXX) $(CXXFLAGS) $(INCLUDES) viewport_test.cpp src/glad.c -o $(BIN_DIR)/viewport_test $(LIBS)
-	@echo "Run with: ./bin/viewport_test"
-
-# Viewport debug test with ECS and Renderer (comprehensive debugging)
-viewport-debug-test: $(OBJS)
-	@echo "\n========================================"
-	@echo "  Building Viewport Debug Test (Full)"
-	@echo "========================================\n"
-	$(CXX) $(CXXFLAGS) $(INCLUDES) viewport_debug_test.cpp $(filter-out build/test.o,$(OBJS)) -o $(BIN_DIR)/viewport_debug_test $(LIBS)
-	@echo "Run with: ./bin/viewport_debug_test"
-
-# Build all test applications
-all-tests: physics_test animation_test world_test viewport-test geoterrain_test
-
-# GeoTerrain integration test
-geoterrain_test: $(OBJS)
-	@echo "\n========================================"
-	@echo "  Building GeoTerrain Test"
-	@echo "========================================\n"
-	$(CXX) $(CXXFLAGS) $(INCLUDES) tests/test_geoterrain.cpp $(filter-out build/test.o,$(OBJS)) -o $(BIN_DIR)/geoterrain_test $(LIBS)
-	@echo "Run with: ./bin/geoterrain_test"
-
-# Clean test applications
-clean-test-apps:
-	rm -f $(BIN_DIR)/physics_test $(BIN_DIR)/animation_test $(BIN_DIR)/world_test $(BIN_DIR)/viewport_test
-
-# ============================================================
-#  Unit Tests
-# ============================================================
-test-animation: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Animation System Tests"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="AnimationTest.*:AnimationFSMTest.*:HybridAnimationTest.*:HybridMMFSMTest.*:MotionMatching*:RootMotion*" --gtest_print_time=1
-
-# Physics system tests
-test-physics: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Physics System Tests"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="PhysicsTest.*" --gtest_print_time=1
-
-# World/Terrain system tests
-test-world: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  World System Tests"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="TerrainTest.*:WorldTest.*" --gtest_print_time=1
-
-# Camera system tests
-test-camera: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Camera System Tests"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Camera*" --gtest_print_time=1
-
-# Memory management tests
-test-memory: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Memory Management Tests"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Memory*" --gtest_print_time=1
-
-# Character controller tests
-test-character: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Character Controller Tests"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Character*" --gtest_print_time=1
-
-# Math tests
-test-math: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Math Tests"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Math*" --gtest_print_time=1
-
-# Integration tests
-test-integration: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Integration Tests"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="Integration*" --gtest_print_time=1
-
-# ============================================================
-#  Memory Debug Build (AddressSanitizer + LeakSanitizer)
-# ============================================================
-test-memory-debug: clean
-	@echo "\n========================================"
-	@echo "  Building with Memory Sanitizers"
-	@echo "========================================\n"
-	$(MAKE) MODE=asan test
-	@echo "\n========================================"
-	@echo "  Running Tests with Memory Debug"
-	@echo "========================================\n"
-	ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:halt_on_error=1" ./$(BIN_DIR)/$(TEST_TARGET) --gtest_print_time=1
-
-# ============================================================
-#  Quick Test (skip slow tests)
-# ============================================================
-test-quick: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Quick Test Suite (excluding slow tests)"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="-*.PERF_*:-*Integration*:-*Terrain*" --gtest_print_time=1
-
-# ============================================================
-#  List all tests
-# ============================================================
-test-list: $(BIN_DIR)/$(TEST_TARGET)
-	@echo "\n========================================"
-	@echo "  Available Tests"
-	@echo "========================================\n"
-	./$(BIN_DIR)/$(TEST_TARGET) --gtest_list_tests
-
-# ============================================================
-#  Clean tests
-# ============================================================
-clean-tests:
-	rm -f $(BIN_DIR)/$(TEST_TARGET)
-	rm -rf $(BUILD_DIR)/tests
-
-.PHONY: all dirs run clean rebuild release test clean-tests test-animation test-physics test-world test-camera test-memory test-character test-math test-integration test-memory-debug test-quick test-list physics_test animation_test world_test all-tests clean-test-apps
+.PHONY: all dirs test clean rebuild release \
+        test-physics test-motion-matching test-memory test-math \
+        test-character test-camera test-world test-terrain-pipeline test-integration \
+        test-quick test-list test-memory-debug \
+        bot-viewport-test geoterrain-test \
+        editor engine run run-headless

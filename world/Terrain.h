@@ -4,73 +4,109 @@
 #include <vector>
 #include <memory>
 #include <map>
+#include <set>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <queue>
+#include <condition_variable>
 
-// Terrain system - manages all chunks and streaming
+struct PendingChunk {
+    int chunkX;
+    int chunkY;
+    std::vector<float> heights;
+    int resolution;
+    float chunkSize;
+};
+
+struct ChunkCoord {
+    int x, y;
+    bool operator<(const ChunkCoord& o) const {
+        if (x != o.x) return x < o.x;
+        return y < o.y;
+    }
+    bool operator==(const ChunkCoord& o) const { return x == o.x && y == o.y; }
+};
+
 class Terrain {
 public:
     struct TerrainConfig {
-        float chunkSize = 100.0f;          // Size of each chunk in world units
-        int chunkResolution = 64;           // Vertices per chunk side
-        int viewDistance = 4;               // How many chunks to load in each direction
-        float lodDistance = 50.0f;          // Distance for LOD transitions
-        int heightmapSize = 1024;           // Size of heightmap texture
-        float heightScale = 50.0f;          // Maximum terrain height
+        float chunkSize = 80.0f;
+        int chunkResolution = 32;
+        int viewDistance = 2;
+        float lodDistance = 60.0f;
+        int heightmapSize = 1024;
+        float heightScale = 25.0f;
     };
 
     Terrain();
     Terrain(const TerrainConfig& config);
     ~Terrain();
 
-    // Initialize terrain (generate or load heightmap)
     void initialize();
-    
-    // Update terrain (stream chunks based on camera position)
     void update(const glm::vec3& cameraPos, float dt);
-
-    // Render all visible chunks (with frustum culling)
-    void render(const glm::vec3& cameraPos, float fovDegrees = 45.0f, 
-                float aspectRatio = 16.0f/9.0f, float nearPlane = 0.1f, 
+    void render(const glm::mat4& view, const glm::mat4& projection,
+                const glm::vec3& cameraPos, float fovDegrees = 45.0f,
+                float aspectRatio = 16.0f/9.0f, float nearPlane = 0.1f,
                 float farPlane = 1000.0f) const;
 
-    // Render all chunks (no culling - deprecated)
-    [[deprecated("Use render(cameraPos, ...) for frustum culling")]]
-    void render() const { render(glm::vec3(0.0f)); }
-    
-    // Get height at world position (for collision)
     float getHeightAt(float worldX, float worldZ) const;
-    
-    // Get normal at world position (for physics)
     glm::vec3 getNormalAt(float worldX, float worldZ) const;
-    
-    // Check if position is loaded
     bool isLoadedAt(float worldX, float worldZ) const;
-    
-    // Get configuration
     const TerrainConfig& getConfig() const { return m_config; }
-    
-    // Get number of active chunks
     size_t getActiveChunkCount() const { return m_chunks.size(); }
 
+    // Master heightmap texture (GPU displacement source).
+    GLuint getHeightTexture() const { return m_heightTexture; }
+
+    // RVT-style material cache: multi-layer auto-material baked into an atlas
+    // once per chunk, then sampled per-pixel (no per-frame layer blending).
+    static constexpr int kMaterialAtlasSize = 4096;    // virtual texture size
+    static constexpr int kMaterialPageSize = 128;      // page (tile) size
+    static constexpr int kMaterialPagesPerSide = kMaterialAtlasSize / kMaterialPageSize;
+    GLuint getMaterialAtlas() const { return m_materialAtlas; }
+    int getMaterialPageCount() const { return kMaterialPagesPerSide * kMaterialPagesPerSide; }
+
+    // Bake a chunk's auto-material into its atlas page (main thread, GL alive).
+    // Returns the page index, or -1 if baking is unavailable.
+    int bakeChunkMaterial(const TerrainChunk& chunk);
+
+    // FBO the material atlas is rendered into (page readback / tests).
+    GLuint getBakeFramebuffer() const { return m_bakeFBO; }
+
 private:
-    // Generate procedural heightmap (Perlin noise)
     void generateHeightmap();
-    
-    // Get chunk key for map lookup
-    int getChunkKey(int chunkX, int chunkY) const;
-    
-    // Get or create chunk
-    TerrainChunk* getOrCreateChunk(int chunkX, int chunkY);
-    
-    // Remove chunk
-    void removeChunk(int chunkX, int chunkY);
-    
-    // Get chunk coordinates from world position
     void getChunkCoords(float worldX, float worldZ, int& chunkX, int& chunkY) const;
 
+    void workerThread();
+    PendingChunk generateChunkData(int chunkX, int chunkY);
+    void commitChunks();
+
     TerrainConfig m_config;
-    std::vector<float> m_heightmap;        // Global heightmap data
-    std::map<int, std::unique_ptr<TerrainChunk>> m_chunks;  // Active chunks
-    
-    int m_lastChunkX = 0, m_lastChunkY = 0;  // Last center chunk
+    std::vector<float> m_heightmap;
+    std::map<ChunkCoord, std::unique_ptr<TerrainChunk>> m_chunks;
+
+    GLuint m_heightTexture = 0;   // GL_R32F master heightmap (GPU displacement)
+    GLuint m_desertTex = 0;       // tiling rock albedo (dry-desert material)
+
+    // Material atlas + bake FBO (RVT).
+    GLuint m_materialAtlas = 0;
+    GLuint m_bakeFBO = 0;
+    int m_nextFreePage = 0;
+    std::map<ChunkCoord, int> m_chunkPage;   // chunk -> atlas page
+
+    ChunkCoord m_lastChunk{-9999, -9999};
     bool m_initialized = false;
+
+    std::thread m_workerThread;
+    std::atomic<bool> m_running{false};
+    std::queue<ChunkCoord> m_pendingRequests;
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCV;
+
+    std::queue<PendingChunk> m_completedChunks;
+    std::mutex m_completedMutex;
+
+    std::set<ChunkCoord> m_knownChunks;
+    std::mutex m_knownMutex;
 };

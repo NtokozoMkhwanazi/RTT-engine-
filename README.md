@@ -16,6 +16,18 @@ test suite (535 tests / 58 suites) as a self-check**, then boots the full engine
 camera, demo recorder and GPS simulation) and runs its main loop.
 
 ---
+## TEST GIFs
+
+
+
+
+
+<img width="480" height="270" alt="test1" src="https://github.com/user-attachments/assets/8d58547b-4e8f-4904-a6ab-bc9753bfe811" />
+<img width="400" height="225" alt="Look" src="https://github.com/user-attachments/assets/b33922b4-22bd-4ab4-8493-295881d47ed6" />
+
+
+
+
 
 ## ✨ Features
 

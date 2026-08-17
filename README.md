@@ -2,35 +2,29 @@
 
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![OpenGL](https://img.shields.io/badge/OpenGL-4.5-orange)
+![Vulkan](https://img.shields.io/badge/Vulkan-1.0-purple)
 ![Platform](https://img.shields.io/badge/Platform-Linux-6f42c1)
-![Tests](https://img.shields.io/badge/Tests-515%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-604%20passing-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 **Advanced lightweight 3D game engine** built for scalability and high-performance
 systems: real-time rendering, animation, motion matching, physics and geospatial
-simulation — written in **C++17** with **OpenGL 4.5** and a **Dear ImGui** editor.
+simulation — written in **C++17** on a **dual-backend RHI** (OpenGL 4.5 for
+low/optimized machines, Vulkan for high-quality rendering) with a **Dear ImGui**
+editor. Pick the backend at launch with `--graphics opengl|vulkan`.
 
 The repository ships as a single entry point: `make run` first runs the **entire
-test suite (535 tests / 58 suites) as a self-check**, then boots the full engine
+test suite (604 tests / 66 suites) as a self-check**, then boots the full engine
 (renderer, terrain world, physics, play-mode character with motion matching, follow
 camera, demo recorder and GPS simulation) and runs its main loop.
 
 ---
-## TEST GIFs
-
-
-
-
-
-<img width="480" height="270" alt="test1" src="https://github.com/user-attachments/assets/8d58547b-4e8f-4904-a6ab-bc9753bfe811" />
-
-
-
 
 ## ✨ Features
 
 ### Core Systems
 - **Real-time Rendering** — OpenGL 4.5 with batching, instancing, frustum culling and a persistent buffer pool
+- **Render Hardware Interface (RHI)** — dual-backend abstraction in `rhi/`: OpenGL (low/optimized, default) and Vulkan (high quality — device/swapchain, depth-tested instanced scene rendering, SPIR-V pipelines compiled from GLSL with `glslc`). Both backends render the same scenes to identical pixels, verified headless via offscreen readback
 - **Physics System** — GJK/EPA collision detection, constraints, rigid bodies and a character controller
 - **Motion Matching** — Advanced character locomotion with trajectory prediction and a KD-tree pose search
 - **Animation System** — Locomotion FSM, GPU skinning, foot planting / foot IK and animation blending
@@ -41,6 +35,7 @@ camera, demo recorder and GPS simulation) and runs its main loop.
 
 ### Editor (Dear ImGui)
 - **Dark theme** with toolbar, menu bar, and tabbed panels (Outliner / Layers / World / **Geo**)
+- **Graphics backend toggle** — **View → Graphics** switches OpenGL ↔ Vulkan for the next launch (persisted to `graphics_api.cfg`); on Vulkan the editor UI itself renders through the swapchain (imgui_impl_vulkan) over the 3D scene
 - **Geo tracking panel** — live GPS fix, NMEA feeds, Kalman trajectory prediction, InfluxDB storage, all wired into the left panel (F8)
 - **Transform gizmos** — Translate / Rotate / Scale tools
 - **Click-to-select picking** — Ray-pick entities in the viewport
@@ -52,7 +47,7 @@ camera, demo recorder and GPS simulation) and runs its main loop.
 - **Debug rendering** — Skeleton debug, physics debug, trajectory overlay
 
 ### Engine Entry Point (`test.cpp`)
-- **Self-check gate** — runs all 535 unit + integration tests before boot; refuses to boot on failure
+- **Self-check gate** — runs all 604 unit + integration tests before boot; refuses to boot on failure
 - **Play mode** — third-person character with locomotion FSM + motion matching + foot IK on live terrain
 - **Scripted cinematic demo** — idle → walk → run → jump → return loop (`CinematicDemo`)
 - **Demo recorder** — keyframe camera path recording/playback (`DemoRecorder`)
@@ -85,7 +80,7 @@ make            # Build the test runner (debug)
 make run
 ```
 
-This builds `bin/engine`, runs the full 535-test self-check, and — if everything
+This builds `bin/engine`, runs the full 604-test self-check, and — if everything
 passes — opens the engine window. Boot into the scripted cinematic demo; press any
 movement key to take control.
 
@@ -106,12 +101,15 @@ make run-headless FRAMES=300 # custom budget
 
 ```bash
 make editor   # builds bin/editor_app (ImGui editor, own entry point)
+./bin/editor_app --graphics opengl   # low/optimized mode (default)
+./bin/editor_app --graphics vulkan   # high-quality mode: live ImGui editor UI
+                                     # (menu bar + panels) over the RHI scene
 ```
 
 ### Run Tests
 
 ```bash
-make test        # run all 535 unit + integration tests
+make test        # run all 604 unit + integration tests
 make test-list   # list every test
 ```
 
@@ -133,6 +131,7 @@ The Google Test suite covers every engine system (run one at a time with `make <
 | `make test-world` | Terrain heightmaps, chunks, LOD, normals; scene manager |
 | `make test-integration` | Input → FSM → motion matching → pose sync, end to end |
 | `make test-quick` | Fast subset (skips slow/perf tests) |
+| `make test-rhi` | RHI: GL/Vulkan backends, offscreen 3D scenes, depth + instancing, swapchain present, GL↔Vulkan pixel parity |
 | `make test-list` | List all available tests |
 
 Suites without a dedicated target (animation/blending, FBX, ECS, entity manager, geo)
@@ -171,9 +170,10 @@ motionMatching/   KD-tree pose search, trajectory prediction, foot planting
 physicsSystem/    GJK/EPA collision, rigid bodies, constraints, character controller
 playerSystem/     Character controller
 renderer/         Renderer, GPU profilers, debug rendering
+rhi/              Render Hardware Interface: RHI.h + OpenGL/Vulkan backends, SPIR-V shaders
 shaderSystem/     Shader loading, skybox rendering
 src/              Editor application main, GLAD OpenGL loader
-tests/            Google Test suite (unit + integration; 535 tests)
+tests/            Google Test suite (unit + integration; 604 tests)
 world/            Terrain, vegetation, world objects
 external/         Third-party libraries (Dear ImGui, JetBrains Mono)
 assets/           Character FBX files + locomotion clips (bot.fbx, Idle/Walk/Run/Jump/…)
@@ -190,7 +190,8 @@ build/            Object files (generated)
 ## 📊 System Requirements
 
 - **OS:** Linux (Ubuntu 24.04+; other distros supported with the listed packages)
-- **OpenGL:** 4.5 Core Profile (4.6+ works; Mesa radeonsi/llvmpipe verified)
+- **OpenGL:** 4.5 Core Profile (4.6+ works; Mesa radeonsi/llvmpipe verified) — the default backend
+- **Vulkan (optional):** loader + driver for the high-quality backend; `glslc` (Vulkan SDK or `shaderc` package) compiles the RHI shaders to SPIR-V at build time
 - **Compiler:** GCC 13+ with C++17 support
 - **Dependencies:** GLFW, GLAD, GLM, GLEW, Assimp, Dear ImGui, jsoncpp, libcurl, OpenAL, Eigen3, Google Test
 - **Optional:** InfluxDB (time-series storage), TensorFlow Lite (ML prediction), Xvfb (headless CI)

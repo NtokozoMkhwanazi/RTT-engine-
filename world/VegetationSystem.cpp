@@ -1,4 +1,5 @@
 #include "VegetationSystem.h"
+#include "TerrainChunk.h"
 #include <cmath>
 #include <algorithm>
 
@@ -15,6 +16,8 @@ VegetationSystem::VegetationSystem(const VegetationConfig& config)
 void VegetationSystem::clear() {
     m_trees.clear();
     m_rocks.clear();
+    m_pebbles.clear();
+    m_plants.clear();
     m_instanceBuffersDirty = true;
 }
 
@@ -158,19 +161,26 @@ void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,
     // Generate trees
     int numTrees = (int)(chunkSize * chunkSize * m_config.treeDensity);
     numTrees = std::min(numTrees, m_config.maxTreesPerChunk);
+
+    // Global hard cap for performance: never place more than 5 trees scene-wide
+    // total (overridable via VegetationConfig::treeDensity/maxTreesPerChunk for
+    // production). The function-local static accumulates across chunks so the
+    // cap is global, not per-chunk.
+    static int s_totalTreesPlaced = 0;
+    constexpr int kMaxTotalTrees = 5;
+    numTrees = std::max(0, std::min(numTrees, kMaxTotalTrees - s_totalTreesPlaced));
+    s_totalTreesPlaced += numTrees;
     
     for (int i = 0; i < numTrees; i++) {
         glm::vec3 pos;
         pos.x = worldStartX + posDist(m_rng);
         pos.z = worldStartZ + posDist(m_rng);
         
-        // Get height at position
+        // Get height at position using the standardized utility function
+        // (terrain::sampleHeightBilinear from TerrainChunk.h) which correctly
+        // maps world meters → texel coordinates, matching the GPU heightmap.
         if (!heights.empty() && heightmapSize > 0) {
-            float hx = pos.x / heightmapSize;
-            float hz = pos.z / heightmapSize;
-            int hxInt = std::clamp((int)hx, 0, heightmapSize - 1);
-            int hzInt = std::clamp((int)hz, 0, heightmapSize - 1);
-            pos.y = heights[hzInt * heightmapSize + hxInt];
+            pos.y = terrain::sampleHeightBilinear(heights.data(), heightmapSize, pos.x, pos.z);
         } else {
             pos.y = 0.0f;
         }
@@ -186,44 +196,80 @@ void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,
         }
     }
     
-    // Generate rocks
+    // Generate rocks as small clusters (outcrops) instead of a uniform grid -
+    // a scattering of 2-4 rocks hugging the same spot reads as a rocky outcrop
+    // rather than evenly-sprinkled pebbles. The cluster count keeps the total
+    // under maxRocksPerChunk; each rock jitters a few meters off the cluster
+    // center (clamped to the chunk) so the group stays tight.
     int numRocks = (int)(chunkSize * chunkSize * m_config.rockDensity);
     numRocks = std::min(numRocks, m_config.maxRocksPerChunk);
-    
-    for (int i = 0; i < numRocks; i++) {
-        glm::vec3 pos;
-        pos.x = worldStartX + posDist(m_rng);
-        pos.z = worldStartZ + posDist(m_rng);
-        
-        if (!heights.empty() && heightmapSize > 0) {
-            float hx = pos.x / heightmapSize;
-            float hz = pos.z / heightmapSize;
-            int hxInt = std::clamp((int)hx, 0, heightmapSize - 1);
-            int hzInt = std::clamp((int)hz, 0, heightmapSize - 1);
-            pos.y = heights[hzInt * heightmapSize + hxInt];
-        } else {
-            pos.y = 0.0f;
-        }
-        
-        // Rocks prefer higher elevations and steep areas
-        if (heights.empty() || pos.y > 15.0f || isValidPosition(pos, heights, heightmapSize, 20.0f)) {
-            Rock rock;
-            rock.position = pos;
-            rock.scale = glm::vec3(scaleDist(m_rng), scaleDist(m_rng) * 0.6f, scaleDist(m_rng));
-            rock.rotation = rotDist(m_rng);
-            rock.type = typeDist(m_rng);
-            m_rocks.push_back(rock);
+    const int rocksPerCluster = 3;
+    const int numClusters = std::max(1, (numRocks + rocksPerCluster - 1) / rocksPerCluster);
+    std::uniform_real_distribution<float> clusterJitter(-4.0f, 4.0f);
+    int rocksPlaced = 0;  // per-chunk count (m_rocks is global across chunks)
+
+    for (int c = 0; c < numClusters && rocksPlaced < numRocks; c++) {
+        glm::vec3 center;
+        center.x = worldStartX + posDist(m_rng);
+        center.z = worldStartZ + posDist(m_rng);
+        const int here = std::min(rocksPerCluster, numRocks - rocksPlaced);
+        for (int i = 0; i < here; i++) {
+            glm::vec3 pos;
+            pos.x = std::clamp(center.x + clusterJitter(m_rng), worldStartX, worldStartX + chunkSize - 0.01f);
+            pos.z = std::clamp(center.z + clusterJitter(m_rng), worldStartZ, worldStartZ + chunkSize - 0.01f);
+            
+            if (!heights.empty() && heightmapSize > 0) {
+                pos.y = terrain::sampleHeightBilinear(heights.data(), heightmapSize, pos.x, pos.z);
+            } else {
+                pos.y = 0.0f;
+            }
+            
+            // Rocks prefer higher elevations and steep areas
+            if (heights.empty() || pos.y > 15.0f || isValidPosition(pos, heights, heightmapSize, 20.0f)) {
+                Rock rock;
+                rock.position = pos;
+                rock.scale = glm::vec3(scaleDist(m_rng), scaleDist(m_rng) * 0.6f, scaleDist(m_rng));
+                rock.rotation = rotDist(m_rng);
+                rock.type = typeDist(m_rng);
+                m_rocks.push_back(rock);
+                rocksPlaced++;
+            }
         }
     }
 
-    // Generate ground plants (grass clusters + low desert flora).
-    // grassDensity is a per-m2 value that is typically tiny (0.001), so scale
-    // it up for small clusters: ~10-25 plants per 80m chunk, capped so the
-    // terrain isn't littered. Low plants belong on gentle, dry ground.
-    const int rawPlants = (int)(chunkSize * chunkSize * m_config.grassDensity * 1.0f);
-    int numPlants = std::clamp(rawPlants, 12, 40);
-    std::uniform_int_distribution<int> plantTypeDist(0, 2);
+    // Pebbles: a ground scatter of tiny stones (rock type 3) hugging the
+    // surface - the "tiny rocks" that fill the negative space between the
+    // larger boulder/stone/cliff outcrops. These reuse the stone model (stone.fbx)
+    // scaled down to pebble size; WorldManager maps type 3 -> ROCK_STONE.
+    int numPebbles = (int)(chunkSize * chunkSize * m_config.pebbleDensity);
+    numPebbles = std::min(numPebbles, m_config.maxPebblesPerChunk);
+    std::uniform_real_distribution<float> pebbleScaleDist(0.06f, 0.22f);
+    for (int i = 0; i < numPebbles; i++) {
+        glm::vec3 pos;
+        pos.x = worldStartX + posDist(m_rng);
+        pos.z = worldStartZ + posDist(m_rng);
+        pos.y = 0.0f;
+        if (heights.empty() || isValidPosition(pos, heights, heightmapSize, 0.5f)) {
+            Rock rock;
+            rock.position = pos;
+            const float s = pebbleScaleDist(m_rng);
+            rock.scale = glm::vec3(s * 0.9f, s * 0.5f, s);
+            rock.rotation = rotDist(m_rng);
+            rock.type = 3;   // pebble
+            m_pebbles.push_back(rock);
+        }
+    }
+
+    // Generate ground plants (grass clusters + low desert flora) - planted
+    // MODELS on top of the boulder-textured terrain, so a high density reads
+    // as a grassy field. grassDensity is per-m2; with the default 0.01 that's
+    // ~64 per 80m chunk. Mostly bushy grass, with a few flowers/succulents
+    // scattered among it. Low plants belong on gentle, dry ground.
+    const int rawPlants = (int)(chunkSize * chunkSize * m_config.grassDensity);
+    int numPlants = std::clamp(rawPlants, 20, 200);
+    std::uniform_real_distribution<float> plantTypeDist(0.0f, 1.0f);   // 80% grass
     std::uniform_real_distribution<float> plantScaleDist(0.6f, 1.4f);
+    std::uniform_real_distribution<float> plantTintDist(0.0f, 1.0f);
 
     for (int i = 0; i < numPlants; i++) {
         glm::vec3 pos;
@@ -243,7 +289,20 @@ void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,
             plant.position = pos;
             plant.scale = plantScaleDist(m_rng);
             plant.rotation = rotDist(m_rng);
-            plant.type = plantTypeDist(m_rng);
+            const float r = plantTypeDist(m_rng);
+            plant.type = (r < 0.80f) ? 0 : (r < 0.93f) ? 1 : 2;   // grass:flower:bush
+            // Per-instance color variation: grass drifts between healthy green
+            // and dry yellow; flowers/bushes get a milder green-range tint so
+            // the whole field isn't one flat shade.
+            const float t = plantTintDist(m_rng);
+            if (plant.type == 0) {
+                plant.tint = glm::mix(glm::vec3(0.55f, 0.95f, 0.45f),   // lush green
+                                      glm::vec3(0.85f, 0.78f, 0.42f),   // dry yellow
+                                      t);
+            } else {
+                plant.tint = glm::mix(glm::vec3(0.75f, 0.98f, 0.6f),
+                                      glm::vec3(0.95f, 0.85f, 0.55f), t);
+            }
             m_plants.push_back(plant);
         }
     }
@@ -259,11 +318,7 @@ bool VegetationSystem::isValidPosition(const glm::vec3& pos, const std::vector<f
     
     // Sample heights around position
     auto sampleHeight = [&](float x, float z) -> float {
-        float hx = x / heightmapSize;
-        float hz = z / heightmapSize;
-        int hxInt = std::clamp((int)hx, 0, heightmapSize - 1);
-        int hzInt = std::clamp((int)hz, 0, heightmapSize - 1);
-        return heights[hzInt * heightmapSize + hxInt];
+        return terrain::sampleHeightBilinear(heights.data(), heightmapSize, x, z);
     };
     
     hL = sampleHeight(pos.x - delta, pos.z);

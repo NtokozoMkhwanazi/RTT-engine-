@@ -5,7 +5,11 @@
 #include <iostream>
 #include <fstream>
 #include <filesystem>
+#include <functional>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtx/quaternion.hpp>
+#include <glm/gtx/matrix_decompose.hpp>
 
 namespace fs = std::filesystem;
 
@@ -86,7 +90,8 @@ WorldImporter::ImportedWorld WorldImporter::importFromFBX(const std::string& pat
     
     Assimp::Importer importer;
     
-    // Import with optimization flags
+    // Import with optimization flags — keep node hierarchy intact for
+    // transform extraction (remove OptimizeGraph which flattens it).
     const aiScene* scene = importer.ReadFile(path,
         aiProcess_Triangulate |
         aiProcess_GenNormals |
@@ -95,7 +100,6 @@ WorldImporter::ImportedWorld WorldImporter::importFromFBX(const std::string& pat
         aiProcess_RemoveRedundantMaterials |
         aiProcess_FindDegenerates |
         aiProcess_SortByPType |
-        aiProcess_OptimizeGraph |
         aiProcess_OptimizeMeshes
     );
     
@@ -111,8 +115,49 @@ WorldImporter::ImportedWorld WorldImporter::importFromFBX(const std::string& pat
     
     // Calculate world bounds
     glm::vec3 minBound(999999), maxBound(-999999);
-    
-    // Process all meshes
+
+    // Build a mesh-index → node-transform lookup by recursively traversing
+    // the aiNode hierarchy. Each mesh inherits the accumulated parent
+    // transform so objects placed in Blender/Unreal arrive at the correct
+    // world position, rotation, and scale.
+    struct MeshTransform {
+        glm::vec3 position{0.0f};
+        glm::vec3 rotation{0.0f};
+        glm::vec3 scale{1.0f};
+    };
+    std::vector<MeshTransform> meshTransforms(scene->mNumMeshes);
+
+    std::function<void(const aiNode*, const glm::mat4&)> extractTransforms;
+    extractTransforms = [&](const aiNode* node, const glm::mat4& parentXform) {
+        if (!node) return;
+        // aiNode transform is row-major; Assimp stores it transposed from GLM.
+        const aiMatrix4x4& aiT = node->mTransformation;
+        glm::mat4 localXform(
+            aiT.a1, aiT.a2, aiT.a3, aiT.a4,
+            aiT.b1, aiT.b2, aiT.b3, aiT.b4,
+            aiT.c1, aiT.c2, aiT.c3, aiT.c4,
+            aiT.d1, aiT.d2, aiT.d3, aiT.d4);
+        glm::mat4 worldXform = parentXform * localXform;
+
+        // Decompose the accumulated transform for each mesh this node owns.
+        for (unsigned int m = 0; m < node->mNumMeshes; ++m) {
+            unsigned int meshIdx = node->mMeshes[m];
+            if (meshIdx < scene->mNumMeshes) {
+                glm::vec3 skew;
+                glm::vec4 persp;
+                glm::vec3 unusedScale;
+                glm::quat rotQuat;
+                glm::decompose(worldXform, meshTransforms[meshIdx].scale,
+                               rotQuat, meshTransforms[meshIdx].position, skew, persp);
+                meshTransforms[meshIdx].rotation = glm::eulerAngles(rotQuat);
+            }
+        }
+        for (unsigned int c = 0; c < node->mNumChildren; ++c)
+            extractTransforms(node->mChildren[c], worldXform);
+    };
+    extractTransforms(scene->mRootNode, glm::mat4(1.0f));
+
+    // Process all meshes with their extracted world-space transforms
     for (unsigned int i = 0; i < scene->mNumMeshes; i++) {
         aiMesh* mesh = scene->mMeshes[i];
         
@@ -129,11 +174,10 @@ WorldImporter::ImportedWorld WorldImporter::importFromFBX(const std::string& pat
             }
         }
         
-        // For now, add as single object at origin
-        // In a full implementation, you'd extract node transforms
-        obj.position = glm::vec3(0);
-        obj.rotation = glm::vec3(0);
-        obj.scale = glm::vec3(1);
+        // Use the transform extracted from the node hierarchy
+        obj.position = meshTransforms[i].position;
+        obj.rotation = meshTransforms[i].rotation;
+        obj.scale = meshTransforms[i].scale;
         obj.meshPath = path;
         
         world.objects.push_back(obj);

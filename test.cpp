@@ -60,6 +60,8 @@
 #include "editor/input_manager.h"
 #include "editor/ui_config.h"
 #include "editor/editor_application.h"
+#include "editor/console.h"
+#include "editor/profiler.h"
 #include "editor/ui.h"
 #include "editor/phosphor_imgui.h"
 #include "editor/editor_theme.h"
@@ -75,6 +77,7 @@
 #include "geospatial/GeoAPI.h"
 #include "geospatial/GPSTracker.h"
 #include "renderer/GPUProfilerAdvanced.h"
+#include "lighting/CVar.h"
 
 // ============================================================================
 // Options
@@ -308,7 +311,7 @@ static void UpdatePlayCamera(int mode, ThirdPersonCamera& cam,
             glm::vec3(-std::sin(heading) * std::cos(p),
                        std::sin(p),
                        -std::cos(heading) * std::cos(p)));
-        cam.position = charPos + glm::vec3(0.0f, 1.55f, 0.0f);  // eye height
+        cam.position = charPos + glm::vec3(0.0f, 1.55f, 1.5f);  // eye height
         cam.target = cam.position + fwd * 10.0f;
         return;
     }
@@ -316,13 +319,16 @@ static void UpdatePlayCamera(int mode, ThirdPersonCamera& cam,
     // ---- Follow / Orbit / Top-down share the state-aware follow camera ------
     if (firstInit) {
         // Start slightly above and behind the character, chest-level target.
-        cam.position = charPos + glm::vec3(0.0f, 2.2f, 3.5f);
-        cam.target = charPos + glm::vec3(0.0f, 1.3f, 0.0f);
+        // The bot renders at 70% height (~1.26 m), so the framing target
+        // sits proportionally higher (chest/shoulders of the larger bot).
+        cam.position = charPos + glm::vec3(0.0f, 2.2f * 0.7f, 3.5f * 0.7f);
+        cam.target = charPos + glm::vec3(0.0f, 1.3f * 0.7f, 0.0f);
         cam.currentState = camIn.animState;
         cam.yaw = -90.0f;
         cam.pitch = 10.0f;
-        cam.config.distance = 4.0f;
-        cam.config.height = 1.6f;
+        cam.config.distance = 4.0f * 0.7f;
+        cam.config.height = 1.6f * 0.7f;
+        cam.config.pivotHeight = 1.3f * 0.7f;
         firstInit = false;
     }
 
@@ -333,7 +339,7 @@ static void UpdatePlayCamera(int mode, ThirdPersonCamera& cam,
             cam.pitch = std::clamp(cam.pitch - in.mouseDelta.y * 0.3f,
                                    cam.config.minPitch, cam.config.maxPitch);
         }
-        cam.config.distance = std::clamp(cam.config.distance - in.scrollDelta.y * 1.5f, 2.0f, 10.0f);
+        cam.config.distance = std::clamp(cam.config.distance - in.scrollDelta.y * 3.0f, 0.5f, 10.0f);
     } else if (mode == 2) {  // Top-down: aerial overview, rotate around the character
         if (drag) cam.yaw -= in.mouseDelta.x;
         cam.pitch = 80.0f;
@@ -351,7 +357,7 @@ static void UpdatePlayCamera(int mode, ThirdPersonCamera& cam,
         } else {
             cam.pitch = glm::mix(cam.pitch, 10.0f, std::min(1.0f, 1.0f - std::exp(-3.0f * dt)));
         }
-        cam.config.distance = std::clamp(cam.config.distance - in.scrollDelta.y * 1.5f, 2.0f, 9.0f);
+        cam.config.distance = std::clamp(cam.config.distance - in.scrollDelta.y * 3.0f, 0.5f, 9.0f);
     }
 
     cam.update(dt, camIn, aspect);
@@ -360,10 +366,14 @@ static void UpdatePlayCamera(int mode, ThirdPersonCamera& cam,
 static CharacterInput KeyboardInput(const Input::InputState& ks) {
     CharacterInput input;
     glm::vec2 move(0.0f);
+    // World-space move direction (x->X, y->Z); the bot turns to face it and
+    // the follow camera orbits behind. Local forward is -Z, so W = forward
+    // (-Z, away from the camera), S = backward, A = strafe left (-X), D =
+    // right. A/D were previously swapped (A strafed right, D left).
     if (ks.isKeyDown(GLFW_KEY_W)) move.y -= 1.0f;
     if (ks.isKeyDown(GLFW_KEY_S)) move.y += 1.0f;
-    if (ks.isKeyDown(GLFW_KEY_A)) move.x += 1.0f;
-    if (ks.isKeyDown(GLFW_KEY_D)) move.x -= 1.0f;
+    if (ks.isKeyDown(GLFW_KEY_A)) move.x -= 1.0f;
+    if (ks.isKeyDown(GLFW_KEY_D)) move.x += 1.0f;
     const float len = glm::length(move);
     if (len > 0.001f) move /= len;
     input.moveDirection = move;
@@ -373,6 +383,15 @@ static CharacterInput KeyboardInput(const Input::InputState& ks) {
     input.sprint = ks.isKeyDown(GLFW_KEY_LEFT_SHIFT) || ks.isKeyDown(GLFW_KEY_RIGHT_SHIFT);
     input.grounded = true;
     input.verticalVelocity = 0.0f;
+
+    // Context switching (combat / dance / return to locomotion)
+    // 1 = Locomotion, 3 = Combat, 5 = Dance (matches MotionContext enum order)
+    if (ks.isKeyDown(GLFW_KEY_1))      input.motionContext = 0;
+    else if (ks.isKeyDown(GLFW_KEY_3)) input.motionContext = 2;  // COMBAT
+    else if (ks.isKeyDown(GLFW_KEY_5)) input.motionContext = 4;  // DANCE
+
+    // Attack trigger (combat strikes)
+    input.attack = ks.isKeyDown(GLFW_MOUSE_BUTTON_LEFT) || ks.isKeyDown(GLFW_KEY_J);
     return input;
 }
 
@@ -385,10 +404,11 @@ static void RenderPlayCharacter(Editor::PlayModeController& play, Model* playMod
     if (!shader) return;
 
     AnimatedCharacter& cc = play.character();
-    glm::mat4 model(1.0f);
-    model = glm::translate(model, cc.position);
-    model = glm::rotate(model, cc.heading, glm::vec3(0.0f, 1.0f, 0.0f));
-    model = glm::scale(model, glm::vec3(cc.scale));
+    // modelMatrix() applies the 180-degree facing flip (the bot is authored
+    // facing +Z while the logic treats local -Z as forward) so the rendered
+    // model faces AWAY from the follow camera. Without it the camera saw the
+    // bot's front and it looked like it was walking backward.
+    const glm::mat4 model = cc.modelMatrix();
 
     shader->use();
     shader->setMat4("projection", proj);
@@ -422,10 +442,18 @@ static int runEditorApp(const AppOptions& opts) {
 
     const bool hidden = opts.headless || (std::getenv("DISPLAY") == nullptr);
     glfwWindowHint(GLFW_VISIBLE, hidden ? GLFW_FALSE : GLFW_TRUE);
+    // Request the latest released OpenGL version. 4.6 is the high-water mark
+    // (no 4.7 has ever been released) and promotes several image-quality
+    // features to core: ARB_texture_filter_anisotropic,
+    // ARB_texture_filter_clamp, ARB_gl_spirv (driver-optimised SPIR-V shaders)
+    // and the full ARB_direct_state_access entry-point set. Requesting a 4.6
+    // core context lets these be used downstream. If the driver cannot grant
+    // 4.6, glfwCreateWindow below fails and we fall back to the GL-free logic
+    // sim, so this never hard-crashes an older GPU.
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_SAMPLES, 4);
+    glfwWindowHint(GLFW_SAMPLES, 4);       // 4x MSAA (resolved below)
 
     auto& renderConfig = Config::getRenderConfig();
     GLFWwindow* window = glfwCreateWindow(renderConfig.defaultWindowWidth,
@@ -447,7 +475,42 @@ static int runEditorApp(const AppOptions& opts) {
     }
     std::cout << "[Engine] OpenGL: " << glGetString(GL_VERSION)
               << " | " << glGetString(GL_RENDERER) << "\n";
+    std::cout << "[Engine] Requested OpenGL 4.6 core profile context.\n";
     glctx::setAlive(true);
+
+    // ---- Graphics quality: toggle the GL capabilities a 4.6 core context
+    //      exposes that directly improve output quality. Every call below uses
+    //      only enums present in the bundled (3.3) loader, so they are safe
+    //      regardless of the loader's GLVERSION flags:
+    //
+    //  * GL_FRAMEBUFFER_SRGB - gamma-correct compositing to the window. The
+    //    renderer draws linear HDR (GL_RGBA16F G-buffer then tone-maps in the
+    //    post-composite shader); without sRGB framebuffer encoding the final
+    //    image lands on the display with the wrong (flat, washed-out) gamma.
+    //  * GL_MULTISAMPLE - activates the 4x MSAA samples requested above via
+    //    GLFW_SAMPLES; without glEnable(GL_MULTISAMPLE) the sample buffer is
+    //    never resolved, so edges stay aliased.
+    //  * texture / mipmap quality hints - prefer the highest-quality decode
+    //    for compressed textures and the sharpest generated mipmaps.
+    glEnable(GL_FRAMEBUFFER_SRGB);
+    glEnable(GL_MULTISAMPLE);
+    glHint(GL_TEXTURE_COMPRESSION_HINT, GL_NICEST);
+    // GL_GENERATE_MIPMAP_HINT is core since GL 1.4, but the bundled 4.6 glad
+    // core generator only emits its _SGIS alias. Define the canonical core
+    // alias so this hint compiles regardless of loader.
+    #ifndef GL_GENERATE_MIPMAP_HINT
+    #define GL_GENERATE_MIPMAP_HINT 0x8192
+    #endif
+    glHint(GL_GENERATE_MIPMAP_HINT,    GL_NICEST);
+
+    // Sanity check: warn (but don't abort) if the driver couldn't actually
+    // hand us a 4.6 context - the logic sim can still boot in that case.
+    if (GLVersion.major < 4 || (GLVersion.major == 4 && GLVersion.minor < 6)) {
+        std::cout << "[Engine] WARNING: driver reported OpenGL " << GLVersion.major
+                  << "." << GLVersion.minor << " (4.6 requested). Falling back to\n"
+                  << "         the 4.5-quality path - 4.6 image-quality features"
+                  << " may be limited.\n";
+    }
 
     // ---- Editor state (shaders, meshes, grid, ECS world, camera) -----------
     std::cout << "[Engine] Initializing editor..." << std::endl;
@@ -479,7 +542,9 @@ static int runEditorApp(const AppOptions& opts) {
     io.ConfigWindowsMoveFromTitleBarOnly = true;
     io.ConfigWindowsResizeFromEdges = true;
     ImGui_ImplGlfw_InitForOpenGL(window, true);
-    ImGui_ImplOpenGL3_Init("#version 450");
+    // Match ImGui's GLSL shaders to the requested 4.6 (#version 460 == GLSL
+    // 4.60, the shading-language version shipped with OpenGL 4.6).
+    ImGui_ImplOpenGL3_Init("#version 460");
 
     // Editor look & feel: JetBrains Mono UI font (default), then the Phosphor
     // + FontAwesome6 icon fonts, then the modern theme painted onto ImGui.
@@ -524,11 +589,51 @@ static int runEditorApp(const AppOptions& opts) {
     terrainConfig.viewDistance = 2;
     terrainConfig.lodDistance = renderConfig.terrainLODDistance;
     vegConfig.vegetationDrawDistance = renderConfig.vegetationLODDistance;
+
+    // ---- Start scene (heightmap terrain, not the arena) --------------------
+    // Default start scene is the authored heightmap terrain — arena mode is
+    // OFF so WorldManager::initialize builds m_terrain (GL_R32F vertex
+    // displacement driven by the heightmap) + world objects + vegetation, and
+    // worldManager.render() draws them. The arena procedural test stage is
+    // still reachable via WorldManager.setArenaMode(true) (or F7 in-viewport);
+    // the entry point just picks the authored scene by default instead.
+    worldManager.setArenaMode(false);
+
     if (!worldManager.initialize(terrainConfig, vegConfig)) {
         std::cerr << "[Engine] World manager initialization had issues\n";
     }
 
     ecs::World& world = g_editor.world();
+
+    // ---- Wire the ECS adapter systems to the live engine modules --------------
+    // These thin adapters (ecs/systems/TerrainSystem, WorldObjectSystem,
+    // MotionMatchingSystem) delegate to the better, tested standalone modules
+    // owned by WorldManager instead of re-implementing placement/culling/height
+    // logic. Registering them here makes them part of the ECS dispatch every
+    // frame via world.update(dt); they are null-safe (see each adapter) so they
+    // are harmless no-ops until the modules they wrap are instantiated.
+    world.addSystem<ecs::TerrainSystem>();
+    world.addSystem<ecs::WorldObjectSystem>();
+    world.addSystem<ecs::MotionMatchingSystem>();
+
+    // Inject the live WorldManager singletons. In the default (arena) start
+    // scene these are null — initialize() skips terrain + world-object
+    // creation in arena mode (see WorldManager::initialize) — so the adapters
+    // simply have nothing to drive yet. The injected pointers are re-read here
+    // once and the adapters null-check on every update.
+    if (auto* ts = world.getSystem<ecs::TerrainSystem>())
+        ts->setTerrain(worldManager.getTerrain());
+    if (auto* wos = world.getSystem<ecs::WorldObjectSystem>())
+        wos->setWorldObjectManager(worldManager.getWorldObjectManager());
+
+    // Hand off Terrain + WorldObjectManager Update() ownership to the ECS
+    // adapter systems registered above. WorldManager::update() will skip its
+    // own Terrain::update / WorldObjectManager::update calls from now on; the
+    // ECS systems drive them in world.update(dt) (camera position is fed to
+    // them just below in the frame loop). Safe no-op in the default arena scene
+    // (the modules are null there); the real effect shows up when a heightmap
+    // scene instantiates them.
+    worldManager.setEcsOwnsTerrainObjects(true);
 
     // ---- Play mode state ------------------------------------------------------
     Editor::PlayModeController play;
@@ -547,9 +652,59 @@ static int runEditorApp(const AppOptions& opts) {
     // control; camera modes 1-4 orbit it.
     if (!play.load("assets/bot.fbx", "assets")) {
         std::cerr << "[Engine] Failed to load character\n";
+    } else {
+        // Register profiling CVars (artists tune live via config/cvars.ini).
+        // These mirror the ones in EditorApplication::initialize().
+        CVar::Instance().registerFloat("profiling.enabled", 1.0f);
+        CVar::Instance().registerFloat("profiling.logInterval", 5.0f);
+        CVar::Instance().registerFloat("profiling.consoleVerbose", 1.0f);
+
+        // Configure the Profiler from CVars.
+        Profiler::Instance().setEnabled(
+            CVar::Instance().getFloat("profiling.enabled", 1.0f) > 0.5f);
+        Profiler::Instance().setLogIntervalSeconds(
+            CVar::Instance().getFloat("profiling.logInterval", 5.0f));
+
+        // Flush a one-time summary to the console so creators see the
+        // character + matcher stats immediately.
+        EditorConsole::Log(
+            "[Engine] Character loaded: " +
+            std::to_string(play.character().boneCount()) + " bones, " +
+            std::to_string(play.character().clipCount()) + " clips",
+            EditorConsole::LogCategory::Animation);
+    }
+    // Spawn the bot ON the physics surface (terrain + tree/rock tops) instead
+    // of floating at y=0 above a valley / tree line: floor-snap to the surface
+    // so the first rendered frame already rests on the ground.
+    if (play.isLoaded()) {
+        AnimatedCharacter& ch = play.character();
+        const float surf = worldManager.getSurfaceHeightAt(ch.position.x, ch.position.z);
+        ch.position.y = surf;
+        ch.grounded = true;
+        std::cout << "[Spawn] bot clamped to surface y=" << surf
+                  << " at (" << ch.position.x << "," << ch.position.z << ")\n";
+        // Register the character with the Editor so the gizmo can manipulate it
+        // when no ECS entity is explicitly selected.
+        g_editor.setCharacter(&ch);
+
+        // Spawn NPC training dummies around the bot so combat targeting
+        // (Intent Matrix + LOS) has real targets to query.
+        worldManager.spawnNPC(ch.position + glm::vec3(5.0f, 0.0f, -3.0f), true);
+        worldManager.spawnNPC(ch.position + glm::vec3(-4.0f, 0.0f, 6.0f), true);
+        worldManager.spawnNPC(ch.position + glm::vec3(2.0f, 0.0f, 8.0f), true);
+        std::cout << "[Spawn] NPC training dummies spawned (" << worldManager.npcCount() << " total)\n";
     }
     playModel = std::make_unique<Model>("assets/bot.fbx");
     if (playModel->GetMeshCount() == 0) playModel.reset();
+
+    // Character visibility toggle — press F6 to hide/show the bot while
+    // building / inspecting the arena. The character is still simulated;
+    // only the viewport render is suppressed.
+    // Bot hidden while we fix the scene (skybox depth, terrain asset
+    // displacement, camera). The character is still simulated and drives
+    // camera framing / physics; only the viewport draw-call is suppressed.
+    // Press F6 to show it again.
+    bool showCharacter = false;
 
     // ---- Timing ----------------------------------------------------------------
     float lastTime = static_cast<float>(glfwGetTime());
@@ -577,13 +732,24 @@ static int runEditorApp(const AppOptions& opts) {
     entityCache.dirty = true;
 
     // ---- Main loop --------------------------------------------------------------
+    const double loopStartTime = glfwGetTime();
     while (!glfwWindowShouldClose(window)) {
+        // Profiling frame lifecycle — captures CPU timing for all regions
+        // inside this loop and flushes aggregated stats to the console.
+        PROFILE_CPU_SCOPE("MainLoop");
+        Profiler::Instance().beginFrame();
+
         // Headless: fixed 60 Hz timestep for a deterministic bounded run.
         float now = static_cast<float>(glfwGetTime());
         float dt = opts.headless ? (1.0f / 60.0f) : (now - lastTime);
         lastTime = now;
         if (dt > 0.1f) dt = 0.1f;
         if (dt < 0.0f) dt = 0.0f;
+
+        // Respect the game speed slider (Play menu). Multiplies the delta
+        // time so that character movement, camera easing, and animation all
+        // scale uniformly. Clamped to the slider's [0.1, 3.0] range.
+        dt *= std::clamp(g_editor.gameSpeed(), 0.1f, 3.0f);
 
         ++frameCount;
         ++frames;
@@ -650,6 +816,20 @@ static int runEditorApp(const AppOptions& opts) {
             // Geo tab is index 3 in the fixed tab bar {Outliner, Layers, World, Geo}.
             if (g_editor.uiState.showGameMode) g_editor.scenePanelConfig.activeTabIndex = 3;
         }
+        // F6 toggles the play character's visibility — temporarily "remove"
+        // the bot from the viewport so you can inspect / build the arena
+        // without the model getting in the way. The character is still
+        // simulated (so physics / camera follow keep working); only the
+        // render draw-call is suppressed.
+        if (!opts.headless && !wantCaptureKeyboard && inputState.isKeyPressed(GLFW_KEY_F6)) {
+            showCharacter = !showCharacter;
+            std::cout << "[Engine] Character " << (showCharacter ? "visible" : "hidden") << "\n";
+        }
+        // F7 toggles the arena stage itself (managed by WorldManager).
+        if (!opts.headless && !wantCaptureKeyboard && inputState.isKeyPressed(GLFW_KEY_F7)) {
+            worldManager.getArena().setVisible(!worldManager.getArena().isVisible());
+            std::cout << "[Engine] Arena " << (worldManager.getArena().isVisible() ? "visible" : "hidden") << "\n";
+        }
 
         // ---- Editor keyboard shortcuts (Ctrl combos + Delete) ----------------
         if (!opts.headless && !wantCaptureKeyboard) {
@@ -689,7 +869,14 @@ static int runEditorApp(const AppOptions& opts) {
         // The bot is always present in the viewport (loaded at startup). Play
         // mode just hands the player control; exiting keeps the bot visible.
         if (playing && !playWasActive) {
-            followCamInit = false;
+            // Arm the follow-cam one-shot in UpdatePlayCamera (the `if (firstInit)`
+            // block at line 320). Previously this was reset to `false` and never
+            // re-armed, so the close chest-level framing never fired and the
+            // follow camera drifted back to its constructor pose (0,5,10) — i.e.
+            // "very far from view, looking from above, world at the bottom" in
+            // every non-TopDown mode. Re-arming here makes the one-shot run once
+            // on play start (and again on each play-mode re-entry).
+            followCamInit = true;
             std::cout << "[Engine] Entering play mode\n";
         } else if (!playing && playWasActive) {
             std::cout << "[Engine] Exiting play mode\n";
@@ -732,12 +919,16 @@ static int runEditorApp(const AppOptions& opts) {
             if (!wantCaptureKeyboard) {
                 float moveSpeed = 10.0f * dt;
                 if (cam) {
-                    glm::vec3 forward = glm::normalize(cam->Target + cam->Position);
+                    // Free-fly camera (mode 0): WASD translates the eye AND the
+                    // target together along the view frame so the orientation is
+                    // preserved (W = forward into the scene, S = back, A/D strafe
+                    // left/right). Matches the Vulkan viewport's free-fly math.
+                    glm::vec3 forward = glm::normalize(cam->Target - cam->Position);
                     glm::vec3 right = glm::normalize(glm::cross(forward, cam->WorldUp));
-                    if (inputState.isKeyDown(GLFW_KEY_W)) { cam->Position -= forward * moveSpeed; cam->Target -= forward * moveSpeed; }
-                    if (inputState.isKeyDown(GLFW_KEY_S)) { cam->Position += forward * moveSpeed; cam->Target -= forward * moveSpeed; }
-                    if (inputState.isKeyDown(GLFW_KEY_A)) { cam->Position += right * moveSpeed; cam->Target -= right * moveSpeed; }
-                    if (inputState.isKeyDown(GLFW_KEY_D)) { cam->Position -= right * moveSpeed; cam->Target += right * moveSpeed; }
+                    if (inputState.isKeyDown(GLFW_KEY_W)) { cam->Position += forward * moveSpeed; cam->Target += forward * moveSpeed; }
+                    if (inputState.isKeyDown(GLFW_KEY_S)) { cam->Position -= forward * moveSpeed; cam->Target -= forward * moveSpeed; }
+                    if (inputState.isKeyDown(GLFW_KEY_A)) { cam->Position -= right * moveSpeed; cam->Target -= right * moveSpeed; }
+                    if (inputState.isKeyDown(GLFW_KEY_D)) { cam->Position += right * moveSpeed; cam->Target += right * moveSpeed; }
                 }
             }
             // Orbit: hold right mouse (or trackpad right-button) and drag.
@@ -750,6 +941,29 @@ static int runEditorApp(const AppOptions& opts) {
             // Zoom: scroll wheel / trackpad two-finger scroll.
             if (!wantCaptureMouse && inputState.scrollDelta.y != 0.0f) {
                 if (cam) cam->ProcessMouseScroll(inputState.scrollDelta.y);
+            }
+            // Free cam (mode 0) also respects the Viewport > Camera Distance /
+            // Pitch sliders so they are never "not registered". Push is
+            // edge-triggered from the UI: when a slider moves we write it to the
+            // fly cam (DistanceToTarget / Pitch clamped to its own limits) and
+            // re-orbit; between edits the right-drag orbit + scroll zoom keep
+            // full control, so the slider never fights the mouse. Gated on
+            // `playing` so the editor preview free-look viewport is untouched.
+            if (playing && cam) {
+                static float lastSliderDist  = g_editor.uiState.playCameraDistance;
+                static float lastSliderPitch = g_editor.uiState.playCameraPitch;
+                if (g_editor.uiState.playCameraDistance != lastSliderDist) {
+                    cam->DistanceToTarget = glm::clamp(
+                        g_editor.uiState.playCameraDistance,
+                        cam->MinDistance, cam->MaxDistance);
+                    lastSliderDist = g_editor.uiState.playCameraDistance;
+                    cam->RepositionOrbit();
+                }
+                if (g_editor.uiState.playCameraPitch != lastSliderPitch) {
+                    cam->Pitch = std::clamp(g_editor.uiState.playCameraPitch, -89.0f, 89.0f);
+                    lastSliderPitch = g_editor.uiState.playCameraPitch;
+                    cam->RepositionOrbit();
+                }
             }
         }
 
@@ -779,9 +993,24 @@ static int runEditorApp(const AppOptions& opts) {
             }
             // else: zero input -> the character idles in place
 
+            // Surface height INCLUDING static world-object colliders
+            // (boulder/rock/trunk tops), so the character stands ON solid
+            // objects the same way it stands on terrain.
             auto terrain = [&worldManager](float x, float z) -> float {
-                return worldManager.getHeightAt(x, z);
+                return worldManager.getSurfaceHeightAt(x, z);
             };
+            // ---- Physics collision resolution (BEFORE animation) ----
+            // FIX (v5 todo Area 3): Resolve solid-object collisions before
+            // animation so foot IK targets use the corrected root position.
+            if (worldManager.getPhysicsWorld()) {
+                AnimatedCharacter& ccM = play.character();
+                glm::vec3 feet = ccM.position;
+                glm::vec3 vel = ccM.velocity;
+                worldManager.resolveCharacterCollision(feet, 0.12f, 0.54f, vel, ccM.grounded);
+                ccM.position = feet;
+                ccM.velocity = vel;
+            }
+
             play.update(dt, in, terrain);
 
             const AnimatedCharacter& cc = play.character();
@@ -794,9 +1023,31 @@ static int runEditorApp(const AppOptions& opts) {
             // bot; mode 0 (Free) uses the fly camera above. camMode is already
             // clamped + driven by keys 0-4 / the Camera menu / World Settings.
             if (camMode >= 1) {
+                // Two-way sync: push slider values to the camera config before
+                // UpdatePlayCamera so they take effect, then sync back so scroll
+                // zoom / drag updates the slider. Applied to ALL play-camera modes
+                // (not just Follow, which was the only previously-supported case):
+                // the distance/pitch sliders now drive Orbit / Top-Down /
+                // First-Person too. Modes that fix those values (Top-Down) still
+                // override in UpdatePlayCamera; First-Person maps pitch -> fpPitch.
+                const bool firstPerson = (camMode == 4);
+                // Push: slider -> camera config (clamped to config limits)
+                followCam.config.distance = std::clamp(
+                    g_editor.uiState.playCameraDistance,
+                    followCam.config.minDistance, followCam.config.maxDistance);
+                followCam.pitch = std::clamp(
+                    g_editor.uiState.playCameraPitch,
+                    followCam.config.minPitch, followCam.config.maxPitch);
+                if (firstPerson) {
+                    fpPitch = std::clamp(g_editor.uiState.playCameraPitch,
+                                         followCam.config.minPitch, followCam.config.maxPitch);
+                }
                 UpdatePlayCamera(camMode - 1, followCam, cc, dt, aspect, inputState,
                                  followCamInit, lastCamMode, fpPitch);
                 lastCamMode = camMode - 1;
+                // Pull: camera config -> slider (reflect scroll-zoom / drag)
+                g_editor.uiState.playCameraDistance = followCam.config.distance;
+                g_editor.uiState.playCameraPitch = firstPerson ? fpPitch : followCam.pitch;
             } else {
                 lastCamMode = -1;
             }
@@ -822,6 +1073,14 @@ static int runEditorApp(const AppOptions& opts) {
                                        ? followCam.position
                                        : (cam ? cam->Position : glm::vec3(0.0f));
         worldManager.update(cameraPosition, dt);
+        // Feed the live camera position to the ECS adapter systems. The ECS
+        // World update is camera-less (update(dt)), so systems read it here.
+        // Null-safe via getSystem<> (the systems may not be registered in every
+        // entry path).
+        if (auto* ts = world.getSystem<ecs::TerrainSystem>())
+            ts->setCameraPosition(cameraPosition);
+        if (auto* wos = world.getSystem<ecs::WorldObjectSystem>())
+            wos->setCameraPosition(cameraPosition);
         world.update(dt);
 
         // ---- Geo pipeline <-> UI bridge -------------------------------------------
@@ -848,6 +1107,15 @@ static int runEditorApp(const AppOptions& opts) {
             }
         }
 
+        // ---- Sync World Settings culling/LOD debug UI to render pipeline ----
+        // (only the engine binary uses this path; editor_main reads these fields)
+        renderPipeline.setCullingDebug(g_editor.uiState.worldSettings.cullingDebug);
+        renderPipeline.setMaxVisibleInstances(g_editor.uiState.worldSettings.maxVisibleInstances);
+        renderPipeline.setLODBands(
+            g_editor.uiState.worldSettings.lodBand1,
+            g_editor.uiState.worldSettings.lodBand2,
+            g_editor.uiState.worldSettings.lodBand3);
+
         // ---- Render scene into the viewport FBO ----------------------------------
         // beginFrame()/renderScene() do not clear, so clear color + depth first or
         // the FBO keeps stale/undefined contents (blank viewport).
@@ -855,6 +1123,11 @@ static int runEditorApp(const AppOptions& opts) {
         glViewport(0, 0, renderPipeline.getViewportWidth(), renderPipeline.getViewportHeight());
         glClearColor(0.08f, 0.09f, 0.12f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // Apply wireframe mode to ALL scene rendering (renderPipeline +
+        // worldManager + character), so the toggle affects every draw call.
+        const bool wireframe = g_editor.showWireframe() != 0;
+        if (wireframe) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 
         glm::mat4 view = cam ? cam->GetViewMatrix() : glm::mat4(1.0f);
         if (camMode >= 1 && play.isLoaded()) view = followCam.getViewMatrix();
@@ -866,11 +1139,110 @@ static int runEditorApp(const AppOptions& opts) {
             renderConfig.nearPlane, renderConfig.farPlane);
 
         renderPipeline.beginFrame();
+        // Push the wireframe toggle from the Editor UI into the render pipeline.
+        renderPipeline.setWireframeMode(g_editor.showWireframe() != 0);
         renderPipeline.renderScene(view, projection, cameraPosition, kCamFov);
+        // WorldManager handles arena rendering in arena mode (and terrain in
+        // regular mode). The arena renders on top of the skybox.
         worldManager.render(view, projection, cameraPosition);
-        // The bot is always in the viewport (idle outside play mode).
-        if (play.isLoaded()) RenderPlayCharacter(play, playModel.get(), renderPipeline, view, projection, cameraPosition);
+        // The bot is always in the viewport (idle outside play mode). F6 hides
+        // it temporarily while building / inspecting the arena.
+        if (showCharacter && play.isLoaded()) {
+            RenderPlayCharacter(play, playModel.get(), renderPipeline, view, projection, cameraPosition);
+        }
 
+        // Culling debug output (after all render passes complete so stats are final)
+        if (renderPipeline.isCullingDebug()) {
+            const Render::RenderStats& s = renderPipeline.getStats();
+            printf("[cull-debug] visible=%zu culled=%zu maxVisible=%d "
+                   "lodBands=[%.1f %.1f %.1f]\n",
+                   s.visibleInstances, s.culledInstances,
+                   renderPipeline.getMaxVisibleInstances(),
+                   renderPipeline.getLODBand(0),
+                   renderPipeline.getLODBand(1),
+                   renderPipeline.getLODBand(2));
+            fflush(stdout);
+        }
+
+        // Render NPC targets as wireframe spheres (debug visualization).
+        // Gated on showCharacter (F6) so the default gameplay viewport is clean;
+        // the spheres are debug viz only and are re-armed when inspecting the
+        // arena (showCharacter == true), alongside the play-character toggle.
+        if (showCharacter) {
+            static unsigned int sphereVAO = 0, sphereVBO = 0, sphereEBO = 0;
+            static unsigned int sphereIndexCount = 0;
+            if (sphereVAO == 0) {
+                const int sectors = 16, stacks = 12;
+                const float radius = 0.5f;
+                std::vector<glm::vec3> verts;
+                std::vector<unsigned int> idx;
+                for (int s = 0; s <= stacks; ++s) {
+                    float phi = M_PI * s / stacks;
+                    for (int k = 0; k < sectors; ++k) {
+                        float th = 2.0f * M_PI * k / sectors;
+                        verts.emplace_back(
+                            radius * sin(phi) * cos(th),
+                            radius * cos(phi),
+                            radius * sin(phi) * sin(th));
+                    }
+                }
+                for (int s = 0; s < stacks; ++s) {
+                    for (int k = 0; k < sectors; ++k) {
+                        int a = s*sectors + k;
+                        int b = (s+1)*sectors + k;
+                        int c = (s+1)*sectors + (k+1)%sectors;
+                        int d = s*sectors + (k+1)%sectors;
+                        idx.push_back(a); idx.push_back(b); idx.push_back(d);
+                        idx.push_back(b); idx.push_back(c); idx.push_back(d);
+                    }
+                }
+                glGenVertexArrays(1, &sphereVAO);
+                glGenBuffers(1, &sphereVBO);
+                glGenBuffers(1, &sphereEBO);
+                sphereIndexCount = (unsigned int)idx.size();
+                glBindVertexArray(sphereVAO);
+                glBindBuffer(GL_ARRAY_BUFFER, sphereVBO);
+                glBufferData(GL_ARRAY_BUFFER, verts.size()*sizeof(glm::vec3), verts.data(), GL_STATIC_DRAW);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sphereEBO);
+                glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size()*sizeof(unsigned int), idx.data(), GL_STATIC_DRAW);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
+                glBindVertexArray(0);
+            }
+
+            Shader* npcShader = renderPipeline.getDefaultShader();
+            if (!npcShader) npcShader = renderPipeline.getModelShader();
+            if (!npcShader) { glPolygonMode(GL_FRONT_AND_BACK, GL_FILL); return 0; }
+
+            npcShader->use();
+            npcShader->setMat4("projection", projection);
+            npcShader->setMat4("view", view);
+            npcShader->setVec3("viewPos", cameraPosition);
+            npcShader->setInt("uDisableInstancing", 1);
+            npcShader->setInt("uDisableSkinning", 1);
+            npcShader->setInt("uShowDebug", 0);
+            npcShader->setVec3("lightPos", glm::vec3(10.0f, 15.0f, 10.0f));
+
+            glBindVertexArray(sphereVAO);
+            for (const auto& npc : worldManager.npcs()) {
+                if (!npc.alive) continue;
+                glm::mat4 model(1.0f);
+                model = glm::translate(model, npc.position);
+                npcShader->setMat4("model", model);
+                npcShader->setVec3("color", npc.isEnemy
+                    ? glm::vec3(0.9f, 0.2f, 0.2f) : glm::vec3(0.2f, 0.5f, 0.9f));
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+                glDrawElements(GL_TRIANGLES, sphereIndexCount, GL_UNSIGNED_INT, 0);
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            }
+            glBindVertexArray(0);
+        }
+
+        // Restore solid polygon mode for ImGui UI rendering (wireframe only
+        // applied to scene geometry above)
+        if (wireframe) {
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        }
 
         // ---- ImGui editor UI on top of the viewport texture ----------------------
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -889,7 +1261,10 @@ static int runEditorApp(const AppOptions& opts) {
         UI::RenderSceneDialogs(g_editor);
         UI::RenderToolbar(g_editor);
         UI::RenderLeftPanel(g_editor);
-        UI::RenderRightPanel(g_editor);
+        // The play-mode debug UI lives in the Details panel (not as a
+        // floating overlay on the viewport) so the 3D view stays clear and
+        // the character remains visible while playing.
+        UI::RenderRightPanel(g_editor, &play, kPlayCameraModeNames[camMode]);
         UI::RenderBottomPanel(g_editor, fps);
         // Pass the active view camera (fly in Free mode, follow cam in modes
         // 1-4) so the viewport overlay + gizmo/grid reflect what is rendered.
@@ -903,7 +1278,6 @@ static int runEditorApp(const AppOptions& opts) {
                            projection, view,
                            play.isLoaded() ? kPlayCameraModeNames[camMode] : nullptr,
                            activeCamPos, activeCamTarget);
-        if (playing && play.isLoaded()) UI::RenderPlayModeHUD(play, kPlayCameraModeNames[camMode]);
         UI::RenderStatusBar(world.getEntityCount(), g_editor.selectedEntity(), fps,
                             g_editor.isPlaying(), g_editor.wasPlaying(), windowW, windowH);
         UI::RenderAboutDialog(g_editor.showAboutRef());
@@ -922,7 +1296,8 @@ static int runEditorApp(const AppOptions& opts) {
             glfwSetWindowShouldClose(window, true);
         }
 
-
+        // End profiling frame — calls all stat providers and flushes to console.
+        Profiler::Instance().endFrame();
     }
 
     // ---- Summary ------------------------------------------------------------------
@@ -942,7 +1317,12 @@ static int runEditorApp(const AppOptions& opts) {
                   << "  foot IK         : L=" << (diag.leftLocked ? "LOCK" : "free")
                   << " R=" << (diag.rightLocked ? "LOCK" : "free") << "\n";
     }
-    std::cout << "  average fps     : " << (frameCount > 0 ? (float)frameCount / std::max(0.001f, lastTime - 0.0f) : 0.0f) << "\n";
+    // Average FPS over the MAIN LOOP only (excluding startup: the -O0 debug
+    // build spends tens of seconds loading clips / building databases before
+    // the loop, which used to drag this number down to ~5 fps and hide the
+    // real frame cost).
+    const double loopElapsed = lastTime - loopStartTime;
+    std::cout << "  average fps     : " << (frameCount > 0 ? (float)frameCount / std::max(0.001f, (float)loopElapsed) : 0.0f) << "\n";
 
     // ---- Cleanup --------------------------------------------------------------------
     // Tear down play-mode GPU resources while the GL context is still alive
@@ -962,6 +1342,11 @@ static int runEditorApp(const AppOptions& opts) {
     glfwDestroyWindow(window);
     glfwTerminate();
 
+    // Restore original stdout/stderr before process exit so final messages
+    // go to the terminal (the console streambufs may be destroyed during
+    // static teardown).
+    EditorConsole::UninstallStdoutRedirect();
+
     std::cout << "[Engine] Shutdown complete.\n";
     return 0;
 }
@@ -973,6 +1358,11 @@ int main(int argc, char** argv) {
     signal(SIGSEGV, crashHandler);
     signal(SIGABRT, crashHandler);
     signal(SIGFPE, crashHandler);
+
+    // Redirect std::cout / std::cerr into the EditorConsole so ALL log output
+    // (including the startup banner below and every "[Engine] ..." line)
+    // appears in the Output Log panel.  Installed BEFORE any other output.
+    EditorConsole::InstallStdoutRedirect();
 
     const AppOptions opts = parseOptions(argc, argv);
 

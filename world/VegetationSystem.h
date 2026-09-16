@@ -11,10 +11,12 @@ public:
         float treeDensity = 0.02f;         // Trees per square meter
         float grassDensity = 0.5f;         // Grass clusters per square meter
         float rockDensity = 0.01f;         // Rocks per square meter
+        float pebbleDensity = 0.05f;       // Tiny ground stones per m2
         float minTreeHeight = 3.0f;
         float maxTreeHeight = 8.0f;
         int maxTreesPerChunk = 50;
         int maxRocksPerChunk = 30;
+        int maxPebblesPerChunk = 80;
     };
 
     struct Tree {
@@ -28,7 +30,7 @@ public:
         glm::vec3 position;
         glm::vec3 scale;
         float rotation;
-        int type;  // 0=boulder, 1=stone, 2=cliff
+        int type;  // 0=boulder, 1=stone, 2=cliff, 3=pebble (tiny ground stone)
     };
 
     // Ground plants: grass clusters / flower patches (celandine, periwinkle) /
@@ -38,6 +40,9 @@ public:
         float scale;
         float rotation;
         int type;  // 0=grass, 1=flower (periwinkle), 2=succulent (othonna)
+        // Albedo multiplier for per-instance color variation (e.g. healthy
+        // green <-> dry yellow grass tufts) so the field isn't uniform.
+        glm::vec3 tint = glm::vec3(1.0f);
     };
 
     // Instance data for GPU (tightly packed for performance)
@@ -65,6 +70,11 @@ public:
     // Get trees for rendering
     const std::vector<Tree>& getTrees() const { return m_trees; }
     const std::vector<Rock>& getRocks() const { return m_rocks; }
+    // Pebbles (tiny ground stones, rock type 3) are tracked separately from
+    // the rock outcrops: they reuse the stone model scaled down to pebble
+    // size and are governed by maxPebblesPerChunk, NOT maxRocksPerChunk, so
+    // getRocks() is bounded by maxRocksPerChunk as the tests assert.
+    const std::vector<Rock>& getPebbles() const { return m_pebbles; }
     const std::vector<Plant>& getPlants() const { return m_plants; }
 
     // Clear vegetation (for chunk unloading)
@@ -96,6 +106,7 @@ private:
     VegetationConfig m_config;
     std::vector<Tree> m_trees;
     std::vector<Rock> m_rocks;
+    std::vector<Rock> m_pebbles;   // tiny ground stones (rock type 3), separate from outcrops
     std::vector<Plant> m_plants;
     std::mt19937 m_rng;
 

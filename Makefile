@@ -47,14 +47,20 @@ INCLUDES := -I. \
             -IshaderSystem \
             -Iworld \
             -Iutils \
+            -Irhi \
             -Iexternal/imgui \
             -Iexternal/imgui/backends \
+            -Iexternal \
             -IIconFontCppHeaders-main \
             -I/usr/include/jsoncpp \
-            -I/usr/include/eigen3
+            -I/usr/include/eigen3 \
+            -I/usr/include/OpenEXR \
+            -I/usr/include/Imath
 
 # --- Libraries ---
-LIBS := -lassimp -lopenal -lz -ldl -lglfw -lGL -lX11 -lGLEW -ljsoncpp -pthread -lcurl
+LIBS := -lassimp -lopenal -lz -ldl -lglfw -lGL -lX11 -lGLEW -ljsoncpp -pthread -lcurl \
+        -lOpenEXR-3_1 -lOpenEXRUtil-3_1 -lOpenEXRCore-3_1 -lIex-3_1 -lIlmThread-3_1 -lImath-3_1 \
+        -lvulkan
 
 # --- Google Test ---
 # gtest_main provides the main() used by the test runner only. The engine
@@ -91,6 +97,7 @@ SRC_CPP := \
 	$(wildcard physicsSystem/*.cpp) \
 	$(wildcard playerSystem/*.cpp) \
 	$(wildcard renderer/*.cpp) \
+	$(wildcard rhi/*.cpp) \
 	$(wildcard shaderSystem/*.cpp) \
 	$(wildcard world/*.cpp) \
 	$(wildcard utils/*.cpp)
@@ -103,18 +110,43 @@ IMGUI_SRC := \
 	external/imgui/imgui_tables.cpp \
 	external/imgui/imgui_widgets.cpp \
 	external/imgui/backends/imgui_impl_glfw.cpp \
-	external/imgui/backends/imgui_impl_opengl3.cpp
+	external/imgui/backends/imgui_impl_opengl3.cpp \
+	external/imgui/backends/imgui_impl_vulkan.cpp
 
 SRC_CPP += $(IMGUI_SRC)
 
 # C source files
 SRC_C := src/glad.c
 
+# --- RHI shaders (GLSL -> SPIR-V via glslc for the Vulkan backend) ---
+RHI_SHADERS := $(wildcard rhi/shaders/*.vert) $(wildcard rhi/shaders/*.frag) $(wildcard rhi/shaders/*.comp)
+RHI_SPV := $(patsubst rhi/shaders/%.,$(BUILD_DIR)/rhi/%.,$(RHI_SHADERS))
+RHI_SPV := $(RHI_SHADERS:rhi/shaders/%.vert=$(BUILD_DIR)/rhi/%.vert.spv)
+RHI_SPV += $(RHI_SHADERS:rhi/shaders/%.frag=$(BUILD_DIR)/rhi/%.frag.spv)
+RHI_SPV += $(RHI_SHADERS:rhi/shaders/%.comp=$(BUILD_DIR)/rhi/%.comp.spv)
+
+# glslc ships with the Vulkan SDK - compile the RHI shaders once at build
+# time (SPIR-V is the shader format Vulkan consumes). The .comp shaders
+# (FSR3 EASU) include the AMD FSR1 GLSL headers from the SDK, so they need
+# the SDK include root; the vertex/fragment shaders are standalone glslc.
+$(BUILD_DIR)/rhi/%.vert.spv: rhi/shaders/%.vert
+	@mkdir -p $(BUILD_DIR)/rhi
+	glslc $< -o $@
+
+$(BUILD_DIR)/rhi/%.frag.spv: rhi/shaders/%.frag
+	@mkdir -p $(BUILD_DIR)/rhi
+	glslc $< -o $@
+
+$(BUILD_DIR)/rhi/%.comp.spv: rhi/shaders/%.comp
+	@mkdir -p $(BUILD_DIR)/rhi
+	glslc --target-env=vulkan1.3 -IFidelityFX-SDK-FSR3/sdk/include/FidelityFX/gpu $< -o $@
+
 # --- Test source files (all tests; individually excluded if broken) ---
 ALL_TESTS := $(wildcard $(TEST_DIR)/*.cpp)
 
 # Standalone apps (have their own main())
-STANDALONE_TESTS := $(TEST_DIR)/bot_viewport_minimal.cpp $(TEST_DIR)/test_geoterrain.cpp
+STANDALONE_TESTS := $(TEST_DIR)/bot_viewport_minimal.cpp $(TEST_DIR)/test_geoterrain.cpp \
+                     $(TEST_DIR)/repro_static_destruction.cpp $(TEST_DIR)/bench_soa_cache.cpp
 
 # Excluded files that need deeper implementation work (none currently):
 EXCLUDED_TESTS :=
@@ -148,7 +180,7 @@ DEP_FILES := $(OBJS:.o=.d) $(TEST_OBJ:.o=.d) \
 # ============================================================
 #  Default target
 # ============================================================
-all: dirs $(BIN_DIR)/$(TEST_TARGET)
+all: dirs $(BIN_DIR)/$(TEST_TARGET) $(BIN_DIR)/$(ENGINE_APP)
 	@echo ""
 	@echo "========================================"
 	@echo "  Build complete! Run: make test"
@@ -164,7 +196,7 @@ dirs:
 # ============================================================
 #  Link test runner
 # ============================================================
-$(BIN_DIR)/$(TEST_TARGET): dirs $(OBJS) $(TEST_OBJ)
+$(BIN_DIR)/$(TEST_TARGET): dirs $(OBJS) $(TEST_OBJ) $(RHI_SPV)
 	$(CXX) $(CXXFLAGS) $(OBJS) $(TEST_OBJ) -o $@ $(LIBS) $(GTEST_LIBS) $(LDFLAGS)
 
 # ============================================================
@@ -201,9 +233,21 @@ $(BIN_DIR)/$(BOT_VIEWPORT_TEST): dirs $(OBJS) build/tests/bot_viewport_minimal.o
 $(BIN_DIR)/$(GEOTERRAIN_TEST): dirs $(OBJS) build/tests/test_geoterrain.o
 	$(CXX) $(CXXFLAGS) $(OBJS) build/tests/test_geoterrain.o -o $@ $(LIBS) $(LDFLAGS)
 
+# --- Static-destruction crash regression guard (crash.log: ResourceManager
+#     singleton destroyed after GL context teardown calls glDelete* on a dead
+#     context -> SIGSEGV). Exit 0 = guards hold; SIGSEGV = regression. ---
+STATIC_DESTRUCTION_TEST := repro_static_destruction
+
+$(BIN_DIR)/$(STATIC_DESTRUCTION_TEST): dirs $(OBJS) build/tests/repro_static_destruction.o
+	$(CXX) $(CXXFLAGS) $(OBJS) build/tests/repro_static_destruction.o -o $@ $(LIBS) $(LDFLAGS)
+
 # --- Editor application (own main, not part of the test runner) ---
 $(BIN_DIR)/$(EDITOR_APP): dirs $(OBJS) build/src/editor_main.o
 	$(CXX) $(CXXFLAGS) $(OBJS) build/src/editor_main.o -o $@ $(LIBS) $(LDFLAGS)
+
+# --- #4 perf harness (headless micro-bench; NOT part of the 246 gate) ---
+$(BIN_DIR)/bench_soa_cache: dirs build/tests/bench_soa_cache.o
+	$(CXX) $(CXXFLAGS) build/tests/bench_soa_cache.o -o $@
 
 # --- Full engine entry point (test.cpp): runs the whole test suite as a
 #     self-check, then boots the entire engine. ---
@@ -328,6 +372,15 @@ test-world: $(BIN_DIR)/$(TEST_TARGET)
 	@echo "========================================"
 	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="TerrainTest.*:WorldTest.*" --gtest_print_time=1
 
+test-rhi: $(BIN_DIR)/$(TEST_TARGET)
+	@echo ""
+	@echo "========================================"
+	@echo "  RHI / Graphics Backend Tests"
+	@echo "  (GL + Vulkan backends, offscreen 3D scenes, depth/instancing,"
+	@echo "   swapchain present, GL <-> Vulkan pixel parity)"
+	@echo "========================================"
+	./$(BIN_DIR)/$(TEST_TARGET) --gtest_filter="RHI.*" --gtest_print_time=1
+
 test-terrain-pipeline: $(BIN_DIR)/$(TEST_TARGET)
 	@echo ""
 	@echo "========================================"
@@ -394,7 +447,7 @@ release:
 # ============================================================
 .PHONY: all dirs test clean rebuild release \
         test-physics test-motion-matching test-memory test-math \
-        test-character test-camera test-world test-terrain-pipeline test-integration \
+        test-character test-camera test-world test-rhi test-terrain-pipeline test-integration \
         test-quick test-list test-memory-debug \
         bot-viewport-test geoterrain-test \
         editor engine run run-headless

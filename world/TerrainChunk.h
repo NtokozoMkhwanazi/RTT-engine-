@@ -39,12 +39,22 @@ enum TerrainUniform {
     // Desert rock albedo texture (dry-desert terrain look)
     TU_DESERT_TEX,      // sampler2D - tiling rock/sand albedo
     TU_TEX_SCALE,       // float - world meters per texture tile
+    TU_DESERT_NORMAL,   // sampler2D - tiling rock normal map
+    TU_DESERT_ROUGH,    // sampler2D - tiling rock roughness map
+    TU_PBR_ATLAS,       // sampler2D - PBR material atlas (albedo/normal/rough)
     TU_COUNT
 };
 extern GLint g_terrainUniforms[TU_COUNT];
 
 // Bake program: desert albedo sampler lives on unit 2 (heightmap=0, atlas=1).
 extern GLint g_terrainBakeDesertTex;
+extern GLint g_terrainBakeNormalTex;
+extern GLint g_terrainBakeRoughTex;
+
+// G-Buffer terrain shader (deferred path — same VS, outputs MRT)
+void initTerrainGBufferShader();
+extern GLuint g_terrainGBufferShader;
+extern GLint g_terrainGBufferUniforms[TU_COUNT];
 
 // ============================================================
 // Heightfield sampling (shared by physics + GPU displacement)
@@ -131,8 +141,12 @@ public:
     // Update LOD based on distance to camera
     void updateLOD(const glm::vec3& cameraPos, float lodDistance);
 
-    // Render the chunk (no shader setup - call Terrain::renderBatch first)
-    void draw() const;
+    // Render the chunk (no shader setup - call Terrain::renderBatch first).
+    // When asPatches is true the index list is emitted as GL_PATCHES (triangle
+    // patches, requires the tessellation pipeline + glPatchParameteri(GL_PATCH_VERTICES,3));
+    // false keeps the legacy GL_TRIANGLES path. Defaults to false so all existing
+    // callers are unaffected.
+    void draw(bool asPatches = false) const;
 
     // Get chunk world position
     glm::vec3 getWorldPosition() const;

@@ -1,0 +1,61 @@
+// FSR3 velocity dilation pass. GLSL 4.6 compute.
+//
+// At object silhouette edges, background and foreground pixels share a thin
+// boundary tile.  Standard 1:1 pixel sampling can let background velocity
+// vectors leak into foreground edges, producing ghost-trails and black
+// artefacts during temporal reprojection.  This pass scans a 3x3 neighbourhood
+// around each pixel, finds the closest-depth (foreground) sample, and copies
+// that pixel's velocity vector into the centre output — dilating foreground
+// motion vectors over the edge boundaries so FSR3 reprojects the correct
+// surface.
+//
+// Layout (set = 0):
+//   binding 0   : rgba32f storage image  inVelocity   (raw velocity, RG32F)
+//   binding 1   : texture2D             sceneDepth   (half-res D32_SFLOAT)
+//   binding 1000: sampler               s_linear_clamp (linear, clamp)
+//   binding 2   : rg32f  storage image  outDilated   (dilated velocity)
+//   binding 3000: uniform buffer        cbDilate     (depthUvScale vec2)
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rg32f) uniform readonly image2D inVelocity;
+layout(set = 0, binding = 1)         uniform texture2D sceneDepth;
+layout(set = 0, binding = 1000)      uniform sampler s_linear_clamp;
+layout(set = 0, binding = 2, rg32f)  uniform writeonly image2D outDilated;
+
+layout(set = 0, binding = 3000) uniform cbDilate_t {
+    vec2  depthUvScale;   // maps fbUV -> half-res depth UV
+} cbD;
+
+void main() {
+    const ivec2 p   = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 dim = imageSize(inVelocity);
+    if (p.x >= dim.x || p.y >= dim.y) return;
+
+    const vec2  texelSize = 1.0 / vec2(dim);
+    const vec2  uv        = (vec2(p) + 0.5) * texelSize;
+
+    // Find the closest (minimum) depth in the 3x3 neighbourhood.
+    float closestDepth = 1.0;   // Vulkan depth clears to 1.0 (far plane)
+    ivec2 offsetTarget = ivec2(0);
+
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            ivec2 q = p + ivec2(dx, dy);
+            if (q.x < 0 || q.x >= dim.x || q.y < 0 || q.y >= dim.y) continue;
+            vec2 qUv = (vec2(q) + 0.5) * texelSize;
+            float d = texture(sampler2D(sceneDepth, s_linear_clamp),
+                              qUv * cbD.depthUvScale).r;
+            if (d < closestDepth) {
+                closestDepth = d;
+                offsetTarget = ivec2(dx, dy);
+            }
+        }
+    }
+
+    // Copy the closest (foreground-most) velocity to the centre pixel.
+    vec2 dilatedVel = imageLoad(inVelocity, p + offsetTarget).rg;
+    imageStore(outDilated, p, vec4(dilatedVel, 0.0, 0.0));
+}

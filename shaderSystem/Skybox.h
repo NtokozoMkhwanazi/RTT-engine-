@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include "Shader.h"
+#include "lighting/LightingEnvironment.h"  // #3: lighting env threaded in, not Instance()'d
 
 class Skybox {
 public:
@@ -16,7 +17,10 @@ public:
     void update(float dt);
 
     // render the skybox
-    void render(const glm::mat4& view, const glm::mat4& projection);
+    // #3: lighting env passed in explicitly (no LightingEnvironment::Instance()
+    // inside the render path) so the skybox tint matches the frame's env.
+    void render(const glm::mat4& view, const glm::mat4& projection,
+                const LightingEnvironment& lighting);
     void setDebugSolid(bool debug) { debugSolid = debug; }
 
     void setBlend(float amount) { blend = glm::clamp(amount, 0.0f, 1.0f); }

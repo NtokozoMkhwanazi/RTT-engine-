@@ -445,7 +445,7 @@ TEST_F(CameraSystemTest, Controller_Reset) {
     
     // Should be back to third person
     EXPECT_NEAR(camera.config.distance, 4.0f, 1.0f);
-    EXPECT_FLOAT_EQ(camera.yaw, -90.0f);
+    EXPECT_FLOAT_EQ(camera.yaw, 180.0f);
     EXPECT_FLOAT_EQ(camera.pitch, 0.0f);
 }
 
@@ -979,7 +979,7 @@ TEST_F(CameraSystemTest, Constructor_DefaultValues) {
     EXPECT_FLOAT_EQ(defaultCam.target.z, 0.0f);
 
     // Default yaw/pitch
-    EXPECT_FLOAT_EQ(defaultCam.yaw, -90.0f);
+    EXPECT_FLOAT_EQ(defaultCam.yaw, 180.0f);
     EXPECT_FLOAT_EQ(defaultCam.pitch, 0.0f);
 }
 
@@ -1000,6 +1000,97 @@ TEST_F(CameraSystemTest, Constructor_CustomStartPosition) {
     EXPECT_FLOAT_EQ(customCam.target.x, targetPos.x);
     EXPECT_FLOAT_EQ(customCam.target.y, targetPos.y);
     EXPECT_FLOAT_EQ(customCam.target.z, targetPos.z);
+}
+
+/**
+ * Test: Frame-Rate Independent Smoothing
+ * The exponential blend makes convergence depend only on total elapsed
+ * time, not the frame rate: (1 - (1 - exp(-k*dt)))^n = exp(-k*n*dt) =
+ * exp(-k*T). A linear lerp (the "camera lags by a fixed percentage"
+ * problem from suggestions.txt) converges differently at 30/60/120 Hz and
+ * makes the world appear to slide under the character as the framerate
+ * varies. Locks in dt-independent behavior.
+ */
+TEST_F(CameraSystemTest, Smoothing_FrameRateIndependent) {
+    input.characterPosition = glm::vec3(5.0f, 0.0f, 8.0f);
+    input.animState = CameraState::RUN;
+    input.isGrounded = true;
+
+    const float totalTime = 1.0f;
+
+    auto runAtHz = [&](float hz) {
+        ThirdPersonCamera cam;
+        cam.config = camera.config;
+        cam.position = camera.position;
+        cam.pivot = camera.pivot;
+        cam.target = camera.target;
+        cam.currentFollowSmooth = camera.currentFollowSmooth;
+        cam.yaw = camera.yaw;
+        cam.pitch = camera.pitch;
+        const float step = 1.0f / hz;
+        const int frames = static_cast<int>(totalTime * hz + 0.5f);
+        for (int i = 0; i < frames; ++i) {
+            cam.update(step, input, 16.0f / 9.0f);
+        }
+        return cam.position;
+    };
+
+    const glm::vec3 at30 = runAtHz(30.0f);
+    const glm::vec3 at60 = runAtHz(60.0f);
+    const glm::vec3 at120 = runAtHz(120.0f);
+
+    // After the same simulated time the camera must have converged to the
+    // same place regardless of frame rate (float-exact up to rounding).
+    EXPECT_NEAR(glm::length(at60 - at30), 0.0f, 1e-3f);
+    EXPECT_NEAR(glm::length(at120 - at60), 0.0f, 1e-3f);
+}
+
+/**
+ * Test: Auto-Orient Behind - Bot Turns Around
+ * The follow camera must always sit BEHIND the character. When the character
+ * turns 180 degrees (walks toward / past the camera), the camera must orbit
+ * around to the new back instead of staying in front of it.
+ */
+TEST_F(CameraSystemTest, OrientBehind_BotTurnaround) {
+    camera.config.orientToCharacterForward = true;
+    input.characterPosition = glm::vec3(0.0f, 0.0f, 0.0f);
+    input.animState = CameraState::RUN;
+    const float aspect = 16.0f / 9.0f;
+    const float dt = 1.0f / 60.0f;
+
+    // Bot faces -Z (heading 0): the camera must settle behind it at +Z.
+    input.characterForward = glm::vec3(0.0f, 0.0f, -1.0f);
+    for (int i = 0; i < 120; ++i) camera.update(dt, input, aspect);
+    EXPECT_GT(camera.position.z, 0.5f)
+        << "Camera must sit behind a bot facing -Z";
+    EXPECT_GT(camera.position.z, 3.0f)
+        << "Camera should reach the follow distance behind the bot";
+
+    // Bot turns 180 degrees to face +Z (walks toward / past the camera):
+    // the camera must swing around to the new back at -Z.
+    input.characterForward = glm::vec3(0.0f, 0.0f, 1.0f);
+    for (int i = 0; i < 180; ++i) camera.update(dt, input, aspect);
+    EXPECT_LT(camera.position.z, -0.5f)
+        << "Camera must re-orient behind a bot now facing +Z";
+    EXPECT_LT(camera.position.z, -3.0f)
+        << "Camera should reach the follow distance behind the turned bot";
+}
+
+/**
+ * Test: Auto-Orient Behind - Disabled Keeps World-Fixed Yaw
+ * With the flag off the camera keeps its yaw (no auto-correction), so
+ * existing behavior and manual orbit control are unaffected.
+ */
+TEST_F(CameraSystemTest, OrientBehind_DisabledKeepsYaw) {
+    input.characterPosition = glm::vec3(0.0f, 0.0f, 0.0f);
+    input.characterForward = glm::vec3(0.0f, 0.0f, 1.0f);
+    input.animState = CameraState::RUN;
+    const float aspect = 16.0f / 9.0f;
+    const float dt = 1.0f / 60.0f;
+
+    const float yawBefore = camera.yaw;
+    for (int i = 0; i < 120; ++i) camera.update(dt, input, aspect);
+    EXPECT_FLOAT_EQ(camera.yaw, yawBefore) << "Yaw must stay fixed when disabled";
 }
 
 /**

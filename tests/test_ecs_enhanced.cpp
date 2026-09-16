@@ -105,6 +105,69 @@ TEST_F(ArchetypeStorageTest, ArchetypeCacheCoherency) {
     EXPECT_EQ(count2, 50);   // Only batch2 has RigidBody
 }
 
+TEST_F(ArchetypeStorageTest, LegacyAddComponentVisibleToForEach) {
+    // #3 runtime sync: an entity built via the LEGACY addComponent path
+    // (ComponentManager store) must be visible to World::forEach. Before the fix,
+    // forEach iterated ArchetypeManager only, silently skipping legacy components
+    // added through World::addComponent.
+    auto entity = world.createEntity();
+    world.addComponent<TransformComponent>(entity);
+
+    int count = 0;
+    world.forEach<TransformComponent>([&count](EntityID, TransformComponent&) {
+        count++;
+    });
+    EXPECT_EQ(count, 1);
+
+    // The legacy component is also readable via the dual-path getComponent.
+    ASSERT_NE(world.getComponent<TransformComponent>(entity), nullptr);
+    EXPECT_EQ(world.getComponent<TransformComponent>(entity)->position, glm::vec3(0.0f));
+}
+
+TEST_F(ArchetypeStorageTest, RemoveComponentReconcilesArchetypeStore) {
+    // #3 runtime sync: removeComponent must drop the component from BOTH stores so it
+    // is no longer reported by hasComponent / visited by forEach, regardless of which
+    // store created it. Pre-fix, removeComponent only touched ComponentManager, leaving
+    // the ArchetypeManager copy live (hasComponent stayed true and forEach still visited).
+    auto entity = world.createEntityWithComponents<TransformComponent, MeshComponent>();
+
+    EXPECT_TRUE(world.hasComponent<TransformComponent>(entity));
+    EXPECT_TRUE(world.hasComponent<MeshComponent>(entity));
+
+    world.removeComponent<TransformComponent>(entity);
+
+    // Transform removed from ArchetypeManager -> no longer reported.
+    EXPECT_FALSE(world.hasComponent<TransformComponent>(entity));
+    // Mesh untouched -> still present.
+    EXPECT_TRUE(world.hasComponent<MeshComponent>(entity));
+
+    int remaining = 0;
+    world.forEach<TransformComponent, MeshComponent>(
+        [&remaining](EntityID, TransformComponent&, MeshComponent&) { remaining++; });
+    // Transform was removed, so the (Transform, Mesh) pair no longer matches.
+    EXPECT_EQ(remaining, 0);
+}
+
+// ============================================================================
+// Component Cache Layout Profiling Tests (#4)
+// ============================================================================
+class CacheLayoutProfileTest : public ::testing::Test {};
+
+TEST_F(CacheLayoutProfileTest, FlagsHeapHandleComponents) {
+    // #4: component types whose in-struct fields are DynamicVector/DynamicString
+    // heap handles must be flagged so chunk scanners can account for the
+    // indirection miss on iteration. After Step B, AnimatorComponent's
+    // animations/animationLayers are inlined (StaticVector) -> no heap handles.
+    // SkeletonComponent still carries DynamicVector<Bone> bones -> the heap-handle component.
+    // TransformComponent is fully inline.
+    auto& reg = ecs::detail::ComponentSizeRegistry::instance();
+    // #L1075: SkeletonComponent.bones is now BoneSoA (split arrays, self-owned,
+    // NOT a DynamicPool/DynamicVector handle) -> no pool-indirection miss on scan.
+    EXPECT_FALSE(reg.hasHeapHandles(getComponentTypeID<SkeletonComponent>()));
+    EXPECT_FALSE(reg.hasHeapHandles(getComponentTypeID<AnimatorComponent>()));
+    EXPECT_FALSE(reg.hasHeapHandles(getComponentTypeID<TransformComponent>()));
+}
+
 // ============================================================================
 // Multi-threaded Execution Tests
 // ============================================================================
@@ -490,6 +553,141 @@ TEST_F(SerializationTest, TransformSerialization) {
     // Verify components were loaded
     EXPECT_EQ(world2.getEntityCount(), 1);
     
+    world2.shutdown();
+}
+
+TEST_F(SerializationTest, ComponentRoundTrip) {
+    // Prove the type-erased serialize/deserialize pipeline actually restores
+    // component DATA (not just entity counts). Serialize an entity with a
+    // real component, load into a fresh World, and read back the values.
+    auto entity = world.createEntity();
+    TransformComponent original;
+    original.position = glm::vec3(10, 20, 30);
+    original.rotation = glm::quat(1, 0, 0, 0);
+    original.scale = glm::vec3(2, 2, 2);
+    world.addComponent<TransformComponent>(entity, original);
+
+    std::string jsonString = world.serializeToString();
+    EXPECT_FALSE(jsonString.empty());
+
+    World world2;
+    world2.init();
+    registerDefaultComponentSerializers();
+    world2.deserializeFromString(jsonString);
+
+    EXPECT_EQ(world2.getEntityCount(), 1);
+
+    bool found = false;
+    for (EntityID id : world2.getEntityManager().getLiveEntities()) {
+        if (const auto* t = world2.getComponent<TransformComponent>(Entity{id}); t) {
+            EXPECT_EQ(t->position, glm::vec3(10, 20, 30));
+            EXPECT_EQ(t->scale, glm::vec3(2, 2, 2));
+            // quat(1,0,0,0) => identity; rotation.z == 0
+            EXPECT_FLOAT_EQ(t->rotation.z, 0.0f);
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found) << "loaded entity missing TransformComponent";
+
+    world2.shutdown();
+}
+
+TEST_F(SerializationTest, ArchetypeComponentRoundTrip) {
+    // Bi-directional layout: an entity whose component lives ONLY in
+    // ArchetypeManager (added via addComponentArchetype, the
+    // createEntityWithComponents path) must survive the serialize/deserialize
+    // pipeline -- not just the legacy ComponentManager path exercised by
+    // ComponentRoundTrip above. Before the fix, serializeEntity iterated
+    // compManager.getRegisteredTypeIDs() (CM arrays); an archetype-only entity
+    // has no CM arrays, so zero components were saved and the load came back empty.
+    auto entity = world.createEntity();
+    TransformComponent original;
+    original.position = glm::vec3(11, 22, 33);
+    original.rotation = glm::quat(0.7071f, 0.0f, 0.0f, 0.7071f); // w,z => rotation.z
+    original.scale = glm::vec3(3, 3, 3);
+    world.addComponentArchetype<TransformComponent>(entity, original);
+
+    std::string jsonString = world.serializeToString();
+    EXPECT_FALSE(jsonString.empty());
+
+    World world2;
+    world2.init();
+    registerDefaultComponentSerializers();
+    world2.deserializeFromString(jsonString);
+
+    EXPECT_EQ(world2.getEntityCount(), 1);
+
+    bool found = false;
+    for (EntityID id : world2.getEntityManager().getLiveEntities()) {
+        if (const auto* t = world2.getComponent<TransformComponent>(Entity{id}); t) {
+            EXPECT_EQ(t->position, glm::vec3(11, 22, 33));
+            EXPECT_EQ(t->scale, glm::vec3(3, 3, 3));
+            EXPECT_NEAR(t->rotation.z, 0.7071f, 1e-3f);
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found) << "loaded archetype entity missing TransformComponent";
+
+    world2.shutdown();
+}
+
+TEST_F(SerializationTest, RelationshipComponentRoundTrip) {
+    // Entity-ID Translation Engine: a parent <-> child hierarchy built with
+    // entity-reference components (ParentComponent::parent, ChildrenComponent::children)
+    // must survive a save/load with refs remapped to the FRESH live entity ids --
+    // not the stale serialized ids (which would dangle on a fresh World).
+    auto parent = world.createEntity();   // serialized id 0
+    auto child  = world.createEntity();   // serialized id 1
+    world.addComponentArchetype<ParentComponent>(child, Entity{parent.id});
+    world.addComponentArchetype<ChildrenComponent>(parent);
+    world.getComponent<ChildrenComponent>(parent)->addChild(Entity{child.id});
+
+    // Cross-link invariant in the SOURCE world.
+    EXPECT_EQ(world.getComponent<ParentComponent>(child)->parent, Entity{parent.id});
+    EXPECT_EQ(world.getComponent<ChildrenComponent>(parent)->children[0], Entity{child.id});
+
+    std::string jsonString = world.serializeToString();
+    EXPECT_FALSE(jsonString.empty());
+
+    // Pre-fill world2 so loaded entities receive HIGHER live ids (5,6) than the
+    // serialized ids (0,1) -> the remap pass is PROVABLY required (not a no-op),
+    // making the test robust to the free-list id policy.
+    World world2;
+    world2.init();
+    registerDefaultComponentSerializers();
+    for (int i = 0; i < 5; ++i) world2.createEntity();  // consume live ids 0..4
+    world2.deserializeFromString(jsonString);           // parent->5, child->6
+
+    EXPECT_EQ(world2.getEntityCount(), 7);  // 5 dummies + parent + child
+
+    // Locate the loaded parent (entity carrying a single-child ChildrenComponent)
+    // and verify the child ref was remapped to liveParent.
+    EntityID liveParent = INVALID_ENTITY_ID;
+    for (EntityID id : world2.getEntityManager().getLiveEntities()) {
+        if (auto* cc = world2.getComponent<ChildrenComponent>(Entity{id}); cc && cc->size() == 1) {
+            liveParent = id;
+            break;
+        }
+    }
+    ASSERT_NE(liveParent, INVALID_ENTITY_ID) << "parent relationship not loaded";
+
+    EntityID liveChild = INVALID_ENTITY_ID;
+    for (EntityID id : world2.getEntityManager().getLiveEntities()) {
+        if (auto* pc = world2.getComponent<ParentComponent>(Entity{id});
+            pc && pc->parent.id == liveParent) {
+            liveChild = id;
+            break;
+        }
+    }
+    ASSERT_NE(liveChild, INVALID_ENTITY_ID) << "child parent-ref not remapped to live parent";
+    EXPECT_NE(liveChild, liveParent);
+
+    // Cross-link after load: parent's children[0] == liveChild, child's parent == liveParent.
+    auto* cc = world2.getComponent<ChildrenComponent>(Entity{liveParent});
+    ASSERT_NE(cc, nullptr);
+    EXPECT_EQ(cc->children[0], Entity{liveChild});
+    EXPECT_EQ(world2.getComponent<ParentComponent>(Entity{liveChild})->parent, Entity{liveParent});
+
     world2.shutdown();
 }
 

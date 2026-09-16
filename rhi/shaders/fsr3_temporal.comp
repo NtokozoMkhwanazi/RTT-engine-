@@ -1,0 +1,139 @@
+// FSR3 temporal resolve: reproject + accumulate. GLSL 4.6 compute.
+//
+// Phase 5c: takes the SHARPENED full-res color from RCAS (currColor), the
+// previous frame's history color (prevHist) and the half-res scene depth
+// (currDepth), reprojects prevHist onto the current frame via the reprojection
+// matrix R = prevViewProj * inverse(viewProj), blends, and writes the new
+// history (nextHist). On the first frame (hist_valid == 0) the history is
+// uninitialized, so it copies currColor -> nextHist (no blend / no reproject).
+//
+// NDC convention (matches the Vulkan scene pipeline + mat4GlToVulkanProj, and
+// RHIMath.h): framebuffer uv (0..1, top-left) maps to ndc = (2*u-1, 2*v-1, depth)
+// with depth in [0,1] (Vulkan post-GlToVulkanProj). Because VK NDC y=+1 is the
+// bottom and the viewport maps ndc_y=-1 -> framebuffer y=0 (top), the uv<->ndc
+// map is symmetric in x and y: uv = 0.5 + 0.5*ndc. There is therefore NO y-flip
+// in the reprojection: prev_uv = 0.5 + 0.5 * prevNdc.xy.
+//
+//   world_h      = inverse(viewProj) * vec4(ndc_curr, 1)   // homogeneous
+//   prev_clip    = prevViewProj * (world_h.xyz / world_h.w) = (R * vec4(ndc,1))
+//   prev_ndc.xy  = prev_clip.xy / prev_clip.w
+//   prev_uv      = 0.5 + 0.5 * prev_ndc.xy            (R baked as a single mat4)
+//
+// Compile (engine Makefile .comp rule):
+//   glslc -IFidelityFX-SDK-FSR3/sdk/include/FidelityFX/gpu rhi/shaders/fsr3_temporal.comp
+//
+// (The -I is harmless; this shader is self-contained and uses no SDK headers,
+//  but the Makefile .comp rule always passes the SDK include root.)
+//
+// Layout (set = 0), a DEDICATED temporal set (NOT the EASU set — it has extra
+// sampled views and its own UBO layout):
+//   binding 0   : SAMPLED_IMAGE  t_curr_color   (RCAS output, RGBA32f, full-res)
+//   binding 1   : SAMPLED_IMAGE  t_history      (prev history, RGBA16f, full-res)
+//   binding 2   : SAMPLED_IMAGE  t_depth        (half-res scene depth, D32_SFLOAT)
+//   binding 1000: SAMPLER        s_linear_clamp (linear, clamp-to-edge)
+//   binding 1001: SAMPLER        s_point_clamp   (nearest, clamp-to-edge — depth only)
+//   binding 2000: STORAGE_IMAGE  rw_history     (next history, RGBA16f, full-res)
+//   binding 3000: UNIFORM_BUFFER cbTemporal    (std140, see struct below)
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D t_curr_color;
+layout(set = 0, binding = 1) uniform texture2D t_history;
+layout(set = 0, binding = 2) uniform texture2D t_depth;
+layout(set = 0, binding = 1000) uniform sampler s_linear_clamp;
+layout(set = 0, binding = 1001) uniform sampler s_point_clamp;
+layout(set = 0, binding = 2000, rgba16f) uniform image2D rw_history;
+
+// std140: mat4 reproject (0..64), float feedback (64), float hist_valid (68),
+// vec2 depth_uv_scale (72..80), vec2 jitterOffset (80..88). depth_uv_scale maps
+// framebuffer uv -> the half-res depth texture's uv (identity (1,1) because the
+// half-res depth image is sampled with the full 0..1 uv range and
+// hardware-bilinear-upscaled). jitterOffset is the current frame's sub-pixel
+// Halton jitter in NDC space — it is subtracted from the pixel uv BEFORE the
+// reprojection NDC calculation so the history is reprojected as if the camera
+// had not jittered this frame (the jitter was applied to the projection, so we
+// must undo it before mapping into the previous frame's space).
+layout(set = 0, binding = 3000) uniform cbTemporal_t {
+    mat4 reproject;          // prevViewProj * inverse(viewProj)
+    float feedback;         // blend weight for current frame (e.g. 0.9)
+    float hist_valid;       // 1.0 = reproject+blend, 0.0 = copy (first frame)
+    vec2 depth_uv_scale;    // (1,1) for a half-res depth image sampled at full uv
+    vec2 jitterOffset;      // current frame's sub-pixel jitter (NDC, from CameraUBO/jitterOffset)
+} cbT;
+
+void main() {
+    const ivec2 p   = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 dim = imageSize(rw_history);
+    if (p.x >= dim.x || p.y >= dim.y) return;
+
+    const vec2  uv   = (vec2(p) + 0.5) / vec2(dim);
+    // Depth: use NEAREST (point) sampling.  Linear filtering across depth
+    // discontinuities (object silhouettes) produces phantom mid-air Z values,
+    // skewing reprojection and creating thin black halos.
+    const float currD = texture(sampler2D(t_depth, s_point_clamp), uv * cbT.depth_uv_scale).r;
+    // Safety clamp: RCAS sharpening kernels contain negative lobes that can
+    // produce slightly negative color values.  Clamp to [0, inf) before
+    // blending so negative lobes never poison the history feedback loop.
+    const vec3  currC = max(vec3(0.0), texture(sampler2D(t_curr_color, s_linear_clamp), uv).rgb);
+
+    vec3 outC = currC;                       // first frame: passthrough = copy
+    if (cbT.hist_valid > 0.5) {
+        // Cancel the current frame's sub-pixel jitter before reprojection:
+        // the low-res scene was rendered with gl_Position.xy += jitter*w,
+        // so the actual pixel positions are shifted by jitterOffset in NDC.
+        // jitterOffset is in NDC [-1,1] space; uv is in [0,1] framebuffer
+        // space, so multiply by 0.5 to convert (uv = 0.5 + 0.5*ndc). The
+        // reprojection matrix (built from the un-jittered viewProj) then
+        // maps correctly into previous-frame history.
+        vec2 adjustedUv = uv - 0.5 * cbT.jitterOffset;
+        vec4 ndc = vec4(adjustedUv.x * 2.0 - 1.0, adjustedUv.y * 2.0 - 1.0, currD, 1.0);
+        vec4 prevClip = cbT.reproject * ndc;
+        vec2 prevUv   = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+
+        // REFINEMENT: Reject out-of-bounds history UVs.  When the camera
+        // pans or geometry enters/leaves the frame, reprojection naturally
+        // maps some pixels outside [0,1].  Clamp-to-edge would return the
+        // black border texel, which then accumulates into history via the
+        // feedback loop and turns the whole screen black.  Instead, fall
+        // back to 100 % current-frame color — the pixel is new/unoccluded.
+        bool isInsideHistory = prevUv.x >= 0.0 && prevUv.x <= 1.0 &&
+                               prevUv.y >= 0.0 && prevUv.y <= 1.0;
+
+        if (isInsideHistory) {
+            // Safety clamp on history retrieval to handle negative RCAS output
+            vec3 hist = max(vec3(0.0), texture(sampler2D(t_history, s_linear_clamp), prevUv).rgb);
+
+            // AAB (Adaptive Local Backbuffer) neighborhood clamping:
+            // sample the 3x3 window of the CURRENT color around this pixel,
+            // compute the min/max color bounds, and clamp the reprojected
+            // history sample to those bounds.  Without this, sub-pixel
+            // reprojection errors (floating-point residue, depth quantization,
+            // motion boundaries) cause the history to accumulate color values
+            // that do not exist in the current frame, producing crawling
+            // edges and specular "buzz" on static geometry.
+            vec3 minC = vec3(1e30); vec3 maxC = vec3(-1e30);
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                    ivec2 pp = p + ivec2(x, y);
+                    if (pp.x >= 0 && pp.x < dim.x && pp.y >= 0 && pp.y < dim.y) {
+                        vec3 c = max(vec3(0.0), texelFetch(t_curr_color, pp, 0).rgb);
+                        minC = min(minC, c);
+                        maxC = max(maxC, c);
+                    }
+                }
+            }
+            hist = clamp(hist, minC, maxC);
+
+            outC = cbT.feedback * currC + (1.0 - cbT.feedback) * hist;
+        } else {
+            outC = currC;                       // no history for this pixel
+        }
+    }
+
+    // Final safety: clamp before writing to history to prevent any residual
+    // negative/Inf/NaN from persisting in the RGBA16F target.
+    imageStore(rw_history, p, vec4(max(vec3(0.0), outC), 1.0));
+}

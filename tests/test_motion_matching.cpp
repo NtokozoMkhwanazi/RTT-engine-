@@ -672,6 +672,55 @@ TEST_F(MotionMatchingIntegrationTest, MotionMatcher_LocomotionCycle_IdleWalkRunS
     step(0.0f, 40, "Idle", 15);   // stop -> idle
 }
 
+/**
+ * Test: rapid run<->walk alternation must switch clips immediately.
+ *
+ * The speed-band-aware hysteresis bypasses the 15% distance margin when the
+ * query speed leaves the current clip's nominal gait band, so a fast
+ * run -> walk -> run -> walk sequence lands on the matching clip within a few
+ * frames instead of lagging behind the speed change (the old behavior kept
+ * playing the previous gait - footskating - until the pose search finally
+ * won by the margin). Steady phases still hold their clip.
+ */
+TEST_F(MotionMatchingIntegrationTest, MotionMatcher_RapidRunWalk_SwitchesWithoutLag) {
+    idleAnim = CreateTestAnimation("Idle", 2.0f);
+    walkAnim = CreateTestAnimation("Walk", 1.0f);
+    runAnim = CreateTestAnimation("Run", 1.0f);
+    idleAnim->boneAnimations["root"].positionValues[1] = glm::vec3(0.0f, 0.0f, 0.0f);
+    walkAnim->boneAnimations["root"].positionValues[1] = glm::vec3(0.0f, 0.0f, 2.0f);
+    runAnim->boneAnimations["root"].positionValues[1] = glm::vec3(0.0f, 0.0f, 4.0f);
+
+    matcher->LoadAnimation("Idle", idleAnim);
+    matcher->LoadAnimation("Walk", walkAnim);
+    matcher->LoadAnimation("Run", runAnim);
+    matcher->BuildSearchIndex();
+
+    auto step = [&](float speed, int frames) {
+        CharacterState s;
+        s.velocity = glm::vec3(0.0f, 0.0f, -speed);  // world forward = -Z
+        s.moveDirection = glm::vec2(0.0f, 1.0f);
+        s.grounded = true;
+        for (int i = 0; i < frames; ++i) matcher->Update(0.016f, s);
+        return matcher->GetDebugInfo().currentAnimationName;
+    };
+
+    // Settle into Walk first.
+    EXPECT_EQ(step(2.0f, 10), "Walk");
+
+    // Rapid gait changes: 4 frames (~67 ms) must be enough to leave the old
+    // gait - the speed band trips on the first frame of the new speed.
+    EXPECT_EQ(step(4.0f, 4), "Run")
+        << "run switch must not lag behind the speed change";
+    EXPECT_EQ(step(2.0f, 4), "Walk")
+        << "walk switch must not lag behind the speed change";
+    EXPECT_EQ(step(4.0f, 4), "Run")
+        << "run switch must not lag behind the speed change";
+
+    // Stopping from a run must also leave Run immediately (band trip).
+    EXPECT_EQ(step(0.0f, 4), "Idle")
+        << "stop must not trap the matcher in Run";
+}
+
 // ============================================================================
 // AIRBORNE MATCHING TESTS (UE-style movement-state gate + vertical velocity)
 // ============================================================================
@@ -835,9 +884,493 @@ TEST_F(MotionMatchingIntegrationTest, MotionMatcher_Airborne_LandingReturnsToLoc
     EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "Walk");
 }
 
+/**
+ * Test: a landing (airborne -> grounded) switch uses the dedicated landing
+ * blend (0.3s default), not the generic 0.1s pose-switch crossfade. The tucked
+ * Fall pose to full-stance Walk delta pops at the generic duration.
+ */
+TEST_F(MotionMatchingIntegrationTest, MotionMatcher_LandingUsesDedicatedBlendDuration) {
+    auto idle = CreateTestAnimation("Idle", 2.0f);
+    auto walk = CreateTestAnimation("Walk", 1.0f);
+    auto fall = CreateTestAnimation("Fall", 1.0f);
+    fall->boneAnimations["root"].positionValues[1] = glm::vec3(0.0f, -4.0f, 0.0f);
+
+    matcher->LoadAnimation("Idle", idle);
+    matcher->LoadAnimation("Walk", walk);
+    matcher->LoadAnimation("Fall", fall);
+    matcher->BuildSearchIndex();
+
+    // Descent -> Fall.
+    CharacterState falling;
+    falling.velocity = glm::vec3(0.0f, -3.0f, 0.0f);
+    falling.moveDirection = glm::vec2(0.0f, 1.0f);
+    falling.grounded = false;
+    falling.jumping = true;
+    for (int i = 0; i < 15; ++i) matcher->Update(0.016f, falling);
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "Fall");
+
+    // Land -> the gate flips grounded and the matcher crossfades into Walk.
+    CharacterState walking;
+    walking.velocity = glm::vec3(0.0f, 0.0f, -1.5f);
+    walking.moveDirection = glm::vec2(0.0f, 1.0f);
+    walking.grounded = true;
+    walking.jumping = false;
+    matcher->Update(0.016f, walking);
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "Walk");
+
+    // The incoming Walk layer must be ramping with the landing blend, not the
+    // generic pose-switch blend.
+    float walkBlend = -1.0f;
+    for (int i = 0; i < animator->GetActiveAnimationLayerCount(); ++i) {
+        const auto* layer = animator->GetActiveLayer(i);
+        if (layer && layer->animation == walk.get()) walkBlend = layer->blendDuration;
+    }
+    EXPECT_NEAR(walkBlend, 0.3f, 0.01f)
+        << "landing crossfade must use the dedicated landing blend duration";
+}
+
 // ============================================================================
 // DEBUG HELPERS
 // ============================================================================
+
+// ============================================================================
+// CLIP-SWITCH BANDS (direction-away switching + tunable + fallback path)
+// ============================================================================
+
+// Build an animation whose root follows the given (time, position) keys with
+// constant identity rotation/scale. The fixture's CreateTestAnimation only
+// supports linear two-key motion; the band tests need a clip that walks
+// forward for half its cycle and backward for the other half (its poses carry
+// BOTH directions, so after a reversal the pose search cannot tell its best
+// pose from the dedicated backward clip's - the direction band is the only
+// decider).
+static std::shared_ptr<Animation> CreateKeyedAnimation(
+    const std::string& name,
+    const std::vector<double>& times,
+    const std::vector<glm::vec3>& positions) {
+    auto anim = std::make_shared<Animation>(name, static_cast<float>(times.back()), 30.0f);
+    BoneAnimation root;
+    root.boneName = "root";
+    root.positionTimes = times;
+    root.positionValues = positions;
+    root.rotationTimes = {0.0, times.back()};
+    root.rotationValues = {glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f)};
+    root.scaleTimes = {0.0, times.back()};
+    root.scaleValues = {glm::vec3(1.0f), glm::vec3(1.0f)};
+    anim->boneAnimations["root"] = root;
+    return anim;
+}
+
+// TurnF + Back, engineered so the direction band - not the 15% margin - is
+// the deciding factor, with STRICT (tie-free) ranking so the top-8 candidates
+// are deterministic, AND the switch is sticky (no flip-flop):
+//  - TurnF: +2 forward for the first second then a -1.85 backward phase at
+//    the END of the clip. Its nominal heading is ~0 (forward dominates), but
+//    after a reversal the current clip still holds 6 competitive poses (the
+//    ones whose 0.4s trajectory horizon stays inside the backward phase).
+//  - Back: a dedicated -1.845 clip whose clean backward poses rank strictly
+//    behind TurnF's -1.85 poses (0.83 vs 0.75 in KD feature space, so the
+//    top-8 holds 6 TurnF + 2 Back) but within the 15% margin (0.83 is not <
+//    0.75*0.85). On a -1.9 reversed query: with bands disabled the margin
+//    HOLDS (stay in TurnF); with the direction band enabled the pi-away
+//    heading trips it (switch to Back), and once in Back the margin also
+//    holds (0.75 is not < 0.83*0.85) - so it stays, no oscillation. The
+//    speed band never trips (all speeds within ~0.05 of the 1.9 query).
+static void SetupTurnFAndBack(MotionMatcher* matcher) {
+    auto turnF = CreateKeyedAnimation(
+        "TurnF", {0.0, 1.0, 1.45},
+        {glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 2.0f),
+         glm::vec3(0.0f, 0.0f, 1.1675f)});
+    auto back = CreateKeyedAnimation(
+        "Back", {0.0, 1.0},
+        {glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, -1.845f)});
+    matcher->LoadAnimation("TurnF", turnF);
+    matcher->LoadAnimation("Back", back);
+}
+
+static CharacterState WalkState(float worldVelZ) {
+    CharacterState s;
+    s.velocity = glm::vec3(0.0f, 0.0f, worldVelZ);
+    s.moveDirection = glm::vec2(0.0f, 0.0f);  // zero input -> straight prediction
+    s.grounded = true;
+    return s;
+}
+
+/**
+ * Test: direction-away switching - reversing the movement direction leaves
+ * the current clip at once instead of waiting for the 15% margin.
+ *
+ * With the default direction band (90 deg), a reversed query heading pi away
+ * from TurnF's nominal angle 0 must drop the persistence hysteresis and play
+ * the dedicated Back clip - and stay there. The speed band does NOT trip
+ * (the query speed is within ~0.1 of both clips), so this proves the
+ * direction band is what forces it.
+ */
+TEST_F(MotionMatchingIntegrationTest, MotionMatcher_DirectionBand_SwitchesOnReversal) {
+    SetupTurnFAndBack(matcher);
+    matcher->BuildSearchIndex();
+
+    for (int i = 0; i < 10; ++i) matcher->Update(0.016f, WalkState(-2.0f));
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "TurnF");
+
+    // Reversed at a similar speed: the direction band must force the switch.
+    for (int i = 0; i < 5; ++i) matcher->Update(0.016f, WalkState(1.9f));
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "Back")
+        << "reversal must switch clips at once (direction-away band)";
+}
+
+/**
+ * Test: the persistence bands are tunable - disabling them restores the pure
+ * 15%-margin hysteresis (the reversal holds the current clip), and a tight
+ * direction band switches the moment the heading diverges.
+ */
+TEST_F(MotionMatchingIntegrationTest, MotionMatcher_DirectionBand_Tunable) {
+    SetupTurnFAndBack(matcher);
+    matcher->BuildSearchIndex();
+
+    for (int i = 0; i < 10; ++i) matcher->Update(0.016f, WalkState(-2.0f));
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "TurnF");
+
+    // Bands off (negative = disabled): the 15% margin holds TurnF - its
+    // -1.9 backward pose beats Back's -1.88 by less than the margin, so
+    // nothing forces the switch.
+    matcher->SetClipSwitchBands(-1.0f, -1.0f);
+    for (int i = 0; i < 10; ++i) matcher->Update(0.016f, WalkState(1.9f));
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "TurnF")
+        << "with bands disabled the hysteresis must keep the current clip";
+
+    // Tighten the direction band: any real heading divergence now switches.
+    matcher->SetClipSwitchBands(0.5f, 0.1f);
+    for (int i = 0; i < 5; ++i) matcher->Update(0.016f, WalkState(1.9f));
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "Back")
+        << "tightening the direction band must switch on the reversal";
+}
+
+/**
+ * Test: the band-aware switching also runs on the brute-force fallback search
+ * path (KD tree not built). Before, that path jumped straight to the global
+ * best - it had no persistence hysteresis at all, so it could not honor the
+ * band semantics. The fallback path's metric is the database's LINEAR one
+ * (and it ignores the trajectory feature - pose numPoints is 0), so the
+ * matching poses here use a SHORT backward phase: 9 TurnF poses at -1.85
+ * (the top-10 holds all 9 + 1 Back) vs Back at -1.845. The margin holds with
+ * bands disabled (1.375 is not < 1.25*0.85) -> stay in TurnF; with the
+ * direction band enabled the pi-away heading switches to Back and stays
+ * (1.25 is not < 1.375*0.85).
+ */
+TEST_F(MotionMatchingIntegrationTest, MotionMatcher_DirectionBand_FallbackPath) {
+    // Short backward phase so the current clip contributes <= 9 candidates
+    // (the fallback search returns the top-10 of ALL poses - a long phase
+    // would fill them and hide Back).
+    auto turnF = CreateKeyedAnimation(
+        "TurnF", {0.0, 1.0, 1.075},
+        {glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 2.0f),
+         glm::vec3(0.0f, 0.0f, 1.86125f)});
+    auto back = CreateKeyedAnimation(
+        "Back", {0.0, 1.0},
+        {glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, -1.845f)});
+    matcher->LoadAnimation("TurnF", turnF);
+    matcher->LoadAnimation("Back", back);
+    // Deliberately NO BuildSearchIndex() -> brute-force fallback path.
+
+    for (int i = 0; i < 10; ++i) matcher->Update(0.016f, WalkState(-2.0f));
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "TurnF");
+
+    // Bands off: the fallback path holds the current clip (hysteresis).
+    matcher->SetClipSwitchBands(-1.0f, -1.0f);
+    for (int i = 0; i < 5; ++i) matcher->Update(0.016f, WalkState(1.9f));
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "TurnF")
+        << "fallback path must keep the current clip with bands disabled";
+
+    // Default band: the reversal switches to Back on the fallback path too.
+    matcher->SetClipSwitchBands(0.5f, 1.5707963267948966f);
+    for (int i = 0; i < 5; ++i) matcher->Update(0.016f, WalkState(1.9f));
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "Back")
+        << "direction band must apply and hold on the brute-force fallback path";
+}
+
+/**
+ * Test: GetClipNominalMoveAngle returns the clip's dominant heading - ~0 for
+ * a forward-walking clip, ~pi for a backward-walking clip.
+ */
+TEST_F(MotionMatchingIntegrationTest, MotionDatabase_GetClipNominalMoveAngle_ForwardBackward) {
+    auto fwd = CreateKeyedAnimation("Fwd", {0.0, 1.0},
+                                    {glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 2.0f)});
+    auto back = CreateKeyedAnimation("Back", {0.0, 1.0},
+                                     {glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, -2.0f)});
+    matcher->LoadAnimation("Fwd", fwd);
+    matcher->LoadAnimation("Back", back);
+
+    const auto* db = matcher->GetDatabase();
+    size_t fwdIdx = static_cast<size_t>(-1), backIdx = static_cast<size_t>(-1);
+    for (size_t i = 0; i < db->GetAnimationCount(); ++i) {
+        if (db->GetAnimationName(i) == "Fwd") fwdIdx = i;
+        if (db->GetAnimationName(i) == "Back") backIdx = i;
+    }
+    ASSERT_NE(fwdIdx, static_cast<size_t>(-1));
+    ASSERT_NE(backIdx, static_cast<size_t>(-1));
+
+    EXPECT_NEAR(db->GetClipNominalMoveAngle(fwdIdx), 0.0f, 0.01f)
+        << "forward-walking clip's nominal angle is ~0";
+    EXPECT_NEAR(std::abs(db->GetClipNominalMoveAngle(backIdx)), glm::pi<float>(), 0.01f)
+        << "backward-walking clip's nominal angle is ~pi";
+}
+
+/**
+ * Test: the nominal angle is a CIRCULAR mean - a clip whose motion sweeps
+ * across the +/-pi seam (velocities at ~-175 and ~+165 deg) averages to the
+ * dominant backward heading (~pi), not to ~0 (where the raw angle mean would
+ * land). The direction band depends on this: a wrong ~0 nominal would never
+ * trip for a backward-moving query.
+ */
+TEST_F(MotionMatchingIntegrationTest, MotionDatabase_GetClipNominalMoveAngle_CircularMeanAcrossSeam) {
+    auto seam = CreateKeyedAnimation(
+        "Seam", {0.0, 0.5, 1.0},
+        {glm::vec3(0.0f), glm::vec3(-0.087f, 0.0f, -0.996f),
+         glm::vec3(0.174f, 0.0f, -1.992f)});
+    matcher->LoadAnimation("Seam", seam);
+
+    const auto* db = matcher->GetDatabase();
+    const float angle = db->GetClipNominalMoveAngle(0);
+    EXPECT_GT(std::abs(angle), 2.5f)
+        << "seam-sweeping clip must keep its dominant backward heading (~pi), "
+           "got " << angle << " (raw mean would collapse to ~0)";
+}
+TEST_F(MotionMatchingIntegrationTest, HighSpeed_NoClipFlicker) {
+    idleAnim = CreateTestAnimation("Idle", 2.0f);
+    walkAnim = CreateTestAnimation("Walk", 1.0f);
+    runAnim  = CreateTestAnimation("Run",  1.0f);
+    auto sprintAnim = CreateTestAnimation("Sprint", 1.0f);
+
+    idleAnim->boneAnimations["root"].positionValues[1]     = glm::vec3(0.0f, 0.0f, 0.0f);
+    walkAnim->boneAnimations["root"].positionValues[1]     = glm::vec3(0.0f, 0.0f, 2.0f);
+    runAnim->boneAnimations["root"].positionValues[1]      = glm::vec3(0.0f, 0.0f, 4.0f);
+    sprintAnim->boneAnimations["root"].positionValues[1]   = glm::vec3(0.0f, 0.0f, 6.0f);
+
+    matcher->LoadAnimation("Idle",   idleAnim);
+    matcher->LoadAnimation("Walk",   walkAnim);
+    matcher->LoadAnimation("Run",    runAnim);
+    matcher->LoadAnimation("Sprint", sprintAnim);
+    matcher->BuildSearchIndex();
+
+    CharacterState state;
+    state.position      = glm::vec3(0.0f, 0.0f, 0.0f);
+    state.velocity      = glm::vec3(0.0f, 0.0f, -6.0f);  // high speed forward
+    state.moveDirection = glm::vec2(0.0f, 1.0f);
+    state.grounded      = true;
+
+    // Phase-in: let the matcher settle into the high-speed clip.
+    for (int i = 0; i < 15; ++i) matcher->Update(0.016f, state);
+    std::string firstClip = matcher->GetDebugInfo().currentAnimationName;
+    EXPECT_NE(firstClip, "Idle") << "Should not stay on Idle at 6.0 speed";
+
+    // Steady: must hold the same clip without flicker for 200 frames.
+    for (int i = 0; i < 200; ++i) {
+        matcher->Update(0.016f, state);
+        EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, firstClip)
+            << "clip flickered at high speed on frame " << i
+            << ": was " << firstClip << ", now "
+            << matcher->GetDebugInfo().currentAnimationName;
+    }
+}
+
+/**
+ * Test: speed ramp from walk to sprint with gradual velocity increase.
+ * Clip changes should be monotonically forward (Walk→Run→Sprint) with
+ * at most a small number of back-transitions (hysteresis).  Excessive
+ * clip thrashing (>5 changes) indicates the KD-tree search is unstable
+ * at intermediate speeds.
+ */
+TEST_F(MotionMatchingIntegrationTest, SpeedRamp_SmoothTransitions) {
+    idleAnim = CreateTestAnimation("Idle", 2.0f);
+    walkAnim = CreateTestAnimation("Walk", 1.0f);
+    runAnim  = CreateTestAnimation("Run",  1.0f);
+    auto sprintAnim = CreateTestAnimation("Sprint", 1.0f);
+
+    idleAnim->boneAnimations["root"].positionValues[1]     = glm::vec3(0.0f, 0.0f, 0.0f);
+    walkAnim->boneAnimations["root"].positionValues[1]     = glm::vec3(0.0f, 0.0f, 2.0f);
+    runAnim->boneAnimations["root"].positionValues[1]      = glm::vec3(0.0f, 0.0f, 4.0f);
+    sprintAnim->boneAnimations["root"].positionValues[1]   = glm::vec3(0.0f, 0.0f, 6.0f);
+
+    matcher->LoadAnimation("Idle",   idleAnim);
+    matcher->LoadAnimation("Walk",   walkAnim);
+    matcher->LoadAnimation("Run",    runAnim);
+    matcher->LoadAnimation("Sprint", sprintAnim);
+    matcher->BuildSearchIndex();
+
+    CharacterState state;
+    state.position      = glm::vec3(0.0f, 0.0f, 0.0f);
+    state.moveDirection = glm::vec2(0.0f, 1.0f);
+    state.grounded      = true;
+
+    std::string lastClip = "";
+    int clipChanges = 0;
+
+    // Ramp from 1.0 to 7.0 speed over 300 frames (~5 seconds).
+    for (int i = 0; i < 300; ++i) {
+        float t = (float)i / 299.0f;
+        state.velocity = glm::vec3(0.0f, 0.0f, -(1.0f + 6.0f * t));
+        state.position += state.velocity * 0.016f;
+        matcher->Update(0.016f, state);
+
+        std::string clip = matcher->GetDebugInfo().currentAnimationName;
+        if (clip != lastClip) {
+            ++clipChanges;
+            lastClip = clip;
+        }
+    }
+
+    // Walk→Run→Sprint = 2-3 changes max (allow hysteresis tolerance).
+    EXPECT_LE(clipChanges, 5)
+        << "Too many clip changes during speed ramp — possible flicker/hysteresis bug";
+}
+
+/**
+ * Test: specialized clip transition — crouch walk at high speed.
+ * When the character toggles crouching while moving fast, the matcher
+ * must not flicker between standing and crouching clips.
+ */
+TEST_F(MotionMatchingIntegrationTest, SpecializedClips_CrouchTransition) {
+    idleAnim = CreateTestAnimation("Idle", 2.0f);
+    walkAnim = CreateTestAnimation("Walk", 1.0f);
+    auto crouchWalkAnim = CreateTestAnimation("CrouchWalk", 1.0f);
+    auto sprintAnim = CreateTestAnimation("Sprint", 1.0f);
+
+    idleAnim->boneAnimations["root"].positionValues[1]        = glm::vec3(0.0f, 0.0f, 0.0f);
+    walkAnim->boneAnimations["root"].positionValues[1]        = glm::vec3(0.0f, 0.0f, 2.0f);
+    crouchWalkAnim->boneAnimations["root"].positionValues[1]  = glm::vec3(0.0f, 0.0f, 1.0f);
+    sprintAnim->boneAnimations["root"].positionValues[1]      = glm::vec3(0.0f, 0.0f, 6.0f);
+
+    matcher->LoadAnimation("Idle",       idleAnim);
+    matcher->LoadAnimation("Walk",       walkAnim);
+    matcher->LoadAnimation("CrouchWalk", crouchWalkAnim);
+    matcher->LoadAnimation("Sprint",     sprintAnim);
+    matcher->BuildSearchIndex();
+
+    CharacterState state;
+    state.position      = glm::vec3(0.0f, 0.0f, 0.0f);
+    state.velocity      = glm::vec3(0.0f, 0.0f, -6.0f);  // high speed
+    state.moveDirection = glm::vec2(0.0f, 1.0f);
+    state.grounded      = true;
+    state.crouching     = true;
+
+    // Phase-in while crouching at high speed
+    for (int i = 0; i < 10; ++i) matcher->Update(0.016f, state);
+    std::string clip = matcher->GetDebugInfo().currentAnimationName;
+    EXPECT_NE(clip, "Idle") << "Should not select Idle at 6.0 speed";
+
+    // Toggle crouch off — check for flicker during the transition
+    state.crouching = false;
+    std::string lastClip = clip;
+    int clipChanges = 0;
+    for (int i = 0; i < 120; ++i) {
+        state.position += state.velocity * 0.016f;
+        matcher->Update(0.016f, state);
+        std::string newClip = matcher->GetDebugInfo().currentAnimationName;
+        if (newClip != lastClip) {
+            ++clipChanges;
+            lastClip = newClip;
+        }
+    }
+
+    EXPECT_LE(clipChanges, 3)
+        << "Too many clip changes during crouch→stand transition: " << clipChanges;
+}
+
+/**
+ * Test: high-speed direction reversal.
+ * When running forward at 4.0 units/s and instantly reversing to backwards
+ * at 4.0 units/s, the matcher should settle into a stable clip within a few
+ * frames.  Excessive flickering indicates the search boundary is unstable
+ * near the reversal point — a classic cause of foot-placement jitter.
+ */
+TEST_F(MotionMatchingIntegrationTest, HighSpeed_DirectionReversal_NoFlicker) {
+    idleAnim = CreateTestAnimation("Idle", 2.0f);
+    walkAnim = CreateTestAnimation("Walk", 1.0f);
+    runAnim  = CreateTestAnimation("Run",  1.0f);
+
+    idleAnim->boneAnimations["root"].positionValues[1] = glm::vec3(0.0f, 0.0f, 0.0f);
+    walkAnim->boneAnimations["root"].positionValues[1] = glm::vec3(0.0f, 0.0f, 2.0f);
+    runAnim->boneAnimations["root"].positionValues[1]  = glm::vec3(0.0f, 0.0f, 4.0f);
+
+    matcher->LoadAnimation("Idle", idleAnim);
+    matcher->LoadAnimation("Walk", walkAnim);
+    matcher->LoadAnimation("Run",  runAnim);
+    matcher->BuildSearchIndex();
+
+    CharacterState state;
+    state.position      = glm::vec3(0.0f, 0.0f, 0.0f);
+    state.velocity      = glm::vec3(0.0f, 0.0f, -4.0f);  // running forward (-Z)
+    state.moveDirection = glm::vec2(0.0f, 1.0f);
+    state.grounded      = true;
+
+    // Ramp up speed
+    for (int i = 0; i < 30; ++i) matcher->Update(0.016f, state);
+
+    // Instant reversal — high-speed backpedal
+    state.velocity      = glm::vec3(0.0f, 0.0f, 4.0f);   // reversed (+Z = backward for -Z-forward)
+    state.moveDirection = glm::vec2(0.0f, -1.0f);         // facing backward
+
+    std::string lastClip = matcher->GetDebugInfo().currentAnimationName;
+    int clipChanges = 0;
+    int stableCount = 0;
+    for (int i = 0; i < 120; ++i) {
+        state.position += state.velocity * 0.016f;
+        matcher->Update(0.016f, state);
+        std::string clip = matcher->GetDebugInfo().currentAnimationName;
+        if (clip != lastClip) {
+            ++clipChanges;
+            lastClip = clip;
+            stableCount = 0;
+        } else {
+            ++stableCount;
+        }
+    }
+
+    // Must settle within 3 clip changes; after settling, must stay stable
+    // for the last 60 frames (1 second of steady backpedal).
+    EXPECT_LE(clipChanges, 3)
+        << "Too many clip changes during high-speed reversal: " << clipChanges;
+    EXPECT_GE(stableCount, 30)
+        << "Failed to settle on a stable clip after reversal (only "
+        << stableCount << " consecutive stable frames at the end)";
+}
+
+/**
+ * Test: zero velocity stays on Idle (catches false-positive clip selection
+ * at rest that causes the character to twitch/jitter into a locomotion clip).
+ */
+TEST_F(MotionMatchingIntegrationTest, ZeroVelocity_StaysIdle) {
+    idleAnim = CreateTestAnimation("Idle", 2.0f);
+    walkAnim = CreateTestAnimation("Walk", 1.0f);
+    runAnim  = CreateTestAnimation("Run",  1.0f);
+
+    idleAnim->boneAnimations["root"].positionValues[1] = glm::vec3(0.0f, 0.0f, 0.0f);
+    walkAnim->boneAnimations["root"].positionValues[1] = glm::vec3(0.0f, 0.0f, 2.0f);
+    runAnim->boneAnimations["root"].positionValues[1]  = glm::vec3(0.0f, 0.0f, 4.0f);
+
+    matcher->LoadAnimation("Idle", idleAnim);
+    matcher->LoadAnimation("Walk", walkAnim);
+    matcher->LoadAnimation("Run",  runAnim);
+    matcher->BuildSearchIndex();
+
+    CharacterState state;
+    state.position      = glm::vec3(0.0f, 0.0f, 0.0f);
+    state.velocity      = glm::vec3(0.0f, 0.0f, 0.0f);  // standing still
+    state.moveDirection = glm::vec2(0.0f, 1.0f);
+    state.grounded      = true;
+
+    matcher->Update(0.016f, state);
+    EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "Idle")
+        << "Matcher switched away from Idle at zero velocity — false positive selection";
+
+    for (int i = 0; i < 60; ++i) {
+        matcher->Update(0.016f, state);
+        EXPECT_EQ(matcher->GetDebugInfo().currentAnimationName, "Idle")
+            << "Idle flickered at zero velocity on frame " << i;
+    }
+}
+
 
 /**
  * Test: Debug Print Animator State

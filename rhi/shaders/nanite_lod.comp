@@ -1,0 +1,182 @@
+#version 460
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_basic : require
+/**
+ * nanite_lod.comp — Multi-LOD Cluster Selection (Phase 3)
+ *
+ * Replaces the flat frustum-cull of Phase 2 with a DAG-hierarchy-aware
+ * screen-space-error selector.  Each node in the cluster hierarchy carries
+ * errorSelf / errorParent (world-space geometric deviation from its
+ * simplified parent).  A node is rendered when its own SSE ≤ target pixel
+ * error but its parent's SSE > target — producing a seamless crack-free
+ * transition surface.
+ *
+ * AMD RDNA optimisation: workgroup size 32 matches RDNA's Wave32
+ * execution mode, cutting register pressure and doubling active-wave
+ * occupancy versus Wave64 (local_size_x was 64).  Subgroup ballot
+ * operations coalesce the atomic-counter writes: one atomic per
+ * subgroup instead of one per thread.
+ *
+ * Struct layout MUST match the host C++ struct GPULODCluster (see Mesh.h).
+ */
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#define PI 3.14159265358979323846
+
+struct LODCluster {
+    vec4  sphereCenterRadius;  // xyz = center, w = radius
+    float errorSelf;           // this cluster's geometric error
+    float errorParent;         // parent cluster's geometric error
+    uint  firstVertex;
+    uint  firstIndex;
+    uint  indexCount;
+    uint  instanceId;
+    uint  parentId;             // index of parent cluster (0 for root)
+    uint  pad0, pad1, pad2;     // std430 16-byte alignment
+};
+
+struct IndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+layout(set = 0, binding = 0) uniform CameraUBO {
+    mat4  viewProj;
+    vec3  camPos;
+    float fogDensity;
+    vec3  fogColor;
+} cam;
+
+layout(set = 0, binding = 1, std430) readonly buffer LODClusterBuffer {
+    LODCluster nodes[];
+} inHierarchy;
+
+layout(set = 0, binding = 2, std430) readonly buffer ClusterCommandBuffer {
+    // Reuses the GPUClusterCommand layout for firstVertex/firstIndex/indexCount/instanceId
+    uvec4 cmds[];  // [firstVertex, firstIndex, indexCount, instanceId]
+} inCommands;
+
+layout(set = 0, binding = 3, std430) writeonly buffer IndirectDrawBuffer {
+    IndirectCommand drawCmds[];
+} outDraws;
+
+layout(set = 0, binding = 4, std430) buffer QueueCounter {
+    uint drawCount;
+} outCounter;
+
+// --- Push constants (shared with cluster_cull.comp layout) ---
+// offset 0:  uint  totalNodes        (total clusters / hierarchy nodes)
+// offset 4:  float viewportW         (viewport width in pixels)
+// offset 8:  float viewportH         (viewport height in pixels)
+// offset 12: float lodPixelError     (target screen-space error in pixels)
+layout(push_constant) uniform PushConstants {
+    uint   totalNodes;
+    float  viewportW;
+    float  viewportH;
+    float  lodPixelError;
+} pc;
+
+/*
+ * Convert world-space error (meters) to screen-space pixel error.
+ * Standard perspective formula:
+ *   sse = (error * viewportHeight) / (2 * distance * tan(fov/2))
+ */
+float getScreenSpaceError(vec3 center, float radius, float worldError) {
+    float dist = distance(cam.camPos, center);
+    if (dist <= radius) return 99999.0;  // force max detail if inside bounds
+
+    // vertical fov = 60 deg (must match engine camera; could be a UBO field)
+    float fovY = 60.0 * PI / 180.0;
+    float projectedError = (worldError * pc.viewportH) / (2.0 * dist * tan(fovY * 0.5));
+    return projectedError;
+}
+
+// Extract frustum planes from viewProj (world-space, normals pointing inward)
+vec4 extractFrustumPlane(int which) {
+    vec4 rowX = cam.viewProj[0];
+    vec4 rowY = cam.viewProj[1];
+    vec4 rowZ = cam.viewProj[2];
+    vec4 rowW = cam.viewProj[3];
+
+    vec4 plane;
+    if      (which == 0) plane = rowW + rowX;  // left
+    else if (which == 1) plane = rowW - rowX;  // right
+    else if (which == 2) plane = rowW + rowY;  // bottom
+    else if (which == 3) plane = rowW - rowY;  // top
+    else if (which == 4) plane = rowW + rowZ;  // near
+    else            plane = rowW - rowZ;  // far
+
+    float invLen = 1.0 / length(plane.xyz);
+    return plane * invLen;
+}
+
+bool sphereInFrustum(vec3 center, float radius) {
+    for (int i = 0; i < 6; ++i) {
+        vec4 plane = extractFrustumPlane(i);
+        if (dot(plane.xyz, center) + plane.w < -radius)
+            return false;
+    }
+    return true;
+}
+
+void main() {
+    uint gId = gl_GlobalInvocationID.x;
+    if (gId >= pc.totalNodes) return;
+
+    LODCluster node = inHierarchy.nodes[gId];
+    vec3 center  = node.sphereCenterRadius.xyz;
+    float radius = node.sphereCenterRadius.w;
+
+    // 1. Core frustum culling (early out)
+    if (!sphereInFrustum(center, radius)) return;
+
+    // 2. Dynamic LOD evaluator
+    float sseSelf   = getScreenSpaceError(center, radius, node.errorSelf);
+    float sseParent = getScreenSpaceError(center, radius, node.errorParent);
+
+    // Rule: render THIS node if own error is acceptable, but parent's is not.
+    // For root nodes (errorParent = 0), always test own error.
+    bool renderThis = false;
+    if (node.parentId == 0) {
+        // Root: render only if own error is within budget
+        renderThis = (sseSelf <= pc.lodPixelError);
+    } else {
+        renderThis = (sseSelf <= pc.lodPixelError &&
+                      sseParent > pc.lodPixelError);
+    }
+
+    if (renderThis) {
+        // AMD Wave32 optimisation: instead of every active thread doing an
+        // atomicAdd on outCounter.drawCount, we use subgroup ballot to count
+        // the active threads in this Wave32, let the elected leader perform a
+        // SINGLE atomicAdd for the whole subgroup, and broadcast the base
+        // offset back to all lanes via subgroupBroadcastFirst.  This removes
+        // register spills from atomics contention and keeps the full 32-lane
+        // wavefront in lock-step.
+        uvec4 activeBallot = subgroupBallot(renderThis);
+        uint  waveCount    = subgroupBallotBitCount(activeBallot);
+
+        uint waveBase = 0;
+        if (subgroupElect()) {
+            waveBase = atomicAdd(outCounter.drawCount, waveCount);
+        }
+        waveBase = subgroupBroadcastFirst(waveBase);
+
+        uint threadOffset = subgroupBallotExclusiveBitCount(activeBallot);
+        uint drawIndex    = waveBase + threadOffset;
+
+        uvec4 src = inCommands.cmds[gId];
+        IndirectCommand cmd;
+        cmd.indexCount    = src.z;       // indexCount
+        cmd.instanceCount = 1;
+        cmd.firstIndex    = src.y;       // firstIndex
+        cmd.vertexOffset  = int(src.x);  // firstVertex
+        cmd.firstInstance = src.w;       // instanceId
+
+        outDraws.drawCmds[drawIndex] = cmd;
+    }
+}

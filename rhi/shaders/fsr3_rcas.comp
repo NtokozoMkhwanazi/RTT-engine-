@@ -1,0 +1,61 @@
+// FSR3 RCAS (Robust Contrast-Adaptive Sharpen) compute shader.
+//
+// Phase 5b: sharpens the EASU float output before the color-convert blit into
+// the presentable swapchain image. Reuses AMD's CANONICAL RCAS math verbatim
+// from the SDK headers (same include strategy + FFX_GPU/FFX_GLSL activation as
+// rhi/shaders/fsr3_easu.comp), so the sharpen matches FidelityFX exactly:
+//
+//   #include "fsr1/ffx_fsr1_callbacks_glsl.h" -> binding macros (SRV/UAV/CB/sampler)
+//   #include "fsr1/ffx_fsr1_rcas.h"           -> RCAS() macro + FsrRcasF
+//       -> which pulls ffx_core.h (ffxRemapForQuad, the 5x5->3x3 RCAS filter)
+//          + fsr1/ffx_fsr1.h (RCasConfig / the cbFSR1 constant buffer).
+//
+// Compile (engine Makefile .comp rule):
+//   glsc -IFidelityFX-SDK-FSR3/sdk/include/FidelityFX/gpu rhi/shaders/fsr3_rcas.comp
+//
+// RCAS reads the EASU float scratch (SRV, sampled via texelFetch — no sampler)
+// and writes a SECOND full-res float scratch (UAV), which is then linearly
+// blitted (color-converted) into the swapchain. RCAS is NOT run in-place
+// because its 3x3 neighborhood gather would race against adjacent workgroups'
+// imageStore writes on the same image.
+//
+// Bindings (set = 0) — REUSE the engine's EASU descriptor set layout:
+//   binding  0  : SAMPLED_IMAGE  r_internal_upscaled_color (EASU float output, texelFetch source)
+//   binding 1000: SAMPLER        s_LinearClamp (declared by callbacks, UNUSED by the float path)
+//   binding 2001: STORAGE_IMAGE  rw_upscaled_output (RCAS float output; aliased to 2001)
+//   binding 3000: UNIFORM_BUFFER cbFSR1 (rcasConfig lives in const3; std140, 80B)
+//
+// RCAS workgroup = 64 threads (1D, local_size_x=64). RCAS() uses ffxRemapForQuad
+// which spans 0..63, so the group MUST be 64-wide (an 8x8 group would only cover
+// 1/8 of the tile). Each 64-thread group tiles a 16x16 region via 4 CurrFilter
+// sub-calls, so dispatch = (outW+15)/16 x (outH+15)/16 — identical to EASU.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#define FFX_GPU 1
+#define FFX_GLSL 1
+
+// Match the engine's EASU descriptor set layout (set 0, bindings 0/1000/2001/3000).
+#define FSR1_BIND_SRV_INTERNAL_UPSCALED_COLOR 0
+#define FSR1_BIND_UAV_UPSCALED_OUTPUT         2001   // engine alias (not 2000)
+#define FSR1_BIND_CB_FSR1                     3000
+
+// Canonical AMD: 64 threads per workgroup (1D).  RCAS() calls
+// ffxRemapForQuad(LocalThreadId.x) which expects a linear index in [0..63].
+#define FFX_FSR1_THREAD_GROUP_WIDTH  64
+#define FFX_FSR1_THREAD_GROUP_HEIGHT 1
+#define FFX_FSR1_THREAD_GROUP_DEPTH  1
+#define FFX_FSR1_NUM_THREADS \
+    layout(local_size_x = FFX_FSR1_THREAD_GROUP_WIDTH, \
+           local_size_y = FFX_FSR1_THREAD_GROUP_HEIGHT, \
+           local_size_z = FFX_FSR1_THREAD_GROUP_DEPTH) in;
+
+#include "fsr1/ffx_fsr1_callbacks_glsl.h"
+#include "fsr1/ffx_fsr1_rcas.h"
+
+FFX_FSR1_NUM_THREADS
+void main() {
+    RCAS(gl_LocalInvocationID.xyz, gl_WorkGroupID.xyz, gl_GlobalInvocationID.xyz);
+}

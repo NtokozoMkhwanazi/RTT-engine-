@@ -17,6 +17,12 @@ public:
     // Constructor (from file paths)
     Shader(const char* vertexPath, const char* fragmentPath);
 
+    // Constructor (from file paths, 4 stages: vertex + tessellation control +
+    // tessellation evaluation + fragment). Falls back gracefully (ID == 0) if
+    // any stage fails to compile or the program fails to link.
+    Shader(const char* vertexPath, const char* tessCtrlPath,
+           const char* tessEvalPath, const char* fragmentPath);
+
     // Constructor (from raw source strings)
     Shader(const std::string& vertexSource, const std::string& fragmentSource, bool fromString);
 

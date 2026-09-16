@@ -20,24 +20,25 @@ bool TextureAtlas::initialize() {
         return true;  // Already initialized
     }
 
-    glGenTextures(1, &m_atlasTexture);
+    // Direct State Access (GLAD 4.6): glCreateTextures gives us a texture
+    // object with immutable storage allocated below (no bind required to set up).
+    glCreateTextures(GL_TEXTURE_2D, 1, &m_atlasTexture);
     if (m_atlasTexture == 0) {
         std::cerr << "[TextureAtlas] Failed to generate texture!\n";
         return false;
     }
 
-    // Allocate atlas texture
-    glBindTexture(GL_TEXTURE_2D, m_atlasTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_config.atlasSize, m_config.atlasSize, 
-                 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    
-    // Set texture parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
-    glBindTexture(GL_TEXTURE_2D, 0);
+    // Allocate atlas texture: immutable, single level (no mipmaps; MIN=LINEAR).
+    // GL_RGBA (unsized) becomes the sized GL_RGBA8 required by glTextureStorage2D.
+    glTextureStorage2D(m_atlasTexture, 1, GL_RGBA8, m_config.atlasSize, m_config.atlasSize);
+
+    // Parameters via DSA (no bind required).
+    glTextureParameteri(m_atlasTexture, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTextureParameteri(m_atlasTexture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTextureParameteri(m_atlasTexture, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(m_atlasTexture, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glBindTexture(GL_TEXTURE_2D, 0);  // preserve prior unbind semantics
 
     std::cout << "[TextureAtlas] Initialized: " << m_config.atlasSize << "x" 
               << m_config.atlasSize << ", max " << m_config.maxTextures << " textures\n";

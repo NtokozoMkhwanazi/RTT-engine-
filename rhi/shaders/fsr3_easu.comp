@@ -1,0 +1,70 @@
+// FSR3 EASU (Enhanced Subpixel-scale Upscale) compute shader.
+//
+// Phase 4: spatial upscale stage of FSR3. AMD's FSR3 reuses the FSR1 EASU
+// algorithm (edge-directed 4-tap upscale) — we reuse AMD's CANONICAL shader
+// math verbatim from the SDK headers rather than re-implement it, so the
+// upscale math matches FidelityFX exactly:
+//
+//   #include "fsr1/ffx_fsr1_callbacks_glsl.h"  -> binding macros (CB/in/out/sampler)
+//   #include "fsr1/ffx_fsr1_easu.h"            -> EASU() macro + ffxFsrEasuFloat
+//       -> which pulls ffx_core.h (GatherEasu{Red,Green,Blue}, the analytic
+//          4-tap filter) + fsr1/ffx_fsr1.h (EASU constants struct).
+//
+// Compile (engine Makefile .comp rule):
+//   glslc -IFidelityFX-SDK-FSR3/sdk/include/FidelityFX/gpu rhi/shaders/fsr3_easu.comp
+//
+// FFX_GPU/FFX_GLSL activate the GLSL type+function block in ffx_core.h
+// (FfxFloat32x2, FfxUInt32x3, ffxFsrEasuFloat, GatherEasu{Red,Green,Blue}).
+// AMD's own VK shaders define FFX_GPU; the build script adds FFX_GLSL.
+// Bindings (set = 0) match the engine's EASU descriptor set:
+//   binding  0  : SAMPLED_IMAGE  r_input_color   (low-res, sRGB/linear RGBA8 scene color)
+//   binding 1000: SAMPLER        s_LinearClamp   (linear, clamp-to-edge)
+//   binding 2001: STORAGE_IMAGE  rw_upscaled_output        (full-res RGBA32f output)
+//   binding 3000: UNIFORM_BUFFER cbFSR1 (std140: const0..const3 + sample0)
+//
+// FFX_FSR1_THREAD_GROUP_WIDTH/HEIGHT are consumed by ffx_core.h (GROUP_SIZE).
+// FSR1_BIND_* drive which resources the callbacks header declares; we define
+// them before the include so the layout is exactly our descriptor set.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#define FFX_GPU 1
+#define FFX_GLSL 1
+
+// Map your engine's standard image descriptor bindings (Set 0)
+#define FSR1_BIND_SRV_INPUT_COLOR               0
+#define FSR1_BIND_UAV_INTERNAL_UPSCALED_COLOR  2001
+#define FSR1_BIND_UAV_UPSCALED_OUTPUT          2001
+#define FSR1_BIND_CB_FSR1                      3000
+
+// Canonical AMD: 64 threads per workgroup (1D).  The EASU() function calls
+// ffxRemapForQuad(LocalThreadId.x) which expects a linear index in [0..63]
+// and produces the 8x8 PS-like swizzle pattern.  Each 64-thread workgroup
+// covers a 16x16 output tile via 4 CurrFilter sub-calls (offset by 8 in x
+// and y).  Dispatch is (outW+15)/16 x (outH+15)/16.
+#define FFX_FSR1_THREAD_GROUP_WIDTH  64
+#define FFX_FSR1_THREAD_GROUP_HEIGHT 1
+#define FFX_FSR1_THREAD_GROUP_DEPTH  1
+
+#define FFX_FSR1_NUM_THREADS \
+    layout(local_size_x = FFX_FSR1_THREAD_GROUP_WIDTH, \
+           local_size_y = FFX_FSR1_THREAD_GROUP_HEIGHT, \
+           local_size_z = FFX_FSR1_THREAD_GROUP_DEPTH) in;
+
+// By defining FSR1_BIND_CB_FSR1, the callbacks header will declare the
+// cbFSR1_t uniform block at binding 3000 with the correct members.  This
+// avoids a duplicate layout declaration and keeps the CB layout identical
+// to AMD's canonical shader.
+#include "fsr1/ffx_fsr1_callbacks_glsl.h"
+#include "fsr1/ffx_fsr1_easu.h"
+
+FFX_FSR1_NUM_THREADS
+void main() {
+    // Canonical AMD EASU entry point: ffxRemapForQuad + 4 sub-tile CurrFilter
+    // calls are handled entirely inside EASU().  This replaces the previous
+    // custom 8x8 remapping that only covered 16x4 of each 16x16 tile, collapsing
+    // the output into the top-left quadrant of the screen.
+    EASU(gl_LocalInvocationID.xyz, gl_WorkGroupID.xyz, gl_GlobalInvocationID.xyz);
+}

@@ -17,11 +17,21 @@ layout (location = 7) in vec4 instanceModelRow0;
 layout (location = 8) in vec4 instanceModelRow1;
 layout (location = 9) in vec4 instanceModelRow2;
 layout (location = 10) in vec4 instanceModelRow3;
+layout (location = 11) in vec4 instanceColor;
 
 out vec2 TexCoords;
 out vec3 FragPos;
 out vec3 Normal;
+out vec3 vTangent;
+out vec3 vBitangent;
 out float DebugInfo;  // Debug output
+out vec4 InstanceColor;
+
+// Wind sway (per-plant animation). uWindStrength > 0 enables; characters and
+// other non-vegetation draws leave it at the default 0, so they never move.
+uniform float uWindStrength = 0.0;
+uniform float uTime = 0.0;
+uniform vec3 uWindDir = vec3(1.0, 0.0, 0.2);
 
 uniform sampler2D boneTex;
 uniform mat4 view;
@@ -118,11 +128,30 @@ void main()
     // Transform skinned position from model space to world space
     vec4 worldPos = mdl * skinnedPos;
 
+    // Per-instance tint. When instancing is disabled (characters via
+    // Mesh::Draw) attribute 11 is not enabled in the VAO and reads back the
+    // default (0,0,0,1) - so force white there or everything turns black.
+    InstanceColor = (uDisableInstancing == 1) ? vec4(1.0) : instanceColor;
+
+    // Wind sway: bend the top of the plant more than its base (amplitude
+    // scales with local height above ground). The spatial phase comes from
+    // the world XZ so neighboring plants sway out of step. Only runs when
+    // uWindStrength > 0 (world-vegetation draws); rocks/trees set 0.
+    if (uWindStrength > 0.0) {
+        float localH = max(skinnedPos.y, 0.0);
+        float phase = uTime * 2.0 + worldPos.x * 0.12 + worldPos.z * 0.12;
+        float sway = sin(phase) * localH * uWindStrength;
+        worldPos.x += uWindDir.x * sway;
+        worldPos.z += uWindDir.z * sway;
+    }
+
     FragPos = worldPos.xyz;
 
     // Transform normals using the skin matrix and model matrix
     mat3 normalMat = transpose(inverse(mat3(mdl) * mat3(skin)));
     Normal = normalize(normalMat * aNormal);
+    vTangent   = normalize(normalMat * aTangent);
+    vBitangent = normalize(normalMat * aBitangent);
 
     // FINAL POSITION - transform world position by view/projection
     gl_Position = projection * view * worldPos;

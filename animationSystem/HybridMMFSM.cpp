@@ -1,7 +1,9 @@
 #include "HybridMMFSM.h"
 #include <iostream>
+#include <string>
 #include <algorithm>
 #include <glm/gtc/quaternion.hpp>
+#include "../editor/config.h"  // InertializationConfig for live editor tuning
 
 // ============================================================================
 // HYBRID MM + FSM IMPLEMENTATION (FIXED - Proper shared_ptr ownership)
@@ -14,8 +16,8 @@ HybridMMFSM::HybridMMFSM() {
 HybridMMFSM::~HybridMMFSM() {
     std::cout << "[HybridMMFSM] Destructor called - this=" << this << "\n";
     // Clear all databases (shared_ptr will properly clean up animations)
-    std::cout << "[HybridMMFSM] Clearing " << stateDatabases.size() << " state databases\n";
-    stateDatabases.clear();
+    std::cout << "[HybridMMFSM] Clearing " << hybridStateSlots.size() << " state databases\n";
+    hybridStateSlots.clear();
     std::cout << "[HybridMMFSM] Destructor complete\n";
 }
 
@@ -32,10 +34,10 @@ void HybridMMFSM::Initialize(const Skeleton* skel, Animator* anim) {
     motionMatcher.Initialize(skeleton, animator);
     mmActive = true;
 
-    // Pre-create databases for each state using unique_ptr
-    stateDatabases[HybridState::LOCOMOTION] = std::make_unique<MotionDatabase>();
-    stateDatabases[HybridState::CROUCH_WALK] = std::make_unique<MotionDatabase>();
-    stateDatabases[HybridState::COMBAT] = std::make_unique<MotionDatabase>();
+    // Pre-create databases for each state
+    hybridStateSlots[HybridState::LOCOMOTION].database = std::make_unique<MotionDatabase>();
+    hybridStateSlots[HybridState::CROUCH_WALK].database = std::make_unique<MotionDatabase>();
+    hybridStateSlots[HybridState::COMBAT].database = std::make_unique<MotionDatabase>();
 
     std::cout << "[HybridMMFSM] Initialized - MM for locomotion, FSM for states\n";
     std::cout << "  ✓ Proper unique_ptr ownership enabled\n";
@@ -102,13 +104,15 @@ void HybridMMFSM::LoadStateAnimation(HybridState state, const std::string& name,
     }
 
     // Create database for this state if it doesn't exist
-    if (stateDatabases.find(state) == stateDatabases.end()) {
-        stateDatabases[state] = std::make_unique<MotionDatabase>();
+    auto& slot = hybridStateSlots[state];
+    if (!slot.database) {
+        slot.database = std::make_unique<MotionDatabase>();
         std::cout << "[HybridMMFSM] Created database for state: " << HybridStateToString(state) << "\n";
     }
 
     // Add animation to state's database - database takes ownership via shared_ptr
-    stateDatabases[state]->AddAnimation(name, anim, skeleton);
+    slot.database->AddAnimation(name, anim, skeleton);
+    slot.isBuilt = false;
     
     std::cout << "[HybridMMFSM] Loaded state animation: " << HybridStateToString(state) 
               << " - " << name << " (duration=" << anim->duration << "s)\n";
@@ -121,12 +125,50 @@ void HybridMMFSM::BuildDatabases() {
         std::cout << "[HybridMMFSM] Locomotion MM database built\n";
     }
 
-    // Build KD-Trees for state-specific databases
-    for (auto& [state, database] : stateDatabases) {
-        if (database && database->GetPoseCount() > 0) {
-            std::cout << "[HybridMMFSM] State " << HybridStateToString(state) 
-                      << " has " << database->GetPoseCount() << " poses\n";
+    // FIX (v11 Section 2): Pre-build and warm EVERY state-specific KD-Tree
+    // at load time. Previously this rebuilt the tree each frame during state
+    // switches, causing FPS dips. Now each state owns a persistent tree that
+    // is swapped in by reference at runtime (zero allocation).
+    for (auto& [state, slot] : hybridStateSlots) {
+        if (slot.database && slot.database->GetPoseCount() > 0) {
+            std::cout << "[Engine Performance] Pre-building warm KD-Tree for State: "
+                      << HybridStateToString(state) << " ("
+                      << slot.database->GetPoseCount() << " poses)\n";
+
+            slot.searchTree = std::make_unique<MotionKDTree>();
+            slot.searchTree->BuildWithSAH(slot.database->GetPoses(), 10);
+            slot.isBuilt = true;
+
+            // FIX (v12 Section 2): Pre-bake the SIMD SoA cache at load time
+            // so runtime database switches via SetDatabaseExplicit never
+            // trigger mid-frame heap allocations in RebuildSIMDCacheIfNeeded.
+            slot.WarmSIMDCache();
         }
+    }
+
+    // ---- Structural Motion Graph: Pre-compute transition clips ----
+    // Instead of instant database swaps at runtime, pre-compute smooth
+    // transition clips between all state pairs. Each clip is generated using
+    // the paper's window-based similarity metric (§3.1), 2D rigid alignment
+    // (equation 1), and C1-continuous slerp blending (equations 5-7).
+    // This eliminates the need for stature offset / pose blend patches.
+    std::cout << "[HybridMMFSM] Building structural motion transition graph...\n";
+    // BuildTransitions expects a map<int, MotionDatabase*>.
+    // Convert from our HybridState-keyed hybridStateSlots.
+    std::map<int, MotionDatabase*> dbPtrMap;
+    for (auto& [state, slot] : hybridStateSlots) {
+        if (slot.database && slot.database->GetPoseCount() > 0) {
+            dbPtrMap[static_cast<int>(state)] = slot.database.get();
+        }
+    }
+    transitionGraph.BuildTransitions(dbPtrMap, skeleton);
+
+    // Restore the active database back to the primary locomotion DB.
+    // FIX (v12 Section 2): Use ResetDatabaseExplicit instead of
+    // SetCurrentDatabase — the latter calls BuildSearchIndex() which rebuilds
+    // the KD-tree we just built above, wasting a full allocation mid-init.
+    if (mmActive && motionMatcher.GetDatabase()) {
+        motionMatcher.ResetDatabaseExplicit();
     }
 }
 
@@ -174,7 +216,24 @@ void HybridMMFSM::Update(float dt, const HybridMMFSMState& state) {
         UpdateInertialization(dt);
     }
 
-    // Update based on current state
+    // =========================================================================
+    // CONTINUOUS ANIMATION FLOW (replaces Standstill Posture Lock)
+    //
+    // Previously: captured a frozen skeleton snapshot on the first frame of
+    // rest and replayed it for all subsequent idle frames, bypassing the live
+    // IK solver to prevent sub-millimetre knee jitter ("IK Loop Churn").
+    //
+    // Now: the structural motion graph handles ALL state transitions via
+    // pre-computed transition clips (slerp + 2D alignment). Idle poses are
+    // selected from the motion database by the MotionMatcher each frame.
+    // Foot IK runs continuously with sub-frame damping (ApplyFootIK) to
+    // eliminate jitter without freezing — all clips flow seamlessly through
+    // the graph. No pose is ever frozen, so all animation is continuous.
+    // =========================================================================
+
+    // =========================================================================
+    // Standard live execution loop for active gameplay
+    // =========================================================================
     switch (currentState) {
         case HybridState::LOCOMOTION:
             UpdateLocomotion(dt);
@@ -192,13 +251,88 @@ void HybridMMFSM::Update(float dt, const HybridMMFSMState& state) {
         default:
             break;
     }
+
+    // =========================================================================
+    // FIX: Tight synchronous layout loop to destroy leg stretching.
+    // The state tick above updates animation sampling (Pass 1 bone evaluation),
+    // but foot IK / pelvis adjustment must run in the SAME frame against fresh
+    // bone positions. Previously these ran on the next frame, using stale root
+    // data — knees pulled straight and ankles stretched during pose switches.
+    // =========================================================================
+    if (animator && skeleton && mmActive) {
+        // Character world transform: root bone's global matrix (identity-safe).
+        glm::mat4 currentModelMatrix =
+            animator->globalBoneMatrices.empty()
+                ? glm::mat4(1.0f)
+                : animator->globalBoneMatrices[0];
+
+        motionMatcher.SetCharacterModelMatrix(currentModelMatrix);
+        motionMatcher.SetFloorHeight(characterState.position.y);
+        motionMatcher.ApplyFootIK(dt);
+        // Re-evaluate skeleton in this frame so the visual pose matches the
+        // IK solve — eliminates the 1-frame lag that caused knee jitter.
+        animator->RevalidateIK();
+
+        // ---- Structural Motion Graph: Transition clip playback ----
+        // When a pre-computed transition clip is playing, the MotionMatcher
+        // handles playback internally (driving the Animator from the clip).
+        // No runtime stature offset or pose blend patches needed — the clip
+        // already structurally blends all joints via slerp + 2D alignment.
+        // Just check for completion and commit the state switch.
+        if (m_transitionClipPlaying && !motionMatcher.IsPlayingTransitionClip()) {
+            // Transition clip has completed — MotionMatcher has swapped to
+            // the target database. Commit the state switch.
+            m_transitionClipPlaying = false;
+            if (isTransitioning) {
+                isTransitioning = false;
+                transitionProgress = 0.0f;
+                previousState = transitionFrom;
+                currentState = transitionTo;
+                std::cout << "[HybridMMFSM] Transition complete (Atomic database hand-off): "
+                          << HybridStateToString(previousState) << " -> "
+                          << HybridStateToString(currentState) << "\n";
+
+                // CRITICAL FIX: FORCE THE INSTANT RESTORATION OF TARGET ANIM
+                // TO LAYER STACK. When IsPlayingTransitionClip() turns false,
+                // the state machine commits the switch, but the Animator may
+                // not have had its base blend weights raised above 0.0001f yet
+                // for the incoming database, causing totalWeight < 0.0001f →
+                // T-pose snap on the next bone buffer update. Prime the layer
+                // stack immediately so the target animation is at full weight
+                // the same frame the transition completes.
+                auto targetAnim = motionMatcher.GetCurrentAnimation();
+                if (targetAnim && animator) {
+                    animator->Play(targetAnim.get());
+                    animator->SetCurrentTime(motionMatcher.GetCurrentAnimationTime());
+                }
+            }
+        }
+
+        animator->UpdateBoneBuffer();
+    }
 }
 
 void HybridMMFSM::UpdateStateMachine(float dt) {
     // Update transition progress
     if (isTransitioning) {
-        transitionProgress += dt / transitionDuration;
+        // If a structural transition clip is playing, use its duration
+        // (≈0.33s) instead of the default blend duration (0.1s) so the
+        // state machine commits at the same time the clip completes.
+        float effectiveDuration = transitionDuration;
+        if (m_transitionClipPlaying) {
+            effectiveDuration = (float)motionMatcher.GetTransitionClipDuration();
+        }
+
+        transitionProgress += dt / effectiveDuration;
         if (transitionProgress >= 1.0f) {
+            // If a transition clip is playing, let the clip complete first.
+            // The state switch is committed in Update() when
+            // IsPlayingTransitionClip() returns false.
+            if (m_transitionClipPlaying) {
+                transitionProgress = 1.0f;
+                return;  // Wait for clip completion in Update()
+            }
+
             // Transition complete
             isTransitioning = false;
             transitionProgress = 0.0f;
@@ -218,6 +352,33 @@ void HybridMMFSM::UpdateStateMachine(float dt) {
 void HybridMMFSM::EvaluateTransitions() {
     for (const auto& t : transitions) {
         bool conditionMet = t.condition();
+
+        // ── Phase 3: Airborne Gating Safeties ──────────────────────────
+        // Block transitions that would crossfade airborne animations into
+        // grounded locomotion datasets (or vice-versa) when the motion
+        // matching database has no airborne poses. Without this gate, a
+        // grounded→Jump transition fires the Jump animation, but if the
+        // database lacks Jump/Fall clips the matcher can't represent the
+        // arc — the character snaps back to a grounded pose mid-air. Similarly,
+        // an airborne→grounded transition without landing detection causes
+        // the grounded clip to play while the feet are still in the air.
+        static auto IsAirborne = [](HybridState s) {
+            return s == HybridState::JUMP || s == HybridState::FALL;
+        };
+        if (conditionMet && mmActive && motionMatcher.GetDatabase() &&
+            motionMatcher.GetDatabase()->GetPoseCount() > 0) {
+            bool fromAir = IsAirborne(t.from);
+            bool toAir   = IsAirborne(t.to);
+            if (fromAir != toAir) {
+                // Cross-domain transition (grounded ↔ airborne). Only allow
+                // if the database actually has airborne poses to represent
+                // the arc.
+                if (!motionMatcher.GetDatabase()->HasAirbornePoses()) {
+                    conditionMet = false;
+                }
+            }
+        }
+
         if (debugEnabled) {
             std::cout << "[HybridMMFSM] Checking transition: " << HybridStateToString(t.from)
                       << " -> " << HybridStateToString(t.to)
@@ -253,9 +414,12 @@ void HybridMMFSM::StartTransition(HybridState toState) {
         useInertialization = transitionConfig->useInertialization;
     }
 
-    // Capture source state for inertialization
+    // Capture source state for inertialization (root position/rotation momentum
+    // is still preserved — the transition clip handles bone-shape blending
+    // structurally via pre-computed slerp + 2D alignment)
     inertialization.sourceRootPos = characterState.position;
-    inertialization.sourceRootRot = characterState.rotation;
+    inertialization.sourceRootRot = glm::angleAxis(characterState.rotation,
+                                                     glm::vec3(0, 1, 0));
     inertialization.sourceVelocity = characterState.velocity;
 
     transitionFrom = currentState;
@@ -265,35 +429,81 @@ void HybridMMFSM::StartTransition(HybridState toState) {
     isTransitioning = true;
 
     std::cout << "[HybridMMFSM] Starting transition: " << HybridStateToString(transitionFrom)
-              << " -> " << HybridStateToString(transitionTo) 
+              << " -> " << HybridStateToString(transitionTo)
               << " (blend=" << duration << "s, inertial=" << (useInertialization ? "YES" : "NO") << ")\n";
 
-    // Play animation for target state
+    // ---- Structural Motion Graph: Play pre-computed transition clip ----
+    // Instead of instantly swapping databases (SetDatabaseExplicit), look up
+    // a pre-baked transition clip from the motion transition graph. The clip
+    // smoothly blends ALL joints via slerp + linear root interpolation with
+    // 2D coordinate alignment — no runtime stature offset or pose blend patches
+    // needed.
+    if (mmActive) {
+        auto transitionClip = transitionGraph.GetTransition(
+            static_cast<int>(currentState), static_cast<int>(toState));
+
+        if (transitionClip && animator) {
+            // Find the target state's database and KD-tree for post-transition
+            auto dbIt = hybridStateSlots.find(toState);
+            const MotionDatabase* targetDB =
+                (dbIt != hybridStateSlots.end()) ? dbIt->second.database.get() : nullptr;
+            const MotionKDTree* targetTree =
+                (dbIt != hybridStateSlots.end()) ? dbIt->second.searchTree.get() : nullptr;
+
+            // Find the nearest pose in the target database to the transition
+            // clip's ending pose, so the matcher resumes from a compatible pose
+            int targetPoseIndex = -1;
+            if (targetDB && targetDB->GetPoseCount() > 0) {
+                // Use the first pose of the target database as a reasonable
+                // starting point — the transition clip ends at a pose sampled
+                // from this database, so any pose in the same clip is close.
+                targetPoseIndex = 0;
+            }
+
+            motionMatcher.PlayTransitionClip(
+                transitionClip,
+                targetDB ? *targetDB : *motionMatcher.GetDatabase(),
+                targetTree ? *targetTree : motionMatcher.GetSearchTree(),
+                targetPoseIndex);
+
+            m_transitionClipPlaying = true;
+            m_transitionClipTarget = toState;
+            std::cout << "[HybridMMFSM] Playing structural transition clip ("
+                      << transitionClip->duration << "s)\n";
+            return;
+        }
+    }
+
+    // Fallback: if no transition clip exists (e.g., JUMP, VAULT states that
+    // are one-shot animations, not MM databases), use the old inertialization
+    // approach for root momentum preservation.
     if (useInertialization) {
-        // Start inertialization blending
         inertialization.active = true;
         inertialization.progress = 0.0f;
         inertialization.duration = inertializationDuration;
         inertialization.preservedMomentum = characterState.velocity;
-        
+
         // Target state setup
         inertialization.targetRootPos = characterState.position;
-        inertialization.targetRootRot = characterState.rotation;
-        inertialization.targetVelocity = glm::vec3(0.0f);  // Will be updated
-    }
-
-    // Try to get animation from state database
-    auto dbIt = stateDatabases.find(toState);
-    if (dbIt != stateDatabases.end() && dbIt->second) {
-        // For state-specific MM, we would switch databases here
-        // For now, just log it
-        std::cout << "[HybridMMFSM] Using state database for " << HybridStateToString(toState) << "\n";
+        inertialization.targetRootRot = glm::angleAxis(characterState.rotation,
+                                                     glm::vec3(0, 1, 0));
+        inertialization.targetVelocity = glm::vec3(0.0f);
     }
 }
 
 void HybridMMFSM::UpdateLocomotion(float dt) {
-    // Motion Matching handles smooth idle↔walk↔run blending
+    // Motion Matching handles smooth idle↔walk↔run blending.
+    // Crouch ↔ Locomotion transitions are now handled structurally via
+    // pre-computed transition clips (MotionTransitionGraph), so the old
+    // instant SetDatabaseExplicit swap + crouch DB switch token is removed.
     if (mmActive) {
+        // Crouch↔Locomotion database restoration is handled by
+        // MotionMatcher::CompleteTransitionNow() which swaps the
+        // database pointer when the transition clip finishes.
+        // No manual ResetDatabaseExplicit needed — the transition clip
+        // ends at a pose sampled from the target database, so the matcher
+        // resumes seamlessly.
+
         CharacterState mmState;
         mmState.position = characterState.position;
         mmState.velocity = characterState.velocity;
@@ -301,6 +511,7 @@ void HybridMMFSM::UpdateLocomotion(float dt) {
         mmState.moveDirection = characterState.moveDirection;
         mmState.grounded = characterState.grounded;
         mmState.crouching = false;
+        mmState.worldVelocity = characterState.velocity;  // real-world m/s for speed-smoothed IK
 
         CharacterInput mmInput;
         mmInput.moveDirection = characterState.moveDirection;
@@ -332,10 +543,17 @@ void HybridMMFSM::UpdateFall(float dt) {
 }
 
 void HybridMMFSM::UpdateCrouch(float dt) {
-    // Crouch uses MM with crouch database for smooth crouch idle <-> crouch walk blending
-    auto it = stateDatabases.find(HybridState::CROUCH_WALK);
-    if (it != stateDatabases.end() && it->second && it->second->GetPoseCount() > 0) {
-        // Use crouch-specific motion matching
+    // Crouch uses MM with crouch database for smooth crouch idle <-> crouch walk blending.
+    // The database switch from LOCOMOTION is now handled by the structural
+    // transition clip (MotionTransitionGraph), which plays a pre-computed
+    // blend clip and then seamlessly swaps the database via
+    // MotionMatcher::CompleteTransitionNow(). No instant SetDatabaseExplicit
+    // swap — no stature offset patches — no pose snapshot blending.
+    auto it = hybridStateSlots.find(HybridState::CROUCH_WALK);
+    if (it != hybridStateSlots.end() && it->second.database &&
+        it->second.database->GetPoseCount() > 0 && it->second.isBuilt) {
+        // Use crouch-specific motion matching. The crouch database is
+        // already active (set by CompleteTransitionNow when the clip finished).
         CharacterState crouchState;
         crouchState.position = characterState.position;
         crouchState.velocity = characterState.velocity;
@@ -343,18 +561,13 @@ void HybridMMFSM::UpdateCrouch(float dt) {
         crouchState.moveDirection = characterState.moveDirection;
         crouchState.grounded = characterState.grounded;
         crouchState.crouching = true;
+        crouchState.worldVelocity = characterState.velocity;
 
         CharacterInput crouchInput;
         crouchInput.moveDirection = characterState.moveDirection;
         crouchInput.moveMagnitude = characterState.moveMagnitude;
         crouchInput.grounded = characterState.grounded;
 
-        // Temporarily switch to crouch database
-        // Temporarily switch to crouch database (non-owning — the database
-        // remains owned by stateDatabases so the next UpdateCrouch call can
-        // still find it. Previously this std::move'd the unique_ptr out of
-        // the map, permanently emptying the slot).
-        motionMatcher.SetDatabase(*it->second, 0.1f);
         motionMatcher.Update(dt, crouchInput, crouchState);
     } else {
         // Fallback: use locomotion MM with crouching flag
@@ -366,6 +579,7 @@ void HybridMMFSM::UpdateCrouch(float dt) {
             crouchState.moveDirection = characterState.moveDirection;
             crouchState.grounded = characterState.grounded;
             crouchState.crouching = true;
+            crouchState.worldVelocity = characterState.velocity;
 
             CharacterInput crouchInput;
             crouchInput.moveDirection = characterState.moveDirection;
@@ -387,7 +601,8 @@ void HybridMMFSM::UpdateInertialization(float dt) {
         // Inertialization complete
         inertialization.active = false;
         inertialization.progress = 1.0f;
-        
+        // NOTE: Stature offset / pose snapshot cleanup removed —
+        // these fields no longer exist (replaced by transition clips).
         std::cout << "[HybridMMFSM] Inertialization complete\n";
         return;
     }
@@ -399,23 +614,78 @@ void HybridMMFSM::UpdateInertialization(float dt) {
 void HybridMMFSM::ApplyInertializationBlending(float dt) {
     if (!inertialization.active || !animator) return;
 
+    // Quintic smoothstep blend weight: 6t^5 - 15t^4 + 10t^3
+    // Gives zero first AND second derivatives at both t=0 and t=1,
+    // eliminating the velocity/acceleration "pop" at transition start/end
+    // that the old exponential (1 - e^{-5t}) produced (non-zero derivative
+    // at t=1 → knee jerk on state switch).
     float blendWeight = CalculateInertializationWeight(inertialization.progress);
+    const float t = inertialization.progress;
+    const float quintic = t * t * (3.0f - 2.0f * t);  // cubic smoothstep
+    // Refine to quintic for zero 2nd derivative at endpoints
+    const float quinticDecay = quintic * quintic * (3.0f - 2.0f * quintic);
 
-    // Calculate blended root position
-    glm::vec3 blendedPos = glm::mix(
-        inertialization.sourceRootPos + inertialization.preservedMomentum * inertialization.progress,
-        inertialization.targetRootPos,
-        blendWeight
-    );
+    // ---- Note: Stature-offset blending removed ----
+    // Previously decayed statureOffset here to hold the pelvis up during
+    // walk→crouch database swaps. Replaced by structural transition clips
+    // (MotionTransitionGraph) that pre-compute all-joint slerp + 2D alignment.
 
-    // Calculate root motion offset to apply
-    glm::vec3 rootOffset = blendedPos - inertialization.sourceRootPos;
+    // FIX (refreshed todo Fix 1): Synchronize inertialization with the
+    // multi-database root path. When the instant 0.0f database switch
+    // transitions into a Crouch/CrouchWalk pose domain while the character is
+    // practically stationary, the motion matcher immediately picks crouch
+    // frames (ankle close to pelvis) while inertialization still carries
+    // forward locomotion momentum. The two fight each other, the posture
+    // relaxer fires, and the residual ankleOffset stretches the leg.
+    // Snap the root to the target and zero momentum so the new database's
+    // rest pose aligns with the already-planted feet.
+    bool enteringCrouch = (transitionTo == HybridState::CROUCH ||
+                           transitionTo == HybridState::CROUCH_WALK);
+    bool isStationary = (glm::length(characterState.velocity) < 0.05f);
 
-    // Apply root motion offset to the animator's root bone
-    // The root bone is typically at index 0 or can be found via skeleton
+    // Position: blend between (source + momentum carry) and target root
+    glm::vec3 blendedPos;
+    if (enteringCrouch && isStationary) {
+        blendedPos = inertialization.targetRootPos;
+        inertialization.preservedMomentum = glm::vec3(0.0f);
+    } else {
+        blendedPos = glm::mix(
+            inertialization.sourceRootPos + inertialization.preservedMomentum * inertialization.progress,
+            inertialization.targetRootPos,
+            blendWeight
+        );
+
+        // Apply quintic decay to preserved momentum to prevent structural sliding.
+        // Uses the editor-configurable driftRecoveryRate for live tuning.
+        inertialization.preservedMomentum = glm::mix(
+            inertialization.preservedMomentum,
+            glm::vec3(0.0f),
+            dt * Config::getInertializationConfig().driftRecoveryRate);
+    }
+
+    // Rotation: track the source→target facing delta and apply it as a
+    // root-rotation offset, weighted by the quintic decay. This smoothly
+    // aligns the new pose's heading with the old pose's momentum, rather
+    // than snapping at transition start. Rotation is still applied during
+    // the stationary-crouch snap (only the positional drift is suppressed).
     if (skeleton && skeleton->rootBoneIndex >= 0) {
-        // Apply the offset to the root bone
-        animator->AddIKOffset(skeleton->rootBoneIndex, rootOffset, blendWeight);
+        // Positional offset (carried by AddIKOffset on the root bone) —
+        // suppressed when snapping into a stationary crouch to avoid the
+        // root drift that stretches the legs against planted feet.
+        if (!(enteringCrouch && isStationary)) {
+            glm::vec3 rootOffset = blendedPos - inertialization.sourceRootPos;
+            animator->AddIKOffset(skeleton->rootBoneIndex, rootOffset, blendWeight);
+        }
+
+        // Rotational offset: slerp from source→target facing over quintic decay
+        glm::quat rotDelta = glm::normalize(inertialization.targetRootRot *
+                                            glm::conjugate(inertialization.sourceRootRot));
+        // Only apply if there's a meaningful rotation (avoid no-op slerp)
+        if (glm::angle(rotDelta) > 0.001f) {
+            glm::quat applyRot = glm::slerp(glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                                            rotDelta, quinticDecay);
+            animator->AddRootRotationOffset(applyRot);
+        }
     } else {
         // Fallback: try to find root bone by name
         int rootBoneIdx = skeleton ? skeleton->GetBoneIndex("Hips") : -1;
@@ -423,26 +693,44 @@ void HybridMMFSM::ApplyInertializationBlending(float dt) {
             rootBoneIdx = skeleton ? skeleton->GetBoneIndex("Root") : -1;
         }
         if (rootBoneIdx >= 0) {
-            animator->AddIKOffset(rootBoneIdx, rootOffset, blendWeight);
+            if (!(enteringCrouch && isStationary)) {
+                glm::vec3 rootOffset = blendedPos - inertialization.sourceRootPos;
+                animator->AddIKOffset(rootBoneIdx, rootOffset, blendWeight);
+            }
+
+            glm::quat rotDelta = glm::normalize(inertialization.targetRootRot *
+                                                glm::conjugate(inertialization.sourceRootRot));
+            if (glm::angle(rotDelta) > 0.001f) {
+                glm::quat applyRot = glm::slerp(glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                                                rotDelta, quinticDecay);
+                animator->AddRootRotationOffset(applyRot);
+            }
         }
     }
 
     // Update source position for next frame
     inertialization.sourceRootPos = blendedPos;
 
+    // NOTE: Stature offset decay removed — replaced by structural transition
+    // clips. The transition clip already blends all joints via slerp + 2D
+    // alignment, so no runtime pelvis-hold offset is needed.
+
     if (debugEnabled) {
-        std::cout << "[Inertialization] Applied root offset: (" 
-                  << rootOffset.x << ", " << rootOffset.y << ", " << rootOffset.z << ")\n";
+        glm::vec3 debugOffset = blendedPos - inertialization.sourceRootPos;
+        std::cout << "[Inertialization] Applied root offset: ("
+                  << debugOffset.x << ", " << debugOffset.y << ", " << debugOffset.z << ")\n";
     }
 }
 
 float HybridMMFSM::CalculateInertializationWeight(float progress) const {
-    // Exponential decay function for natural momentum fade
-    // w = 1 - e^(-k * progress)
-    // This gives a smooth, natural-looking transition
-    
-    const float k = 5.0f;  // Decay rate
-    return 1.0f - std::exp(-k * progress);
+    // Quintic smoothstep: 6t^5 - 15t^4 + 10t^3
+    // Zero 1st & 2nd derivatives at both endpoints — no popping.
+    // Replaces the exponential decay (1 - e^{-5t}) which had a non-zero
+    // derivative at t=1 (velocity discontinuity → "knee snap").
+    if (progress <= 0.0f) return 0.0f;
+    if (progress >= 1.0f) return 1.0f;
+    return progress * progress * progress *
+           (progress * (progress * 6.0f - 15.0f) + 10.0f);
 }
 
 std::string HybridMMFSM::GetDebugInfo() const {
@@ -457,13 +745,13 @@ std::string HybridMMFSM::GetDebugInfo() const {
         info += "Progress: " + std::to_string((int)(progress * 100)) + "%\n";
     }
     info += "MM Active: " + std::string(mmActive ? "YES" : "NO") + "\n";
-    info += "State Databases: " + std::to_string(stateDatabases.size()) + "\n";
+    info += "State Databases: " + std::to_string(hybridStateSlots.size()) + "\n";
     
     // List state databases
-    for (const auto& [state, db] : stateDatabases) {
-        if (db) {
+    for (const auto& [state, slot] : hybridStateSlots) {
+        if (slot.database) {
             info += "  " + HybridStateToString(state) + ": " + 
-                    std::to_string(db->GetPoseCount()) + " poses\n";
+                    std::to_string(slot.database->GetPoseCount()) + " poses\n";
         }
     }
     
@@ -471,16 +759,17 @@ std::string HybridMMFSM::GetDebugInfo() const {
 }
 
 const MotionDatabase* HybridMMFSM::GetStateDatabase(HybridState state) const {
-    auto it = stateDatabases.find(state);
-    if (it != stateDatabases.end() && it->second) {
-        return it->second.get();  // Return raw pointer from unique_ptr
+    auto it = hybridStateSlots.find(state);
+    if (it != hybridStateSlots.end() && it->second.database) {
+        return it->second.database.get();
     }
     return nullptr;
 }
 
 bool HybridMMFSM::HasStateDatabase(HybridState state) const {
-    auto it = stateDatabases.find(state);
-    return (it != stateDatabases.end() && it->second && it->second->GetPoseCount() > 0);
+    auto it = hybridStateSlots.find(state);
+    return (it != hybridStateSlots.end() && it->second.database &&
+            it->second.database->GetPoseCount() > 0);
 }
 
 std::string HybridMMFSM::GetMotionMatcherDebug() const {

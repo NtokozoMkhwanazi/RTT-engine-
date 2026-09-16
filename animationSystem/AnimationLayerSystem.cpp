@@ -396,8 +396,12 @@ void AnimationLayerSystem::ApplyLayerToAnimator(Animator* animator, const Animat
         sampledPose[boneIndex] = transform;
     }
 
-    // Get the current pose from the animator (base pose)
-    const std::vector<glm::mat4>& basePose = animator->GetFinalBoneMatrices();
+    // Get the current pose from the animator (base pose).
+    // FIX: Pull from globalBoneMatrices (un-skinned) instead of
+    // GetFinalBoneMatrices() (post-skinning). The post-skinned matrices
+    // have globalInverseTransform and bone.offset baked in — decomposing
+    // them destroys IK offsets (root snap/skate/floating on state transitions).
+    const std::vector<glm::mat4>& basePose = animator->globalBoneMatrices;
 
     // Blend sampled pose with base pose using bone mask and weight
     // For proper skeletal blending, blend TRS components separately
@@ -426,11 +430,18 @@ void AnimationLayerSystem::ApplyLayerToAnimator(Animator* animator, const Animat
         glm::quat finalRotation = glm::slerp(baseRotation, sampledRotation, weight);
         glm::vec3 finalScale = glm::mix(baseScale, sampledScale, weight);
 
-        // Rebuild final matrix
+        // Rebuild final matrix in un-skinned global space
         glm::mat4 finalMatrix = glm::translate(glm::mat4(1.0f), finalTranslation);
         finalMatrix *= glm::mat4_cast(finalRotation);
         finalMatrix *= glm::scale(glm::mat4(1.0f), finalScale);
 
+        // Write clean un-skinned matrix back to the animator and keep
+        // finalBoneMatrices in sync so skinning doesn't use stale data.
+        animator->globalBoneMatrices[i] = finalMatrix;
+        auto& finalMats = animator->GetFinalBoneMatricesMutable();
+        if (i < finalMats.size() && skeleton) {
+            finalMats[i] = skeleton->globalInverseTransform * finalMatrix * skeleton->bones[i].offset;
+        }
         blendedMatrices[i] = finalMatrix;
     }
 

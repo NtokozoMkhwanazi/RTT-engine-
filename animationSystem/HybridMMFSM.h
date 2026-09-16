@@ -1,7 +1,9 @@
 #pragma once
 #include "AnimationStateMachine.h"
+#include "HybridState.h"
 #include "../motionMatching/MotionMatcher.h"
 #include "../motionMatching/MotionDatabase.h"
+#include "../motionMatching/MotionTransitionGraph.h"
 #include <memory>
 #include <vector>
 #include <unordered_map>
@@ -11,47 +13,6 @@
 // ============================================================================
 // HYBRID MM + FSM SYSTEM (FIXED - Proper shared_ptr ownership)
 // ============================================================================
-//
-// Architecture:
-// - FSM manages high-level states (Jump, Fall, Crouch, Combat)
-// - MM handles smooth locomotion blending (Idle↔Walk↔Run)
-// - Each FSM state has its own optimized motion database
-// - Uses inertialization for state transitions (not crossfade)
-// - Cache-friendly Struct-of-Arrays for motion data
-//
-// CRITICAL FIXES:
-// 1. All animations stored as shared_ptr with PROPER ownership
-// 2. Motion databases OWN their animations (no raw pointers)
-// 3. Clear ownership semantics - caller creates, system owns
-// 4. Cache-friendly data layout for motion matching search
-//
-// This is the AAA approach: MM for smoothness, FSM for state logic
-// ============================================================================
-
-enum class HybridState {
-    LOCOMOTION,      // MM handles idle/walk/run
-    JUMP,            // One-shot jump animation
-    FALL,            // Falling animation (looping)
-    CROUCH,          // Crouch idle
-    CROUCH_WALK,     // Crouch walk (MM with crouch database)
-    COMBAT,          // Combat state
-    VAULT,           // Vaulting/climbing
-    CUSTOM           // User-defined state
-};
-
-inline std::string HybridStateToString(HybridState state) {
-    switch (state) {
-        case HybridState::LOCOMOTION: return "Locomotion";
-        case HybridState::JUMP: return "Jump";
-        case HybridState::FALL: return "Fall";
-        case HybridState::CROUCH: return "Crouch";
-        case HybridState::CROUCH_WALK: return "CrouchWalk";
-        case HybridState::COMBAT: return "Combat";
-        case HybridState::VAULT: return "Vault";
-        case HybridState::CUSTOM: return "Custom";
-        default: return "Unknown";
-    }
-}
 
 /**
  * Hybrid Transition with Inertialization Support
@@ -117,45 +78,51 @@ struct InertializationState {
 
     // Source state (where we're transitioning FROM)
     glm::vec3 sourceRootPos{0.0f, 0.0f, 0.0f};
-    float sourceRootRot{0.0f};
+    glm::quat sourceRootRot{1.0f, 0.0f, 0.0f, 0.0f};
     glm::vec3 sourceVelocity{0.0f, 0.0f, 0.0f};
 
     // Target state (where we're transitioning TO)
     glm::vec3 targetRootPos{0.0f, 0.0f, 0.0f};
-    float targetRootRot{0.0f};
+    glm::quat targetRootRot{1.0f, 0.0f, 0.0f, 0.0f};
     glm::vec3 targetVelocity{0.0f, 0.0f, 0.0f};
 
     // Momentum preservation
     glm::vec3 preservedMomentum{0.0f, 0.0f, 0.0f};
     float driftRecoveryRate{5.0f};  // How fast to recover from drift
 
-    // Explicit default constructor to ensure proper initialization
-    InertializationState()
-        : active(false)
-        , progress(0.0f)
-        , duration(0.0f)
-        , sourceRootPos(0.0f, 0.0f, 0.0f)
-        , sourceRootRot(0.0f)
-        , sourceVelocity(0.0f, 0.0f, 0.0f)
-        , targetRootPos(0.0f, 0.0f, 0.0f)
-        , targetRootRot(0.0f)
-        , targetVelocity(0.0f, 0.0f, 0.0f)
-        , preservedMomentum(0.0f, 0.0f, 0.0f)
-        , driftRecoveryRate(5.0f) {}
+    // InertializationState no longer carries stature offset or pose snapshot
+    // fields. These were runtime patches for walk→crouch snap that are
+    // replaced by the pre-computed transition clips in MotionTransitionGraph.
+    // The transition clips structurally handle height differences, root
+    // alignment, and all-joint blending at load time — no runtime patches needed.
 
     void Reset() {
         active = false;
         progress = 0.0f;
         duration = 0.0f;
         sourceRootPos = glm::vec3(0.0f, 0.0f, 0.0f);
-        sourceRootRot = 0.0f;
+        sourceRootRot = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
         sourceVelocity = glm::vec3(0.0f, 0.0f, 0.0f);
         targetRootPos = glm::vec3(0.0f, 0.0f, 0.0f);
-        targetRootRot = 0.0f;
+        targetRootRot = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
         targetVelocity = glm::vec3(0.0f, 0.0f, 0.0f);
         preservedMomentum = glm::vec3(0.0f, 0.0f, 0.0f);
+        driftRecoveryRate = 5.0f;
     }
 };
+
+/**
+ * REMOVED: Standstill Posture Lock (StableIdleSnapshot).
+ *
+ * Previously captured a frozen skeleton snapshot on the first frame of rest
+ * and replayed it for all subsequent idle frames, bypassing the live IK/loop
+ * evaluation to prevent sub-millimetre knee jitter ("IK Loop Churn").
+ *
+ * Now replaced by: continuous motion matching through the structural
+ * transition graph. Idle poses are selected from the motion database each
+ * frame, and foot IK applies sub-frame damping (ApplyFootIK) to eliminate
+ * jitter without freezing — all clips flow continuously through the graph.
+ */
 
 class HybridMMFSM {
 public:
@@ -231,7 +198,7 @@ public:
 
     HybridState GetCurrentState() const { return currentState; }
     bool IsInState(HybridState state) const { return currentState == state; }
-    bool IsTransitioning() const { return isTransitioning || inertialization.active; }
+    bool IsTransitioning() const { return isTransitioning || inertialization.active || m_transitionClipPlaying; }
     bool IsUsingInertialization() const { return inertialization.active; }
     
     // Get current character state (for transition conditions)
@@ -291,12 +258,41 @@ private:
     // Inertialization state (for smooth transitions)
     InertializationState inertialization;
 
-    // State-specific MM databases (OWN their animations via shared_ptr)
-    // Using unique_ptr for exclusive ownership, accessed via raw pointer
-    std::unordered_map<HybridState, std::unique_ptr<MotionDatabase>> stateDatabases;
+    // State-specific MM databases (OWN their animations via shared_ptr).
+    // FIX (v11 Section 2): Each state now owns its own pre-built KD-Tree so
+    // that state switches are zero-allocation pointer swaps instead of
+    // synchronous tree rebuilds that cause FPS dips.
+    struct MotionDatabaseSlot {
+        std::unique_ptr<MotionDatabase> database;
+        std::unique_ptr<MotionKDTree> searchTree;
+        bool isBuilt = false;
+
+        // FIX (v12 Section 2): Pre-warm the database's internal SIMD SoA cache
+        // at load time so that runtime SearchSIMD calls never trigger
+        // mid-frame heap allocations when a database switch changes
+        // simdCache_.poseCount.
+        void WarmSIMDCache() {
+            if (database)
+                database->RebuildSIMDCacheIfNeeded();
+        }
+    };
+    std::unordered_map<HybridState, MotionDatabaseSlot> hybridStateSlots;
 
     // Character state
     HybridMMFSMState characterState;
+
+    // ---- Structural Motion Graph Transition State ----
+    // Pre-computed transition clips replace the instant SetDatabaseExplicit
+    // swap. When a state transition fires, HybridMMFSM looks up the pre-baked
+    // transition clip from the transition graph and plays it via
+    // MotionMatcher::PlayTransitionClip(). The clip smoothly blends ALL joints
+    // (slerp + linear root + 2D alignment) over ~0.33s. When the clip finishes,
+    // the MotionMatcher swaps to the target database seamlessly.
+    bool m_transitionClipPlaying{false};
+    HybridState m_transitionClipTarget{HybridState::LOCOMOTION};
+
+    // Pre-computed transition clips between state databases (Kovar & Gleicher §3)
+    MotionTransitionGraph transitionGraph;
 
     // Debug
     bool debugEnabled{false};

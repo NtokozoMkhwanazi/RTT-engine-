@@ -406,12 +406,22 @@ void HybridAnimGraph::UpdateLayers(float dt) {
 
 void HybridAnimGraph::ApplyLayerBlending(float dt) {
     // Apply upper-body layers
+    // FIX (unknown doc): give each active upper-body action its own animator
+    // layer (1..3) instead of every action hard-clobbering the same Layer 1.
+    // Overlapping actions (rapid attacks, etc.) no longer snap the torso back
+    // and forth between clips mid-frame.
+    int currentUpperBodyLayerTargetIndex = 1;
     for (const auto& layer : upperBodyLayers) {
         if (!layer.animation || layer.currentWeight <= 0.01f) continue;
 
         // Set layer weight on animator
         // In a full implementation, this would use bone masks
-        animator->SetAnimationWeight(1, layer.currentWeight);  // Layer 1 = upper body
+        animator->SetAnimationWeight(currentUpperBodyLayerTargetIndex, layer.currentWeight);
+
+        // Increment slot so subsequent active effects stack / overlay natively,
+        // up to the animator max blending layers.
+        currentUpperBodyLayerTargetIndex++;
+        if (currentUpperBodyLayerTargetIndex > 3) break;
     }
 
     // Apply additive layers

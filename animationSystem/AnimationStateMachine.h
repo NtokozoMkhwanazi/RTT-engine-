@@ -72,6 +72,16 @@ struct CharacterInput {
     bool sprint = false;
     bool grounded = true;
     float verticalVelocity = 0.0f;         // For jump/fall detection
+    // Motion-matching CONTEXT request: >=0 switches the active pose database
+    // (locomotion / crouch / combat / capoeira / dance) via the character's
+    // contextual database switching. -1 (default) = no request. The character
+    // consumes it edge-triggered (switching again to the same context is a
+    // no-op), so the caller may hold the value every frame while a key is
+    // down. reset() intentionally leaves it alone - it is a request, not
+    // persistent movement state.
+    int motionContext = -1;
+    bool attack = false;  // Combat-context trigger: plays a strike clip, then
+                         // auto-returns to Locomotion when the clip finishes.
     
     void reset() {
         moveDirection = glm::vec2(0.0f);
@@ -80,6 +90,7 @@ struct CharacterInput {
         crouch = false;
         sprint = false;
         verticalVelocity = 0.0f;
+        attack = false;
     }
 };
 

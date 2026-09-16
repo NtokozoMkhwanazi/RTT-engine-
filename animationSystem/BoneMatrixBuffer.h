@@ -89,8 +89,23 @@ public:
     bool UpdateRaw(const float* matrices, size_t count);
 
     // =========================================================================
-    // BINDING
+    // BONES PER-CHUNK SOA BATCH API (item 1 of C)
+    // The per-animator bone matrices are already stored as a contiguous
+    // std::vector<glm::mat4> slab (Animator::finalBoneMatrices -> GetFinalBoneMatrices(),
+    // already a per-animator SoA slab over glm::mat4). The remaining indirection in
+    // the skinning path is the per-entity glBufferSubData call in
+    // ModelRenderSystem::renderAnimatedModel (one Update() per animator). This API
+    // collapses N animators' slabs into ONE staging buffer + ONE buffer update per
+    // frame. ComputeBatch is statically GL-free so it is unit-tested headless.
     // =========================================================================
+    static std::vector<glm::mat4> ComputeBatch(
+        const std::vector<const std::vector<glm::mat4>*>& batches);
+
+    bool UpdateBatched(const std::vector<const std::vector<glm::mat4>*>& batches,
+                       bool forceUpdate = false);
+
+    // =========================================================================
+    // BINDING    // =========================================================================
 
     /**
      * Bind buffer to specified binding point

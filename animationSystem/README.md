@@ -26,8 +26,10 @@ animationSystem/
 ├── HybridAnimGraph.cpp       # Graph implementation
 ├── HybridMMFSM.h             # Hybrid FSM + MM
 ├── HybridMMFSM.cpp           # Hybrid implementation
-├── SkeletonRetargeter.h      # Skeleton retargeting
-├── SkeletonRetargeter.cpp    # Retargeter implementation
+├── HybridState.h             # Hybrid FSM state
+├── HybridState.cpp           # Hybrid state implementation
+├── SkeletonRetargeter.h      # Skeleton retargeting (header-only)
+├── Skinning.h                # GPU skinning helpers
 └── README.md                 # This file
 ```
 
@@ -167,26 +169,37 @@ mmConfig.databaseSize = 10000;     // Max clips in database
 The animation system compiles as part of the main engine build. From the repository root:
 
 ```bash
-make            # build the test runner
-make test       # run the full unit-test suite (494 tests)
+make            # build bin/test_runner + bin/engine (debug)
+make test       # run the full unit-test suite (731 tests / 99 suites)
+make test-motion-matching  # animation + motion-matching suites only
+make test-integration     # end-to-end input→FSM→matching→pose pipeline
 make run        # self-check tests, then boot the engine
 make run-headless  # bounded headless engine run (CI-friendly)
 ```
 
-Blending, layers, FSM, root motion, foot IK, and motion-matching pose search are covered
-by `make test-motion-matching` and `make test-integration`, plus `make test` with the
-`--gtest_filter=Animation*` filter. The engine boots straight into a motion-matching
-play-mode character. See the [root README](../README.md) for prerequisites and engine
-controls.
+Blending, layers, FSM, root motion, foot IK, bone SOA batching, retargeting and
+motion-matching pose search are covered by `make test-motion-matching` and
+`make test-integration`, plus `make test` with the `--gtest_filter=Animation*` /
+`AnimationFSM* / Hybrid*` / `MotionMatching* / FootIK*` filters. The engine boots
+straight into a motion-matching play-mode character. See the
+[root README](../README.md) for prerequisites and engine controls.
 
 ## 🐛 Debugging
 
-See documentation in `docs/animation/`:
-- [ANIMATION_DEBUG_GUIDE.md](../docs/animation/ANIMATION_DEBUG_GUIDE.md)
-- [MOTION_MATCHING_DEBUG_FIXES.md](../docs/animation/MOTION_MATCHING_DEBUG_FIXES.md)
-- [FOOT_IK_CHARACTER_GROUNDING_FIX.md](../docs/animation/FOOT_IK_CHARACTER_GROUNDING_FIX.md)
+See the engine documentation under `docs/`:
+- [Architecture](../docs/ARCHITECTURE.md) — animation layer, data flow and the
+  Hybrid FSM + Motion Matching integration.
+- [Troubleshooting](../docs/TROUBLESHOOTING.md) — build/test failures, asset
+  warnings and headless runs.
+
+Runtime debugging is also driven by the **GPU Profiler** (`renderer/` —
+hierarchical scopes, frame-history graphs, CSV export) and the in-engine
+**Debug Rendering** (skeleton, gizmos, trajectory overlay) toggleable from the
+ImGui viewport. Foot IK / grounding regressions are covered by the
+`FootIKTest`, `AnimatorFootIK` and `RootMotionDebugTest` suites under
+`make test`.
 
 ---
 
 **Status:** ✅ Production Ready
-**Last Updated:** August 2026
+**Last Updated:** September 2026

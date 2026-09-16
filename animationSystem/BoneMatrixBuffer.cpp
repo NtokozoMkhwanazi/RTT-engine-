@@ -241,6 +241,79 @@ bool BoneMatrixBuffer::UpdateRaw(const float* matrices, size_t count) {
     return true;
 }
 
+// BONES PER-CHUNK SOA BATCH (item 1 of C): flatten N animators' contiguous
+// finalBoneMatrices slabs into one staging SoA slab. GL-free (no GL call).
+std::vector<glm::mat4> BoneMatrixBuffer::ComputeBatch(
+    const std::vector<const std::vector<glm::mat4>*>& batches) {
+    size_t total = 0;
+    for (const auto* batch : batches) {
+        if (batch) total += batch->size();
+    }
+    std::vector<glm::mat4> staging;
+    staging.reserve(total);
+    for (const auto* batch : batches) {
+        if (batch) {
+            staging.insert(staging.end(), batch->begin(), batch->end());
+        }
+    }
+    return staging;
+}
+
+// One buffer update for an entire frame's animated skeletons (batched skinning).
+// `batches` are the GetFinalBoneMatrices() spans of every animator rendered this
+// frame. The shared buffer must be Initialize()'d with maxBones >= sum of sizes.
+bool BoneMatrixBuffer::UpdateBatched(
+    const std::vector<const std::vector<glm::mat4>*>& batches, bool forceUpdate) {
+    if (!initialized) {
+        std::cerr << "[BoneMatrixBuffer] Not initialized!\n";
+        return false;
+    }
+
+    // Flatten N animators' slabs into one contiguous SoA batch.
+    std::vector<glm::mat4> staging = ComputeBatch(batches);
+    if (staging.empty()) {
+        return true;  // no animated skeletons this frame
+    }
+
+    size_t newCount = staging.size();
+    if (ShouldSkipUpload(forceUpdate, needsUpdate, currentBoneCount, newCount)) {
+        return true;  // static pose across the batch, no upload needed
+    }
+
+    if (newCount > maxBoneCount) {
+        std::cerr << "[BoneMatrixBuffer] Batched bone count " << newCount
+                  << " exceeds buffer capacity " << maxBoneCount
+                  << " (Initialize() a shared buffer sized for the full frame)\n";
+        return false;
+    }
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    // ONE upload for all animators' bones (was N Update() calls per frame).
+    size_t dataSize = newCount * 16 * sizeof(float);
+    UploadData(reinterpret_cast<const float*>(staging.data()), dataSize);
+
+    currentBoneCount = newCount;
+    needsUpdate = false;
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    double elapsedMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+
+    stats.updateCount++;
+    stats.bytesUploaded += dataSize;
+    stats.lastUpdateTimeMs = elapsedMs;
+
+    frameCount++;
+    lastFrameTime += elapsedMs;
+    if (frameCount >= 100) {
+        stats.avgUpdateTimeMs = lastFrameTime / frameCount;
+        frameCount = 0;
+        lastFrameTime = 0.0;
+    }
+
+    return true;
+}
+
 void BoneMatrixBuffer::Bind(GLuint bindingPoint) const {
     if (!initialized) {
         std::cerr << "[BoneMatrixBuffer] Cannot bind - not initialized!\n";
@@ -263,10 +336,15 @@ void BoneMatrixBuffer::Bind(GLuint bindingPoint) const {
 }
 
 void BoneMatrixBuffer::Unbind() const {
+    // FIX: Was unbinding binding point 0, which left the shader reading from
+    // binding point 3 (BONE_BUFFER_BINDING) still pointing at the stale buffer.
+    // This could cause the character to fall back to T-pose when a stale buffer
+    // was accidentally rebound, or to read garbage matrices after a model
+    // switch.  Now unbinds the CORRECT binding point.
     if (bufferType == BoneBufferType::UBO) {
-        glBindBufferBase(GL_UNIFORM_BUFFER, 0, 0);
+        glBindBufferBase(GL_UNIFORM_BUFFER, BONE_BUFFER_BINDING, 0);
     } else {
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BONE_BUFFER_BINDING, 0);
     }
 }
 

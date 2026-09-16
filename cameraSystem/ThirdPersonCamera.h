@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include "CinematicCamera.h"
 
 /**
  * Third-Person Camera - State-Aware Follow System
@@ -67,7 +68,7 @@ public:
         previousState(CameraState::IDLE),
         currentFollowSmooth(cfg.idleFollowSmooth),
         targetFollowSmooth(cfg.idleFollowSmooth),
-        yaw(-90.0f),
+        yaw(180.0f), // Z-forward: behind the -Z-forward character, looks down -Z (U6)
         pitch(0.0f),
         isColliding(false),
         idealDistance(cfg.distance)
@@ -102,6 +103,22 @@ public:
             targetFollowSmooth,
             1.0f - std::exp(-config.smoothTransitionRate * dt)
         );
+
+        // Always keep the camera BEHIND the character: when enabled, ease yaw
+        // toward the character's heading so the camera orbits around to its
+        // back the moment it turns. Without this the camera stays fixed in
+        // world space and ends up in front of the character when it walks
+        // toward or past the camera.
+        if (config.orientToCharacterForward) {
+            const glm::vec2 fwd2(input.characterForward.x, input.characterForward.z);
+            if (glm::length(fwd2) > 0.001f) {
+                const float targetYaw = glm::degrees(std::atan2(fwd2.x, fwd2.y));
+                float dy = targetYaw - yaw;
+                while (dy > 180.0f) dy -= 360.0f;
+                while (dy < -180.0f) dy += 360.0f;
+                yaw += dy * std::min(1.0f, 1.0f - std::exp(-config.orientSmoothRate * dt));
+            }
+        }
 
         // Update pivot (look-at point)
         updatePivot(dt, input.characterPosition);
@@ -224,11 +241,14 @@ private:
         float yawRad = glm::radians(yaw);
         float pitchRad = glm::radians(pitch);
 
-        // Calculate direction from yaw and pitch (pitch sign: +pitch = above)
+        // Z-forward convention (U6): yaw=0 looks down +Z. This matches the
+        // yaw/atan2 convention used by the editor free-fly, the orbit camera and
+        // the cinematic orbit math, so a single yaw value means the same heading
+        // everywhere. dir.x = cos(pitch)*sin(yaw), dir.z = cos(pitch)*cos(yaw).
         glm::vec3 direction;
-        direction.x = std::cos(yawRad) * std::cos(pitchRad);
-        direction.y = -std::sin(pitchRad);   // NEGATED: +pitch now = camera above
-        direction.z = std::sin(yawRad) * std::cos(pitchRad);
+        direction.x = std::cos(pitchRad) * std::sin(yawRad);
+        direction.y = -std::sin(pitchRad);   // +pitch raises the camera above
+        direction.z = std::cos(pitchRad) * std::cos(yawRad);
         direction = glm::normalize(direction);
 
         // Camera orbits the character's chest at `distance`, slightly raised.
@@ -247,13 +267,19 @@ private:
         glm::vec3 direction = idealPos - charPos;
         float distance = glm::length(direction);
         
+        if (distance < 1e-6f) return idealPos;  // degenerate: camera at character
+        
+        glm::vec3 dirNorm = direction / distance;
+        
         if (distance < config.collisionRadius) {
+            // The ideal position would place the camera inside the collision
+            // boundary — pull it to the safe radius. Pull slightly closer than
+            // the wall face so the camera never clips through geometry.
             isColliding = true;
-            idealDistance = distance;
-            
-            // Move camera closer to avoid clipping
-            float newDistance = config.collisionRadius;
-            glm::vec3 newPos = charPos + glm::normalize(direction) * newDistance;
+            float safetyBuffer = config.collisionRadius * 0.15f;
+            float newDistance = config.collisionRadius - safetyBuffer;
+            idealDistance = newDistance;
+            glm::vec3 newPos = charPos + dirNorm * newDistance;
             
             // Smooth collision transition
             return glm::mix(position, newPos, config.collisionLerp);
@@ -296,6 +322,13 @@ public:
     };
     
     CameraMode currentMode;
+    // Cinematic timeline tracking (unknown U7 drop-in): an explicit clock
+    // so the perpetual-orbit math advances smoothly over time instead of
+    // freezing at its entry angle.
+    float cinematicTime{0.0f};
+    double cinematicOrbitAngle{0.0f};
+    float cinematicRotationSpeed{15.0f}; // deg/s (fixed: was {15.0f;} syntax error)
+
     
     CameraController(ThirdPersonCamera* cam) 
         : camera(cam), currentMode(CameraMode::THIRD_PERSON) {}
@@ -314,6 +347,8 @@ public:
                 configureOrbit();
                 break;
             case CameraMode::CINEMATIC:
+            cinematicTime = 0.0f;       // Reset timeline on state entry
+            cinematicOrbitAngle = 0.0;   // Restart orbit at 0 degrees
                 configureCinematic();
                 break;
             default:
@@ -321,6 +356,37 @@ public:
         }
     }
     
+    /**
+     * Cinematic tick driver (unknown U7 drop-in): advances the explicit
+     * cinematic clock and repositions the camera on its perpetual orbit each
+     * frame. Engaged only in CINEMATIC mode; a safe no-op in other modes.
+     */
+    void update(float dt, const CameraInput& input) {
+        if (!camera) return;
+
+        if (currentMode == CameraMode::CINEMATIC) {
+            cinematicTime += dt;
+
+            // Integrate with the Cinematic namespace math (CinematicCamera.h)
+            cinematicOrbitAngle = Cinematic::AdvanceAngle(
+                cinematicOrbitAngle, cinematicRotationSpeed, dt);
+
+            // Height profile: ease down from (pivot+2) over a 3s intro.
+            float liveHeight = Cinematic::IntroHeight(
+                cinematicTime, 3.0f,
+                camera->config.height + 2.0f, camera->config.height);
+
+            glm::vec3 lookAtTarget = input.characterPosition
+                + glm::vec3(0.0f, camera->config.pivotHeight, 0.0f);
+            glm::vec3 nextOrbitPos = lookAtTarget
+                + Cinematic::OrbitPosition(cinematicOrbitAngle,
+                                          camera->config.distance, liveHeight);
+
+            camera->setPosition(nextOrbitPos);
+            camera->setTarget(lookAtTarget);
+        }
+    }
+
     /**
      * Configure for third-person (default)
      */
@@ -377,7 +443,7 @@ public:
      */
     void reset() {
         setMode(CameraMode::THIRD_PERSON);
-        camera->yaw = -90.0f;
+        camera->yaw = 180.0f;     // Z-forward behind-camera default heading (U6)
         camera->pitch = 0.0f;
     }
 };

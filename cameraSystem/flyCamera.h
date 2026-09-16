@@ -253,17 +253,20 @@ private:
         float sinYaw = sin(glm::radians(Yaw));
 
         glm::vec3 offset;
-        offset.x = DistanceToTarget * cosPitch * sinYaw;
+        offset.x = DistanceToTarget * cosYaw * cosPitch;
         offset.y = DistanceToTarget * sinPitch;
-        offset.z = DistanceToTarget * cosPitch * cosYaw;
+        offset.z = DistanceToTarget * sinYaw * cosPitch;
 
         Position = Target - offset;
 
-        // Calculate right and up vectors (guard against a NaN front vector).
+        // Calculate right and up vectors (guard against NaN from parallel cross product).
         glm::vec3 front = Target - Position;
         if (glm::length(front) < 1e-6f) front = glm::vec3(0.0f, 0.0f, -1.0f);
         front = glm::normalize(front);
-        Right = glm::normalize(glm::cross(front, WorldUp));
+        if (glm::abs(glm::dot(front, WorldUp)) > 0.999f)
+            Right = glm::normalize(glm::cross(front, glm::vec3(1.0f, 0.0f, 0.0f)));
+        else
+            Right = glm::normalize(glm::cross(front, WorldUp));
         Up = glm::normalize(glm::cross(Right, front));
     }
 };

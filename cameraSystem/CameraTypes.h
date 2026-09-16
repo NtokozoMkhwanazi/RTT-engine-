@@ -74,6 +74,14 @@ struct CameraConfig {
     bool collisionEnabled = true;
     float collisionRadius = 0.5f;
     float collisionLerp = 0.1f;
+
+    // Auto-orient the camera behind the character's forward direction
+    // (Unreal-style). When enabled, yaw eases toward the heading given by
+    // CameraInput.characterForward each frame, so if the character turns
+    // around or walks toward the camera it orbits around to the character's
+    // back instead of ending up in front of it.
+    bool orientToCharacterForward = false;
+    float orientSmoothRate = 6.0f;   // Yaw swing speed when auto-orienting
     
     /**
      * Get follow smoothing for a given state

@@ -53,7 +53,7 @@ public:
 
     void processMouseScroll(double yoffset) {
         radius -= yoffset * zoomSpeed;
-        if (radius < 1.0f) radius = 1.0f;
+        if (radius < 1.0f) radius = 0.000000000000001f;
         if (radius > 30.0f) radius = 30.0f;
     }
 };

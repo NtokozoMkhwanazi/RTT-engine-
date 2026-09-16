@@ -106,6 +106,14 @@ public:
     }
 
     /**
+     * Number of points currently stored in memory.
+     */
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        return memoryBuffer.size();
+    }
+
+    /**
      * Query points by time range
      */
     std::vector<TimeSeriesPoint> queryByTimeRange(double startTime, double endTime,

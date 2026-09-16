@@ -50,6 +50,8 @@ private:
 
     // Input
     glm::vec3 moveInput {0.0f};
+    float moveMagnitude {0.0f};  // Raw stick deflection magnitude (0..1)
+    float accelerationRate {12.0f};  // Velocity ramp-up smoothing rate
 
     // State
     bool isCrouched = false;

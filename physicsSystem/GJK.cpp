@@ -387,8 +387,13 @@ EPAResult EPA(
     std::vector<Face> faces;
     faces.reserve(maxIterations + 4);
 
-    // Face orientation: use the vertex that's NOT in the face to check orientation
-    auto createFace = [&](int a, int b, int c, int ref) {
+    // Face orientation: use the centroid of the tetrahedron (not a single
+    // reference vertex which can drift with degenerate simplices).
+    glm::vec3 tetCentroid(0.0f);
+    for (int i = 0; i < 4; ++i) tetCentroid += vertices[i];
+    tetCentroid *= 0.25f;
+
+    auto createFace = [&](int a, int b, int c, int /*ref*/) {
         Face f;
         f.v[0] = a; f.v[1] = b; f.v[2] = c;
         f.valid = true;
@@ -406,12 +411,11 @@ EPAResult EPA(
         f.normal /= len;
         f.distance = glm::dot(f.normal, vertices[a]);
 
-        // Ensure normal points away from origin (distance > 0)
-        // If the reference vertex is on the same side as the normal, flip
-        if (glm::dot(f.normal, vertices[ref]) > f.distance) {
+        // Ensure normal points outward from the tetrahedron centroid.
+        // If the centroid is on the same side as the normal, flip.
+        if (glm::dot(f.normal, tetCentroid - vertices[a]) > 0.0f) {
             f.normal = -f.normal;
             f.distance = -f.distance;
-            // Swap two vertices to flip face orientation
             std::swap(f.v[0], f.v[1]);
         }
 

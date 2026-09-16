@@ -23,6 +23,12 @@ void CharacterController::setMoveInput(const glm::vec3& dir) {
     moveInput = dir;
     moveInput.y = 0.0f;
 
+    // FIX (v12 Section 3): Preserve raw stick-deflection magnitude before
+    // normalising. Without this, WASD-taps and partial stick deflection
+    // both snap to full speed, causing the MotionMatcher query to see a
+    // high velocity and select Run/Sprint poses instead of Walk.
+    moveMagnitude = glm::length(dir);
+
     if (glm::length2(moveInput) > 1e-6f)
         moveInput = glm::normalize(moveInput);
 }
@@ -135,6 +141,12 @@ void CharacterController::applyMovement(float dt) {
     
     glm::vec3 desired = moveInput * currentSpeed;
 
+    // FIX (v12 Section 3): Scale by stick deflection so the capsule physics
+    // velocity reflects the player's actual input intensity. This keeps the
+    // MotionMatcher query speed proportional to intended movement, so light
+    // stick taps select Walk poses (not Run).
+    desired *= moveMagnitude;
+
     if (body->onGround) {
         // Handle slope traversal
         handleSlope(dt);
@@ -148,8 +160,11 @@ void CharacterController::applyMovement(float dt) {
         desired *= airControl;
     }
 
-    body->velocity.x = desired.x;
-    body->velocity.z = desired.z;
+    // Smooth the velocity ramp-up AFTER slope/air-control adjustments so the
+    // capsule accelerates naturally toward the target velocity.
+    float velT = accelerationRate * dt;
+    body->velocity.x = body->velocity.x + (desired.x - body->velocity.x) * velT;
+    body->velocity.z = body->velocity.z + (desired.z - body->velocity.z) * velT;
 }
 
 // ---------------- Slope Handling ----------------

@@ -40,7 +40,7 @@ which keeps subsystems testable in isolation.
 
 | Binary | Entry | What it does |
 |--------|-------|--------------|
-| `bin/engine` | `test.cpp` | **Full engine run**: banner → system inventory → Google Test self-check (535 tests) → engine boot → main loop → summary. Owns `main()`, links all test objects **except** `tests/test_main.cpp`. |
+| `bin/engine` | `test.cpp` | **Full engine run**: banner → system inventory → Google Test self-check (731 tests) → engine boot → main loop → summary. Owns `main()`, links all test objects **except** `tests/test_main.cpp`. |
 | `bin/editor_app` | `src/editor_main.cpp` | ImGui editor application: GLFW window + ImGui context + `EditorApplication::run()`. |
 | `bin/test_runner` | `tests/test_main.cpp` | Plain Google Test runner (`make test`). |
 | `bin/bot_viewport_test`, `bin/geoterrain_test` | standalone test mains | Focused demo/test apps. |
@@ -52,7 +52,7 @@ main()
  ├─ crash handlers (SIGSEGV/ABRT/FPE → demangled backtrace to crash.log)
  ├─ parse flags (--skip-tests, --headless, --frames N)
  ├─ print system inventory (module → test suite → description)
- ├─ PHASE 1: runTestPhase()  → InitGoogleTest + RUN_ALL_TESTS (535 tests)
+ ├─ PHASE 1: runTestPhase()  → InitGoogleTest + RUN_ALL_TESTS (731 tests)
  │            └─ failures?  → print + exit (refuse to boot)
  └─ PHASE 2: runEngine()
       ├─ glfwInit → window (hidden if --headless / no DISPLAY)
@@ -98,9 +98,197 @@ The engine's frame is driven by `test.cpp`; the editor app uses the same shape i
 │              └─ renderPlayCharacter (skinned model w/ animator bone palette)│
 │              ImGui: beginFrame → PlayModeHUD + engine status → endFrame     │
 │                                                                             │
-│ 4. PRESENT ── glfwSwapBuffers + glfwPollEvents                              │
+│ 4. PRESENT ── RHI::endFrame (OpenGL: glfwSwapBuffers; Vulkan: queue        │
+│               present)                                                     │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 🎨 RHI (Render Hardware Interface)
+
+The engine renders through a thin RHI layer (`rhi/RHI.h`) so it can run on
+OpenGL (low / budget machines - the default) or Vulkan (high graphics
+quality). Selected via `--graphics opengl|vulkan` on the command line (default
+opengl).
+
+```
+IRHI (rhi/RHI.h)
+ ├── RHIGL     (rhi/RHIGL.cpp)   — GLFW window + OpenGL context + present.
+ │                                The full engine renderer runs unchanged
+ │                                between beginFrame()/endFrame().
+ └── RHIVulkan (rhi/RHIVulkan.cpp) — Vulkan instance/device/swapchain +
+                                    clear-frame present, PLUS a real offscreen
+                                    render path (SPIR-V pipeline, buffers,
+                                    render pass, submit, readback) that works
+                                    headless - this is the skeleton the scene
+                                    renderers port onto.
+```
+
+**Runtime state.** `activeGraphicsApi()` reports the backend the session is
+running on; the editor's **Graphics menu** (View→Graphics) shows it and lets
+the user switch for the next launch, persisted to `graphics_api.cfg` (also
+overridable with `--graphics opengl|vulkan`). A live mid-frame hot-swap of two
+graphics contexts is deliberately not attempted.
+
+**Headless rendering.** `renderOffscreenTriangle()` renders a fixed triangle
+through each backend's real render stack into a CPU buffer. This is how the
+Vulkan port is verified on machines with no display: the device is created in
+device-only mode (no surface/swapchain needed) and the pixel readback proves
+the SPIR-V pipeline, buffers, render pass and command submission actually
+produce output. The `RHI.*` tests assert both backends render the SAME
+triangle (center green, corner clear).
+
+**3D scene render** (`renderOffscreenScene` + `rhi/RHIMath.h`): the first
+"real" ported render path, implemented identically on both backends. It draws
+an instanced scene through a perspective camera with three building blocks
+every engine renderer needs:
+
+- a **camera uniform buffer** (view-projection matrix, computed with the
+  shared `RHI::Mat4` math in `rhi/RHIMath.h`),
+- a **depth attachment** so nearer geometry occludes farther
+  (depth test on, `GL_LESS` / `VK_COMPARE_OP_LESS`),
+- **per-instance model matrices** (the batched renderer's core pattern).
+
+Two geometry paths are supported. `OffscreenScene::instances` is the simple
+instanced-CUBE path; `OffscreenScene::meshes` is the GENERIC path the engine's
+real renderers port onto: `OffscreenMesh` carries interleaved vertex data
+(position/normal/uv, 8 floats per vertex) + 32-bit indices + its own
+per-instance transforms, drawn INDEXED-INSTANCED with a lambert-lit mesh
+shader (`rhi/shaders/mesh.vert/.frag`). Both backends concatenate all meshes
+into shared vertex/index/instance buffers and draw each with
+`vkCmdDrawIndexed` offsets (GL: per-mesh `glBufferData` + `glDrawElements-
+Instanced`). This is the exact vertex format and draw pattern the engine's
+world-object / terrain / character renderers need, so they port to the RHI by
+submitting meshes instead of calling GL directly.
+
+Vulkan clip space differs from GL (y down, z in [0,1]); `mat4GlToVulkanProj`
+bakes the y-flip + z-remap into the projection so the SAME scene description
+produces IDENTICAL pixels on both backends (row 0 = top; the GL backend flips
+its bottom-up readback). Shaders compiled to SPIR-V by `glslc` at build time.
+The `RHI.*` scene tests verify depth ordering (near cube occludes far),
+camera movement (viewing from behind swaps which cube is on top), instancing
+(all 4 instances appear), generic meshes (a quad renders at the expected
+pixels on both backends, multi-instance meshes too), and exact GL/Vulkan
+pixel parity on the same scene.
+
+**Visible window content** (`renderFrameScene`): the Vulkan backend now
+renders the scene INTO the swapchain image (between `beginFrame`/`endFrame`)
+instead of just clearing - a swapchain-sized depth image, a color+depth
+render pass (ending in `COLOR_ATTACHMENT_OPTIMAL` so the UI can draw over
+it), and a second instanced pipeline built for it (sharing the camera-UBO
+descriptor set). `endFrame` submits the recorded command buffer and presents;
+it falls back to the clear pass when nothing was rendered, and transitions
+the image to `PRESENT_SRC` itself when no UI pass followed the scene. The
+swapchain extent respects the surface's `currentExtent` (requesting a size
+outside the surface bounds makes every acquire/present OUT_OF_DATE and leaves
+the acquire semaphore signaled).
+
+**Editor UI on Vulkan** (`initializeImGui`/`renderFrameImGui`): the Dear ImGui
+overlay renders on the SAME swapchain image, on top of the scene - a color-
+only render pass with `loadOp = LOAD` (the scene stays visible under the UI)
+ending in `PRESENT_SRC`, driven by `imgui_impl_vulkan` (initialized lazily by
+the backend against its own descriptor pool). The GL backend is a no-op here:
+the GL editor owns ImGui through `imgui_context`.
+
+**The SAME editor on both backends** (`src/editor_main.cpp`): the full editor
+UI - menu bar (File / Edit / Add / View with the **Graphics** toggle / Play /
+Camera), toolbar, left/right/bottom panels and status bar - is driven by one
+shared function, `RenderSharedEditorUI`, on BOTH backends. The only
+backend-specific part is HOW the 3D scene reaches the screen: on OpenGL the
+`EditorApplication` renders the real world (terrain, world objects, play-mode
+character) into a viewport FBO whose texture `UI::RenderViewport` displays;
+on Vulkan the RHI renders the scene INTO the swapchain and the viewport
+panel is **swapchain-backed** (`UI::RenderViewport(..., swapchainBacked)`):
+fully transparent (no WindowBg, no FBO image), so the live scene shows
+through below the 28px viewport header while the toolbar buttons, camera
+overlay and hover-rect tracking still work. `./bin/editor_app --graphics
+vulkan` therefore shows the identical editor as `--graphics opengl` - the
+same menu bar, panels, theming and icons (EditorTheme / Phosphor /
+FontAwesome6, fonts uploaded lazily by imgui_impl_vulkan) - and the View →
+Graphics menu persists the backend for the next launch (`graphics_api.cfg`).
+`RHI.VulkanBackend_RendersImGuiOverScene` drives the full chain in the tests.
+
+**Real world content on Vulkan** (`src/editor_main.cpp`): the Vulkan viewport
+no longer shows a demo cube grid - it renders the engine's REAL world-object
+assets (quiver_tree trees, boulders, grass/periwinkle/othonna plants)
+loaded through the CPU-only assimp path (`Model::LoadModelData` - raw
+vertices/indices/textures, no GL, so it works on the GLFW_NO_API window),
+merged into `OffscreenMesh`es (one indexed-instanced draw per model) and
+scattered over the engine's REAL terrain heightfield. The scatter replicates
+the GL `VegetationSystem`/`WorldManager` placements EXACTLY (same
+mt19937(42) seed, distributions and draw order), so both backends put
+trees/rocks/plants in IDENTICAL world positions.
+
+The terrain is a genuine port: the heightfield lives in the shared GL-free
+header `world/TerrainHeight.h` (`terrain::heightAtWorld`, seed-42 perlin at
+the engine's fixed scales) that BOTH the GL `Terrain` renderer's master
+heightmap and the Vulkan viewport's ground grid sample - so both backends
+render the same surface (the master heightmap is just that function on the
+integer texel grid, "texel i = world x=i"). The ground grid is built from
+`terrain::heightAtWorld(x, z, 25)` (the editor's heightScale) with central-
+difference normals.
+
+**Albedo textures on the mesh path** (`OffscreenMesh::texturePixels`, both
+backends + `mesh.vert/.frag`): each model's first diffuse texture is attached
+CPU-side (from `AsyncModelData::textures`, downscaled to ≤1024 to keep the
+editor's GPU footprint sane) and sampled in the fragment shader, modulated
+by the per-instance color. Meshes WITHOUT a texture bind a shared 1x1 WHITE
+texture, so the shader math - and therefore GL/Vulkan pixel parity - is
+identical for every mesh (`RHI.TexturedMeshRendersAndParity` asserts a
+checkerboard renders with both checker colors on both backends, to matching
+pixels). The world objects therefore keep their authored materials on
+Vulkan instead of flat lambert colors. The ground grid is textured too - a
+procedural grass/rock albedo (slope + height + hash-noise, world-anchored
+to the grid's UVs) so the terrain reads as grassland instead of a flat
+brown plane.
+
+**Distance fog + long view distance** (`CameraUBOData`, both backends): the
+shared scene UBO grew to 96 bytes (viewProj + camera position + fog
+parameters, same std140 layout on GL and Vulkan). The mesh shaders compute
+exponential-squared distance fog with IDENTICAL math on both backends and
+mix toward the scene's fog color (which matches the clear color, so the
+horizon melts into the sky). `fogDensity = 0` disables fog exactly (factor
+0, unchanged output), keeping the parity tests pixel-exact. `OffscreenCamera
+::farPlane` (default 100) lets the editor push the projection out to 600 so
+the 300-unit world is never hard-clipped at the horizon.
+
+**4x MSAA on the visible swapchain** (`RHIVulkan.cpp`): the windowed scene
+renders at 4 samples/pixel into a multisampled color target that resolves
+into the swapchain image (multisampled depth, `pickSwapchainSamples`
+falls back to 1x when the device lacks 4x support). The offscreen readback
+path stays 1x so the parity tests stay exact. This is the "leverage the
+GPU" part of the dual RHI: crisp edges on real hardware with no
+per-pixel cost on the CPU.
+
+**Animated character** (`SkinnedCharacter`, same file): the bot model is
+loaded CPU-only with its Skeleton deep-copied, and the WALK clip is loaded
+via `AnimatedCharacter::LoadClipFromFile` (Assimp → `AssimpAnimationLoader`,
+no GL - the most visible clip, clear limb motion; Idle is the fallback). An
+`Animator` drives it: every frame `SkinCharacter` advances the clip, sums
+each vertex's weighted `GetFinalBoneMatrices` skinning matrices and rewrites
+the mesh's interleaved buffer; the `version` bump makes the Vulkan backend
+re-upload ONLY that mesh's slice of the shared buffers (incremental path)
+while the multi-hundred-KB static world stays resident. The struct lives on
+the heap deliberately: the Animator holds a raw pointer to its skeleton, so
+the character must never move after construction. It stands 2m at the world
+origin, front and center in the default framing.
+
+The orbit camera starts CLOSE on the character (dist 13, pitch 15) so the
+animation is plainly visible, and adds a gentle AUTO-ORBIT showcase: after a
+few seconds without input the camera slowly swings around the scene (drag or
+scroll to take back control). Right-drag orbits, scroll zooms, WASD pans the
+target across the terrain (which it follows, so the camera never drops
+underground) - all gated on `UI::IsViewport3DHovered()` / ImGui capture so
+panels and menus keep the mouse and keyboard. A bottom-right overlay lists
+the bindings.
+
+`available()` probes whether a backend can run on this machine (GL is always
+yes; Vulkan checks the loader + driver). The full windowed surface/swapchain
+present path runs on machines with a display. One environment note: the
+engine runs a single backend per launch, and the Vulkan backend requests a
+`GLFW_NO_API` window (never a GL context) so it can never clobber the GL
+backend's context.
 
 ---
 
@@ -252,8 +440,10 @@ the matcher.
 
 - `Editor::ImGuiContext` — owns the ImGui context + GLFW/OpenGL3 backends
   (`beginFrame`/`endFrame`).
-- `UI::RenderPlayModeHUD` — play-mode overlay (state, speed, motion-matching
-  diagnostics, foot IK locks). Safe to call without a loaded character.
+- `UI::RenderPlayModeDebug` — play-mode debug section (state, speed,
+  motion-matching diagnostics, foot IK locks) rendered INSIDE the Details
+  panel while playing, so the viewport stays unobstructed. Safe to call
+  without a loaded character.
 - Editor panels (outliner, inspector, content, console, profiler, geo config) are
   driven by the `EditorState`/`EditorApplication` machinery in `editor/`.
 
@@ -308,5 +498,5 @@ engine src + system src ─► OBJS  ──┬──► bin/test_runner
 | Integration | `IntegrationTest` (input→FSM→MM→pose sync), `PlayModeController` (loads FBX) | s–10s |
 | Headless GL | `ImGuiContext`, `ViewportFramebuffer`, `ViewportRenderingSafety` | need an X server (xvfb) |
 
-The engine self-check runs **all of these in process before boot** — the 535-test
+The engine self-check runs **all of these in process before boot** — the 731-test
 suite is the engine's own smoke test.

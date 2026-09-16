@@ -7,7 +7,9 @@
 #include <memory>
 
 // Plane constraint - constrains a body to move along a plane
-class PlaneConstraint : public Constraint
+// [[deprecated]] — superseded by vel::ConstraintSolver::addPlaneConstraint.
+class [[deprecated("use vel::ConstraintSolver::addPlaneConstraint")]]
+PlaneConstraint : public Constraint
 {
 public:
     PlaneConstraint(std::shared_ptr<RigidBody> body, const glm::vec3 &planeNormal, float planeDistance)
@@ -40,7 +42,10 @@ private:
 
 // Hinge constraint - allows rotation around a single axis
 // Full implementation with position and rotation constraints
-class HingeConstraint : public Constraint
+// [[deprecated]] — superseded by vel::ConstraintSolver::addHingeConstraint,
+// which solves the same 5 DOFs as a coupled block-mass-matrix revolute joint.
+class [[deprecated("use vel::ConstraintSolver::addHingeConstraint")]]
+HingeConstraint : public Constraint
 {
 public:
     HingeConstraint(std::shared_ptr<RigidBody> bodyA, std::shared_ptr<RigidBody> bodyB,
@@ -93,12 +98,13 @@ public:
         // =========================================================================
         // POSITION CONSTRAINT: Maintain anchor point
         // =========================================================================
-        // Calculate world-space anchor positions for both bodies
-        glm::vec3 localAnchorA = anchor - bodyA->position;
-        glm::vec3 localAnchorB = anchor - bodyB->position;
+        // Transform the world-space anchor into each body's local frame first,
+        // then reconstruct world positions correctly (avoids double-rotation).
+        glm::vec3 trueLocalAnchorA = glm::inverse(bodyA->rotation) * (anchor - bodyA->position);
+        glm::vec3 trueLocalAnchorB = glm::inverse(bodyB->rotation) * (anchor - bodyB->position);
 
-        glm::vec3 worldAnchorA = bodyA->position + (bodyA->rotation * localAnchorA);
-        glm::vec3 worldAnchorB = bodyB->position + (bodyB->rotation * localAnchorB);
+        glm::vec3 worldAnchorA = bodyA->position + (bodyA->rotation * trueLocalAnchorA);
+        glm::vec3 worldAnchorB = bodyB->position + (bodyB->rotation * trueLocalAnchorB);
 
         // Calculate position error
         glm::vec3 positionError = worldAnchorB - worldAnchorA;
@@ -129,8 +135,8 @@ public:
                 }
 
                 // Recalculate world anchors after position correction
-                worldAnchorA = bodyA->position + (bodyA->rotation * localAnchorA);
-                worldAnchorB = bodyB->position + (bodyB->rotation * localAnchorB);
+                worldAnchorA = bodyA->position + (bodyA->rotation * trueLocalAnchorA);
+                worldAnchorB = bodyB->position + (bodyB->rotation * trueLocalAnchorB);
             }
         }
 
@@ -153,17 +159,14 @@ public:
             // Calculate corrective angular impulse
             glm::vec3 correctionAxis = glm::normalize(crossProduct);
 
-            // Calculate effective angular mass
+            // Fetch world-space inverse inertia tensors — project entirely
+            // in world space to avoid mixing reference frames.
             glm::mat3 invInertiaA = bodyA->isStatic ? glm::mat3(0.0f) : bodyA->getInverseInertiaTensor();
             glm::mat3 invInertiaB = bodyB->isStatic ? glm::mat3(0.0f) : bodyB->getInverseInertiaTensor();
 
-            // Transform correction axis to local space
-            glm::vec3 localCorrectionA = glm::inverse(bodyA->rotation) * correctionAxis;
-            glm::vec3 localCorrectionB = glm::inverse(bodyB->rotation) * correctionAxis;
-
-            // Calculate effective mass for rotation
-            float kA = bodyA->isStatic ? 0.0f : glm::dot(localCorrectionA, invInertiaA * localCorrectionA);
-            float kB = bodyB->isStatic ? 0.0f : glm::dot(localCorrectionB, invInertiaB * localCorrectionB);
+            // Project in consistent world space
+            float kA = bodyA->isStatic ? 0.0f : glm::dot(correctionAxis, invInertiaA * correctionAxis);
+            float kB = bodyB->isStatic ? 0.0f : glm::dot(correctionAxis, invInertiaB * correctionAxis);
             float invEffectiveMass = kA + kB;
 
             if (invEffectiveMass > 0.0001f)
@@ -172,14 +175,14 @@ public:
                 const float angularBaumgarte = 0.3f;
                 float impulseMagnitude = -(angularError * angularBaumgarte) / invEffectiveMass;
 
-                // Apply angular impulse to angular velocities
+                // Apply angular impulse to angular velocities (world space)
                 if (!bodyA->isStatic)
                 {
-                    bodyA->angularVelocity -= invInertiaA * localCorrectionA * impulseMagnitude;
+                    bodyA->angularVelocity -= invInertiaA * correctionAxis * impulseMagnitude;
                 }
                 if (!bodyB->isStatic)
                 {
-                    bodyB->angularVelocity += invInertiaB * localCorrectionB * impulseMagnitude;
+                    bodyB->angularVelocity += invInertiaB * correctionAxis * impulseMagnitude;
                 }
             }
         }

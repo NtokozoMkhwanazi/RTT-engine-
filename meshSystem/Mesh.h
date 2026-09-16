@@ -8,6 +8,9 @@
 #include <vector>
 #include <unordered_map>
 #include <memory>
+#include <cstdint>
+#include <fstream>
+#include <cstring>
 
 #include "../shaderSystem/Shader.h"
 #include "../animationSystem/AnimationConfig.h"
@@ -315,11 +318,79 @@ private:
     unsigned int VBO = 0;
     unsigned int EBO = 0;
     unsigned int instanceVBO = 0;
+    // Allocated size of instanceVBO in bytes. The buffer is grown only when
+    // needed; updates use glBufferSubData (in-place) instead of a per-frame
+    // glBufferData orphan+realloc, which stalled the GPU every frame in the
+    // instanced world-object pass (~600 tree/rock/plant instances).
+    size_t instanceVBOCapacity = 0;
     
     bool setupDone = false;
     
     void SetupVertexAttributes();
     void SetupInstanceAttributes();
+};
+
+// ============================================================
+// Virtualized Geometry — Cluster Data Structures (Phase 1)
+// ============================================================
+
+// A single 128-triangle cluster: sub-set of vertices (locally reindexed)
+// plus its bounding volumes for GPU frustum/occlusion culling.
+struct MeshCluster {
+    std::vector<Vertex> vertices;       // max ~128 unique (sub-set of parent mesh)
+    std::vector<unsigned int> indices;  // exactly 128 triangles (384 indices)
+                                        // (except possibly the last cluster)
+    BoundingBox boundingBox;
+    BoundingSphere boundingSphere;
+};
+
+// Packed payload: all clusters from one mesh, ready for GPU upload or
+// binary serialization (.meshpack format).
+struct ClusterPackedPayload {
+    std::vector<MeshCluster> clusters;
+    size_t totalVertices = 0;
+    size_t totalIndices = 0;
+};
+
+// --- GPU-side structures for the cluster-culling compute shader (Phase 2) ---
+// These MUST match the GLSL std430 layout in rhi/shaders/cluster_cull.comp.
+
+// std140-compatible: 2 × vec4 = 32 bytes
+struct GPUClusterBounds {
+    glm::vec4 sphereCenterRadius;  // xyz = center, w = radius
+    glm::vec4 minBounds;           // xyz = min, w = padding
+    glm::vec4 maxBounds;           // xyz = max, w = padding
+};
+
+// std430-compatible: 4 × uint = 16 bytes
+struct GPUClusterCommand {
+    uint32_t firstVertex;   // offset in the global vertex pool
+    uint32_t firstIndex;    // offset in the global index pool
+    uint32_t indexCount;    // usually 384 (128 triangles * 3)
+    uint32_t instanceId;    // maps back to object model matrix
+};
+
+// std430-compatible: matches LODCluster in rhi/shaders/nanite_lod.comp
+// 4 vec4s (16) + 5 uints + 3 pad = 80 bytes (16-byte aligned)
+struct GPULODCluster {
+    glm::vec4 sphereCenterRadius;  // xyz = center, w = radius
+    float     errorSelf;
+    float     errorParent;
+    uint32_t  firstVertex;
+    uint32_t  firstIndex;
+    uint32_t  indexCount;
+    uint32_t  instanceId;
+    uint32_t  parentId;
+    uint32_t  pad0, pad1, pad2;
+};
+
+// Matches VkDrawIndexedIndirectCommand (20 bytes, 4-byte aligned)
+struct ClusterIndirectCommand {
+    uint32_t indexCount;
+    uint32_t instanceCount;
+    uint32_t firstIndex;
+    int32_t  vertexOffset;
+    uint32_t firstInstance;
 };
 
 // ============================================================
@@ -377,6 +448,14 @@ namespace MeshUtils
                          std::vector<unsigned int>& indices,
                          float gridCellSize);
 
+    // Static-prop decimation (adaptive vertex clustering). Reduces meshes
+    // above maxTriangles down to roughly that budget; smaller meshes are left
+    // untouched. Cell size starts at ~1/64 of the longest axis and grows until
+    // the budget is met, so reduction adapts to the model's scale. Averaged
+    // normals preserve the authored shading. Intended for one-time load-time
+    // use on heavy static props (trees/rocks/plants). Re-uploads GPU buffers.
+    void DecimateStaticMesh(Mesh& mesh, size_t maxTriangles);
+
     // Combined optimization: reorder + cluster
     // Best for maximum performance gain
     struct MeshOptimizationConfig
@@ -387,6 +466,39 @@ namespace MeshUtils
         size_t targetCacheSize = 24;
     };
 
-    void OptimizeMeshForRendering(Mesh& mesh, 
+    void OptimizeMeshForRendering(Mesh& mesh,
                                   const MeshOptimizationConfig& config);
+
+    // ============================================================
+    // Virtualized Geometry — Cluster Builder & Serializer (Phase 1)
+    // ============================================================
+
+    // Splits a raw mesh into 128-triangle clusters with local vertex
+    // reindexing and bounding volumes. Each cluster has at most
+    // kTrianglesPerCluster triangles (default 128, the industry standard).
+    // Runs on the existing (Forsyth-optimized) index buffer so cluster
+    // boundaries respect vertex-cache ordering.
+    ClusterPackedPayload BuildMeshClusters(const std::vector<Vertex>& vertices,
+                                           const std::vector<unsigned int>& indices,
+                                           size_t trianglesPerCluster = 128);
+
+    // Serializes a ClusterPackedPayload to a .meshpack binary file.
+    // Layout: [clusterCount:u64][per-cluster: sphereCenter(3) radius(1)
+    //          vCount:u64 iCount:u64 vertices... indices...]
+    void ExportClusterMeshFile(const std::string& binaryPath,
+                               const ClusterPackedPayload& payload);
+
+    // Loads a .meshpack file back into a ClusterPackedPayload.
+    // Returns false on file/parse errors.
+    bool ImportClusterMeshFile(const std::string& binaryPath,
+                               ClusterPackedPayload& outPayload);
+
+    // Flattens a ClusterPackedPayload into global pooled buffers (vertices
+    // concatenated,  indices remapped to global vertex offsets) suitable for
+    // upload to a single GPU storage buffer. Returns the per-cluster commands
+    // (firstVertex / firstIndex / indexCount) for the MDI indirect buffer.
+    std::vector<GPUClusterCommand> FlattenClustersToBuffers(
+        const ClusterPackedPayload& payload,
+        std::vector<Vertex>& outVertices,
+        std::vector<unsigned int>& outIndices);
 }

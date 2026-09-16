@@ -145,6 +145,16 @@ public:
     Mode getMode() const { return currentMode; }
 
     /**
+     * Get simulated speed (m/s).
+     */
+    double getSpeed() const { return simSpeed; }
+
+    /**
+     * Get GPS noise level (meters).
+     */
+    double getNoiseLevel() const { return noiseLevel; }
+
+    /**
      * Get mode name for display.
      */
     static const char* getModeName(Mode mode) {

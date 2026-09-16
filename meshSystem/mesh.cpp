@@ -1,4 +1,5 @@
 #include "Mesh.h"
+#include "../editor/gl_context_lifecycle.h"
 #include <iostream>
 #include <algorithm>
 #include <numeric>
@@ -22,12 +23,14 @@ Mesh::Mesh(Mesh&& other) noexcept
     , VBO(other.VBO)
     , EBO(other.EBO)
     , instanceVBO(other.instanceVBO)
+    , instanceVBOCapacity(other.instanceVBOCapacity)
     , setupDone(other.setupDone)
 {
     other.VAO = 0;
     other.VBO = 0;
     other.EBO = 0;
     other.instanceVBO = 0;
+    other.instanceVBOCapacity = 0;
     other.setupDone = false;
 }
 
@@ -48,12 +51,14 @@ Mesh& Mesh::operator=(Mesh&& other) noexcept
         VBO = other.VBO;
         EBO = other.EBO;
         instanceVBO = other.instanceVBO;
+        instanceVBOCapacity = other.instanceVBOCapacity;
         setupDone = other.setupDone;
 
         other.VAO = 0;
         other.VBO = 0;
         other.EBO = 0;
         other.instanceVBO = 0;
+        other.instanceVBOCapacity = 0;
         other.setupDone = false;
     }
     return *this;
@@ -287,13 +292,22 @@ void Mesh::Draw(Shader& shader)
                   << std::hex << e1 << std::dec << "\n";
     }
 
-    // Bind textures (skip if texture ID is 0 - invalid)
+    // Bind textures. Samplers are named texture_<semantic><N> where N is the
+    // per-semantic occurrence index (1-based) - e.g. the first normal map is
+    // texture_normal1 on a packed texture unit. This matches pbrFS.glsl/FS.glsl
+    // (which sample texture_diffuse1, texture_normal1, texture_metallic1,
+    // texture_roughness1, texture_ao1). Units are packed contiguously so they
+    // line up with the sampler uniforms regardless of which maps a mesh has.
+    std::unordered_map<std::string, int> typeIndex;
+    unsigned int unit = 0;
     for (size_t i = 0; i < textures.size(); i++)
     {
         if (textures[i].id != 0) {  // Only bind valid textures
-            glActiveTexture(GL_TEXTURE0 + i);
-            shader.setInt(("texture_" + textures[i].type + std::to_string(i + 1)).c_str(), i);
+            int n = ++typeIndex[textures[i].type];
+            glActiveTexture(GL_TEXTURE0 + unit);
+            shader.setInt(("texture_" + textures[i].type + std::to_string(n)).c_str(), unit);
             glBindTexture(GL_TEXTURE_2D, textures[i].id);
+            unit++;
         }
     }
     GLenum e2 = glGetError();
@@ -331,13 +345,17 @@ void Mesh::DrawInstanced(Shader& shader, size_t instanceCount)
 
     glBindVertexArray(VAO);
 
-    // Bind textures (skip if texture ID is 0 - invalid)
+    // Bind textures (per-type sampler naming, packed units - see Draw above).
+    std::unordered_map<std::string, int> typeIndex;
+    unsigned int unit = 0;
     for (size_t i = 0; i < textures.size(); i++)
     {
         if (textures[i].id != 0) {  // Only bind valid textures
-            glActiveTexture(GL_TEXTURE0 + i);
-            shader.setInt(("texture_" + textures[i].type + std::to_string(i + 1)).c_str(), i);
+            int n = ++typeIndex[textures[i].type];
+            glActiveTexture(GL_TEXTURE0 + unit);
+            shader.setInt(("texture_" + textures[i].type + std::to_string(n)).c_str(), unit);
             glBindTexture(GL_TEXTURE_2D, textures[i].id);
+            unit++;
         }
     }
 
@@ -368,14 +386,20 @@ void Mesh::DrawInstanced(Shader& shader, const std::vector<InstanceData>& instan
         SetupInstanceAttributes();
     }
 
-    // Upload instance data
+    // Upload instance data. Allocate the buffer once and only grow it;
+    // subsequent frames update it IN PLACE with glBufferSubData. The old
+    // per-frame glBufferData(GL_DYNAMIC_DRAW) orphaned + reallocated the
+    // buffer on every call - a driver stall for every mesh/group every frame
+    // (the instanced world-object pass re-draws ~600 tree/rock/plant
+    // instances per frame, which alone cost ~50ms of GPU time).
     glBindBuffer(GL_ARRAY_BUFFER, instanceVBO);
-    glBufferData(
-        GL_ARRAY_BUFFER,
-        instances.size() * InstanceData::Size(),
-        instances.data(),
-        GL_DYNAMIC_DRAW
-    );
+    const size_t bytes = instances.size() * InstanceData::Size();
+    if (bytes > instanceVBOCapacity) {
+        glBufferData(GL_ARRAY_BUFFER, bytes, instances.data(), GL_DYNAMIC_DRAW);
+        instanceVBOCapacity = bytes;
+    } else {
+        glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, instances.data());
+    }
 
     DrawInstanced(shader, instances.size());
 }
@@ -506,13 +530,18 @@ void Mesh::SetFlag(MeshFlags flag, bool enabled)
 // ============================================================
 void Mesh::Clear()
 {
-    // Check if OpenGL context is available
-    if (!glDeleteVertexArrays) {
+    // Check if OpenGL context is available. The GLAD pointer check alone is
+    // NOT enough: after glfwTerminate() the pointers stay non-null, so calling
+    // GL through them is a SIGSEGV. glctx::isAlive() tracks the real context
+    // lifetime (maintained by the RHI / test harness), which matters for
+    // static-destruction-time teardown of global model caches.
+    if (!glDeleteVertexArrays || !glctx::isAlive()) {
         // Just clear CPU data without GL cleanup
         vertices.clear();
         indices.clear();
         textures.clear();
         bonePalette.Clear();
+        setupDone = false;
         return;
     }
 
@@ -1242,6 +1271,137 @@ namespace MeshUtils
     }
 
     // --------------------------------------------------------
+    // Static-Prop Decimation (adaptive vertex clustering)
+    // --------------------------------------------------------
+    void DecimateStaticMesh(Mesh& mesh, size_t maxTriangles)
+    {
+        auto& vertices = mesh.vertices;
+        auto& indices = mesh.indices;
+        if (vertices.empty() || indices.size() < 3) return;
+        const size_t origTris = indices.size() / 3;
+        if (origTris <= maxTriangles) return;
+
+        // Mesh bounding box -> adaptive cell size. Reduction comes from many
+        // vertices sharing a grid cell, so the cell must be a fraction of the
+        // mesh's extent (small relative to the model, large relative to its
+        // vertex spacing). Starting at extent/64 and growing 1.6x per pass
+        // converges in a few cheap O(n) passes for typical heavy props.
+        glm::vec3 minPos(FLT_MAX), maxPos(-FLT_MAX);
+        for (const auto& v : vertices)
+        {
+            minPos = glm::min(minPos, v.Position);
+            maxPos = glm::max(maxPos, v.Position);
+        }
+        const glm::vec3 extent = maxPos - minPos;
+        const float maxExtent = std::max(extent.x, std::max(extent.y, extent.z));
+        if (maxExtent <= 1e-6f) return;
+
+        float cellSize = maxExtent / 64.0f;
+        size_t lastTris = origTris;
+        for (int iter = 0; iter < 10; ++iter)
+        {
+            const int gw = std::max(1, (int)(extent.x / cellSize) + 1);
+            const int gh = std::max(1, (int)(extent.y / cellSize) + 1);
+            const int gd = std::max(1, (int)(extent.z / cellSize) + 1);
+
+            auto cellKey = [&](const glm::vec3& p) -> uint64_t
+            {
+                const int x = std::clamp((int)((p.x - minPos.x) / cellSize), 0, gw - 1);
+                const int y = std::clamp((int)((p.y - minPos.y) / cellSize), 0, gh - 1);
+                const int z = std::clamp((int)((p.z - minPos.z) / cellSize), 0, gd - 1);
+                return (uint64_t)x | ((uint64_t)y << 16) | ((uint64_t)z << 32);
+            };
+
+            // First pass: cluster vertices, accumulating centroid + normals and
+            // remembering the first old vertex per cluster (keeps UVs/etc).
+            std::unordered_map<uint64_t, uint32_t> cellToNew;
+            std::vector<glm::vec3> centroids;
+            std::vector<glm::vec3> normalAcc;
+            std::vector<uint32_t> counts;
+            std::vector<uint32_t> firstOld;
+            std::vector<uint32_t> oldToNew(vertices.size());
+            centroids.reserve(vertices.size() / 4);
+            normalAcc.reserve(vertices.size() / 4);
+            counts.reserve(vertices.size() / 4);
+            firstOld.reserve(vertices.size() / 4);
+
+            for (size_t i = 0; i < vertices.size(); ++i)
+            {
+                const uint64_t key = cellKey(vertices[i].Position);
+                auto it = cellToNew.find(key);
+                if (it == cellToNew.end())
+                {
+                    const uint32_t idx = (uint32_t)centroids.size();
+                    cellToNew[key] = idx;
+                    oldToNew[i] = idx;
+                    centroids.push_back(vertices[i].Position);
+                    normalAcc.push_back(vertices[i].Normal);
+                    counts.push_back(1);
+                    firstOld.push_back((uint32_t)i);
+                }
+                else
+                {
+                    const uint32_t idx = it->second;
+                    oldToNew[i] = idx;
+                    // Running average so the centroid tracks the densest region
+                    centroids[idx] = glm::mix(centroids[idx], vertices[i].Position,
+                                              1.0f / (float)(counts[idx] + 1));
+                    normalAcc[idx] += vertices[i].Normal;
+                    counts[idx]++;
+                }
+            }
+
+            // Build the clustered vertex list (attributes from first member).
+            std::vector<Vertex> newVertices;
+            newVertices.reserve(centroids.size());
+            for (size_t c = 0; c < centroids.size(); ++c)
+            {
+                Vertex nv = vertices[firstOld[c]];
+                nv.Position = centroids[c];
+                const float nl = glm::length(normalAcc[c]);
+                nv.Normal = (nl > 1e-6f) ? normalAcc[c] / nl : nv.Normal;
+                newVertices.push_back(nv);
+            }
+
+            // Remap indices, dropping degenerate (fully collapsed) triangles.
+            std::vector<unsigned int> newIndices;
+            newIndices.reserve(indices.size());
+            for (size_t i = 0; i + 2 < indices.size(); i += 3)
+            {
+                const unsigned int a = oldToNew[indices[i]];
+                const unsigned int b = oldToNew[indices[i + 1]];
+                const unsigned int c = oldToNew[indices[i + 2]];
+                if (a == b || b == c || a == c) continue;
+                newIndices.push_back(a);
+                newIndices.push_back(b);
+                newIndices.push_back(c);
+            }
+
+            const size_t newTris = newIndices.size() / 3;
+            const bool underBudget = newTris <= maxTriangles;
+            const bool stalled = newTris >= lastTris;  // no progress -> stop
+            if (underBudget || stalled || iter == 9)
+            {
+                vertices = std::move(newVertices);
+                indices = std::move(newIndices);
+                break;
+            }
+            lastTris = newTris;
+            cellSize *= 1.6f;  // grow cells for stronger reduction
+        }
+
+        // Refresh derived data + GPU buffers with the decimated geometry.
+        mesh.CalculateBoundingVolumes();
+        mesh.UpdateVertexBuffer();
+        mesh.UpdateIndexBuffer();
+        mesh.stats.Calculate(mesh.vertices, mesh.indices, mesh.textures);
+
+        std::cout << "[DecimateStaticMesh] " << origTris << " -> "
+                  << indices.size() / 3 << " triangles (" << vertices.size()
+                  << " vertices)\n";
+    }
+
+    // --------------------------------------------------------
     // Combined Mesh Optimization
     // --------------------------------------------------------
     void OptimizeMeshForRendering(Mesh& mesh, 
@@ -1276,5 +1436,188 @@ namespace MeshUtils
 
         std::cout << "[MeshOptimization] Complete: " << mesh.vertices.size() 
                   << " vertices, " << mesh.indices.size() / 3 << " triangles\n";
+    }
+
+    // ============================================================
+    // Phase 1: Cluster Builder
+    // ============================================================
+
+    ClusterPackedPayload BuildMeshClusters(const std::vector<Vertex>& vertices,
+                                           const std::vector<unsigned int>& indices,
+                                           size_t trianglesPerCluster)
+    {
+        ClusterPackedPayload payload;
+        if (indices.empty() || vertices.empty()) return payload;
+
+        const size_t totalTriangles = indices.size() / 3;
+        if (totalTriangles == 0) return payload;
+
+        if (trianglesPerCluster == 0) trianglesPerCluster = 128;
+
+        size_t triIdx = 0;  // global triangle cursor
+
+        while (triIdx < totalTriangles) {
+            MeshCluster cluster;
+            cluster.indices.reserve(trianglesPerCluster * 3);
+
+            // Local vertex remapping for this cluster
+            std::unordered_map<unsigned int, unsigned int> vertexRemap;
+
+            size_t trisThisCluster = 0;
+            for (size_t t = 0; t < trianglesPerCluster && triIdx < totalTriangles; ++t) {
+                for (int i = 0; i < 3; ++i) {
+                    unsigned int origIdx = indices[triIdx * 3 + i];
+
+                    auto it = vertexRemap.find(origIdx);
+                    if (it == vertexRemap.end()) {
+                        unsigned int newIdx = static_cast<unsigned int>(cluster.vertices.size());
+                        vertexRemap[origIdx] = newIdx;
+                        cluster.vertices.push_back(vertices[origIdx]);
+                        cluster.indices.push_back(newIdx);
+                        payload.totalVertices++;
+                    } else {
+                        cluster.indices.push_back(it->second);
+                    }
+                    payload.totalIndices++;
+                }
+                ++trisThisCluster;
+                ++triIdx;
+            }
+
+            // Compute bounding volumes
+            cluster.boundingBox = BoundingBox();
+            for (const auto& v : cluster.vertices) {
+                cluster.boundingBox.Extend(v.Position);
+            }
+            if (cluster.boundingBox.IsValid()) {
+                cluster.boundingSphere = BoundingSphere::FromBoundingBox(cluster.boundingBox);
+            }
+
+            payload.clusters.push_back(std::move(cluster));
+        }
+
+        return payload;
+    }
+
+    void ExportClusterMeshFile(const std::string& binaryPath,
+                               const ClusterPackedPayload& payload)
+    {
+        std::ofstream out(binaryPath, std::ios::binary);
+        if (!out) return;
+
+        uint64_t clusterCount = payload.clusters.size();
+        out.write(reinterpret_cast<const char*>(&clusterCount), sizeof(clusterCount));
+
+        for (const auto& cluster : payload.clusters) {
+            // Bounding sphere (xyz=center, w=radius)
+            out.write(reinterpret_cast<const char*>(&cluster.boundingSphere.center),
+                      sizeof(glm::vec3));
+            out.write(reinterpret_cast<const char*>(&cluster.boundingSphere.radius),
+                      sizeof(float));
+
+            // Vertex / index counts
+            uint64_t vCount = cluster.vertices.size();
+            uint64_t iCount = cluster.indices.size();
+            out.write(reinterpret_cast<const char*>(&vCount), sizeof(vCount));
+            out.write(reinterpret_cast<const char*>(&iCount), sizeof(iCount));
+
+            // Raw vertex and index data
+            out.write(reinterpret_cast<const char*>(cluster.vertices.data()),
+                      vCount * sizeof(Vertex));
+            out.write(reinterpret_cast<const char*>(cluster.indices.data()),
+                      iCount * sizeof(unsigned int));
+        }
+    }
+
+    bool ImportClusterMeshFile(const std::string& binaryPath,
+                               ClusterPackedPayload& outPayload)
+    {
+        std::ifstream in(binaryPath, std::ios::binary);
+        if (!in) return false;
+
+        outPayload = {};
+
+        uint64_t clusterCount = 0;
+        in.read(reinterpret_cast<char*>(&clusterCount), sizeof(clusterCount));
+        if (!in) return false;
+
+        for (uint64_t c = 0; c < clusterCount; ++c) {
+            MeshCluster cluster;
+
+            // Bounding sphere
+            in.read(reinterpret_cast<char*>(&cluster.boundingSphere.center),
+                    sizeof(glm::vec3));
+            in.read(reinterpret_cast<char*>(&cluster.boundingSphere.radius),
+                    sizeof(float));
+
+            uint64_t vCount = 0, iCount = 0;
+            in.read(reinterpret_cast<char*>(&vCount), sizeof(vCount));
+            in.read(reinterpret_cast<char*>(&iCount), sizeof(iCount));
+            if (!in) return false;
+
+            cluster.vertices.resize(vCount);
+            cluster.indices.resize(iCount);
+            if (vCount) {
+                in.read(reinterpret_cast<char*>(cluster.vertices.data()),
+                        vCount * sizeof(Vertex));
+            }
+            if (iCount) {
+                in.read(reinterpret_cast<char*>(cluster.indices.data()),
+                        iCount * sizeof(unsigned int));
+            }
+            if (!in) return false;
+
+            // Recompute bounding box from loaded vertex data
+            cluster.boundingBox = BoundingBox();
+            for (const auto& v : cluster.vertices)
+                cluster.boundingBox.Extend(v.Position);
+            if (cluster.boundingBox.IsValid())
+                cluster.boundingSphere = BoundingSphere::FromBoundingBox(cluster.boundingBox);
+
+            outPayload.clusters.push_back(std::move(cluster));
+            outPayload.totalVertices += vCount;
+            outPayload.totalIndices += iCount;
+        }
+
+        return true;
+    }
+
+    std::vector<GPUClusterCommand> FlattenClustersToBuffers(
+        const ClusterPackedPayload& payload,
+        std::vector<Vertex>& outVertices,
+        std::vector<unsigned int>& outIndices)
+    {
+        outVertices.clear();
+        outIndices.clear();
+        outVertices.reserve(payload.totalVertices);
+        outIndices.reserve(payload.totalIndices);
+
+        std::vector<GPUClusterCommand> commands;
+        commands.resize(payload.clusters.size());
+
+        size_t vertexOffset = 0;
+        size_t indexOffset = 0;
+
+        for (size_t c = 0; c < payload.clusters.size(); ++c) {
+            const auto& cluster = payload.clusters[c];
+
+            commands[c].firstVertex = static_cast<uint32_t>(vertexOffset);
+            commands[c].firstIndex  = static_cast<uint32_t>(indexOffset);
+            commands[c].indexCount  = static_cast<uint32_t>(cluster.indices.size());
+            commands[c].instanceId  = static_cast<uint32_t>(c);
+
+            // Append cluster vertices (already local to this cluster)
+            for (const auto& v : cluster.vertices)
+                outVertices.push_back(v);
+
+            // Append indices with the global vertex offset
+            for (unsigned int idx : cluster.indices)
+                outIndices.push_back(idx + static_cast<unsigned int>(vertexOffset));
+
+            vertexOffset += cluster.vertices.size();
+            indexOffset  += cluster.indices.size();
+        }
+
+        return commands;
     }
 }

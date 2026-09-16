@@ -108,9 +108,27 @@ public:
     );
     
     // Constraint system
+    // [[deprecated]] — register joints through the new velocity-constraint API
+    // below (PhysicsWorld::addHingeConstraint / `useVelocityConstraints`) instead.
+    // The legacy `Constraint*` pipeline is retained for backwards compatibility
+    // but is position-based and ignores angular velocity.
+    [[deprecated("use PhysicsWorld::addHingeConstraint with useVelocityConstraints=true instead")]]
     void addConstraint(class Constraint* constraint);
     void clearConstraints();
-    
+
+    // ----------------------------------------------------------------------
+    // Velocity-level joint pipeline (replaces the deprecated Constraint*).
+    // Opt-in: set `useVelocityConstraints = true`, register hinges, and the
+    // 5-DOF block mass-matrix hinge solver runs inside step() instead of the
+    // legacy position-based pass.
+    // ----------------------------------------------------------------------
+    bool useVelocityConstraints = false;
+
+    void addHingeConstraint(BodyHandle a, BodyHandle b,
+                            const glm::vec3& pivotWorld,
+                            const glm::vec3& hingeAxisWorld,
+                            float stiffness = 1.0f);
+
     // Query functions
     std::vector<BodyHandle> getBodiesInAABB(const glm::vec3& min, const glm::vec3& max) const;
     BodyHandle getBodyAtPoint(const glm::vec3& point, float radius = 0.1f) const;
@@ -127,6 +145,43 @@ public:
                                float subdt);
 
     void step(float dt);
+
+    // ---------------------------------------------------------------------
+    // Character-vs-world-object collision (play-mode character capsule vs the
+    // static bodies registered for boulders/rocks/trees/etc). The character
+    // is NOT a body in the world - the caller moves it, then asks the world
+    // to resolve its capsule against every static collider: the feet position
+    // is pushed out of any overlap and the velocity component heading INTO
+    // the surface is zeroed, so the character slides along / stops at rocks
+    // instead of walking through them. totalHeight is the full capsule height
+    // (cylinder + end caps); radius is the cap radius.
+    bool resolveCharacterCapsule(glm::vec3& feetPos, float radius, float totalHeight,
+                                 glm::vec3& velocity);
+
+    // Highest static-body top surface at (x, z) - lets the character stand ON
+    // boulders/rocks the same way it stands on terrain (the caller takes
+    // max(terrain, this)). Returns -inf when no static body covers the point.
+    float getStaticSurfaceHeightAt(float x, float z) const;
+
+    // ------------------------------------------------------------------
+    // Character ground snap via the NEW velocity-constraint plane solver
+    // (vel::PlaneConstraint / vel::ConstraintSolver). `surfaceY` is the
+    // heightmap-aware ground height supplied by the caller (max of the terrain
+    // heightmap + static object/tree tops via WorldManager::getSurfaceHeightAt)
+    // - PhysicsWorld itself only knows the flat physics floor, so passing the
+    // authoritative surface in here avoids sinking a character perched on a
+    // real heightmap down to y=0.
+    //
+    //  - grounded character: settle the feet ON `surfaceY` (this pulls a
+    //    spawn/level placement that "sits high above the terrain" back onto
+    //    the ground) and kill downward velocity into it;
+    //  - airborne character: only act at actual contact (landing), so a
+    //    jumper high above the surface is NOT yanked down.
+    // Shared by BOTH editors (Vulkan + OpenGL) and test.cpp.
+    // ------------------------------------------------------------------
+    bool snapCharacterToGround(glm::vec3& feetPos, float radius,
+                               float totalHeight, glm::vec3& velocity,
+                               float surfaceY, bool grounded = true);
 
     // Spatial hash grid controls
     void setSpatialCellSize(float size) { spatialCellSize = size; spatialGridDirty = true; }
@@ -192,6 +247,16 @@ private:
     
     // Constraints
     std::vector<class Constraint*> constraints;
+
+    // Hinges registered for the opt-in velocity-constraint pass
+    // (m_hingeJoints are consumed by vel::ConstraintSolver inside step()).
+    struct HingeJointSpec {
+        int idxA = -1, idxB = -1;
+        glm::vec3 pivotWorld{0.0f};
+        glm::vec3 axisWorld{0.0f, 0.0f, 1.0f};
+        float stiffness = 1.0f;
+    };
+    std::vector<HingeJointSpec> m_hingeJoints;
     
     // Fluid simulation
     std::vector<FluidVolume> fluidVolumes;

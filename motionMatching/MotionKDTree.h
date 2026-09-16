@@ -149,6 +149,29 @@ public:
     std::vector<KDTSearchResult> FindWithinRadius(
         const MotionFeatures& query, 
         float radius) const;
+
+    /**
+     * Find the best (nearest) pose belonging to a specific clip (animation),
+     * evaluated in the KD tree's own feature-space metric. Used by the matcher
+     * persistence to recover the current clip's true best pose when it is
+     * absent from the top-k window (e.g. another clip floods the near set with
+     * near-identical poses). Returns a sentinel (poseIndex<0) if the tree is
+     * not built or the clip has no poses.
+     */
+    KDTSearchResult FindBestInClip(const MotionFeatures& query, int animIdx) const;
+    
+    // =========================================================================
+    // FEATURE-VIEW / METRIC EXTRACTION (PUBLIC)
+    // =========================================================================
+    // Exposed so MotionMatcher::SelectPoseWithPersistence can sample the TRUE
+    // feature distance of a pose evicted from the Top-K window (FindKNearest
+    // returns only the near set; a dense 120fps clip can flood it, evicting
+    // the active frame). Same primitives the tree uses internally during
+    // search, so the sampled distance is on the identical KD metric.
+    std::vector<float> GetFeatureVector(const PoseSample& pose) const;
+    std::vector<float> GetFeatureVector(const MotionFeatures& features) const;
+    float CalculateDistance(const std::vector<float>& a,
+                            const std::vector<float>& b) const;
     
     // =========================================================================
     // DEBUG
@@ -208,10 +231,6 @@ private:
     static constexpr float SAH_TRAVERSAL_COST = 1.0f;    // Cost of traversing a node
     static constexpr float SAH_INTERSECTION_COST = 1.0f; // Cost of intersecting a primitive
 
-    // Feature extraction (converts PoseSample to feature vector)
-    std::vector<float> GetFeatureVector(const PoseSample& pose) const;
-    std::vector<float> GetFeatureVector(const MotionFeatures& features) const;
-
     // Tree building
     std::unique_ptr<KDTreeNode> BuildRecursive(
         std::vector<int>& indices,
@@ -263,11 +282,6 @@ private:
         const std::vector<float>& query,
         float radius,
         std::vector<KDTSearchResult>& results) const;
-
-    // Distance calculation
-    float CalculateDistance(
-        const std::vector<float>& a,
-        const std::vector<float>& b) const;
 
     // Feature weights (tune search behavior)
     // CRITICAL: speed weight must be HIGH to ensure correct animation selection

@@ -12,7 +12,7 @@ public:
     float maxSpeed = 5.0f;
     float accel = 20.0f;
     float airControl = 0.3f;
-    float frictionGround = 8.0f;
+    float frictionGround = 5.0f;
     float frictionAir = 2.0f;
     float jumpVel = 5.0f;
 

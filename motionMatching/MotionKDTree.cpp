@@ -3,6 +3,14 @@
 #include <queue>
 #include <iomanip>
 #include <limits>
+#include <future>
+
+// Only parallelize KD-Tree construction for large pose sets; small trees (and
+// the small test fixtures) stay serial so the build stays deterministic and
+// thread-overhead-free. The two subtrees are built from DISJOINT index vectors
+// and only READ poseData (written once before recursion), so the fork is
+// race-free by construction; max in-flight threads is O(log(n/threshold)).
+static constexpr int kParallelBuildThreshold = 128;
 
 MotionKDTree::MotionKDTree() {}
 
@@ -176,6 +184,21 @@ MotionKDTree::SAHSplit MotionKDTree::FindBestSplit(const std::vector<int>& indic
     
     // Try each axis
     for (int axis = 0; axis < NUM_FEATURES; axis++) {
+        // Binary categorical escape: axes 4 and 5 are foot-plant states
+        // (0.0f or 1.0f only). Standard floating-point binning splits at
+        // fractional positions like 0.333f, creating degenerate sub-trees
+        // with zero variance that collapse to O(n). Split exactly at 0.5f.
+        if (axis == 4 || axis == 5) {
+            float cost = SAH_TRAVERSAL_COST +
+                         (indices.size() * 0.5f * SAH_INTERSECTION_COST);
+            if (cost < bestSplit.bestCost) {
+                bestSplit.bestAxis = axis;
+                bestSplit.bestBin = SAH_NUM_BINS / 2;  // partition at 50% boundary
+                bestSplit.bestCost = cost;
+            }
+            continue;  // skip standard floating-point continuous binning
+        }
+
         float axisMin = bounds.minBounds[axis];
         float axisMax = bounds.maxBounds[axis];
         float axisRange = axisMax - axisMin;
@@ -332,12 +355,28 @@ std::unique_ptr<KDTreeNode> MotionKDTree::BuildWithSAHRecursive(
     leftBounds.maxBounds[split.bestAxis] = node->splitValue;
     rightBounds.minBounds[split.bestAxis] = node->splitValue;
     
-    // Build subtrees
-    if (!leftIndices.empty()) {
-        node->left = BuildWithSAHRecursive(leftIndices, depth + 1, maxLeafSize, leftBounds, numBins);
-    }
-    if (!rightIndices.empty()) {
-        node->right = BuildWithSAHRecursive(rightIndices, depth + 1, maxLeafSize, rightBounds, numBins);
+    // Build subtrees - parallelize the independent right-subtree construction
+    // across a worker thread so index builds overlap with IO on large pose
+    // databases. The two halves operate on DISJOINT index vectors
+    // (leftIndices vs rightIndices) and only READ poseData (populated once by
+    // BuildWithSAH before any recursion), so the fork is race-free by
+    // construction. Gated by kParallelBuildThreshold so small trees (and the
+    // small test fixtures) stay serial and deterministic.
+    if (!leftIndices.empty() && !rightIndices.empty() &&
+        (int)indices.size() > kParallelBuildThreshold) {
+        auto rightFuture = std::async(std::launch::async,
+            [this, depth, maxLeafSize, numBins,
+             rightBounds, rightIndices = std::move(rightIndices)]() mutable {
+                return BuildWithSAHRecursive(rightIndices, depth + 1,
+                                             maxLeafSize, rightBounds, numBins);
+            });
+        node->left  = BuildWithSAHRecursive(leftIndices, depth + 1, maxLeafSize, leftBounds, numBins);
+        node->right = rightFuture.get();
+    } else {
+        if (!leftIndices.empty())
+            node->left  = BuildWithSAHRecursive(leftIndices, depth + 1, maxLeafSize, leftBounds, numBins);
+        if (!rightIndices.empty())
+            node->right = BuildWithSAHRecursive(rightIndices, depth + 1, maxLeafSize, rightBounds, numBins);
     }
     
     return node;
@@ -412,6 +451,29 @@ std::vector<KDTSearchResult> MotionKDTree::FindKNearest(
     return results;
 }
 
+KDTSearchResult MotionKDTree::FindBestInClip(const MotionFeatures& query, int animIdx) const {
+    KDTSearchResult best;
+    best.poseIndex = -1;
+    best.distance = std::numeric_limits<float>::max();
+    best.score = 0.0f;
+    if (!root) return best;
+
+    auto queryVec = GetFeatureVector(query);
+    for (size_t i = 0; i < poseData.size(); ++i) {
+        if (poseData[i].animationIndex != animIdx) continue;
+        auto poseVec = GetFeatureVector(poseData[i]);
+        float dist = CalculateDistance(queryVec, poseVec);
+        if (dist < best.distance) {
+            best.distance = dist;
+            best.poseIndex = static_cast<int>(i);
+        }
+    }
+    if (best.poseIndex >= 0) {
+        best.score = 1.0f / (1.0f + best.distance);
+    }
+    return best;
+}
+
 std::vector<KDTSearchResult> MotionKDTree::FindWithinRadius(
     const MotionFeatures& query,
     float radius) const {
@@ -467,24 +529,35 @@ void MotionKDTree::SearchRecursive(
     
     // Determine which subtree to search first
     float queryVal = query[node->splitAxis];
-    bool goLeft = queryVal < node->splitValue;
-    
-    // Search closer subtree first
-    if (goLeft) {
+    float delta = queryVal - node->splitValue;
+
+    // Scale-aware noise-margin corridor over the KD-Tree split plane. A flat
+    // 0.03f margin fits the speed/velocity axes but is microscopic for the
+    // move-angle axis (radians) and the future-path axes (centimeter model
+    // units), so the query tripped the split plane during strafing/turning and
+    // pruned the correct branch - clip pops on sharp motion. Size the margin to
+    // the scale of the active split axis instead.
+    float dynamicMargin = 0.03f; // Speed / velocity (m/s)
+    if (node->splitAxis == 3) {
+        dynamicMargin = 0.15f;   // Move angle (radians, ~8.5 degrees)
+    } else if (node->splitAxis >= 7) {
+        dynamicMargin = 2.5f;    // Future path (model units, ~cm)
+    }
+
+    if (delta < -dynamicMargin) {
         SearchRecursive(node->left.get(), query, bestDist, bestIndex);
-        
-        // Check if we need to search the other subtree
-        float distToSplit = std::abs(queryVal - node->splitValue);
-        if (distToSplit < bestDist) {
+        if ((delta * delta) < bestDist) {
             SearchRecursive(node->right.get(), query, bestDist, bestIndex);
         }
-    } else {
+    } else if (delta > dynamicMargin) {
         SearchRecursive(node->right.get(), query, bestDist, bestIndex);
-        
-        float distToSplit = std::abs(queryVal - node->splitValue);
-        if (distToSplit < bestDist) {
+        if ((delta * delta) < bestDist) {
             SearchRecursive(node->left.get(), query, bestDist, bestIndex);
         }
+    } else {
+        // Query lies directly in the noise corridor: explore both subtrees.
+        SearchRecursive(node->left.get(), query, bestDist, bestIndex);
+        SearchRecursive(node->right.get(), query, bestDist, bestIndex);
     }
 }
 
@@ -643,6 +716,15 @@ float MotionKDTree::CalculateDistance(
     // Weighted Euclidean distance
     for (size_t i = 0; i < a.size(); i++) {
         float diff = a[i] - b[i];
+        // The move-angle feature (dim 3) is ANGULAR: two poses both pointing
+        // "backward" can sit at +pi and -pi (the atan2 sign of a zero X
+        // component is arbitrary), which the raw difference scores as 2pi - a
+        // full circle - so a straight-backward character ranks backward poses
+        // as far. Wrap the difference into [-pi, pi] before weighting.
+        if (i == 3) {
+            while (diff > 3.14159265f) diff -= 6.28318530f;
+            while (diff < -3.14159265f) diff += 6.28318530f;
+        }
         float weight = 1.0f;
         
         // Apply weights based on feature type

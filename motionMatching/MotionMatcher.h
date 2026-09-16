@@ -25,6 +25,12 @@ struct CharacterState {
     // world-space velocity and let the matcher convert.
     glm::vec3 position{0.0f};
     glm::vec3 velocity{0.0f};
+    // Raw world-space velocity in metres/second (NOT scaled by 1/scale).
+    // The matcher uses this for speed-dependent smoothing filters whose
+    // thresholds are written in world m/s. Without it, velocity is in model
+    // units (e.g. 200 for 2 m/s at scale=0.01) and every threshold is
+    // bypassed, disabling all low-speed damping.
+    glm::vec3 worldVelocity{0.0f};
     float rotation{0.0f};  // Yaw in radians
     glm::vec2 moveDirection{0.0f, 1.0f};
     bool grounded{true};
@@ -98,6 +104,27 @@ public:
      * trajectoryScale multiplies the near->far trajectory falloff
      * {4, 2.5, 1.5, 1.0} uniformly.
      */
+    /**
+     * Tune the clip-switch persistence bands used by SelectPoseWithPersistence
+     * (the pose search's clip hysteresis) on BOTH search paths (KD-tree and
+     * brute-force fallback):
+     *  - speedBandFactor: the speed band is clipNominalSpeed * this (with a
+     *    1 m/s floor so a stationary Idle never trips it). Lower = switch
+     *    sooner on gait changes (run<->walk, walk<->stop).
+     *  - directionBandRadians: angular band on the movement direction. When
+     *    the query heads more than this far from the current clip's nominal
+     *    move direction (reversal / backpedal / moving away), the margin is
+     *    dropped and the best other-clip candidate is played at once. Lower =
+     *    the character turns around sooner.
+     * A negative factor/band disables that check entirely.
+     */
+    void SetClipSwitchBands(float speedBandFactor, float directionBandRadians) {
+        config.speedBandFactor = speedBandFactor;
+        config.directionBandRadians = directionBandRadians;
+    }
+    float GetSpeedBandFactor() const { return config.speedBandFactor; }
+    float GetDirectionBandRadians() const { return config.directionBandRadians; }
+
     void SetSearchWeights(float speed, float velX, float velZ, float direction,
                           float footPlant, float trajectoryScale,
                           float verticalVelocity = 2.0f) {
@@ -181,6 +208,37 @@ public:
      * Get current pose index in database
      */
     int GetCurrentPoseIndex() const { return currentPoseIndex; }
+
+    /**
+     * Enable/disable "clip lock" mode.
+     *
+     * When the character is at rest (idle), the motion matcher would normally
+     * search for the best-matching pose on every frame. On a looping idle clip
+     * this causes the animation time to jump between nearby frames ("cut mid
+     * clip"), because the pose search selects different frames of the same
+     * cycle every tick. This looks like a subtle but visible discontinuity in
+     * an otherwise smooth idle.
+     *
+     * Clip lock mode solves this: when enabled, the matcher skips the KD-tree
+     * search entirely and simply advances the current clip's play time at real
+     * speed, letting the idle cycle play through naturally. The motion matcher
+     * resumes normal pose search when the character's movement state changes
+     * (velocity > threshold) or when a transition clip starts playing.
+     */
+    void SetClipLock(bool lock) { clipLockActive = lock; }
+    bool IsClipLocked() const { return clipLockActive; }
+    // Returns true when the matcher has a valid clip to play while clip-lock
+    // is engaged. After a transition clip completes, CompleteTransitionNow()
+    // resets currentPoseIndex to 0 AND currentAnimationPtr to nullptr (forcing
+    // re-selection). Clip-lock must NOT engage until BOTH are valid — otherwise
+    // the animator is left with no clip to play (clipDur=-1). We require
+    // currentApplicationPtr != nullptr (set in the "switch clip" or "same
+    // animation" branch of SearchAndBlend) rather than just currentPoseIndex
+    // because the latter is set to 0 by CompleteTransitionNow but the former
+    // remains null until the next search populates it.
+    bool IsClipLockReady() const {
+        return currentPoseIndex >= 0 && currentAnimationPtr != nullptr;
+    }
     
     /**
      * Check if motion matching is active
@@ -206,12 +264,53 @@ public:
      * Print debug info to console
      */
     void PrintDebugInfo() const;
-    
+
+    /**
+     * Aggregated stats for the Profiler / console flush.
+     * Combines KD-tree geometry, search timing, and database scale into one
+     * snapshot that creators can read at a glance.  No editor dependency —
+     * the caller (AnimatedCharacter) pushes these into the Profiler.
+     */
+    struct Stats {
+        // KD-Tree geometry
+        size_t kdTreeNodes     = 0;
+        size_t kdTreeLeaves    = 0;
+        size_t kdTreeInternal  = 0;
+        int    kdTreeMaxDepth  = 0;
+        float  kdTreeAvgLeafSize = 0.0f;
+
+        // Database scale
+        size_t poseCount       = 0;
+        size_t animationCount  = 0;
+
+        // Last-frame search metrics (from debug struct)
+        int    posesSearched   = 0;
+        float  searchTimeMs    = 0.0f;
+        float  searchScore     = 0.0f;
+
+        // SIMD
+        bool   simdAvailable   = false;
+        bool   simdActive      = false;
+
+        // Current pose
+        std::string currentClip;
+        float  currentClipTime = 0.0f;
+        float  querySpeed      = 0.0f;
+    };
+
+    Stats GetStats() const;
+
     /**
      * Get database (for testing)
      */
     MotionDatabase* GetDatabase() { return database.get(); }
     const MotionDatabase* GetDatabase() const { return database.get(); }
+
+    /**
+     * Get the KD-tree (for accessing pre-built search structures).
+     */
+    const MotionKDTree& GetSearchTree() const { return searchTree; }
+    MotionKDTree& GetSearchTree() { return searchTree; }
 
     /**
      * Get database stats
@@ -267,6 +366,115 @@ public:
      * @param blendDuration How long to blend between databases (0 = instant)
      */
     void SetDatabase(const MotionDatabase& newDatabase, float blendDuration = 0.2f);
+
+    /**
+     * Zero-allocation database switch with a pre-built search tree.
+     *
+     * Instead of rebuilding the KD-Tree every frame (the source of FPS dips
+     * during state switches), this method swaps in a reference to an
+     * externally pre-built tree. The tree is built once at load time and
+     * reused forever — the switch itself is a two-pointer address swap
+     * costing 0.00 ms.
+     *
+     * @param newDatabase       Database the caller retains ownership of
+     * @param preBuiltTree      KD-Tree already built against newDatabase's poses
+     */
+    void SetDatabaseExplicit(const MotionDatabase& newDatabase, const MotionKDTree& preBuiltTree);
+
+    /**
+     * FIX (v12 Section 2): Reset the database back to the primary owned DB and
+     * the primary pre-built KD-Tree.  Called when leaving a state (e.g. Crouch→
+     * Locomotion) so the matcher stops using the swapped-in crouch database/tree.
+     * Zero allocation — just nulls the reference pointers so the owned
+     * database.get() and searchTree are used again.
+     */
+    void ResetDatabaseExplicit();
+
+    // =========================================================================
+    // TRANSITION CLIP PLAYBACK (Structural Motion Graph — replaces instant
+    // SetDatabaseExplicit swap with pre-computed transition clips)
+    // =========================================================================
+
+    /**
+     * Play a pre-computed transition clip instead of instantly swapping
+     * databases.
+     *
+     * Structural replacement for SetDatabaseExplicit(): instead of instantly
+     * swapping the database pointer (which causes the walk→crouch snap because
+     * all bone shapes jump to the target database's keys on frame 0), this
+     * method plays a pre-baked transition clip that smoothly blends ALL joints
+     * via slerp + linear root interpolation with 2D coordinate alignment
+     * (Kovar & Gleicher §3.3, equations 1, 5, 6, 7).
+     *
+     * When the transition clip finishes, the database pointer is updated to
+     * the target database, and normal motion matching resumes from the target
+     * clip's starting pose.
+     *
+     * @param transitionClip Pre-computed transition Animation (from
+     *        MotionTransitionGraph)
+     * @param targetDatabase The database to switch to after the clip finishes
+     * @param preBuiltTree KD-tree pre-built for the target database
+     * @param targetClipIndex The pose in the target database to resume from
+     *                        (the pose the transition clip ends at)
+     */
+    void PlayTransitionClip(
+        std::shared_ptr<Animation> transitionClip,
+        const MotionDatabase& targetDatabase,
+        const MotionKDTree& preBuiltTree,
+        int targetClipIndex = -1);
+
+    /**
+     * Check if a transition clip is currently playing.
+     */
+    bool IsPlayingTransitionClip() const { return transitionClipActive; }
+
+    /**
+     * Get the target database that will be active after transition clip
+     * completes (for the HybridMMFSM to know which state it's transitioning to).
+     */
+    std::string GetTransitionTargetDatabase() const { return transitionTargetDBName; }
+
+    /**
+     * Get the target HybridState for transition tracking (as an opaque int
+     * to avoid a circular include dependency with HybridMMFSM.h).
+     */
+    int GetTransitionTargetState() const { return transitionTargetState; }
+
+    /**
+     * Force-complete the transition (switch to target database immediately).
+     * Called by HybridMMFSM when it's confident the transition has resolved.
+     */
+    void CompleteTransitionNow();
+
+    /**
+     * Set the target HybridState for transition tracking (as an opaque int
+     * to avoid a circular include dependency with HybridMMFSM.h).
+     */
+    void SetTransitionTargetState(int state) { transitionTargetState = state; }
+
+    /**
+     * Get the target pose index in the target database to resume from after
+     * the transition clip completes.
+     */
+    int GetTransitionTargetPoseIndex() const { return transitionTargetPoseIndex; }
+
+    /**
+     * Get the duration of the currently playing transition clip (seconds).
+     * Returns 0 if no clip is playing.
+     */
+    float GetTransitionClipDuration() const {
+        return transitionClipActive ? transitionClipDuration : 0.0f;
+    }
+
+    /**
+     * Get the target database pointer (for HybridMMFSM to pass to other systems).
+     */
+    const MotionDatabase* GetTargetDatabase() const { return transitionTargetDB; }
+
+    /**
+     * Get the target KD-tree pointer (for HybridMMFSM database slot lookup).
+     */
+    const MotionKDTree* GetTargetSearchTree() const { return transitionTargetTree; }
 
     /**
      * Get current database name
@@ -337,8 +545,31 @@ public:
     // space a planted foot slides backward under a walking body (the root
     // advances), which defeated every stationary/plant check. With the world
     // transform, a planted foot is genuinely stationary and the lock engages.
-    void SetCharacterModelMatrix(const glm::mat4& m) { m_modelMatrix = m; }
+    void SetCharacterModelMatrix(const glm::mat4& m) {
+        m_prevModelMatrix = m_modelMatrix;  // save prior frame's matrix
+        m_modelMatrix = m;
+        // ── Phase 1 (Retargeting): Scale-Normalize SIMD Queries ─────────
+        // Extract the uniform scale from the model matrix so SearchAndBlend
+        // can normalize query velocities to the database's asset space. A
+        // character retargeted 2× larger has root velocity that doubles in
+        // world space; without normalization the KD-tree distance treats a
+        // walk-speed query as a run (speed weight=25 → huge penalty),
+        // mis-selecting clips. Dividing by characterScale keeps the query
+        // metric scale-invariant.
+        m_characterScale = glm::max(glm::length(glm::vec3(m[0])), 0.0001f);
+    }
     const glm::mat4& GetCharacterModelMatrix() const { return m_modelMatrix; }
+    float GetCharacterScale() const { return m_characterScale; }
+
+    // Terrain heightmap (world x,z -> y) forwarded to the animator's foot IK for
+    // per-foot ground-normal tilt (todo Part 3, Option A). Set by AnimatedCharacter.
+    void SetTerrainFn(const std::function<float(float,float)>& fn) { m_terrainFn = fn; }
+
+    // PUBLIC: called by AnimatedCharacter AFTER Animator::Update() so the
+    // IK/pelvis-adjustment runs against this frame's bone positions (not
+    // the 1-frame-stale poses that caused jittery legs / stretched knees
+    // during motion-matching pose switches).
+    void ApplyFootIK(float dt);
 
 private:
     // Core systems (using unique_ptr for proper ownership)
@@ -347,6 +578,7 @@ private:
     TrajectoryPredictor trajectoryPredictor;
     FootPlantingSystem footPlanting;
     MotionKDTree searchTree;  // KD-Tree for fast search
+    const MotionKDTree* activeSearchTreeRef{nullptr};  // Pre-built tree ref for zero-alloc switches
 
     // Animator reference (order matters for initialization list)
     const Skeleton* skeleton{nullptr};  // Store skeleton for feature extraction
@@ -362,7 +594,8 @@ private:
 
     // Character state
     glm::vec3 characterPosition{0.0f};
-    glm::vec3 characterVelocity{0.0f};
+    glm::vec3 characterVelocity{0.0f};  // Model-space velocity (for KD-tree query)
+    glm::vec3 characterWorldVelocity{0.0f};  // World-space m/s (for speed-dependent smoothing)
     float characterRotation{0.0f};  // Yaw in radians
     glm::vec2 moveDirection{0.0f, 1.0f};
     bool isGrounded{true};
@@ -389,18 +622,86 @@ private:
     // Verbose per-frame logging + world-space floor height for foot IK
     bool verbose{true};
     float m_floorHeight{0.0f};
+
+    // Character scale (from model matrix), used to normalize query velocities
+    // so retargeted characters of different sizes match the same database clips.
+    float m_characterScale{1.0f};
     // World-space character transform for the foot IK (identity until the
     // caller provides it via SetCharacterModelMatrix).
     glm::mat4 m_modelMatrix{1.0f};
+    // Previous frame's world transform — needed to undo last frame's
+    // model-space bone positions correctly. Using the CURRENT frame's
+    // modelMatrix on prevBoneWorldPos computes foot velocity as if the
+    // body hadn't moved, dropping the foot-speed signal and breaking foot
+    // planting (the leg-stretching bug). See part 1 of the audit.
+    glm::mat4 m_prevModelMatrix{1.0f};
+    // Terrain heightmap forwarded from AnimatedCharacter (world x,z->y).
+    std::function<float(float,float)> m_terrainFn;
 
     // Track current animation to avoid redundant Play() calls
     Animation* currentAnimationPtr{nullptr};
 
+    // Last-known foot-contact state (gait phase). Carried across context
+    // database switches: the pose index is reset on a switch, so the first
+    // query in the new context would otherwise seed the foot-plant features
+    // to false and let the search pick an arbitrary mid-swing pose (visible
+    // pose mismatch / footskate when entering crouch). Persisting the phase
+    // makes the entry pose land in the same foot-contact state (UE motion
+    // phase across a database swap).
+    bool lastFootPlantL_{false};
+    bool lastFootPlantR_{false};
+
+    // ---- Transition Clip Playback State (Structural Motion Graph) ----
+    // When a pre-computed transition clip is playing (instead of normal
+    // KD-tree search), these fields track playback progress. Replaces the
+    // instant SetDatabaseExplicit swap with smooth all-joint blending.
+    std::shared_ptr<Animation> transitionClip;  // The pre-baked transition
+    bool transitionClipActive{false};           // Is a transition clip playing?
+    float transitionClipTime{0.0f};             // Elapsed time in transition clip
+    float transitionClipDuration{0.0f};         // Total duration of the clip
+    const MotionDatabase* transitionTargetDB{nullptr};  // DB to activate when done
+    const MotionKDTree* transitionTargetTree{nullptr};   // Tree to activate when done
+    std::string transitionTargetDBName{"Default"};
+    int transitionTargetState{0};  // Opaque HybridState (avoids circular include)
+    int transitionTargetPoseIndex{-1};  // Pose to resume at in target DB
+
+    // Clip lock mode: when true, skips KD-tree search and advances the current
+    // clip's play time at real speed. Used for smooth idle cycle playback.
+    bool clipLockActive{false};
+
     // Internal methods
     void UpdateTrajectory();
     void SearchAndBlend(float dt);
-    void ApplyFootIK(float dt);
+
     void UpdateDebugInfo();
     void UpdateDatabaseBlend(float dt);
     bool CheckStaticRoot();
+
+    /**
+     * Unreal-style clip persistence with band override, shared by the KD-tree
+     * and brute-force fallback search paths so they behave identically.
+     *
+     * Given the candidates sorted by distance, prefer the best pose in the
+     * CURRENT clip unless a different clip clearly wins: it must beat the
+     * current clip's best by the 15% distance margin, OR the query has left
+     * the current clip's nominal speed band (gait change: run<->walk,
+     * walk<->stop; band = nominalSpeed * config.speedBandFactor, min 1 m/s),
+     * OR it is moving more than config.directionBandRadians away from the
+     * clip's nominal heading (reversal / backpedal). Returns the chosen pose
+     * index (-1 if no candidates) and writes its distance to outBestDist.
+     */
+    int SelectPoseWithPersistence(const MotionDatabase* db, int currentPoseIndex,
+                                  const MotionFeatures& query,
+                                  const std::vector<KDTSearchResult>& candidates,
+                                  float& outBestDist) const;
+
+    // The database the search tree is built from: the non-owning reference
+    // (set by SetDatabase(const MotionDatabase&)) when a context switch is
+    // active, else the owned database. EVERY pose lookup (search results,
+    // persistence, debug, foot IK) must go through this - the tree indices
+    // refer to this pose array, and reading the owned database instead would
+    // index into a different array (garbage poses or out-of-bounds).
+    const MotionDatabase* EffectiveDatabase() const {
+        return currentDatabaseRef ? currentDatabaseRef : database.get();
+    }
 };

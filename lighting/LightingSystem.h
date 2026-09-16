@@ -3,6 +3,9 @@
 #include <vector>
 #include <memory>
 
+#include "lighting/LightData.h"  // GPULightData, kMaxLights, makeGpuLight/makeDirectionalLight
+#include "lighting/LightingEnvironment.h"  // #3: fallback sun sourced from an explicit env, not Instance()
+
 enum class LightType {
     DIRECTIONAL,
     POINT,
@@ -73,6 +76,16 @@ public:
     // Calculate light attenuation
     float calculateAttenuation(float distance, float constant, 
                              float linear, float quadratic) const;
+
+    // --- GPU light buffer (suggestions.txt #1) --------------------------------
+    // Packs the registered lights into a flat, std430-aligned GPULightData
+    // array capped at `cap` (<= kMaxLights). Empty -> a single directional
+    // light sourced from the passed-in `fallbackEnv`'s sun (the editor's key
+    // light), so callers always get at least one light to bind.
+    // #3: `fallbackEnv` is REQUIRED -- LightingSystem never reads the global
+    // LightingEnvironment::Instance() itself.
+    std::vector<GPULightData> buildGpuLightData(size_t cap,
+                                                const LightingEnvironment& fallbackEnv) const;
 
     // Set global lighting parameters
     void setGlobalParameters(float ambientIntensity, const glm::vec3& ambientColor);

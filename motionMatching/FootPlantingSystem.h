@@ -52,19 +52,35 @@ public:
                const glm::vec3& leftFootVel,
                const glm::vec3& rightFootVel,
                float groundHeight,
-               const MotionMatchingConfig& config);
+               const MotionMatchingConfig& config,
+               float dt);
     
     /**
      * Check if foot is currently planted
      */
-    bool IsLeftFootPlanted() const { return leftFoot.planted; }
-    bool IsRightFootPlanted() const { return rightFoot.planted; }
+    bool IsLeftFootPlanted() const { return leftFoot.isLocked; }
+    bool IsRightFootPlanted() const { return rightFoot.isLocked; }
     
     /**
      * Get planted foot position (world space, locked)
      */
-    glm::vec3 GetLeftFootPosition() const { return leftFoot.plantPosition; }
-    glm::vec3 GetRightFootPosition() const { return rightFoot.plantPosition; }
+    glm::vec3 GetLeftFootPosition() const { return leftFoot.plantedWorldPos; }
+    glm::vec3 GetRightFootPosition() const { return rightFoot.plantedWorldPos; }
+
+    /**
+     * Set planted foot position (world space, locked). Used by the
+     * MotionMatcher pelvis-damping pass to apply low-frequency smoothing
+     * on the ground tracking positions during idle loops (Fix 3 from
+     * updated todo).
+     */
+    void SetLeftFootPlantedPosition(const glm::vec3& pos) { leftFoot.plantedWorldPos = pos; }
+    void SetRightFootPlantedPosition(const glm::vec3& pos) { rightFoot.plantedWorldPos = pos; }
+    
+    /**
+     * Get lock weight (0 = free, 1 = fully locked, decaying otherwise)
+     */
+    float GetLeftFootLockWeight() const { return leftFoot.lockWeight; }
+    float GetRightFootLockWeight() const { return rightFoot.lockWeight; }
     
     // =========================================================================
     // IK TARGETS
@@ -104,22 +120,22 @@ public:
      * Foot state for debugging
      */
     struct FootDebugInfo {
-        bool planted;
+        bool isLocked;
         glm::vec3 position;
-        glm::vec3 plantPosition;
+        glm::vec3 plantedWorldPos;
         float velocity;
         float height;
         float plantTimer;
     };
     
     FootDebugInfo GetLeftFootDebug() const { 
-        return {leftFoot.debug.planted, leftFoot.debug.position, 
-                leftFoot.debug.plantPosition, leftFoot.debug.velocity,
+        return {leftFoot.debug.isLocked, leftFoot.debug.position, 
+                leftFoot.debug.plantedWorldPos, leftFoot.debug.velocity,
                 leftFoot.debug.height, leftFoot.debug.plantTimer}; 
     }
     FootDebugInfo GetRightFootDebug() const { 
-        return {rightFoot.debug.planted, rightFoot.debug.position, 
-                rightFoot.debug.plantPosition, rightFoot.debug.velocity,
+        return {rightFoot.debug.isLocked, rightFoot.debug.position, 
+                rightFoot.debug.plantedWorldPos, rightFoot.debug.velocity,
                 rightFoot.debug.height, rightFoot.debug.plantTimer}; 
     }
     
@@ -129,12 +145,13 @@ private:
      */
     struct FootState {
         // Current state
-        bool planted{false};
+        bool isLocked{false};           // Is the foot firmly planted (IK locked)
+        float lockWeight{0.0f};         // Smooth blend factor 0→1 (release ramp)
         glm::vec3 position{0.0f};
         glm::vec3 velocity{0.0f};
         
         // Plant data
-        glm::vec3 plantPosition{0.0f};
+        glm::vec3 plantedWorldPos{0.0f}; // World-space anchor where foot planted
         float plantTimer{0.0f};           // How long foot has been planted
         float releaseTimer{0.0f};         // Cooldown before can plant again
         
@@ -144,14 +161,19 @@ private:
         
         // Debug info
         struct {
-            bool planted;
+            bool isLocked;
             glm::vec3 position;
-            glm::vec3 plantPosition;
+            glm::vec3 plantedWorldPos;
             float velocity;
             float height;
             float plantTimer;
         } debug;
         
+        // EMV deadband state (Fix 2 from updated todo: statistically-gated
+        // plant confirmation replacing magic-number velocity thresholds).
+        float speedMean = 0.0f;
+        float speedVariance = 0.0f;
+
         /**
          * Update foot state
          */

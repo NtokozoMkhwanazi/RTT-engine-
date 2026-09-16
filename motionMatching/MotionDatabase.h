@@ -1,5 +1,6 @@
 #pragma once
 #include "MotionMatchingTypes.h"
+#include "MotionKDTreeSIMD.h"
 #include "../animationSystem/Animation.h"
 #include "../boneSystem/Skeleton.h"
 #include <vector>
@@ -278,6 +279,21 @@ public:
         int maxCandidates = 10,
         int airborneFilter = -1) const;
 
+    // ---- AVX2 SIMD-accelerated search ---------------------------------------
+    // Builds an aligned SoA snapshot of the database and runs an 8-wide
+    // AVX2 distance evaluator.  Falls back gracefully if the CPU lacks AVX2.
+    // The SoA cache is rebuilt only when the database changes (dirty flag).
+    std::vector<std::pair<int, float>> SearchSIMD(
+        const MotionFeatures& query,
+        const Trajectory& trajectory,
+        int maxCandidates = 10,
+        int airborneFilter = -1) const;
+
+    /**
+     * Check if the SIMD database cache needs rebuilding
+     */
+    void RebuildSIMDCacheIfNeeded() const;
+
     // =========================================================================
     // POSE ACCESS
     // =========================================================================
@@ -311,6 +327,45 @@ public:
         if (index >= animations.size()) return std::string();
         return animations[index].name;
     }
+
+    /**
+     * Get the pose range [startPoseIndex, endPoseIndex] for the animation
+     * at the given index. Used by MotionMatcher to derive a time-aligned
+     * pose index inside an animation clip (instead of re-running the KD-tree
+     * on every frame during rest).
+     */
+    void GetPoseRange(size_t index, size_t& outStart, size_t& outEnd) const {
+        if (index >= animations.size()) {
+            outStart = 0;
+            outEnd = 0;
+            return;
+        }
+        outStart = animations[index].startPoseIndex;
+        outEnd = animations[index].endPoseIndex;
+    }
+
+    /**
+     * Nominal (authored) gait speed of a clip - the mean root-motion speed
+     * feature over its poses. Used by the matcher's persistence hysteresis
+     * to detect speed-band state changes (run<->walk, walk<->stop) and
+     * switch clips immediately instead of waiting for the 15% distance
+     * margin. Lazily computed once and cached (so clips added later still
+     * work); cache is dropped on Clear().
+     */
+    float GetClipNominalSpeed(size_t animIndex) const;
+
+    /**
+     * Nominal (authored) move direction of a clip - the circular mean of its
+     * poses' moveAngle features (the angle in clip/root space the root motion
+     * points). Used by the matcher's persistence hysteresis to detect
+     * direction-away state changes (reversal / backpedal: the query is moving
+     * AWAY from the clip's heading) and switch clips immediately instead of
+     * waiting for the 15% distance margin. Computed as a circular mean (the
+     * unit vectors are averaged, not the raw angles) so turn clips that sweep
+     * across the +/-pi seam don't average out to a wrong heading. Lazily
+     * computed once and cached; cache is dropped on Clear().
+     */
+    float GetClipNominalMoveAngle(size_t animIndex) const;
 
     /**
      * Does this database contain airborne (Jump/Fall) poses?
@@ -367,9 +422,38 @@ private:
     std::vector<AnimationEntry> animations;     // All animations
     std::unordered_map<std::string, size_t> animationByName;  // Name → index
 
+    // Per-animation nominal gait speed cache (see GetClipNominalSpeed);
+    // -1.0f = not computed yet. Mutable so it can be filled from a const
+    // accessor; size must match animations.size() whenever filled.
+    mutable std::vector<float> clipNominalSpeeds_;
+
+    // Per-animation nominal move-angle cache (see GetClipNominalMoveAngle);
+    // std::numeric_limits<float>::max() = not computed yet (angles can be any
+    // radian value, including -1, so a plain -1 sentinel is unusable). Mutable
+    // so it can be filled from a const accessor; size must match
+    // animations.size() whenever filled.
+    mutable std::vector<float> clipNominalMoveAngles_;
+
+    // ---- AVX2 SIMD search cache (rebuilt when poses change) ----------------
+    mutable struct SIMDCache {
+        mutable SIMDMotionDatabaseSoA soa;
+        mutable bool                  valid = false;
+        mutable size_t                poseCount = 0;
+    } simdCache_;
+
     // Feature extraction helpers
     void ExtractPoseFeatures(size_t poseIndex, std::shared_ptr<Animation> anim, float time,
                             const class Skeleton* skeleton);
+
+    // FIX (v11 Section 3): AVX2-accelerated trajectory feature extraction.
+    // Vectorizes the future-path look-ahead (4 sample points in a single
+    // _mm256_sub_ps) instead of looping scalar. Caller must guard with
+    // cpuSupportsAVX2() — falls back to ExtractPoseFeatures otherwise.
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((target("avx2,fma")))
+#endif
+    void ExtractPoseFeaturesSIMD(size_t poseIndex, std::shared_ptr<Animation> anim,
+                                 float time, float rootPos_x, float rootPos_z);
 
     /**
      * Calculate pose score (lower = better match)

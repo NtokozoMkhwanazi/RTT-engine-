@@ -3,6 +3,19 @@
 #include <glm/glm.hpp>
 #include <memory>
 
+/**
+ * \brief Legacy constraint interface (deprecated).
+ *
+ * \deprecated The legacy `Constraint` / `PhysicsWorld::addConstraint` pipeline is
+ * superseded by the velocity-Level Jacobian constraint framework in
+ * `physicsSystem/VelocityConstraints.h`. New joints should register through
+ * `PhysicsWorld::addHingeConstraint(...)` and the opt-in velocity-constraint
+ * pass in `PhysicsWorld::step`. The legacy classes are retained (and
+ * `[[deprecated]]`) only for backwards compatibility; they will be removed
+ * once all call sites migrate. Note the legacy solver is position-based and
+ * ignores angular velocity, so it is intentionally less correct than
+ * `vel::ConstraintSolver`.
+ */
 class Constraint {
 public:
     virtual ~Constraint() = default;
@@ -12,9 +25,15 @@ public:
 };
 
 // Joint constraint that connects two rigid bodies
-class JointConstraint : public Constraint {
+// [[deprecated]] — superseded by the velocity-Level Jacobian solver in
+// physicsSystem/VelocityConstraints.h. New code should use
+//   PhysicsWorld::addHingeConstraint(...) / vel::ConstraintSolver
+// (a 5-DOF block-mass-matrix revolute joint). The legacy position-based solver
+// ignores angular velocity and is retained only for backwards compatibility.
+class [[deprecated("use vel::ConstraintSolver / PhysicsWorld::addHingeConstraint")]]
+JointConstraint : public Constraint {
 public:
-    JointConstraint(std::shared_ptr<RigidBody> bodyA, std::shared_ptr<RigidBody> bodyB, 
+    JointConstraint(std::shared_ptr<RigidBody> bodyA, std::shared_ptr<RigidBody> bodyB,
                    const glm::vec3& anchorA, const glm::vec3& anchorB)
         : bodyA(bodyA), bodyB(bodyB), anchorA(anchorA), anchorB(anchorB) {
             // Calculate initial rest distance based on current positions
@@ -51,7 +70,9 @@ private:
 };
 
 // Distance constraint that maintains a fixed distance between two points
-class DistanceConstraint : public Constraint {
+// [[deprecated]] — superseded by vel::ConstraintSolver::addDistanceConstraint.
+class [[deprecated("use vel::ConstraintSolver::addDistanceConstraint")]]
+DistanceConstraint : public Constraint {
 public:
     DistanceConstraint(std::shared_ptr<RigidBody> bodyA, std::shared_ptr<RigidBody> bodyB,
                       const glm::vec3& pointA, const glm::vec3& pointB, float distance)
@@ -67,7 +88,10 @@ private:
 };
 
 // Spring constraint that applies spring forces between two bodies
-class SpringConstraint : public Constraint {
+// [[deprecated]] — superseded by vel::ConstraintSolver (distance joint with a
+// stiffness parameter). Kept for backwards compatibility only.
+class [[deprecated("use vel::ConstraintSolver::addDistanceConstraint")]]
+SpringConstraint : public Constraint {
 public:
     SpringConstraint(std::shared_ptr<RigidBody> bodyA, std::shared_ptr<RigidBody> bodyB,
                     const glm::vec3& anchorA, const glm::vec3& anchorB, float restLength)

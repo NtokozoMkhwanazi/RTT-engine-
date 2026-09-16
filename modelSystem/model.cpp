@@ -7,6 +7,7 @@
 #include "boneSystem/BoneName.h"
 #include "renderer/DefaultTexture.h"
 #include "renderer/Renderer.h"
+#include "../editor/gl_context_lifecycle.h"
 #include "TextureCompression.h"
 
 #include <iostream>
@@ -21,9 +22,71 @@
 #include <glm/gtx/quaternion.hpp>
 #include <glm/gtx/string_cast.hpp>
 
+#include <OpenEXR/ImfInputFile.h>
+#include <OpenEXR/ImfChannelList.h>
+#include <OpenEXR/ImfFrameBuffer.h>
+#include <OpenEXR/ImfHeader.h>
+#include <Imath/half.h>
+
 // =====================================================
 // Utility
 // =====================================================
+
+// Decode a native linear-HDR OpenEXR map into RGBA8 pixels (row 0 = TOP,
+// matching the stbi-flipped JPG loads and the RHI texture convention). Reads
+// R/G/B/A (or single-channel Y) half data via the system OpenEXR library -
+// stb_image cannot decode EXR. Returns false on any failure so the caller
+// falls back to the referenced (JPG/PNG) file.
+static bool LoadEXRPixelsRGBA8(const std::string& path, int& outW, int& outH,
+                               std::vector<uint8_t>& outRGBA) {
+    try {
+        Imf::InputFile file(path.c_str());
+        const Imath::Box2i& dw = file.header().dataWindow();
+        const int w = dw.max.x - dw.min.x + 1;
+        const int h = dw.max.y - dw.min.y + 1;
+        if (w <= 0 || h <= 0) return false;
+
+        // Zero-filled RGBA half buffer: channels missing from the file (e.g.
+        // a single-channel roughness EXR) read as 0 / alpha defaults to 1.
+        std::vector<half> pixels(static_cast<size_t>(w) * h * 4, half(0.0f));
+        for (size_t i = 3; i < pixels.size(); i += 4) pixels[i] = half(1.0f);
+        const int xStride = static_cast<int>(sizeof(half) * 4);
+        const int64_t yStride = static_cast<int64_t>(xStride) * w;
+        const char* base = reinterpret_cast<const char*>(pixels.data()) -
+                           (dw.min.x + static_cast<int64_t>(dw.min.y) * w) * xStride;
+        Imf::FrameBuffer fb;
+        const Imf::ChannelList& chans = file.header().channels();
+        auto addChan = [&](const char* name, int comp) {
+            if (chans.findChannel(name))
+                fb.insert(name, Imf::Slice(Imf::HALF,
+                                           const_cast<char*>(base) + comp * sizeof(half),
+                                           xStride, yStride));
+        };
+        addChan("R", 0); addChan("G", 1); addChan("B", 2); addChan("A", 3);
+        // Single-channel EXRs (roughness stores its value in "Y") still fill
+        // the red component.
+        if (!chans.findChannel("R")) addChan("Y", 0);
+        file.setFrameBuffer(fb);
+        file.readPixels(dw.min.y, dw.max.y);
+
+        outW = w;
+        outH = h;
+        outRGBA.resize(static_cast<size_t>(w) * h * 4);
+        // OpenEXR's origin is bottom-left: flip vertically so row 0 is the
+        // image TOP (the RHI texture convention / stbi-flipped loads).
+        for (int y = 0; y < h; ++y) {
+            const size_t src = static_cast<size_t>(h - 1 - y) * w * 4;
+            const size_t dst = static_cast<size_t>(y) * w * 4;
+            for (size_t i = 0; i < static_cast<size_t>(w) * 4; ++i) {
+                outRGBA[dst + i] = static_cast<uint8_t>(
+                    std::clamp(float(pixels[src + i]) * 255.0f, 0.0f, 255.0f));
+            }
+        }
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
 
 // Forward declaration - defined near the hierarchy builders below.
 static void BuildCollapsedHierarchyStatic(AssimpNodeData &dest, const aiNode *src);
@@ -181,9 +244,11 @@ Model::Model(const std::string &path)
 
 Model::~Model()
 {
-    // OpenGL resources are cleaned up automatically when context is destroyed
-    // Bone texture will be cleaned up when OpenGL context is destroyed
-    if (boneTexID != 0) {
+    // OpenGL resources are cleaned up automatically when context is destroyed.
+    // Guard on glctx::isAlive(): global model caches (ResourceManager) are
+    // destroyed at static-destruction time, AFTER the RHI has torn down the
+    // context - issuing GL calls there is a SIGSEGV.
+    if (boneTexID != 0 && glctx::isAlive()) {
         glDeleteTextures(1, &boneTexID);
     }
 }
@@ -317,11 +382,16 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
                 }
             }
             
-            // Extract bone weights
-            extractBoneWeightsStatic(rawMesh.vertices, mesh, data->skeleton);
-            
-            // Extract bone references
+            // Extract bone references FIRST (populates skeleton.boneMapping) so
+            // extractBoneWeightsStatic can look up bone indices. This matches the
+            // sync path (processMesh: ExtractBones before extractBoneWeights).
+            // The previous order (weights before bones) left boneMapping empty
+            // for the first mesh, forcing every vertex BoneID to -1 → no skinning
+            // applied → vertices stuck in bind-pose T-pose.
             ExtractBonesStatic(mesh, data->skeleton);
+
+            // Extract bone weights (now boneMapping is populated)
+            extractBoneWeightsStatic(rawMesh.vertices, mesh, data->skeleton);
             
             // Process material
             PBRMaterial pbrMat;
@@ -334,7 +404,11 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
                     pbrMat.albedo = glm::vec3(diffuse.r, diffuse.g, diffuse.b);
                 }
                 
-                // Collect texture paths (not loading them yet)
+                // Collect texture paths (not loading them yet). Assimp uses
+                // "*N" for embedded textures (GLB / embedded GLTF) - do NOT
+                // prepend the directory to those, or the embedded-texture
+                // lookup in Step 4 (texPath[0] == '*') will never match and
+                // every texture falls back to grey.
                 auto addTexturePath = [&](aiTextureType type, const std::string& typeName) {
                     if (material->GetTextureCount(type) > 0) {
                         aiString str;
@@ -343,8 +417,15 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
                         std::replace(texPath.begin(), texPath.end(), '\\', '/');
                         size_t fbmPos = texPath.find(".fbm/");
                         if (fbmPos != std::string::npos) texPath = texPath.substr(fbmPos + 5);
-                        std::string fullPath = dir + "/" + texPath;
-                        rawMesh.texturePaths.emplace_back(fullPath, typeName);
+                        // Embedded texture? Keep the raw "*N" path so Step 4
+                        // can index scene->mTextures. External file? Resolve
+                        // relative to the model directory.
+                        if (!texPath.empty() && texPath[0] == '*') {
+                            rawMesh.texturePaths.emplace_back(texPath, typeName);
+                        } else {
+                            std::string fullPath = dir + "/" + texPath;
+                            rawMesh.texturePaths.emplace_back(fullPath, typeName);
+                        }
                     }
                 };
                 
@@ -397,22 +478,150 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
                     texturePathToIndex[texPath] = data->textures.size();
                     allTexturePaths.emplace_back(texPath, type);
                     
-                    // Load texture pixels on background thread
-                    int w, h, c;
-                    stbi_set_flip_vertically_on_load(true);
-                    unsigned char* imgData = stbi_load(texPath.c_str(), &w, &h, &c, 0);
-                    
                     TexturePixelData texData;
                     texData.path = texPath;
                     texData.type = type;
                     texData.isNormalMap = (type == "normal");
                     
-                    if (imgData) {
-                        texData.width = w;
-                        texData.height = h;
-                        texData.channels = c;
-                        texData.data.assign(imgData, imgData + w * h * c);
-                        stbi_image_free(imgData);
+                    // --- Embedded texture support ---
+                    // Mixamo/FBX models embed textures (referenced by "*N"
+                    // index or a ".fbm/" path that doesn't exist on disk).
+                    // stbi_load only handles real files on disk, so we must
+                    // also consult scene->mTextures - exactly as the sync path
+                    // does via loadEmbeddedTexture / findEmbeddedTexture.
+                    if (!texPath.empty() && texPath[0] == '*') {
+                        // "*N" → direct index into the embedded texture array
+                        try {
+                            const size_t idx = std::stoul(texPath.substr(1));
+                            if (idx < scene->mNumTextures && scene->mTextures[idx]) {
+                                const aiTexture* at = scene->mTextures[idx];
+                                if (at->mHeight == 0 && at->pcData) {
+                                    // Compressed (PNG/JPEG): decode in memory
+                                    int w2 = 0, h2 = 0, c2 = 0;
+                                    stbi_set_flip_vertically_on_load(true);
+                                    if (unsigned char* d = stbi_load_from_memory(
+                                            reinterpret_cast<const unsigned char*>(at->pcData),
+                                            static_cast<int>(at->mWidth), &w2, &h2, &c2, 0)) {
+                                        texData.width = w2; texData.height = h2; texData.channels = c2;
+                                        texData.data.assign(d, d + (size_t)w2 * h2 * c2);
+                                        stbi_image_free(d);
+                                    } else {
+                                        // EXR/HDR embedded texture: use float loader
+                                        // (stbi_load_from_memory doesn't support EXR)
+                                        int fw=0,fh=0,fc=0;
+                                        stbi_set_flip_vertically_on_load(true);
+                                        if (float* fd = stbi_loadf_from_memory(
+                                                reinterpret_cast<const unsigned char*>(at->pcData),
+                                                static_cast<int>(at->mWidth), &fw, &fh, &fc, 4)) {
+                                            texData.width = fw; texData.height = fh; texData.channels = 4;
+                                            texData.data.resize((size_t)fw * fh * 4);
+                                            for (size_t i = 0; (int)i < fw * fh * 4; ++i)
+                                                texData.data[i] = (uint8_t)std::clamp(fd[i] * 255.0f, 0.0f, 255.0f);
+                                            stbi_image_free(fd);
+                                        }
+                                    }
+                                } else if (at->mHeight > 0 && at->pcData) {
+                                    // Uncompressed raw RGBA
+                                    texData.width = (int)at->mWidth;
+                                    texData.height = (int)at->mHeight;
+                                    texData.channels = 4;
+                                    texData.data.assign(
+                                        reinterpret_cast<const uint8_t*>(at->pcData),
+                                        reinterpret_cast<const uint8_t*>(at->pcData) + (size_t)at->mWidth * at->mHeight * 4);
+                                }
+                            }
+                        } catch (...) {}
+                    }
+                    
+                    // If not embedded or not yet decoded, try disk. Prefer the
+                    // native EXR source when a sibling exists: the shipped props
+                    // carry 8-bit JPG copies (what the glTF/FBX references) PLUS
+                    // the original linear-HDR EXR maps (same basename, .exr
+                    // extension). The EXR is the "actual" texture - decode it
+                    // with the OpenEXR loader so the engine consumes the real
+                    // source pixels instead of the compressed JPG stand-in, and
+                    // fall back to the referenced path when no EXR is present
+                    // (albedo maps, for example, are JPG-only).
+                    if (texData.data.empty()) {
+                        std::string exrPath;
+                        const size_t dot = texPath.find_last_of('.');
+                        if (dot != std::string::npos &&
+                            texPath.compare(dot, 5, ".exr") != 0) {
+                            exrPath = texPath.substr(0, dot) + ".exr";
+                        }
+                        int w = 0, h = 0, c = 0;
+                        if (!exrPath.empty() &&
+                            LoadEXRPixelsRGBA8(exrPath, w, h, texData.data)) {
+                            texData.width = w;
+                            texData.height = h;
+                            texData.channels = 4;
+                        } else {
+                            stbi_set_flip_vertically_on_load(true);
+                            if (unsigned char* imgData = stbi_load(texPath.c_str(), &w, &h, &c, 0)) {
+                                texData.width = w;
+                                texData.height = h;
+                                texData.channels = c;
+                                texData.data.assign(imgData, imgData + (size_t)w * h * c);
+                                stbi_image_free(imgData);
+                            } else {
+                                // HDR on disk (Radiance .hdr): stbi_load doesn't
+                                // support it, so try the float loader and
+                                // convert to uint8 RGBA.
+                                int fw=0, fh=0, fc=0;
+                                if (float* fd = stbi_loadf(texPath.c_str(), &fw, &fh, &fc, 4)) {
+                                    texData.width = fw; texData.height = fh; texData.channels = 4;
+                                    texData.data.resize((size_t)fw * fh * 4);
+                                    for (size_t i = 0; (int)i < fw * fh * 4; ++i)
+                                        texData.data[i] = (uint8_t)std::clamp(fd[i] * 255.0f, 0.0f, 255.0f);
+                                    stbi_image_free(fd);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // If disk load failed, try matching by basename against
+                    // embedded textures (same logic as findEmbeddedTexture).
+                    if (texData.data.empty()) {
+                        auto basenameLower = [](std::string s) {
+                            const size_t slash = s.find_last_of("/\\");
+                            if (slash != std::string::npos) s = s.substr(slash + 1);
+                            for (char& c : s) c = (char)std::tolower((unsigned char)c);
+                            return s;
+                        };
+                        const std::string want = basenameLower(texPath);
+                        if (!want.empty()) {
+                            for (unsigned i = 0; i < scene->mNumTextures; ++i) {
+                                const aiTexture* t = scene->mTextures[i];
+                                if (!t) continue;
+                                if (t->mFilename.length > 0 && basenameLower(t->mFilename.C_Str()) == want) {
+                                    if (t->mHeight == 0 && t->pcData) {
+                                        int w2 = 0, h2 = 0, c2 = 0;
+                                        stbi_set_flip_vertically_on_load(true);
+                                        if (unsigned char* d = stbi_load_from_memory(
+                                                reinterpret_cast<const unsigned char*>(t->pcData),
+                                                static_cast<int>(t->mWidth), &w2, &h2, &c2, 0)) {
+                                            texData.width = w2; texData.height = h2; texData.channels = c2;
+                                            texData.data.assign(d, d + (size_t)w2 * h2 * c2);
+                                            stbi_image_free(d);
+                                        } else {
+                                            // EXR/HDR embedded: float loader + convert
+                                            int fw=0,fh=0,fc=0;
+                                            stbi_set_flip_vertically_on_load(true);
+                                            if (float* fd = stbi_loadf_from_memory(
+                                                    reinterpret_cast<const unsigned char*>(t->pcData),
+                                                    static_cast<int>(t->mWidth), &fw, &fh, &fc, 4)) {
+                                                texData.width = fw; texData.height = fh; texData.channels = 4;
+                                                texData.data.resize((size_t)fw * fh * 4);
+                                                for (size_t i = 0; (int)i < fw * fh * 4; ++i)
+                                                    texData.data[i] = (uint8_t)std::clamp(fd[i] * 255.0f, 0.0f, 255.0f);
+                                                stbi_image_free(fd);
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
                     
                     data->textures.push_back(std::move(texData));
@@ -619,28 +828,39 @@ void Model::setupFromAsyncData(std::unique_ptr<AsyncModelData> data, std::string
         
         // Set default textures if needed
         if (!mat.hasAlbedoMap) { mat.albedoMap = DefaultTexture::GetGreyTexture(); mat.hasAlbedoMap = true; }
-        if (!mat.hasNormalMap) { mat.normalMap = DefaultTexture::GetWhiteTexture(); mat.hasNormalMap = true; }
+        if (!mat.hasNormalMap) { mat.normalMap = DefaultTexture::GetFlatNormalTexture(); mat.hasNormalMap = true; }
         if (!mat.hasMetallicMap) { mat.metallicMap = DefaultTexture::GetGreyTexture(); mat.hasMetallicMap = true; }
         if (!mat.hasRoughnessMap) { mat.roughnessMap = DefaultTexture::GetGreyTexture(); mat.hasRoughnessMap = true; }
         if (!mat.hasAOMap) { mat.aoMap = DefaultTexture::GetGreyTexture(); mat.hasAOMap = true; }
     }
 
-    // CRITICAL FIX: propagate the loaded albedo texture into the mesh's
-    // texture list. Mesh::Draw binds meshes[i].textures as texture_diffuse1
-    // (the FS samples it), but the meshes were created above WITHOUT textures,
-    // so animated models drew with zero bound textures and the fragment
-    // shader sampled whatever was still on unit 0 - the terrain heightmap
-    // (GL_R32F = red) - which is why the bot rendered solid red instead of
-    // its real material.
+    // CRITICAL FIX: push the FULL PBR texture set into each mesh's texture list,
+    // matching the sync path in processMesh (pushMap). Mesh::Draw binds
+    // mesh.textures as texture_<semantic>N samplers, so if normal/metallic/
+    // roughness/ao are missing from this list the shader samples whatever was
+    // stale on those texture units — cross-contaminated maps from previously-
+    // drawn meshes, which is why "some parts aren't properly textured" (flat
+    // Minecraft shading, wrong normals, incorrect metal/roughness). Each
+    // semantic is guaranteed present via the per-mesh pushMap with safe
+    // fallbacks, so no shader ever reads an unbound or stale sampler.
     for (size_t meshIdx = 0; meshIdx < meshes.size() && meshIdx < meshMaterials.size(); ++meshIdx) {
         const auto& mat = meshMaterials[meshIdx];
-        if (mat.albedoMap != 0) {
-            Texture tex;
-            tex.id = mat.albedoMap;
-            tex.type = "diffuse";
-            tex.textureType = Texture::Type::DIFFUSE;
-            meshes[meshIdx].textures.push_back(tex);
-        }
+        auto pushMap = [&](unsigned int id, unsigned int fallback,
+                           const char* semantic, Texture::Type texType) {
+            unsigned int texId = (id != 0) ? id : fallback;
+            if (texId != 0) {
+                Texture tex;
+                tex.id = texId;
+                tex.type = semantic;
+                tex.textureType = texType;
+                meshes[meshIdx].textures.push_back(tex);
+            }
+        };
+        pushMap(mat.albedoMap,     DefaultTexture::GetGreyTexture(),          "diffuse",  Texture::Type::DIFFUSE);
+        pushMap(mat.normalMap,     DefaultTexture::GetFlatNormalTexture(),    "normal",   Texture::Type::NORMAL);
+        pushMap(mat.metallicMap,   DefaultTexture::GetBlackTexture(),         "metallic", Texture::Type::METALLIC);
+        pushMap(mat.roughnessMap,  DefaultTexture::GetGreyTexture(),          "roughness",Texture::Type::ROUGHNESS);
+        pushMap(mat.aoMap,         DefaultTexture::GetWhiteTexture(),          "ao",       Texture::Type::AO);
     }
     
     // Copy skeleton and animation data
@@ -672,40 +892,64 @@ unsigned int Model::uploadTextureFromPixels(const TexturePixelData& texData)
     }
     
     unsigned int texID;
-    glGenTextures(1, &texID);
-    glBindTexture(GL_TEXTURE_2D, texID);
-    
+    // Direct State Access (glCreateTextures / glTextureStorage2D, OpenGL 4.5+
+    // core / ARB_direct_state_access, loaded by the GLAD 4.6 loader): allocates
+    // immutable storage without binding. The bind below is kept only to
+    // preserve the prior observable bind state for callers; all setup is DSA.
+    glCreateTextures(GL_TEXTURE_2D, 1, &texID);
+    glBindTexture(GL_TEXTURE_2D, texID);  // preserve prior bind semantics
+
     bool isNormalMap = texData.isNormalMap;
-    GLenum format;
-    GLenum internalFormat;
-    
+    GLenum pixelFormat;          // source transfer format (unsized OK here)
+    GLenum internalFormat;       // SIZED format - required by glTextureStorage2D
+
     if (texData.channels == 1) {
-        format = GL_RED;
-        internalFormat = GL_RED;
+        pixelFormat = GL_RED;
+        internalFormat = GL_R8;
     } else if (texData.channels == 2) {
-        format = GL_RG;
-        internalFormat = GL_RG;
+        pixelFormat = GL_RG;
+        internalFormat = GL_RG8;
     } else if (texData.channels == 3) {
-        format = GL_RGB;
-        internalFormat = isNormalMap ? GL_RGB : GL_SRGB;
+        pixelFormat = GL_RGB;
+        internalFormat = isNormalMap ? GL_RGB8 : GL_SRGB8;
     } else {
-        format = GL_RGBA;
-        internalFormat = isNormalMap ? GL_RGBA : GL_SRGB_ALPHA;
+        pixelFormat = GL_RGBA;
+        internalFormat = isNormalMap ? GL_RGBA8 : GL_SRGB8_ALPHA8;
     }
-    
-    glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, texData.width, texData.height, 0, format, GL_UNSIGNED_BYTE, texData.data.data());
-    glGenerateMipmap(GL_TEXTURE_2D);
-    
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    
+
+    // Full mip chain (glGenerateTextureMipmap below).
+    GLsizei levels = 1;
+    for (int d = (texData.width > texData.height ? texData.width : texData.height);
+         d >>= 1; ++levels) {
+    }
+
+    glTextureStorage2D(texID, levels, internalFormat, texData.width, texData.height);
+    glTextureSubImage2D(texID, 0, 0, 0, texData.width, texData.height,
+                        pixelFormat, GL_UNSIGNED_BYTE, texData.data.data());
+    glGenerateTextureMipmap(texID);
+
+    glTextureParameteri(texID, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTextureParameteri(texID, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTextureParameteri(texID, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTextureParameteri(texID, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
     if (isNormalMap) {
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTextureParameteri(texID, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTextureParameteri(texID, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     }
-    
+
+    // Anisotropic filtering via DSA. ARB_texture_filter_anisotropic is core since
+    // OpenGL 4.6 (GLAD 4.6 loader): samples a wider footprint at grazing angles,
+    // removing shimmer on ground decals, terrain and the character albedo /
+    // normal / metallic / roughness maps at no extra draw cost. Cap at the
+    // hardware max (typically 16x); on a <4.6 fallback the GLAD flag is false.
+    if (GLAD_GL_ARB_texture_filter_anisotropic) {
+        GLfloat maxAniso = 1.0f;
+        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAniso);
+        if (maxAniso > 1.0f)
+            glTextureParameterf(texID, GL_TEXTURE_MAX_ANISOTROPY, maxAniso);
+    }
+
     return texID;
 }
 
@@ -1076,39 +1320,56 @@ Mesh Model::processMesh(aiMesh *mesh, const aiScene *scene)
     ExtractBones(mesh, m_Skeleton.rootNode);
     extractBoneWeights(vertices, mesh);
 
-    // Process PBR materials
+    // Process PBR materials. processMaterial already substitutes safe defaults
+    // for any map that failed to load (flat normal, black metallic, grey
+    // roughness, white AO), so the values below are always valid GL texture
+    // objects. The simple (VS/FS) and PBR (pbrVS/pbrFS) shaders both sample
+    // texture_<semantic>1, so we bind the full map set through the mesh's
+    // texture list. (Previously only albedo was pushed here, leaving the normal/
+    // roughness/ao samplers UNBOUND - flat "Minecraft" shading in BOTH paths.)
+    PBRMaterial pbrMat;
     if (mesh->mMaterialIndex != static_cast<unsigned int>(-1))
     {
         aiMaterial *material = scene->mMaterials[mesh->mMaterialIndex];
-        PBRMaterial pbrMat = processMaterial(material, directory);
-        meshMaterials.push_back(pbrMat);
-        // CRITICAL FIX: Mesh::Draw binds meshes[i].textures as texture_diffuse1
-        // (the FS samples it). Without this the mesh draws with zero bound
-        // textures and the fragment shader samples whatever is still on unit 0
-        // (the terrain heightmap, GL_R32F = red) - the "red bot" bug.
-        if (pbrMat.albedoMap != 0) {
-            Texture tex;
-            tex.id = pbrMat.albedoMap;
-            tex.type = "diffuse";
-            tex.textureType = Texture::Type::DIFFUSE;
-            textures.push_back(tex);
-        }
+        pbrMat = processMaterial(material, directory, scene);
     }
     else
     {
-        // Default material
-        PBRMaterial pbrMat;
-        pbrMat.albedoMap = DefaultTexture::GetGreyTexture();
-        pbrMat.hasAlbedoMap = true;
-        meshMaterials.push_back(pbrMat);
-        if (pbrMat.albedoMap != 0) {
+        // Default material: grey albedo, flat normal, black metallic, grey
+        // roughness, white AO -> renders lit but neutral (no regression).
+        pbrMat.albedoMap     = DefaultTexture::GetGreyTexture();
+        pbrMat.normalMap     = DefaultTexture::GetFlatNormalTexture();
+        pbrMat.metallicMap   = DefaultTexture::GetBlackTexture();
+        pbrMat.roughnessMap  = DefaultTexture::GetGreyTexture();
+        pbrMat.aoMap         = DefaultTexture::GetWhiteTexture();
+        pbrMat.hasAlbedoMap    = true;
+        pbrMat.hasNormalMap    = true;
+        pbrMat.hasMetallicMap  = true;
+        pbrMat.hasRoughnessMap = true;
+        pbrMat.hasAOMap        = true;
+    }
+    meshMaterials.push_back(pbrMat);
+
+    // Bind the full PBR texture set to the mesh. mesh.cpp names each sampler
+    // texture_<semantic><N> (per-type index) and binds it to a compact texture
+    // unit, which is exactly what pbrFS.glsl/FS.glsl sample
+    // (texture_diffuse1, texture_normal1, texture_metallic1,
+    //  texture_roughness1, texture_ao1). Every semantic is guaranteed bound
+    // (defaults substituted) so no shader ever reads an unbound sampler.
+    auto pushMap = [&](unsigned int id, unsigned int fallback, const char* semantic) {
+        unsigned int texId = (id != 0) ? id : fallback;
+        if (texId != 0) {
             Texture tex;
-            tex.id = pbrMat.albedoMap;
-            tex.type = "diffuse";
-            tex.textureType = Texture::Type::DIFFUSE;
+            tex.id = texId;
+            tex.type = semantic;
             textures.push_back(tex);
         }
-    }
+    };
+    pushMap(pbrMat.albedoMap,    DefaultTexture::GetGreyTexture(),         "diffuse");
+    pushMap(pbrMat.normalMap,    DefaultTexture::GetFlatNormalTexture(),    "normal");
+    pushMap(pbrMat.metallicMap,  DefaultTexture::GetBlackTexture(),         "metallic");
+    pushMap(pbrMat.roughnessMap, DefaultTexture::GetGreyTexture(),          "roughness");
+    pushMap(pbrMat.aoMap,        DefaultTexture::GetWhiteTexture(),          "ao");
 
     return Mesh(vertices, indices, textures);
 }
@@ -1116,9 +1377,21 @@ Mesh Model::processMesh(aiMesh *mesh, const aiScene *scene)
 // =====================================================
 // PBR Material Processing
 // =====================================================
-PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory)
+PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory, const aiScene* scene)
 {
     PBRMaterial material;
+
+    // Resolve a material map, preferring EMBEDDED textures: FBX files
+    // (Mixamo characters in particular) store the pixels inside the file and
+    // reference them by their original export path - usually an absolute
+    // temp ".fbm" path that does not exist on disk. Loading from that path
+    // silently falls back to flat grey, so try the embedded copy first and
+    // only then the legacy disk-path load.
+    auto loadMap = [&](aiTextureType mapType, aiTextureType glType) -> unsigned int {
+        aiString str;
+        if (mat->GetTexture(mapType, 0, &str) != AI_SUCCESS) return 0;
+        return loadEmbeddedTexture(scene, str.C_Str(), glType);
+    };
 
     // Albedo (diffuse)
     aiColor3D diffuse(0.0f, 0.0f, 0.0f);
@@ -1143,19 +1416,23 @@ PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory
             texturePath = texturePath.substr(fbmPos + 5);  // Skip ".fbm/"
         }
         
-        // Try loading from same directory as model
-        std::string path = directory + "/" + texturePath;
-        
         // Extract just the filename for fallback
         size_t lastSlash = texturePath.find_last_of('/');
         std::string filename = (lastSlash != std::string::npos) ? texturePath.substr(lastSlash + 1) : texturePath;
         
-        material.albedoMap = loadTexture(path, aiTextureType_DIFFUSE);
-        
-        // If texture failed to load, try with just filename in same directory
+        // Embedded texture first (see loadMap above), then the legacy disk
+        // loads below.
+        material.albedoMap = loadMap(aiTextureType_DIFFUSE, aiTextureType_DIFFUSE);
         if (material.albedoMap == 0) {
-            std::string fallbackPath = directory + "/" + filename;
-            material.albedoMap = loadTexture(fallbackPath, aiTextureType_DIFFUSE);
+            // Try loading from same directory as model
+            std::string path = directory + "/" + texturePath;
+            material.albedoMap = loadTexture(path, aiTextureType_DIFFUSE);
+            
+            // If texture failed to load, try with just filename in same directory
+            if (material.albedoMap == 0) {
+                std::string fallbackPath = directory + "/" + filename;
+                material.albedoMap = loadTexture(fallbackPath, aiTextureType_DIFFUSE);
+            }
         }
         
         // If still failed, use default grey texture
@@ -1173,16 +1450,19 @@ PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory
     
     // Check for metallic texture
     if (mat->GetTextureCount(aiTextureType_METALNESS) > 0) {
-        aiString str;
-        mat->GetTexture(aiTextureType_METALNESS, 0, &str);
-        std::string texturePath = str.C_Str();
-        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
-        size_t fbmPos = texturePath.find(".fbm/");
-        if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
-        std::string path = directory + "/" + texturePath;
-        material.metallicMap = loadTexture(path, aiTextureType_METALNESS);
+        material.metallicMap = loadMap(aiTextureType_METALNESS, aiTextureType_METALNESS);
         if (material.metallicMap == 0) {
-            material.metallicMap = DefaultTexture::GetGreyTexture();  // Default grey for metallic
+            aiString str;
+            mat->GetTexture(aiTextureType_METALNESS, 0, &str);
+            std::string texturePath = str.C_Str();
+            std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+            size_t fbmPos = texturePath.find(".fbm/");
+            if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
+            std::string path = directory + "/" + texturePath;
+            material.metallicMap = loadTexture(path, aiTextureType_METALNESS);
+        }
+        if (material.metallicMap == 0) {
+            material.metallicMap = DefaultTexture::GetBlackTexture();  // Dielectric default
         }
         material.hasMetallicMap = true;
     }
@@ -1195,14 +1475,17 @@ PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory
 
     // Check for roughness texture
     if (mat->GetTextureCount(aiTextureType_DIFFUSE_ROUGHNESS) > 0) {
-        aiString str;
-        mat->GetTexture(aiTextureType_DIFFUSE_ROUGHNESS, 0, &str);
-        std::string texturePath = str.C_Str();
-        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
-        size_t fbmPos = texturePath.find(".fbm/");
-        if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
-        std::string path = directory + "/" + texturePath;
-        material.roughnessMap = loadTexture(path, aiTextureType_DIFFUSE_ROUGHNESS);
+        material.roughnessMap = loadMap(aiTextureType_DIFFUSE_ROUGHNESS, aiTextureType_DIFFUSE_ROUGHNESS);
+        if (material.roughnessMap == 0) {
+            aiString str;
+            mat->GetTexture(aiTextureType_DIFFUSE_ROUGHNESS, 0, &str);
+            std::string texturePath = str.C_Str();
+            std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+            size_t fbmPos = texturePath.find(".fbm/");
+            if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
+            std::string path = directory + "/" + texturePath;
+            material.roughnessMap = loadTexture(path, aiTextureType_DIFFUSE_ROUGHNESS);
+        }
         if (material.roughnessMap == 0) {
             material.roughnessMap = DefaultTexture::GetGreyTexture();
         }
@@ -1211,32 +1494,38 @@ PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory
 
     // Normal map
     if (mat->GetTextureCount(aiTextureType_NORMALS) > 0) {
-        aiString str;
-        mat->GetTexture(aiTextureType_NORMALS, 0, &str);
-        std::string texturePath = str.C_Str();
-        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
-        size_t fbmPos = texturePath.find(".fbm/");
-        if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
-        std::string path = directory + "/" + texturePath;
-        material.normalMap = loadTexture(path, aiTextureType_NORMALS);
+        material.normalMap = loadMap(aiTextureType_NORMALS, aiTextureType_NORMALS);
         if (material.normalMap == 0) {
-            material.normalMap = DefaultTexture::GetGreyTexture();
+            aiString str;
+            mat->GetTexture(aiTextureType_NORMALS, 0, &str);
+            std::string texturePath = str.C_Str();
+            std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+            size_t fbmPos = texturePath.find(".fbm/");
+            if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
+            std::string path = directory + "/" + texturePath;
+            material.normalMap = loadTexture(path, aiTextureType_NORMALS);
+        }
+        if (material.normalMap == 0) {
+            material.normalMap = DefaultTexture::GetFlatNormalTexture();  // up = (0,0,1); grey would be degenerate
         }
         material.hasNormalMap = (material.normalMap > 0);
     }
 
     // AO (Ambient Occlusion)
     if (mat->GetTextureCount(aiTextureType_AMBIENT_OCCLUSION) > 0) {
-        aiString str;
-        mat->GetTexture(aiTextureType_AMBIENT_OCCLUSION, 0, &str);
-        std::string texturePath = str.C_Str();
-        std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
-        size_t fbmPos = texturePath.find(".fbm/");
-        if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
-        std::string path = directory + "/" + texturePath;
-        material.aoMap = loadTexture(path, aiTextureType_AMBIENT_OCCLUSION);
+        material.aoMap = loadMap(aiTextureType_AMBIENT_OCCLUSION, aiTextureType_AMBIENT_OCCLUSION);
         if (material.aoMap == 0) {
-            material.aoMap = DefaultTexture::GetGreyTexture();
+            aiString str;
+            mat->GetTexture(aiTextureType_AMBIENT_OCCLUSION, 0, &str);
+            std::string texturePath = str.C_Str();
+            std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+            size_t fbmPos = texturePath.find(".fbm/");
+            if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
+            std::string path = directory + "/" + texturePath;
+            material.aoMap = loadTexture(path, aiTextureType_AMBIENT_OCCLUSION);
+        }
+        if (material.aoMap == 0) {
+            material.aoMap = DefaultTexture::GetWhiteTexture();  // white = 1.0, no occlusion darkening
         }
         material.hasAOMap = true;
     }
@@ -1254,10 +1543,21 @@ PBRMaterial Model::processMaterial(aiMaterial* mat, const std::string& directory
     
     // Check for emissive texture
     if (mat->GetTextureCount(aiTextureType_EMISSIVE) > 0) {
-        aiString str;
-        mat->GetTexture(aiTextureType_EMISSIVE, 0, &str);
-        std::string path = directory + "/" + str.C_Str();
-        material.emissiveMap = loadTexture(path, aiTextureType_EMISSIVE);
+        material.emissiveMap = loadMap(aiTextureType_EMISSIVE, aiTextureType_EMISSIVE);
+        if (material.emissiveMap == 0) {
+            aiString str;
+            mat->GetTexture(aiTextureType_EMISSIVE, 0, &str);
+            std::string texturePath = str.C_Str();
+            // FIX: same .fbm/ stripping + backslash normalization as the
+            // other texture types above (normal, metallic, etc.). Without this
+            // the emissive path retains the absolute temp .fbm path and can
+            // never resolve on disk.
+            std::replace(texturePath.begin(), texturePath.end(), '\\', '/');
+            size_t fbmPos = texturePath.find(".fbm/");
+            if (fbmPos != std::string::npos) texturePath = texturePath.substr(fbmPos + 5);
+            std::string path = directory + "/" + texturePath;
+            material.emissiveMap = loadTexture(path, aiTextureType_EMISSIVE);
+        }
         material.hasEmissiveMap = true;
     }
     
@@ -1318,106 +1618,44 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
         }
     }
     
-    // === PATH 2: Load uncompressed image and compress to BC1/BC3 ===
-    glGenTextures(1, &textureID);
-    glBindTexture(GL_TEXTURE_2D, textureID);
-
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
+    // === PATH 1.5: Try native EXR counterpart (higher quality than JPG/PNG) ===
+    // The shipped assets carry a compressed JPG/PNG stand-in alongside a
+    // linear-HDR EXR source (same basename, .exr extension). The async path
+    // in LoadModelData() already prefers EXR, but the SYNC Model path
+    // (used by SimpleWorldRenderer::loadModel → new Model(path)) skips EXR
+    // entirely and falls straight to stbi_load, which cannot decode EXR.
+    // We replicate the async path's check here so world objects get the real
+    // high-precision normal/roughness/metallic data.
+    {
+        std::string exrPath = path;
+        size_t dotPos2 = exrPath.rfind('.');
+        if (dotPos2 != std::string::npos &&
+            exrPath.compare(dotPos2, 4, ".exr") != 0) {
+            exrPath.replace(dotPos2, std::string::npos, ".exr");
+        } else {
+            exrPath.clear();
+        }
+        if (!exrPath.empty()) {
+            int exrW = 0, exrH = 0;
+            std::vector<uint8_t> exrRGBA;
+            if (LoadEXRPixelsRGBA8(exrPath, exrW, exrH, exrRGBA)) {
+                std::cout << "[Model] EXR texture loaded: " << exrPath
+                          << " (" << exrW << "x" << exrH << ")\n";
+                textureID = uploadImageData(exrRGBA.data(), exrW, exrH, 4, type, /*ownedByStbi=*/false);
+                m_textureCache[key] = textureID;
+                return textureID;
+            }
+        }
+    }
+    
+    // === PATH 2: Decode the image and upload (BC1/BC3-compressed) ===
     int width, height, nrComponents;
     stbi_set_flip_vertically_on_load(true);
     unsigned char* data = stbi_load(path.c_str(), &width, &height, &nrComponents, 0);
 
     if (data)
     {
-        // Cap huge (4K+) textures to 1024 before CPU BC1 compression. Decoding
-        // + box-filtering a 16M-pixel RGBA buffer is microseconds; compressing
-        // it to BC1 is the expensive part (seconds per texture), and 4K maps
-        // on small plant meshes gain nothing visually. Box-average downsample.
-        const int kMaxTexSize = 1024;
-        bool ownedByStbi = true;
-        if (width > kMaxTexSize || height > kMaxTexSize) {
-            const int newW = std::min(width, kMaxTexSize);
-            const int newH = std::min(height, kMaxTexSize);
-            const int c = nrComponents > 0 ? nrComponents : 4;
-            const int sx = std::max(1, width / newW);
-            const int sy = std::max(1, height / newH);
-            m_resizedTexBuffer.assign((size_t)newW * newH * c, 0);
-            for (int y = 0; y < newH; ++y) {
-                for (int x = 0; x < newW; ++x) {
-                    int r = 0, g = 0, b = 0, a = 0, n = 0;
-                    for (int j = 0; j < sy; ++j) {
-                        const int yy = std::min(height - 1, y * sy + j);
-                        for (int i = 0; i < sx; ++i) {
-                            const int xx = std::min(width - 1, x * sx + i);
-                            const unsigned char* p = data + ((size_t)yy * width + xx) * c;
-                            r += p[0]; if (c > 1) g += p[1]; if (c > 2) b += p[2]; if (c > 3) a += p[3];
-                            ++n;
-                        }
-                    }
-                    unsigned char* d = &m_resizedTexBuffer[((size_t)y * newW + x) * c];
-                    d[0] = (unsigned char)(r / n);
-                    if (c > 1) d[1] = (unsigned char)(g / n);
-                    if (c > 2) d[2] = (unsigned char)(b / n);
-                    if (c > 3) d[3] = (unsigned char)(a / n);
-                }
-            }
-            stbi_image_free(data);   // free the ORIGINAL stbi buffer
-            data = m_resizedTexBuffer.data(); // borrow from the member vector
-            ownedByStbi = false;
-            width = newW;
-            height = newH;
-        }
-
-        bool isNormalMap = (type == aiTextureType_NORMALS);
-        bool useCompression = (width >= 4 && height >= 4); // Skip compression for tiny textures
-
-        if (useCompression && nrComponents <= 3 && !isNormalMap && nrComponents == 3) {
-            // === COMPRESSED: BC1/DXT1 for RGB (6:1 ratio) ===
-            std::vector<uint8_t> compressed = CompressBC1(data, width, height);
-            int blockW = (width + 3) / 4;
-            int blockH = (height + 3) / 4;
-            glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGB_S3TC_DXT1_EXT, width, height, 0,
-                                   blockW * blockH * 8, compressed.data());
-            glGenerateMipmap(GL_TEXTURE_2D);
-        } else if (useCompression && nrComponents == 4) {
-            // === COMPRESSED: BC3/DXT5 for RGBA (4:1 ratio) ===
-            std::vector<uint8_t> compressed = CompressBC3(data, width, height);
-            int blockW = (width + 3) / 4;
-            int blockH = (height + 3) / 4;
-            glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, width, height, 0,
-                                   blockW * blockH * 16, compressed.data());
-            glGenerateMipmap(GL_TEXTURE_2D);
-        } else if (nrComponents == 1) {
-            // === 1-channel: Use compressed RGTC1 if available, else uncompressed ===
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, data);
-            glGenerateMipmap(GL_TEXTURE_2D);
-        } else if (isNormalMap && nrComponents == 3) {
-            // === Normal map: Use BC5 (RG compression) - pack RGB into RG ===
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RG, width, height, 0, GL_RG, GL_UNSIGNED_BYTE, data);
-            glGenerateMipmap(GL_TEXTURE_2D);
-        } else {
-            // === UNCOMPRESSED FALLBACK (tiny textures or unusual formats) ===
-            GLenum format;
-            if (nrComponents == 1)
-                format = GL_RED;
-            else if (nrComponents == 3)
-                format = GL_RGB;
-            else if (nrComponents == 4)
-                format = GL_RGBA;
-            else
-                format = GL_RGB;
-
-            glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-            glGenerateMipmap(GL_TEXTURE_2D);
-        }
-
-        if (ownedByStbi) {
-            stbi_image_free(data);
-        }
+        textureID = uploadImageData(data, width, height, nrComponents, type, /*ownedByStbi=*/true);
     }
     else
     {
@@ -1426,6 +1664,265 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
 
     m_textureCache[key] = textureID;
     return textureID;
+}
+
+// =====================================================
+// Upload decoded pixels (downscale + BC1/BC3 compression
+// + GL upload). Shared by loadTexture (disk images) and
+// loadEmbeddedTexture (FBX/glTF textures stored inside
+// the model file) so both get identical sampling state.
+// =====================================================
+unsigned int Model::uploadImageData(unsigned char* data, int width, int height,
+                                    int nrComponents, aiTextureType type, bool ownedByStbi)
+{
+    // No GL context (headless model loads / tests): skip the upload instead of
+    // calling a NULL glad function pointer (SIGSEGV). Mirrors the guard in
+    // loadTexture(). The model still loads its meshes/skeleton - only the GPU
+    // texture is missing, which is correct for CPU-only consumers.
+    if (!glGenTextures) {
+        std::cerr << "[Model] WARNING: No OpenGL context available, skipping texture upload\n";
+        return 0;
+    }
+    unsigned int textureID = 0;
+    // DSA object creation: glCreateTextures gives us a texture name with no
+    // storage and no binding-point side effects. (Note: the `if (!glGenTextures)`
+    // above is a *context-availability* check, NOT a first-use guard -- glGenTextures
+    // is a GLAD function-pointer macro that is NULL only when the loader failed /
+    // no GL context exists, so it must remain as-is to keep headless/CPU-only
+    // loads safe.)
+    glCreateTextures(GL_TEXTURE_2D, 1, &textureID);
+
+    glTextureParameteri(textureID, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTextureParameteri(textureID, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTextureParameteri(textureID, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTextureParameteri(textureID, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    // Cap huge (4K+) textures to 1024 before CPU BC1 compression. Decoding
+    // + box-filtering a 16M-pixel RGBA buffer is microseconds; compressing
+    // it to BC1 is the expensive part (seconds per texture), and 4K maps
+    // on small plant meshes gain nothing visually.
+    // Cache-friendly single-pass downsampler: reads and writes memory in
+    // strict contiguous row-major lines, avoiding the pointer-jumping
+    // (non-unit stride) that stalled L1/L2 on the old integer-step loop.
+    const int kMaxTexSize = 1024;
+    if (width > kMaxTexSize || height > kMaxTexSize) {
+        const int newW = std::min(width, kMaxTexSize);
+        const int newH = std::min(height, kMaxTexSize);
+        const int c = nrComponents > 0 ? nrComponents : 4;
+
+        // Fractional steps in fixed-point space — prevents floating-point
+        // accumulation drift and ensures every source pixel contributes.
+        const float stepX = static_cast<float>(width) / static_cast<float>(newW);
+        const float stepY = static_cast<float>(height) / static_cast<float>(newH);
+
+        m_resizedTexBuffer.assign(static_cast<size_t>(newW) * newH * c, 0);
+        unsigned char* dPtr = m_resizedTexBuffer.data();
+
+        // Cache-friendly row-major streaming loop — each inner kernel
+        // iteration walks a tightly localised, contiguous row window.
+        for (int y = 0; y < newH; ++y) {
+            const int srcYStart = static_cast<int>(y * stepY);
+            const int srcYEnd   = std::min(height, static_cast<int>((y + 1) * stepY));
+            const int filterHeight = std::max(1, srcYEnd - srcYStart);
+
+            for (int x = 0; x < newW; ++x) {
+                const int srcXStart = static_cast<int>(x * stepX);
+                const int srcXEnd   = std::min(width, static_cast<int>((x + 1) * stepX));
+                const int filterWidth  = std::max(1, srcXEnd - srcXStart);
+
+                int r = 0, g = 0, b = 0, a = 0;
+
+                // Kernel aggregation — operates on a tightly localised,
+                // contiguous row window (rowPtr walks unit-stride).
+                for (int sy = srcYStart; sy < srcYEnd; ++sy) {
+                    const unsigned char* rowPtr = data + (static_cast<size_t>(sy) * width + srcXStart) * c;
+
+                    for (int sx = srcXStart; sx < srcXEnd; ++sx) {
+                        r += rowPtr[0];
+                        if (c > 1) g += rowPtr[1];
+                        if (c > 2) b += rowPtr[2];
+                        if (c > 3) a += rowPtr[3];
+                        rowPtr += c; // Safe, linear stride stepping
+                    }
+                }
+
+                // Compute box-average division over the accumulated kernel footprint
+                const int divisor = filterWidth * filterHeight;
+                dPtr[0] = static_cast<unsigned char>(r / divisor);
+                if (c > 1) dPtr[1] = static_cast<unsigned char>(g / divisor);
+                if (c > 2) dPtr[2] = static_cast<unsigned char>(b / divisor);
+                if (c > 3) dPtr[3] = static_cast<unsigned char>(a / divisor);
+
+                dPtr += c; // Stream straight to the next output memory address
+            }
+        }
+
+        if (ownedByStbi) {
+            stbi_image_free(data);  // Safely clean up original STB allocation
+        }
+        data = m_resizedTexBuffer.data();
+        ownedByStbi = false;
+        width = newW;
+        height = newH;
+    }
+
+    bool isNormalMap = (type == aiTextureType_NORMALS);
+    bool useCompression = (width >= 4 && height >= 4); // Skip compression for tiny textures
+
+    // Immutable storage must commit to every mip level up front. Compute the
+    // full level count on the FINAL (post-downscale) dimensions.
+    int levels = 1;
+    for (int s = std::max(width, height); s > 1; s >>= 1) ++levels;
+
+    if (useCompression && nrComponents <= 3 && !isNormalMap && nrComponents == 3) {
+        // === COMPRESSED: BC1/DXT1 for RGB (6:1 ratio) ===
+        std::vector<uint8_t> compressed = CompressBC1(data, width, height);
+        int blockW = (width + 3) / 4;
+        int blockH = (height + 3) / 4;
+        int imageSize = blockW * blockH * 8;
+        glTextureStorage2D(textureID, levels, GL_COMPRESSED_RGB_S3TC_DXT1_EXT, width, height);
+        glCompressedTextureSubImage2D(textureID, 0, 0, 0, width, height,
+                                      GL_COMPRESSED_RGB_S3TC_DXT1_EXT, imageSize, compressed.data());
+        glGenerateTextureMipmap(textureID);
+    } else if (useCompression && nrComponents == 4) {
+        // === COMPRESSED: BC3/DXT5 for RGBA (4:1 ratio) ===
+        std::vector<uint8_t> compressed = CompressBC3(data, width, height);
+        int blockW = (width + 3) / 4;
+        int blockH = (height + 3) / 4;
+        int imageSize = blockW * blockH * 16;
+        glTextureStorage2D(textureID, levels, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, width, height);
+        glCompressedTextureSubImage2D(textureID, 0, 0, 0, width, height,
+                                      GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, imageSize, compressed.data());
+        glGenerateTextureMipmap(textureID);
+    } else if (nrComponents == 1) {
+        // === 1-channel: uncompressed (GL_R8) ===
+        glTextureStorage2D(textureID, levels, GL_R8, width, height);
+        glTextureSubImage2D(textureID, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, data);
+        glGenerateTextureMipmap(textureID);
+    } else if (isNormalMap && nrComponents == 3) {
+        // === Normal map RGB8 ===
+        // Use GL_RGB8 + GL_RGB (not GL_RG8 + GL_RG) — the source data from
+        // stbi / embedded textures is 3-bytes-per-pixel RGB, and packing it
+        // into a 2-component GL_RG upload causes a row-stride mismatch (OpenGL
+        // expects W*2 bytes/row for RG but the data is W*3 bytes/row),
+        // producing garbled normals and "some parts not properly textured."
+        // The async path (uploadTextureFromPixels) already does this correctly.
+        glTextureStorage2D(textureID, levels, GL_RGB8, width, height);
+        glTextureSubImage2D(textureID, 0, 0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, data);
+        glGenerateTextureMipmap(textureID);
+    } else {
+        // === UNCOMPRESSED FALLBACK (tiny textures or unusual formats) ===
+        GLenum format;
+        if (nrComponents == 1)
+            format = GL_RED;
+        else if (nrComponents == 3)
+            format = GL_RGB;
+        else if (nrComponents == 4)
+            format = GL_RGBA;
+        else
+            format = GL_RGB;
+
+        // glTextureStorage2D requires a *sized* internal format; map the
+        // unsized pixel format to its sized storage equivalent.
+        GLenum internalFormat = (format == GL_RED)  ? GL_R8
+                              : (format == GL_RGB)  ? GL_RGB8
+                              : (format == GL_RGBA) ? GL_RGBA8
+                              :                       GL_RGB8;
+        glTextureStorage2D(textureID, levels, internalFormat, width, height);
+        glTextureSubImage2D(textureID, 0, 0, 0, width, height, format, GL_UNSIGNED_BYTE, data);
+        glGenerateTextureMipmap(textureID);
+    }
+
+    // ── Phase 2 (Texture): Unify Anisotropic Filtering ────────────────
+    // The async path (uploadTextureFromPixels) already sets max anisotropy,
+    // but the SYNC Model path (this function) was missing it. Textures loaded
+    // on the main thread (environment objects, editor UI assets, etc.) get
+    // default 1× filtering, causing grazing-angle shimmer on floors/walls/boots
+    // that disrupts FSR3 upscaling. Copy the DSA block so both paths agree.
+    if (GLAD_GL_ARB_texture_filter_anisotropic && textureID != 0) {
+        GLfloat maxAniso = 1.0f;
+        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAniso);
+        if (maxAniso > 1.0f) {
+            glTextureParameterf(textureID, GL_TEXTURE_MAX_ANISOTROPY, maxAniso);
+        }
+    }
+
+    if (ownedByStbi) {
+        stbi_image_free(data);
+    }
+    return textureID;
+}
+
+// =====================================================
+// Embedded textures (FBX Video nodes / glTF bufferViews)
+// =====================================================
+const aiTexture* Model::findEmbeddedTexture(const aiScene* scene, const std::string& path) const
+{
+    if (!scene || path.empty()) return nullptr;
+
+    // Assimp convention: a material path of "*<N>" directly indexes the
+    // embedded texture array.
+    if (path[0] == '*') {
+        try {
+            const size_t idx = std::stoul(path.substr(1));
+            if (idx < scene->mNumTextures) return scene->mTextures[idx];
+        } catch (...) { /* not an index - fall through */ }
+        return nullptr;
+    }
+
+    // Otherwise match by basename. FBX Video nodes record the texture's
+    // ORIGINAL export path (often an absolute temp path like
+    // ".../skins_xxx.fbm/Vampire_diffuse.png"); the material references the
+    // same path, but directories may differ after re-export, so compare only
+    // the file name, case-insensitively.
+    auto basenameLower = [](std::string s) {
+        const size_t slash = s.find_last_of("/\\");
+        if (slash != std::string::npos) s = s.substr(slash + 1);
+        for (char& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    };
+    const std::string want = basenameLower(path);
+    if (want.empty()) return nullptr;
+    for (unsigned i = 0; i < scene->mNumTextures; ++i) {
+        const aiTexture* t = scene->mTextures[i];
+        if (!t) continue;
+        if (t->mFilename.length > 0 && basenameLower(t->mFilename.C_Str()) == want) {
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+unsigned int Model::loadEmbeddedTexture(const aiScene* scene, const std::string& path, aiTextureType type)
+{
+    // Cache by the material's referenced path so a texture shared across
+    // meshes uploads once (mirrors loadTexture's cache).
+    const std::string key = "embedded:" + path + "\n" + std::to_string((int)type);
+    auto cacheIt = m_textureCache.find(key);
+    if (cacheIt != m_textureCache.end()) {
+        return cacheIt->second;
+    }
+    unsigned int id = 0;
+    if (const aiTexture* tex = findEmbeddedTexture(scene, path)) {
+        // Compressed image (PNG/JPEG/TGA...): pcData holds mWidth bytes.
+        // Uncompressed: pcData holds mWidth*mHeight raw RGBA8888 texels.
+        if (tex->mHeight == 0 && tex->pcData) {
+            int w = 0, h = 0, c = 0;
+            stbi_set_flip_vertically_on_load(true);
+            unsigned char* data = stbi_load_from_memory(
+                reinterpret_cast<const unsigned char*>(tex->pcData),
+                static_cast<int>(tex->mWidth), &w, &h, &c, 0);
+            if (data) {
+                id = uploadImageData(data, w, h, c, type, /*ownedByStbi=*/true);
+            }
+        } else if (tex->mHeight > 0 && tex->pcData) {
+            id = uploadImageData(reinterpret_cast<unsigned char*>(tex->pcData),
+                                 static_cast<int>(tex->mWidth), static_cast<int>(tex->mHeight),
+                                 4, type, /*ownedByStbi=*/false);
+        }
+    }
+    m_textureCache[key] = id;
+    return id;
 }
 
 // =====================================================
@@ -1734,17 +2231,16 @@ void Model::UploadBoneTexture(Shader &shader, const std::vector<glm::mat4> &mats
     // Create once with fixed size
     if (boneTexID == 0)
     {
-        glGenTextures(1, &boneTexID);
-        glBindTexture(GL_TEXTURE_2D, boneTexID);
+        glCreateTextures(GL_TEXTURE_2D, 1, &boneTexID);
 
         // Allocate once with maximum reasonable size
         int maxWidth = 256 * 4; // Support up to 256 bones
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, maxWidth, 1, 0, GL_RGBA, GL_FLOAT, nullptr);
+        glTextureStorage2D(boneTexID, 1, GL_RGBA32F, maxWidth, 1);   // immutable, 1 level (no mipmaps)
 
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTextureParameteri(boneTexID, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTextureParameteri(boneTexID, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTextureParameteri(boneTexID, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTextureParameteri(boneTexID, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
     // Layout: 1 row, width = mats.size()*4 pixels
@@ -1767,9 +2263,10 @@ void Model::UploadBoneTexture(Shader &shader, const std::vector<glm::mat4> &mats
     glActiveTexture(GL_TEXTURE10);
     glBindTexture(GL_TEXTURE_2D, boneTexID);
 
-    // Use glTexSubImage2D instead of glTexImage2D (no reallocation)
-    glTexSubImage2D(
-        GL_TEXTURE_2D,
+    // DSA sub-image update into the immutable storage allocated above (no
+    // reallocation, no bind dependency for the upload itself).
+    glTextureSubImage2D(
+        boneTexID,
         0,
         0, 0,
         width,

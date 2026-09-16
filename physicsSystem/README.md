@@ -6,16 +6,16 @@ Collision detection and physics simulation with GJK/EPA algorithms, constraints,
 
 ```
 physicsSystem/
-├── physics.h                 # Physics world header
+├── Physics.h                 # Physics world header
 ├── physics.cpp               # Physics world implementation
-├── GJK.h                     # GJK collision detection
-├── GJK.cpp                   # GJK implementation
-├── EPA.h                     # EPA penetration depth
-├── EPA.cpp                   # EPA implementation
-├── Constraint.h              # Constraint base class
-├── Constraint.cpp            # Constraint implementation
-├── AdvancedConstraints.h     # Advanced constraints
-├── AdvancedConstraints.cpp   # Advanced implementation
+├── GJK.h/.cpp                # GJK collision detection + EPA penetration depth (Expanding Polytope)
+├── Constraint.h/.cpp         # Constraint base class + implementation
+├── AdvancedConstraints.h/.cpp # Advanced constraints (hinge, slider, 6DOF, point)
+├── RigidBody.h               # Rigid body definition (mass, inertia)
+├── Floor.h                   # Static floor/ground plane
+├── VelocityConstraints.h     # Velocity-level constraint solver
+├── StaticConstraintPipeline.h # Batched static constraint solve
+├── TOI.h                     # Time-of-impact estimation
 └── README.md                 # This file
 ```
 
@@ -41,6 +41,9 @@ physicsSystem/
 - **Slider Constraint** - Linear sliding joints
 - **6DOF Constraint** - Full 6 degrees of freedom
 - **Character Constraint** - Character-specific constraints
+- **Velocity-Level Solver** - Velocity constraint resolution (`VelocityConstraints.h`)
+- **Static Pipeline** - Batched static constraint solve (`StaticConstraintPipeline.h`)
+- **Time of Impact** - Continuous collision estimation (`TOI.h`)
 
 ### Character Controller
 - **Capsule Collision** - Capsule-shaped character
@@ -141,21 +144,32 @@ charConfig.jumpForce = 5.0f;
 The physics system compiles as part of the main engine build. From the repository root:
 
 ```bash
-make            # build the test runner
-make test       # run the full unit-test suite (494 tests)
+make            # build bin/test_runner + bin/engine (debug)
+make test       # run the full unit-test suite (731 tests / 99 suites)
+make test-physics  # GJK/EPA, gravity, restitution, friction, raycasts, constraints
 make run        # self-check tests, then boot the engine
 make run-headless  # bounded headless engine run (CI-friendly)
+make test-list  # list every test
 ```
 
-Collision detection (GJK/EPA), gravity, restitution, friction, and raycasts are covered
-by `make test-physics`. See the [root README](../README.md) for prerequisites and engine controls.
+Collision detection (GJK/EPA), gravity, restitution, friction, raycasts, rigid-body
+integration and the constraint solver are covered by `make test-physics` (the
+`PhysicsTest`, `ConstraintSolver`, `HingeConstraint`, `HingeMotor`,
+`DistanceConstraint`, `PlaneConstraint` and `Static5DOFHingeBlock` suites), plus
+`make test` with `--gtest_filter=Physics*|Constraint*|Hinge*|Distance*`.
+See the [root README](../README.md#test-suites) for the full target list and prerequisites.
 
 ## 🐛 Debugging
 
-See documentation in `docs/physics/`:
-- [GJK_PHYSICS_OPTIMIZATIONS.md](../docs/physics/GJK_PHYSICS_OPTIMIZATIONS.md)
+See the engine documentation under `docs/`:
+- [Troubleshooting](../docs/TROUBLESHOOTING.md) — build/test failures and physics debug
+  rendering.
+- [Architecture](../docs/ARCHITECTURE.md) — physics/systems data flow.
+
+The editor's **Debug Rendering** (physics shape overlay, `DebugRenderer`) is togglable
+from the ImGui viewport, and the **GPU Profiler** can isolate constraint-solver cost.
 
 ---
 
 **Status:** ✅ Production Ready
-**Last Updated:** August 2026
+**Last Updated:** September 2026

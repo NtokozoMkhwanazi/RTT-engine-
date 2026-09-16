@@ -179,11 +179,37 @@ struct MotionMatchingConfig {
     // Blending configuration
     float blendDuration = 0.1f;         // How long to blend between poses (seconds)
     int numBlendPoses = 2;              // How many poses to blend (2 = current + target)
+
+    // State-boundary blends: an airborne <-> grounded switch (takeoff/landing)
+    // spans a much larger pose delta than a normal locomotion switch (tucked
+    // Fall pose -> full-stance Walk), so the generic 0.1s crossfade pops.
+    float landingBlendDuration = 0.3f;  // air -> ground (landing)
+    float takeoffBlendDuration = 0.2f;  // ground -> air (takeoff)
     
     // Foot planting configuration
     float footPlantThreshold = 0.05f;   // Velocity below which foot is "planted"
     float footPlantHeightThreshold = 0.1f; // Height variance for planting
     bool enableFootLocking = true;      // Lock feet when planted (IK)
+
+    // Velocity-based lock dissolution parameters (Fix: "Lock Inversion Strangle")
+    float footLiftVelocityThreshold = 0.5f;  // Speed above which a planted foot
+                                              // must release (forced lift detection).
+                                              // Fixes the ghost-lock where feet
+                                              // stay pinned while the body strides
+                                              // forward, elastically stretching
+                                              // the leg past its max reach.
+    float footPlantedHeightThreshold = 0.1f; // Max distance below the floor a
+                                              // foot may be and still be
+                                              // considered "close to ground"
+                                              // for (un)locking.
+    float footPlantVelocityThreshold = 0.05f; // Speed below which a free foot
+                                               // is allowed to (re)plant.
+    float footLockReleaseDuration = 0.15f;   // Seconds over which lockWeight
+                                              // ramps 1→0 on release, so the
+                                              // ankle offset fades instead of
+                                              // snapping and the mesh doesn't
+                                              // pop when detaching from a
+                                              // planted anchor.
     
     // Trajectory prediction
     float trajectoryDuration = 0.5f;    // How far into future to predict (seconds)
@@ -192,6 +218,48 @@ struct MotionMatchingConfig {
     // Performance
     bool useSpatialIndex = true;        // Use KD-tree for faster search
     int spatialIndexRebuildFrames = 60; // Rebuild index every N frames
+
+    // Clip-switch persistence bands (see MotionMatcher::SelectPoseWithPersistence).
+    // The matcher keeps the current clip until another clip beats it by the
+    // 15% distance margin - but drops the margin and switches at once when the
+    // query leaves the current clip's nominal band:
+    //  - speedBandFactor: band = clip nominal speed * this (with a 1 m/s floor
+    //    so a stationary Idle never trips it). Catches gait changes
+    //    (run<->walk, walk<->stop, ...) that the margin would otherwise delay.
+    //  - directionBandRadians: angular band on the movement direction. When the
+    //    query heads more than this far from the clip's nominal move direction
+    //    (reversal / backpedal / running away from the clip's heading), switch
+    //    immediately instead of waiting for the margin. ~pi/2 (90 deg) keeps
+    //    straight-line walking / mild turns from tripping it.
+    float speedBandFactor = 0.5f;
+    float directionBandRadians = 1.5707963267948966f;  // pi/2 = 90 degrees
+
+    // Advanced - directional flip penalty (feet/footskate guard, the "Metric
+    // Space Collapsing" fix). A bestOther candidate whose clip-frame root
+    // velocity is geometrically OPPPOSED to the query (cos angle below
+    // directionFlipDotThreshold, i.e. more than ~90deg apart) matched only on
+    // scalar speed - e.g. a backward RunLookBack clip on a forward-left W+A
+    // strafe, which plants the feet on the wrong animation. That candidate's
+    // distance is scaled by directionalFlipMultiplier before the 0.85
+    // persistence comparison so a geometrically-flipped clip can't hijack
+    // selection. Only the OTHER clip's best is penalized; the current clip is
+    // never touched, so genuine reversals (Back aligned with a backpedal query)
+    // still switch. Idle/zero-velocity poses are exempt. Set to 1.0 to disable
+    // (original behavior).
+    float directionalFlipMultiplier = 2.0f;
+    float directionFlipDotThreshold = 0.0f;  // cos: <0 => >90deg apart
+
+    // Pose-level persistence margin (companion to the 0.85 clip margin above).
+    // bestSameIdx is the min-distance pose in the current clip; on a
+    // constant-velocity clip (walk/idle) that minimum is shared by MANY
+    // near-equidistant frames, so it flips every frame and jitters the matched
+    // clip time ~+-half a frame. The foot IK then chases the shifting root and
+    // the ankles stretch/release each flicker - visible "feet vibrate / stretch
+    // on idle" and "walk vibrate". Hold the current pose unless a same-clip
+    // candidate beats it by this fraction (1.0 = never flip pose while the clip
+    // is held). Idle/zero-velocity clips are unaffected (no near-equidistant
+    // frames to flip). Set to 1.0f to disable.
+    float poseHoldMargin = 0.95f;
 };
 
 // ============================================================================

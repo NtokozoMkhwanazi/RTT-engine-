@@ -16,6 +16,7 @@
 #include <random>
 #include <iostream>
 #include <string>
+#include <algorithm>
 #include "../ecs/components/GeospatialComponent.h"
 #include "TFLitePredictor.h"
 #include "TimeSeriesDB.h"
@@ -168,7 +169,8 @@ public:
     }
 
     /**
-     * Predict future positions (uses Kalman filter - fast, no process spawning)
+     * Predict future positions. Uses the trained ML model when loaded (cached
+     * with frame skipping), otherwise the fast Kalman filter.
      */
     std::vector<PredictedState> predictTrajectory(double currentTime,
                                                      double horizonSeconds,
@@ -177,20 +179,23 @@ public:
             return {};
         }
 
-        // Use fast Kalman filter (ML disabled for performance)
+        if (useML) {
+            std::vector<PredictedState> ml = predictWithML(currentTime, horizonSeconds, numPoints);
+            if (!ml.empty()) return ml;
+        }
         return predictWithKalman(currentTime, horizonSeconds, numPoints);
     }
 
     /**
-     * Monte Carlo simulation for uncertainty analysis
+     * Monte Carlo simulation for uncertainty analysis.
+     * Uses a persistent (per-model) RNG - constructing std::random_device per
+     * call was a per-call stall on some systems.
      */
     std::vector<std::vector<PredictedState>> monteCarloSimulation(
         double currentTime, double horizonSeconds,
         int numSimulations = 100, int pointsPerSim = 50) {
 
         std::vector<std::vector<PredictedState>> results;
-        std::random_device rd;
-        std::mt19937 gen(rd());
         std::normal_distribution<double> posNoise(0, kalman.getPositionUncertainty());
         std::normal_distribution<double> velNoise(0, 1.0);
 
@@ -198,10 +203,10 @@ public:
             double x, y, vx, vy;
             kalman.getState(x, y, vx, vy);
 
-            double simX = x + posNoise(gen);
-            double simY = y + posNoise(gen);
-            double simVx = vx + velNoise(gen);
-            double simVy = vy + velNoise(gen);
+            double simX = x + posNoise(m_rng);
+            double simY = y + posNoise(m_rng);
+            double simVx = vx + velNoise(m_rng);
+            double simVy = vy + velNoise(m_rng);
 
             std::vector<PredictedState> trajectory;
             double dt = horizonSeconds / pointsPerSim;
@@ -245,6 +250,7 @@ public:
     int mlFrameCounter; // For frame skipping
     bool initialized;
     bool useML;
+    std::mt19937 m_rng{12345}; // Persistent RNG for Monte Carlo (deterministic)
     double originLat, originLon;
     double lastPredictionTime;
     double lastVx, lastVy;
@@ -287,49 +293,56 @@ public:
     std::vector<PredictedState> predictWithML(double currentTime,
                                                  double horizonSeconds,
                                                  int numPoints) {
-        std::vector<PredictedState> predictions;
-
-        // Frame skipping: only run ML inference every 10 frames
+        // Frame skipping: only run ML inference every 10 calls; the result is
+        // cached so the (microsecond-scale) forward pass is not a hot path.
         if (++mlFrameCounter < 10 && !lastMlPredictions.empty()) {
-            return lastMlPredictions; // Return cached predictions
+            return lastMlPredictions;
         }
         mlFrameCounter = 0;
 
-        // Build input from recent history
-        // Format: [lat0, lon0, speed0, heading0, lat1, lon1, speed1, heading1, ...]
-        std::vector<double> mlInput;
-        int historyWindow = std::min((int)history.size(), 20);
+        if (history.size() < 2) return {};
+
+        // Input: 20 history samples of (dx/100, dy/100, speed/10, heading/pi)
+        // where dx/dy are meter offsets (East/North) from the CURRENT position.
+        const auto& last = history.back();
+        double curX = 0.0, curY = 0.0;
+        geoToLocal(last.latitude, last.longitude, curX, curY);
+
+        std::vector<float> mlInput(80, 0.0f);
+        const size_t n = std::min<size_t>(20, history.size());
         auto it = history.end();
-        for (int i = 0; i < historyWindow; i++) {
-            --it;
-            mlInput.push_back(it->latitude);
-            mlInput.push_back(it->longitude);
-            mlInput.push_back(it->speed);
-            mlInput.push_back(it->heading);
+        for (size_t i = 0; i < n; ++i) --it;  // walk back to the window start
+
+        size_t s = 0;
+        for (auto p = it; p != history.end() && s < 20; ++p, ++s) {
+            double x = 0.0, y = 0.0;
+            geoToLocal(p->latitude, p->longitude, x, y);
+            const double dx = x - curX;
+            const double dy = y - curY;
+            mlInput[s * 4 + 0] = static_cast<float>(dx / 100.0);
+            mlInput[s * 4 + 1] = static_cast<float>(dy / 100.0);
+            mlInput[s * 4 + 2] = static_cast<float>(p->speed / 10.0);
+            mlInput[s * 4 + 3] = static_cast<float>((p->heading * M_PI / 180.0) / M_PI);
         }
 
-        // Run ML prediction
-        std::cerr << "[PredictiveModel] Calling runInference()\n" << std::flush;
-        std::vector<float> mlInputFloat(mlInput.begin(), mlInput.end());
         std::vector<float> mlOutput;
-        auto status = tflitePredictor.runInference(mlInputFloat, mlOutput);
+        const TFLiteStatus status = tflitePredictor.runInference(mlInput, mlOutput);
+        if (status != TFLiteStatus::Ok || mlOutput.size() < 2) return {};
 
-        if (status == TFLiteStatus::Ok && !mlOutput.empty()) {
-            double dt = horizonSeconds / numPoints;
-            int outputPoints = mlOutput.size() / 2; // Expecting lat/lon pairs
-            for (int i = 0; i < outputPoints && i < numPoints; i++) {
-                PredictedState pred;
-                pred.timestamp = currentTime + (i + 1) * dt;
-                pred.latitude = mlOutput[i * 2];
-                pred.longitude = mlOutput[i * 2 + 1];
-                pred.altitude = 0.0;
-                pred.confidence = 0.85; // ML predictions have moderate confidence
-                pred.uncertaintyRadius = 10.0 * (1.0 + (i + 1) * 0.05);
-                predictions.push_back(pred);
-            }
-        } else {
-            // Fallback to Kalman
-            return predictWithKalman(currentTime, horizonSeconds, numPoints);
+        // Output: 50 future (dx/100, dy/100) meter offsets at 1 s steps.
+        std::vector<PredictedState> predictions;
+        const size_t outputPoints = mlOutput.size() / 2;
+        predictions.reserve(outputPoints);
+        for (size_t i = 0; i < outputPoints; ++i) {
+            const double dx = mlOutput[i * 2] * 100.0;
+            const double dy = mlOutput[i * 2 + 1] * 100.0;
+            PredictedState pred;
+            pred.timestamp = currentTime + (double)(i + 1) * 1.0;  // 1 s grid
+            localToGeo(curX + dx, curY + dy, pred.latitude, pred.longitude);
+            pred.altitude = last.altitude;
+            pred.confidence = 0.7;
+            pred.uncertaintyRadius = 8.0 + (double)i * 1.5;
+            predictions.push_back(pred);
         }
 
         lastMlPredictions = predictions;

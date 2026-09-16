@@ -48,12 +48,26 @@
 // ============================================================================
 // Camera UBO Structure - Shared across all shaders
 // ============================================================================
+// Multi-light support: the block carries an array of light positions + colors
+// plus a count (std140: arrays of vec4 are tightly packed at 16-byte stride).
+// Must stay in sync with the CameraBlock layout in editor/shader_manager.cpp.
+constexpr int kMaxLights = 8;
+
+struct RenderLight {
+    glm::vec3 position;
+    glm::vec3 color;
+    float intensity;
+};
+
 struct CameraUBO {
     alignas(16) glm::mat4 view;
     alignas(16) glm::mat4 projection;
     alignas(16) glm::mat4 viewProjection;
     alignas(16) glm::vec4 viewPos;
-    alignas(16) glm::vec4 lightPos;
+    alignas(16) glm::vec4 lightPositions[kMaxLights];
+    alignas(16) glm::vec4 lightColors[kMaxLights];
+    alignas(16) int lightCount;
+    alignas(16) int lightPad[3];  // std140 block size stays a multiple of 16
 };
 
 // ============================================================================
@@ -223,6 +237,15 @@ public:
 
     // Clear all batches
     void ClearBatches();
+    
+    // Culling controls (wired from Editor UI / World Settings)
+    void SetMaxVisibleInstances(int max) { m_maxVisibleInstances = max; }
+    void SetCullingDebug(bool on) { m_cullingDebug = on; }
+    bool IsCullingDebug() const { return m_cullingDebug; }
+    
+    // Culling statistics (updated each SubmitBatches call)
+    size_t getVisibleInstances() const { return m_visibleInstances; }
+    size_t getCulledInstances() const { return m_culledInstances; }
 
     // Set viewport
     void SetViewport(int x, int y, int width, int height);
@@ -239,7 +262,10 @@ public:
     // Set camera matrices (updates UBO)
     void SetCameraMatrices(const glm::mat4& view, const glm::mat4& projection);
     
-    // Set light parameters (updates UBO)
+    // Set light parameters (updates UBO). The multi-light path takes an array
+    // of render lights (editor entities -> LightSystem); the single-light
+    // convenience keeps existing callers working.
+    void SetLights(const RenderLight* lights, int count, const glm::vec3& viewPos);
     void SetLightParameters(const glm::vec3& lightPos, const glm::vec3& viewPos);
 
     // Enable/disable frustum culling
@@ -272,6 +298,12 @@ private:
     bool depthTestingEnabled = true;
     bool faceCullingEnabled = true;
     bool frustumCullingEnabled = true;
+    
+    // Culling control + stats
+    int m_maxVisibleInstances = 2000;   // 0 = unlimited
+    bool m_cullingDebug = false;
+    size_t m_visibleInstances = 0;
+    size_t m_culledInstances = 0;
     
     // Frustum for culling
     Frustum frustum;

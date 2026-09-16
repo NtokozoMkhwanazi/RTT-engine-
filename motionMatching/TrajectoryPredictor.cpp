@@ -39,6 +39,20 @@ Trajectory TrajectoryPredictor::Predict(
     
     // Predict future positions assuming constant velocity + input
     glm::vec3 predictedVel = currentVelocity;
+    // FIX (refreshed todo Fix 2): When the stick is released AND the character
+    // is below the foot-lift velocity threshold, zero the initial prediction
+    // velocity immediately instead of letting residual momentum project a ghost
+    // trajectory 0.5 s into the future. The loop's 0.25-per-step decay only
+    // shrinks velocity exponentially, so at low but non-zero speeds (e.g. 0.3
+    // m/s coasting to a stop) the future path still stretches forward and lures
+    // the KD-tree toward slow walk clips instead of static Idle — producing
+    // root jitter and ankle drift on return to rest. Collapsing the velocity
+    // up-front makes the trajectory converge to a point so the matcher cleanly
+    // selects idle poses.
+    if (glm::length(moveDirection) < 1e-5f &&
+        glm::length(currentVelocity) < config.footLiftVelocityThreshold) {
+        predictedVel = glm::vec3(0.0f);
+    }
     glm::vec3 predictedPos = currentPosition;
     
     for (int i = 0; i < config.trajectoryPoints; i++) {
@@ -53,6 +67,22 @@ Trajectory TrajectoryPredictor::Predict(
         if (inputMagnitude > 1e-6f) {
             const float curSpeed = glm::length(predictedVel);
             predictedVel = glm::mix(predictedVel, worldInputDir * curSpeed, 0.15f);
+        } else {
+            // Replace the frame-rate-dependent glm::mix (0.25f/step) with a
+            // physical, dt-normalized exponential decay. The fixed 0.25
+            // coefficient assumed a hardcoded frame cadence; at 120 Hz it
+            // collapsed the future path far too fast, decoupling the predicted
+            // trajectory from the capsule's real momentum and triggering the
+            // inertialization tug-of-war (hips yanked backward, feet locked)
+            // that hyper-extended the legs. exp(-rate*dt) is frame-rate
+            // invariant — the decay over a fixed time window is constant
+            // regardless of refresh rate. The explicit floor at 0.01 m/s snaps
+            // to true zero, killing sub-threshold micro-drift residual.
+            const float decelerationRate = 12.0f;
+            predictedVel *= std::exp(-decelerationRate * dt);
+            if (glm::length(predictedVel) < 0.01f) {
+                predictedVel = glm::vec3(0.0f);
+            }
         }
         
         // Integrate position

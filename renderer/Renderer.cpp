@@ -13,22 +13,13 @@
 #include <iostream>
 #include <cstring>
 
-// OpenGL 4.3+ constants not available in OpenGL 3.3 headers
-#ifndef GL_DRAW_INDIRECT_BUFFER
-#define GL_DRAW_INDIRECT_BUFFER 0x8F3F
-#endif
-#ifndef GL_MAP_PERSISTENT_BIT
-#define GL_MAP_PERSISTENT_BIT 0x0040
-#endif
-#ifndef GL_MAP_COHERENT_BIT
-#define GL_MAP_COHERENT_BIT 0x0080
-#endif
-
-// Function pointers for OpenGL 4.3+ features
-typedef void (APIENTRY *PFNGLBUFFERSTORAGEPROC)(GLenum target, GLsizeiptr size, const void *data, GLbitfield flags);
-typedef void (APIENTRY *PFNGLMULTIDRAWELEMENTSINDIRECTPROC)(GLenum mode, GLenum type, const void *indirect, GLsizei drawcount, GLsizei stride);
-static PFNGLBUFFERSTORAGEPROC glBufferStoragePtr = nullptr;
-static PFNGLMULTIDRAWELEMENTSINDIRECTPROC glMultiDrawElementsIndirectPtr = nullptr;
+// OpenGL 4.3+ (GL_DRAW_INDIRECT_BUFFER) and 4.4+ (GL_MAP_PERSISTENT_BIT /
+// GL_MAP_COHERENT_BIT) enums are now core in the GLAD 4.6 loader, so the old
+// manual #define shims are unnecessary. glBufferStorage (4.4 /
+// ARB_buffer_storage) and glMultiDrawElementsIndirect (4.3 /
+// ARB_multi_draw_indirect) are likewise loaded directly by GLAD, so the manual
+// glfwGetProcAddress function-pointer dance has been removed in favour of the
+// real entry points.
 
 // ============================================================================
 // Frustum Implementation
@@ -121,20 +112,14 @@ void Renderer::BufferPool::Initialize() {
         mappedPointers[i] = nullptr;
     }
 
-    // Check for OpenGL 4.4+ or GL_ARB_buffer_storage
-    ringBufferSupported = false;
-
-    const char* versionStr = (const char*)glGetString(GL_VERSION);
-    if (versionStr && std::strstr(versionStr, "4.4") != nullptr) {
-        ringBufferSupported = true;
-    }
-    const char* extensions = (const char*)glGetString(GL_EXTENSIONS);
-    if (extensions && std::strstr(extensions, "GL_ARB_buffer_storage") != nullptr) {
-        ringBufferSupported = true;
-    }
+    // Persistent buffer storage is core since OpenGL 4.4 (ARB_buffer_storage).
+    // Read the runtime flag from the GLAD 4.6 loader instead of scanning
+    // glGetString(GL_EXTENSIONS) - that string is NULL under a core profile,
+    // which previously made this always fall back to glBufferSubData.
+    ringBufferSupported = GLAD_GL_ARB_buffer_storage;
 
     if (!ringBufferSupported) {
-        std::cout << "[Renderer] Persistent buffer storage not supported (requires OpenGL 4.4+ or GL_ARB_buffer_storage)\n";
+        std::cout << "[Renderer] Persistent buffer storage not supported (requires OpenGL 4.4+ / GLAD_GL_ARB_buffer_storage)\n";
         std::cout << "[Renderer] Falling back to glBufferSubData\n";
         return;
     }
@@ -146,8 +131,8 @@ void Renderer::BufferPool::Initialize() {
     // Use glBufferStorage with persistent mapping flags
     // GL_MAP_PERSISTENT_BIT: mapping persists after unmap
     // GL_MAP_COHERENT_BIT: GPU sees CPU writes immediately (no flush needed)
-    glBufferStoragePtr(GL_ARRAY_BUFFER, (GLsizeiptr)POOL_SIZE, nullptr,
-                       GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+    glBufferStorage(GL_ARRAY_BUFFER, (GLsizeiptr)POOL_SIZE, nullptr,
+                    GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
 
     // Map once at init time
     ringMappedPtr = glMapBufferRange(GL_ARRAY_BUFFER, 0, (GLsizeiptr)POOL_SIZE,
@@ -218,8 +203,8 @@ size_t Renderer::BufferPool::Allocate(size_t size, void** outMappedPtr) {
 
     // Try to persistently map this buffer too
     if (ringBufferSupported && size < POOL_SIZE / 4) {
-        glBufferStoragePtr(GL_ARRAY_BUFFER, (GLsizeiptr)size, nullptr,
-                           GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+        glBufferStorage(GL_ARRAY_BUFFER, (GLsizeiptr)size, nullptr,
+                        GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
         mappedPointers[idx] = glMapBufferRange(GL_ARRAY_BUFFER, 0, (GLsizeiptr)size,
                                                 GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
     } else {
@@ -415,10 +400,27 @@ void Renderer::SetCameraMatrices(const glm::mat4& view, const glm::mat4& project
     UpdateCameraUBO();
 }
 
-void Renderer::SetLightParameters(const glm::vec3& lightPos, const glm::vec3& viewPos) {
-    cameraData.lightPos = glm::vec4(lightPos, 1.0f);
+void Renderer::SetLights(const RenderLight* lights, int count, const glm::vec3& viewPos) {
     cameraData.viewPos = glm::vec4(viewPos, 1.0f);
+
+    // Clear the previous frame's array, then copy what the scene provides.
+    for (int i = 0; i < kMaxLights; ++i) {
+        cameraData.lightPositions[i] = glm::vec4(0.0f);
+        cameraData.lightColors[i] = glm::vec4(0.0f);
+    }
+    const int n = std::min(count, kMaxLights);
+    for (int i = 0; i < n; ++i) {
+        cameraData.lightPositions[i] = glm::vec4(lights[i].position, 1.0f);
+        // Premultiply intensity so the shader just sums color * attenuation.
+        cameraData.lightColors[i] = glm::vec4(lights[i].color * lights[i].intensity, 1.0f);
+    }
+    cameraData.lightCount = n;
     UpdateCameraUBO();
+}
+
+void Renderer::SetLightParameters(const glm::vec3& lightPos, const glm::vec3& viewPos) {
+    const RenderLight sun = { lightPos, glm::vec3(1.0f), 1.0f };
+    SetLights(&sun, 1, viewPos);
 }
 
 void Renderer::UpdateCameraUBO() {
@@ -497,6 +499,26 @@ void Renderer::SubmitBatches() {
             });
     }
     
+    // Apply max-visible limit: cap the number of batches that get rendered.
+    // When the limit is hit, excess batches are dropped (counted as culled).
+    // Accumulate stats across multiple SubmitBatches calls per frame
+    // (shadow pass, SSAO pass, forward pass). The RenderPipeline resets
+    // these at beginFrame() via ClearBatches().
+    if (m_maxVisibleInstances > 0 && batchIndices.size() > (size_t)m_maxVisibleInstances) {
+        m_culledInstances += batches.size() - m_maxVisibleInstances;
+        m_visibleInstances += m_maxVisibleInstances;
+        batchIndices.resize(m_maxVisibleInstances);
+    } else {
+        m_visibleInstances += batches.size();
+    }
+    
+    // Culling debug: when enabled, disable face culling so backfaces are
+    // visible (helps spot geometry issues), and render in wireframe mode
+    // so the batch boundaries are visible.
+    if (m_cullingDebug) {
+        faceCullingEnabled = false;
+    }
+    
     // Reset ring buffer for new frame (syncs GPU fences, wraps ring)
     bufferPool.ResetRing();
     
@@ -534,8 +556,10 @@ void Renderer::Render() {
         std::vector<size_t> fallbackOrder;
         
         if (batchIndices.empty() && !batches.empty()) {
-            fallbackOrder.resize(batches.size());
-            for (size_t i = 0; i < batches.size(); i++) fallbackOrder[i] = i;
+            size_t limit = m_maxVisibleInstances > 0 ? 
+                std::min(batches.size(), (size_t)m_maxVisibleInstances) : batches.size();
+            fallbackOrder.resize(limit);
+            for (size_t i = 0; i < limit; i++) fallbackOrder[i] = i;
             renderOrder = &fallbackOrder;
         }
         
@@ -609,6 +633,9 @@ void Renderer::Render() {
 void Renderer::ClearBatches() {
     batches.clear();
     batchIndices.clear();
+    // Reset culling stats for the next frame's accumulation
+    m_visibleInstances = 0;
+    m_culledInstances = 0;
 }
 
 void Renderer::SetViewport(int x, int y, int width, int height) {
@@ -695,34 +722,17 @@ void Renderer::SetupBatch(RenderBatch& batch, const std::vector<glm::mat4>& tran
 // ============================================================================
 
 void Renderer::InitializeMDI() {
-    // Check for GL_ARB_multi_draw_indirect or OpenGL 4.3+
-    mdiSupported = false;
-
-    const char* versionStr = (const char*)glGetString(GL_VERSION);
-    const char* extensions = (const char*)glGetString(GL_EXTENSIONS);
-
-    if (versionStr && std::strstr(versionStr, "4.") != nullptr) {
-        mdiSupported = true;
-    }
-
-    if (extensions && std::strstr(extensions, "GL_ARB_multi_draw_indirect") != nullptr) {
-        mdiSupported = true;
-    }
+    // Multi-Draw Indirect (glMultiDrawElementsIndirect) is core since OpenGL
+    // 4.3 (ARB_multi_draw_indirect); the command buffer is persistently mapped
+    // via glBufferStorage (core 4.4, ARB_buffer_storage). Query both through
+    // the GLAD 4.6 loader instead of glGetString(GL_EXTENSIONS) - that string
+    // is NULL under a core profile, which previously made MDI silently fall
+    // back to per-draw glMultiDrawElements.
+    mdiSupported = GLAD_GL_ARB_multi_draw_indirect && GLAD_GL_ARB_buffer_storage;
 
     if (!mdiSupported) {
-        std::cout << "[Renderer] Multi-Draw Indirect not supported (requires OpenGL 4.3+ or GL_ARB_multi_draw_indirect)\n";
+        std::cout << "[Renderer] Multi-Draw Indirect not supported (requires OpenGL 4.3+ / GLAD core loader)\n";
         std::cout << "[Renderer] Falling back to glMultiDrawElements (OpenGL 1.4+)\n";
-        return;
-    }
-
-    // Load OpenGL 4.3+ function pointers
-    glBufferStoragePtr = (PFNGLBUFFERSTORAGEPROC)glfwGetProcAddress("glBufferStorage");
-    glMultiDrawElementsIndirectPtr = (PFNGLMULTIDRAWELEMENTSINDIRECTPROC)glfwGetProcAddress("glMultiDrawElementsIndirect");
-
-    if (!glBufferStoragePtr || !glMultiDrawElementsIndirectPtr) {
-        std::cout << "[Renderer] MDI functions not available via glfwGetProcAddress\n";
-        std::cout << "[Renderer] Falling back to glMultiDrawElements (OpenGL 1.4+)\n";
-        mdiSupported = false;
         return;
     }
 
@@ -732,8 +742,8 @@ void Renderer::InitializeMDI() {
     
     // Allocate storage for indirect commands
     size_t bufferSize = MAX_INDIRECT_COMMANDS * sizeof(DrawElementsIndirectCommand);
-    glBufferStoragePtr(GL_DRAW_INDIRECT_BUFFER, (GLsizeiptr)bufferSize, nullptr,
-                       GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+    glBufferStorage(GL_DRAW_INDIRECT_BUFFER, (GLsizeiptr)bufferSize, nullptr,
+                    GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
     
     // Map the buffer for persistent access
     mdiMappedCommands = glMapBufferRange(GL_DRAW_INDIRECT_BUFFER, 0, (GLsizeiptr)bufferSize,
@@ -760,8 +770,10 @@ void Renderer::ExecuteMultiDraw() {
     std::vector<size_t> fallbackOrder;
     
     if (batchIndices.empty()) {
-        fallbackOrder.resize(batches.size());
-        for (size_t i = 0; i < batches.size(); i++) fallbackOrder[i] = i;
+        size_t limit = m_maxVisibleInstances > 0 ?
+            std::min(batches.size(), (size_t)m_maxVisibleInstances) : batches.size();
+        fallbackOrder.resize(limit);
+        for (size_t i = 0; i < limit; i++) fallbackOrder[i] = i;
         renderOrder = &fallbackOrder;
     }
 
@@ -911,9 +923,9 @@ void Renderer::ExecuteMultiDraw() {
             }
 
             // Single multi-draw call for all batches in this group
-            if (glMultiDrawElementsIndirectPtr) {
-                glMultiDrawElementsIndirectPtr(group.primitiveType, GL_UNSIGNED_INT,
-                                               nullptr, static_cast<GLsizei>(cmdCount), 0);
+            if (GLAD_GL_ARB_multi_draw_indirect) {
+                glMultiDrawElementsIndirect(group.primitiveType, GL_UNSIGNED_INT,
+                                            nullptr, static_cast<GLsizei>(cmdCount), 0);
             }
         } else {
             // === PATH 2: glMultiDrawElements fallback (OpenGL 1.4+) ===

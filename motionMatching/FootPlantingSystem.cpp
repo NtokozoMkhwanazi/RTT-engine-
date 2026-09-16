@@ -29,11 +29,9 @@ void FootPlantingSystem::Update(const glm::vec3& leftFootPos,
                                  const glm::vec3& leftFootVel,
                                  const glm::vec3& rightFootVel,
                                  float groundHeight,
-                                 const MotionMatchingConfig& config) {
+                                 const MotionMatchingConfig& config,
+                                 float dt) {
     if (!initialized) return;
-    
-    // Update foot states (static dt for now)
-    float dt = 0.016f;
     
     leftFoot.Update(leftFootPos, leftFootVel, groundHeight, config, dt);
     rightFoot.Update(rightFootPos, rightFootVel, groundHeight, config, dt);
@@ -83,9 +81,9 @@ glm::vec3 FootPlantingSystem::GetIKTarget(const glm::vec3& animFootPos,
                                            bool isLeftFoot) const {
     const FootState& foot = isLeftFoot ? leftFoot : rightFoot;
     
-    if (foot.planted && foot.plantTimer > 0.05f) {
+    if (foot.isLocked && foot.plantTimer > 0.05f) {
         // Foot is planted - use locked position
-        return foot.plantPosition;
+        return foot.plantedWorldPos;
     } else {
         // Foot is free - use animation position
         return animFootPos;
@@ -102,18 +100,18 @@ void FootPlantingSystem::ApplyFootIK(Animator* animator,
     // For now, this is a placeholder for the IK application
     
     // Apply IK if feet are planted
-    if (leftFoot.planted) {
-       // animator->SetBoneIK(leftFoot.footBone, leftFoot.plantPosition);
+    if (leftFoot.isLocked) {
+       // animator->SetBoneIK(leftFoot.footBone, leftFoot.plantedWorldPos);
     }
-    if (rightFoot.planted) {
-        //animator->SetBoneIK(rightFoot.footBone, rightFoot.plantPosition);
+    if (rightFoot.isLocked) {
+        //animator->SetBoneIK(rightFoot.footBone, rightFoot.plantedWorldPos);
     }
 }
 
 std::string FootPlantingSystem::GetDebugInfo() const {
     std::string info = "Foot Planting: ";
-    info += "L=" + std::string(leftFoot.planted ? "PLANTED" : "FREE");
-    info += " R=" + std::string(rightFoot.planted ? "PLANTED" : "FREE");
+    info += "L=" + std::string(leftFoot.isLocked ? "LOCK" : "free");
+    info += " R=" + std::string(rightFoot.isLocked ? "LOCK" : "free");
     return info;
 }
 
@@ -126,57 +124,77 @@ void FootPlantingSystem::FootState::Update(
     const glm::vec3& newVel,
     float groundHeight,
     const MotionMatchingConfig& config,
-    float dt) {
-
+    float dt)
+{
     position = newPos;
-    velocity = newVel;
 
-    float speed = glm::length(newVel);
-    float footHeight = position.y - groundHeight;
+    // STATE-SPACE REST ZEROING PASS:
+    // If the animation player registers micro-velocity below 0.02 m/s, force-
+    // clamp to zero. The old 0.09 threshold masked real micro-velocity during
+    // walk contact transitions (0.02-0.09 m/s) that the Schmitt trigger needs
+    // to see to decide plant/release — lowering it to match the at-rest
+    // threshold (0.02) so only true noise is zeroed.
+    float currentSpeed = glm::length(newVel);
+    glm::vec3 currentAnkleVel = newVel;
+    if (currentSpeed < 0.02f) {
+        currentAnkleVel = glm::vec3(0.0f);
+        currentSpeed = 0.0f;
+    }
+    velocity = currentAnkleVel;
 
-    if (planted) {
-        // Currently planted - check if should release
-        // CRITICAL FIX: More responsive foot release for proper gait cycles
-        
-        // Release immediately if foot is moving up (heel lift)
-        if (newVel.y > 0.3f) {  // Lowered threshold from 0.5f to 0.3f
-            planted = false;
-            plantTimer = 0.0f;
-            releaseTimer = 0.05f;  // Reduced cooldown from 0.1f to 0.05f
-            return;
+    float distanceToFloor = position.y - groundHeight;
+
+    // --- STATISTICAL VARIANCE SCHMITT-TRIGGER ---
+    // Online Exponential Moving Statistical aggregation (Welford variant).
+    // Gain lowered from 0.15 to 0.08 for more stable variance at low speeds
+    // (the 0.15 gain made speedVariance flutter around the 0.002 threshold
+    // frame-to-frame, causing rapid plant/release oscillation).
+    const float kVarianceGain = 0.08f;
+    float previousMean = speedMean;
+
+    speedMean = glm::mix(speedMean, currentSpeed, kVarianceGain);
+    speedVariance = glm::mix(speedVariance,
+                             (currentSpeed - previousMean) * (currentSpeed - speedMean),
+                             kVarianceGain);
+
+    bool isCloseToGround = distanceToFloor <= config.footPlantedHeightThreshold;
+
+    // Schmitt trigger with hysteresis. The old dead zone was 0.02-0.35 m/s —
+    // far too wide for walk speeds, where foot contact-transition velocities
+    // sit at 0.05-0.15 m/s (squarely in the dead zone, so the foot state
+    // never updated → jitter). The at-rest band is tightened (0.01 for speed,
+    // 0.001 for variance) and the active band is lowered to 0.08 m/s (just
+    // above the velocity-zeroing floor) so a lifting foot releases cleanly
+    // instead of sitting in limbo. The variance thresholds scale with the
+    // speed thresholds to keep the ratio consistent.
+    bool signalIsAtRest  = (speedVariance < 0.001f) && (currentSpeed < 0.01f);
+    bool signalIsActive  = (currentSpeed > 0.08f) || (speedVariance > 0.005f);
+
+    if (isLocked) {
+        if (signalIsActive || !isCloseToGround) {
+            isLocked = false;
+            lockWeight = 0.0f;
+            releaseTimer = 0.10f; // 100ms blending window
+        } else {
+            lockWeight = 1.0f;
+            releaseTimer = 0.0f;
+            plantTimer += dt;  // NOW incremented — was dead code before
         }
-
-        // Release if foot is moving horizontally fast enough
-        float speed = glm::length(newVel);
-        if (speed > config.footPlantThreshold * 1.5f) {  // Reduced from 2.0f to 1.5f
-            planted = false;
-            plantTimer = 0.0f;
-            releaseTimer = 0.05f;  // Reduced cooldown
-            return;
-        }
-
-        // CRITICAL: Release foot after maximum plant duration to prevent "stuck" feet
-        // Most gait cycles have a foot plant duration of 0.3-0.6s
-        // Force release after 0.8s to ensure cycle completes
-        if (plantTimer > 0.8f) {
-            planted = false;
-            plantTimer = 0.0f;
-            releaseTimer = 0.05f;
-            return;
-        }
-
-        // Stay planted
-        plantTimer += dt;
     } else {
-        // Currently free - check if should plant
-        if (releaseTimer > 0.0f) {
-            releaseTimer -= dt;
-        } else if (footHeight <= config.footPlantHeightThreshold &&
-                   speed <= config.footPlantThreshold) {
-            // Plant the foot
-            planted = true;
-            plantPosition = position;
-            plantTimer = 0.0f;
+        if (isCloseToGround && signalIsAtRest) {
+            isLocked = true;
+            lockWeight = 1.0f;
+            plantedWorldPos = position;
+            plantedWorldPos.y = groundHeight; // Snap strictly to floor
+            releaseTimer = 0.0f;
+            plantTimer = 0.0f;  // Reset on plant
+        } else {
+            if (releaseTimer > 0.0f) {
+                releaseTimer -= dt;
+                lockWeight = glm::clamp(releaseTimer / 0.10f, 0.0f, 1.0f);
+            } else {
+                lockWeight = 0.0f;
+            }
         }
     }
 
@@ -184,9 +202,9 @@ void FootPlantingSystem::FootState::Update(
 }
 
 void FootPlantingSystem::FootState::UpdateDebug() {
-    debug.planted = planted;
+    debug.isLocked = isLocked;
     debug.position = position;
-    debug.plantPosition = plantPosition;
+    debug.plantedWorldPos = plantedWorldPos;
     debug.velocity = glm::length(velocity);
     debug.height = position.y;
     debug.plantTimer = plantTimer;

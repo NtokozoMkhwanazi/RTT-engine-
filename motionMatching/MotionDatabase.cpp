@@ -22,8 +22,10 @@ float MotionFeatures::getDifference(const MotionFeatures& other) const {
     float speedDiff = std::abs(speed - other.speed);
     diff += speedDiff * 2.0f;
 
-    // Direction difference
+    // Direction difference (moveAngle is angular - wrap into [0, pi] so two
+    // poses both pointing backward at +pi/-pi don't score a full circle).
     float dirDiff = std::abs(moveAngle - other.moveAngle);
+    if (dirDiff > 3.14159265f) dirDiff = 6.28318530f - dirDiff;
     diff += dirDiff * 2.0f;
 
     // Foot plant state (binary penalty)
@@ -121,6 +123,66 @@ void MotionDatabase::Clear() {
     motionData.Clear();  // Clear SoA data too
     animations.clear();
     animationByName.clear();
+    clipNominalSpeeds_.clear();
+    clipNominalMoveAngles_.clear();
+    simdCache_.valid = false;  // invalidate SIMD cache
+}
+
+float MotionDatabase::GetClipNominalSpeed(size_t animIndex) const {
+    if (animIndex >= animations.size()) return 0.0f;
+
+    // Reallocate if clips were added (or the database was cleared) since the
+    // last access - a fresh -1.0f "not computed" sentinel per clip.
+    if (clipNominalSpeeds_.size() != animations.size()) {
+        clipNominalSpeeds_.assign(animations.size(), -1.0f);
+    }
+    float& cached = clipNominalSpeeds_[animIndex];
+    if (cached >= 0.0f) return cached;
+
+    // Mean root-motion speed over the clip's poses - the same speed feature
+    // the KD-tree ranks on, so this is the clip's natural gait speed
+    // (Idle ~0, Walk ~2, Run ~4 in the test clips / bot clips).
+    double sum = 0.0;
+    size_t count = 0;
+    for (const auto& p : poses) {
+        if (p.animationIndex == static_cast<int>(animIndex)) {
+            sum += p.features.speed;
+            ++count;
+        }
+    }
+    cached = (count > 0) ? static_cast<float>(sum / static_cast<double>(count)) : 0.0f;
+    return cached;
+}
+
+float MotionDatabase::GetClipNominalMoveAngle(size_t animIndex) const {
+    if (animIndex >= animations.size()) return 0.0f;
+
+    // Reallocate if clips were added (or the database was cleared) since the
+    // last access - a fresh max-float "not computed" sentinel per clip. Angles
+    // can be any radian value, so a plain -1.0f sentinel (as used by the speed
+    // cache) would collide with a legitimate -1 radian mean.
+    if (clipNominalMoveAngles_.size() != animations.size()) {
+        clipNominalMoveAngles_.assign(animations.size(),
+                                      std::numeric_limits<float>::max());
+    }
+    float& cached = clipNominalMoveAngles_[animIndex];
+    if (cached != std::numeric_limits<float>::max()) return cached;
+
+    // Circular mean: average the (cos, sin) unit vectors of the clip's move
+    // angles and take atan2 of the result. Raw-angle averaging would let a
+    // turn clip sweeping e.g. -170..170 degrees collapse to ~0 (facing the
+    // wrong way); the unit-vector mean keeps the dominant heading.
+    double sumX = 0.0, sumY = 0.0;
+    size_t count = 0;
+    for (const auto& p : poses) {
+        if (p.animationIndex == static_cast<int>(animIndex)) {
+            sumX += std::cos(static_cast<double>(p.features.moveAngle));
+            sumY += std::sin(static_cast<double>(p.features.moveAngle));
+            ++count;
+        }
+    }
+    cached = (count > 0) ? static_cast<float>(std::atan2(sumY, sumX)) : 0.0f;
+    return cached;
 }
 
 // CRITICAL FIX: Takes shared_ptr - caller MUST use std::make_shared
@@ -235,6 +297,21 @@ void MotionDatabase::AddAnimation(const std::string& name, std::shared_ptr<Anima
     animations.push_back(entry);
     animationByName[name] = animations.size() - 1;
 
+    // CRITICAL CORRECTION: Only invalidate SIMD registers when loading a
+    // genuinely new kinematic structure. During idle rest states the clip is
+    // re-added on every database reset, which would continuously flip
+    // simdCache_.valid = false and force a full SoA cache rebuild every
+    // frame - the memory-alignment shifts register as visual jitter in the
+    // ankle joint matrix buffers. Guarding on the clip name (Idle = the
+    // common non-moving loop) plus the pose-count invariant keeps the cache
+    // warm during the rest cycle.
+    if (name != "Idle" || poses.size() <= expectedPoses) {
+        clipNominalSpeeds_.clear();
+        clipNominalMoveAngles_.clear();
+        simdCache_.valid = false;
+        simdCache_.poseCount = 0;
+    }
+
     std::cout << "  Added " << numFrames << " pose samples (SoA cache-optimized)\n";
 }
 
@@ -337,6 +414,15 @@ void MotionDatabase::ExtractPoseFeatures(size_t poseIndex, std::shared_ptr<Anima
     // Calculate move angle from velocity direction
     if (speed > 0.001f) {
         pose.features.moveAngle = atan2(rootVel.x, rootVel.z);
+        // Canonicalize to [0, 2pi): atan2 returns +/-pi for the SAME backward
+        // heading (the zero-sign of the X component is an arbitrary floating
+        // artifact), and the KD tree builds on these raw values - +pi and -pi
+        // land on opposite ends of the split axis, so a straight-backward
+        // query prunes the matching backward poses. Shifting negatives makes
+        // "backward" always +pi (the seam moves to 0, i.e. forward). The
+        // distance metrics wrap the difference, so the value range does not
+        // affect scoring - only the tree structure.
+        if (pose.features.moveAngle < 0.0f) pose.features.moveAngle += 6.28318530f;
     } else {
         pose.features.moveAngle = 0.0f;
     }
@@ -344,14 +430,14 @@ void MotionDatabase::ExtractPoseFeatures(size_t poseIndex, std::shared_ptr<Anima
     // =========================================================================
     // FOOT PLANTING DETECTION - CRITICAL FOR PREVENTING FOOTSKATING
     // =========================================================================
-    
+
     // Find foot bones
     const BoneAnimation* leftFootAnim = nullptr;
     const BoneAnimation* rightFootAnim = nullptr;
-    
+
     static const std::vector<std::string> leftFootNames = {"leftfoot", "LeftFoot", "mixamorig:LeftFoot"};
     static const std::vector<std::string> rightFootNames = {"rightfoot", "RightFoot", "mixamorig:RightFoot"};
-    
+
     for (const auto& name : leftFootNames) {
         auto it = anim->boneAnimations.find(name);
         if (it != anim->boneAnimations.end()) {
@@ -359,7 +445,7 @@ void MotionDatabase::ExtractPoseFeatures(size_t poseIndex, std::shared_ptr<Anima
             break;
         }
     }
-    
+
     for (const auto& name : rightFootNames) {
         auto it = anim->boneAnimations.find(name);
         if (it != anim->boneAnimations.end()) {
@@ -367,54 +453,147 @@ void MotionDatabase::ExtractPoseFeatures(size_t poseIndex, std::shared_ptr<Anima
             break;
         }
     }
-    
+
     // Calculate foot positions and velocities
     glm::vec3 leftFootPos(0.0f), leftFootVel(0.0f);
     glm::vec3 rightFootPos(0.0f), rightFootVel(0.0f);
-    
+    // FIXED (unknown doc): match the 120fps gait-capture step size exactly.
+    // The prior look-ahead sampled two keyframe increments (2 * 1/120 s),
+    // smearing foot velocity across a frame and mis-flagging planted feet as
+    // moving. One frame step (1/120 s) is the true gait cadence.
+    const float velocityExtractionDt = 1.0f / 120.0f;
+
     if (leftFootAnim) {
         leftFootPos = leftFootAnim->InterpolatePosition(time);
-        glm::vec3 nextPos = leftFootAnim->InterpolatePosition(time + 0.016f);
-        leftFootVel = (nextPos - leftFootPos) / 0.016f;
+        glm::vec3 nextPos = leftFootAnim->InterpolatePosition(time + velocityExtractionDt);
+        leftFootVel = (nextPos - leftFootPos) / velocityExtractionDt;
     }
-    
+
     if (rightFootAnim) {
         rightFootPos = rightFootAnim->InterpolatePosition(time);
-        glm::vec3 nextPos = rightFootAnim->InterpolatePosition(time + 0.016f);
-        rightFootVel = (nextPos - rightFootPos) / 0.016f;
+        glm::vec3 nextPos = rightFootAnim->InterpolatePosition(time + velocityExtractionDt);
+        rightFootVel = (nextPos - rightFootPos) / velocityExtractionDt;
     }
-    
+
     // Store foot heights
     pose.leftFootHeight = leftFootPos.y;
     pose.rightFootHeight = rightFootPos.y;
-    
+
     // Detect foot planting based on velocity and height
     // Foot is planted when:
     // 1. Near ground (low Y position relative to ankle)
     // 2. Moving slowly (low horizontal velocity)
     float footPlantVelThreshold = 0.25f;  // Velocity threshold for planting
     float footPlantHeightThreshold = 0.15f;  // Height threshold relative to min foot height
-    
+
     // Calculate horizontal foot speed (ignore vertical motion)
     float leftFootSpeed = glm::length(glm::vec2(leftFootVel.x, leftFootVel.z));
     float rightFootSpeed = glm::length(glm::vec2(rightFootVel.x, rightFootVel.z));
-    
+
     // Simple foot plant detection
     // Note: For more accurate detection, we would analyze the full animation
     // to find the minimum foot height and use that as reference
-    pose.leftFootPlanted = (leftFootSpeed < footPlantVelThreshold && 
+    pose.leftFootPlanted = (leftFootSpeed < footPlantVelThreshold &&
                             leftFootPos.y < footPlantHeightThreshold &&
                             leftFootVel.y < 0.1f);  // Not moving up
-                            
-    pose.rightFootPlanted = (rightFootSpeed < footPlantVelThreshold && 
+
+    pose.rightFootPlanted = (rightFootSpeed < footPlantVelThreshold &&
                              rightFootPos.y < footPlantHeightThreshold &&
                              rightFootVel.y < 0.1f);  // Not moving up
-    
+
     // Store foot velocities for motion matching
     pose.features.leftFootVel = leftFootVel;
     pose.features.rightFootVel = rightFootVel;
     pose.features.leftFootPos = leftFootPos;
     pose.features.rightFootPos = rightFootPos;
+
+    // FIX (v11 Section 3): Dispatch to the AVX2 trajectory extractor when
+    // the CPU supports it. This recomputes the future-path trajectory offsets
+    // using a single _mm256_sub_ps instead of the scalar loop above. The rest
+    // of the feature (root pos/velocity, speed, angle, foot planting) is
+    // identical — only the trajectory subtractions are vectorized.
+    if (cpuSupportsAVX2()) {
+        ExtractPoseFeaturesSIMD(poseIndex, anim, time, rootPos.x, rootPos.z);
+    }
+}
+
+// --------------------------------------------------------------------------
+// FIX (v11 Section 3): AVX2-accelerated trajectory feature extraction.
+// Replaces the scalar for-loop over kTrajectorySteps with a single
+// _mm256_sub_ps that computes all 4 future (x,z) offsets in one instruction.
+// The 4 time samples are interpolated scalar (InterpolatePosition is not
+// vectorizable without restructuring the Animation class), but the packing
+// and subtraction run in one 8-lane AVX2 register.
+// --------------------------------------------------------------------------
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,fma")))
+#endif
+void MotionDatabase::ExtractPoseFeaturesSIMD(size_t poseIndex,
+                                              std::shared_ptr<Animation> anim,
+                                              float time,
+                                              float rootPos_x,
+                                              float rootPos_z) {
+    if (poseIndex >= poses.size()) return;
+    PoseSample& pose = poses[poseIndex];
+
+    // Reuse the same root-bone search logic as the scalar version
+    const BoneAnimation* rootBoneAnim = nullptr;
+    static const std::vector<std::string> rootBoneNames = {
+        "hips", "Hips", "mixamorig:hips", "mixamorig:Hips",
+        "Mixamorig:Hips", "root", "Root", "hip", "Hip", "pelvis", "Pelvis"
+    };
+    for (const auto& boneName : rootBoneNames) {
+        auto it = anim->boneAnimations.find(boneName);
+        if (it != anim->boneAnimations.end()) {
+            rootBoneAnim = &it->second;
+            break;
+        }
+    }
+    if (!rootBoneAnim && !anim->boneAnimations.empty()) {
+        rootBoneAnim = &anim->boneAnimations.begin()->second;
+    }
+
+    if (rootBoneAnim) {
+        pose.trajectory.localNumPoints = kTrajectorySteps;
+
+        // Sample 4 future time steps ahead (same logic as scalar version)
+        alignas(16) float futureTimes[kTrajectorySteps];
+        for (int k = 0; k < kTrajectorySteps; ++k) {
+            float sampleT = time + (k + 1) * kTrajectoryStepTime;
+            futureTimes[k] = fmod(sampleT, anim->duration);
+        }
+
+        // Interpolate positions (scalar — Animation::InterpolatePosition
+        // is not vectorizable without restructuring the keyframe system)
+        alignas(32) float packedFuture[8] = {};
+        for (int k = 0; k < kTrajectorySteps; ++k) {
+            glm::vec3 fp = rootBoneAnim->InterpolatePosition(futureTimes[k]);
+            packedFuture[k * 2]     = fp.x;  // X0,Z0,X1,Z1,X2,Z2,X3,Z3
+            packedFuture[k * 2 + 1] = fp.z;
+        }
+
+        // Broadcast current root position across all 8 lanes
+        alignas(32) float packedCurrent[8] = {
+            rootPos_x, rootPos_z,
+            rootPos_x, rootPos_z,
+            rootPos_x, rootPos_z,
+            rootPos_x, rootPos_z
+        };
+
+        // Single 256-bit subtraction: (future - current) = relative offset
+        __m256 vFuture = _mm256_load_ps(packedFuture);
+        __m256 vCurrent = _mm256_load_ps(packedCurrent);
+        __m256 vRelative = _mm256_sub_ps(vFuture, vCurrent);
+
+        // Unpack back to the trajectory structure (Y is always 0 — XZ plane)
+        alignas(32) float extractedDeltas[8];
+        _mm256_store_ps(extractedDeltas, vRelative);
+
+        for (int k = 0; k < kTrajectorySteps; ++k) {
+            pose.trajectory.localPositions[k] =
+                glm::vec3(extractedDeltas[k * 2], 0.0f, extractedDeltas[k * 2 + 1]);
+        }
+    }
 }
 
 SearchResult MotionDatabase::Search(const MotionFeatures& query,
@@ -510,6 +689,142 @@ std::vector<std::pair<int, float>> MotionDatabase::SearchCacheOptimized(
     return candidates;
 }
 
+// ---- AVX2 SIMD search -------------------------------------------------------
+void MotionDatabase::RebuildSIMDCacheIfNeeded() const {
+    if (simdCache_.valid && simdCache_.poseCount == poses.size())
+        return;
+
+    const size_t n = poses.size();
+    simdCache_.soa.speeds.resize(n);
+    simdCache_.soa.velocitiesX.resize(n);
+    simdCache_.soa.velocitiesZ.resize(n);
+    simdCache_.soa.moveAngles.resize(n);
+    simdCache_.soa.leftFootPlanted.resize(n);
+    simdCache_.soa.rightFootPlanted.resize(n);
+    simdCache_.soa.velocitiesY.resize(n);
+    simdCache_.soa.originalIndex.resize(n);
+
+    // Trajectory future-path arrays (per-step x,z)
+    for (int k = 0; k < kTrajectorySteps; ++k) {
+        simdCache_.soa.trajectoryX[k].resize(n);
+        simdCache_.soa.trajectoryZ[k].resize(n);
+    }
+    // FIX (v11 Section 4): Interleaved trajectory block — 8 floats per pose
+    // packed as [X0,Z0,X1,Z1,X2,Z2,X3,Z3] for single-instruction _mm256_load_ps.
+    simdCache_.soa.interleavedTrajectories.resize(n * 8);
+
+    for (size_t i = 0; i < n; ++i) {
+        const auto& f = poses[i].features;
+        simdCache_.soa.speeds[i] = f.speed;
+        simdCache_.soa.velocitiesX[i] = f.rootVelocity.x;
+        simdCache_.soa.velocitiesZ[i] = f.rootVelocity.z;
+        simdCache_.soa.velocitiesY[i] = f.rootVelocity.y;
+        simdCache_.soa.moveAngles[i] = f.moveAngle;
+        simdCache_.soa.leftFootPlanted[i] = f.leftFootPlanted ? 1.0f : 0.0f;
+        simdCache_.soa.rightFootPlanted[i] = f.rightFootPlanted ? 1.0f : 0.0f;
+        simdCache_.soa.originalIndex[i] = static_cast<int>(i);
+        // Trajectory: localPositions[k] is a vec3; store x and z (y ignored,
+        // matching the KD-tree feature layout at dims 7+2k and 7+2k+1).
+        for (int k = 0; k < kTrajectorySteps; ++k) {
+            if (f.futureCount > k) {
+                simdCache_.soa.trajectoryX[k][i] = f.futureLocal[k].x;
+                simdCache_.soa.trajectoryZ[k][i] = f.futureLocal[k].y;
+            } else {
+                simdCache_.soa.trajectoryX[k][i] = 0.0f;
+                simdCache_.soa.trajectoryZ[k][i] = 0.0f;
+            }
+        }
+        // FIX (v11 Section 4): Pack all 4 future x,z offsets into 8 contiguous
+        // floats for the interleaved trajectory block [X0,Z0,X1,Z1,X2,Z2,X3,Z3].
+        for (int k = 0; k < kTrajectorySteps; ++k) {
+            size_t base = i * 8;
+            if (f.futureCount > k) {
+                simdCache_.soa.interleavedTrajectories[base + k * 2]     = f.futureLocal[k].x;
+                simdCache_.soa.interleavedTrajectories[base + k * 2 + 1] = f.futureLocal[k].y;
+            } else {
+                simdCache_.soa.interleavedTrajectories[base + k * 2]     = 0.0f;
+                simdCache_.soa.interleavedTrajectories[base + k * 2 + 1] = 0.0f;
+            }
+        }
+    }
+    simdCache_.soa.EnforceVectorPadding();
+    simdCache_.valid = true;
+    simdCache_.poseCount = n;
+}
+
+std::vector<std::pair<int, float>> MotionDatabase::SearchSIMD(
+    const MotionFeatures& query,
+    const Trajectory& trajectory,
+    int maxCandidates,
+    int airborneFilter) const {
+    // Rebuild SoA cache if the database changed
+    RebuildSIMDCacheIfNeeded();
+
+    if (!cpuSupportsAVX2() || simdCache_.soa.GetPoseCount() == 0)
+        return SearchCacheOptimized(query, trajectory, maxCandidates, airborneFilter);
+
+    // Map the MotionFeatures query to the SIMD query format
+    SIMDFeaturesQuery q;
+    q.speed     = query.speed;
+    q.velX      = query.rootVelocity.x;
+    q.velZ      = query.rootVelocity.z;
+    q.moveAngle = query.moveAngle;
+    q.leftFoot  = query.leftFootPlanted ? 1.0f : 0.0f;
+    q.rightFoot = query.rightFootPlanted ? 1.0f : 0.0f;
+    q.velY      = query.rootVelocity.y;
+    // Trajectory future-path: query.futureLocal[k] is a vec2 (x, y) where
+    // x = local-x offset, y = local-z offset (matching KD-tree dims 7+2k, 7+2k+1).
+    for (int k = 0; k < kTrajectorySteps; ++k) {
+        if (query.futureCount > k) {
+            q.trajX[k] = query.futureLocal[k].x;
+            q.trajZ[k] = query.futureLocal[k].y;
+        } else {
+            q.trajX[k] = 0.0f;
+            q.trajZ[k] = 0.0f;
+        }
+    }
+
+    SIMDWeightsConfig w;
+    w.speed     = weights.speedWeight;
+    w.velX      = weights.velocityWeight;
+    w.velZ      = weights.velocityWeight;
+    w.direction = weights.directionWeight;
+    w.footPlant = weights.footPlantWeight;
+    w.velY      = weights.velocityWeight * 0.5f;  // vertical less important
+    // Trajectory weights: use the KD-tree's per-step falloff if available,
+    // otherwise fall back to the database-level trajectoryWeight uniform.
+    for (int k = 0; k < kTrajectorySteps; ++k) {
+        w.trajectoryWeights[k] = weights.trajectoryWeight;
+    }
+
+    // Run the AVX2 8-wide search (returns top maxCandidates sorted by distance)
+    auto allResults = ExecuteAVX2PoseSearch(simdCache_.soa, q, w, maxCandidates);
+
+    // Apply airborne filter if requested (0 = grounded only, 1 = airborne only).
+    // The AVX2 search doesn't know about airborne state, so we filter the
+    // results here.  If the filter empties the top-N, fall back to the scalar
+    // search that respects the filter natively.
+    std::vector<std::pair<int, float>> results;
+    results.reserve(maxCandidates);
+    if (airborneFilter >= 0) {
+        for (const auto& [idx, dist] : allResults) {
+            if (idx >= 0 && idx < static_cast<int>(poses.size()) &&
+                poses[idx].features.isAirborne == (airborneFilter == 1)) {
+                results.emplace_back(idx, dist);
+            }
+        }
+        // If the SIMD top-N didn't contain enough matching poses, the scalar
+        // search (which filters natively) will find the correct ones.
+        if (static_cast<int>(results.size()) < maxCandidates)
+            return SearchCacheOptimized(query, trajectory, maxCandidates, airborneFilter);
+    } else {
+        for (const auto& [idx, dist] : allResults) {
+            results.emplace_back(idx, dist);
+        }
+    }
+    return results;
+}
+
 float MotionDatabase::CalculatePoseScore(const PoseSample& pose,
                                           const MotionFeatures& query,
                                           const Trajectory& trajectory,
@@ -524,8 +839,10 @@ float MotionDatabase::CalculatePoseScore(const PoseSample& pose,
     float speedDiff = std::abs(pose.features.speed - query.speed);
     score += speedDiff * weights.speedWeight;
 
-    // 3. Direction match
+    // 3. Direction match (moveAngle is angular - wrap into [0, pi] so two
+    // poses both pointing backward at +pi/-pi don't score a full circle).
     float dirDiff = std::abs(pose.features.moveAngle - query.moveAngle);
+    if (dirDiff > 3.14159265f) dirDiff = 6.28318530f - dirDiff;
     score += dirDiff * weights.directionWeight;
 
     // 4. Trajectory match (if enabled)
@@ -572,8 +889,10 @@ float MotionDatabase::CalculatePoseScoreCacheOptimized(size_t poseIndex,
     float speedDiff = std::abs(speed - query.speed);
     score += speedDiff * weights.speedWeight;
 
-    // 3. Direction match
+    // 3. Direction match (moveAngle is angular - wrap into [0, pi] so two
+    // poses both pointing backward at +pi/-pi don't score a full circle).
     float dirDiff = std::abs(moveAngle - query.moveAngle);
+    if (dirDiff > 3.14159265f) dirDiff = 6.28318530f - dirDiff;
     score += dirDiff * weights.directionWeight;
 
     // 4. Trajectory match (if enabled)

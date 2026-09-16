@@ -301,13 +301,26 @@ private:
     void extractBoneWeights(std::vector<Vertex>& vertices, aiMesh* mesh);
     
     // Materials
-    PBRMaterial processMaterial(aiMaterial* mat, const std::string& directory);
+    PBRMaterial processMaterial(aiMaterial* mat, const std::string& directory, const aiScene* scene);
     std::vector<Texture> loadMaterialTextures(
         aiMaterial* mat,
         aiTextureType type,
         const std::string& typeName
     );
     unsigned int loadTexture(const std::string& path, aiTextureType type);
+
+    // Embedded-texture support: many FBX exports (Mixamo characters) store
+    // the texture pixels INSIDE the file (FBX Video nodes) and reference them
+    // by the original path - usually an absolute temp path like
+    // "/tmp/.../skins_xxx.fbm/Vampire_diffuse.png" that does not exist on
+    // disk. Without decoding these, clothed characters render with the flat
+    // default grey.
+    const aiTexture* findEmbeddedTexture(const aiScene* scene, const std::string& path) const;
+    unsigned int loadEmbeddedTexture(const aiScene* scene, const std::string& path, aiTextureType type);
+    // Shared upload of decoded pixels (downscale + BC1/BC3 compression + GL
+    // upload), used by both loadTexture (disk) and embedded textures.
+    unsigned int uploadImageData(unsigned char* data, int width, int height,
+                                 int nrComponents, aiTextureType type, bool ownedByStbi);
     
     // LOD
     void generateLODLevels();

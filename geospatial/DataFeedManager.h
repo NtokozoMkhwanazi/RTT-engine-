@@ -13,12 +13,16 @@
 
 #include <string>
 #include <vector>
+#include <deque>
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <condition_variable>
+#include <type_traits>
+#include <cstdlib>
 #include <curl/curl.h>
 #include <iostream>
 
@@ -61,6 +65,13 @@ public:
     // Callback type for receiving data points
     using DataCallback = std::function<void(const GeoDataPoint&)>;
 
+    // Public description of a registered feed (for UI listing).
+    struct FeedInfo {
+        std::string url;
+        std::string type;   // "REST" or "WebSocket"
+        bool active = false;
+    };
+
     /**
      * Add a REST API feed (polling)
      * @param url The REST endpoint URL
@@ -73,7 +84,19 @@ public:
                      DataCallback callback,
                      std::function<GeoDataPoint(const std::string&)> parser = defaultJSONParser) {
         std::lock_guard<std::mutex> lock(feedsMutex);
-        restFeeds.push_back({url, intervalMs, callback, parser, true});
+        auto feed = std::make_unique<RESTFeed>();
+        feed->url = url;
+        feed->intervalMs = intervalMs;
+        feed->callback = std::move(callback);
+        feed->parser = std::move(parser);
+        feed->active = true;
+        RESTFeed* raw = feed.get();
+        restFeeds.push_back(std::move(feed));
+        // If feeds are already running, start this one immediately. Each feed
+        // lives on its own heap allocation (unique_ptr), so the worker
+        // thread's &feed capture stays valid regardless of container growth
+        // or the removal of other feeds.
+        if (running) startFeedThread(*raw);
     }
 
     /**
@@ -81,7 +104,81 @@ public:
      */
     void addWebSocketFeed(const std::string& url, DataCallback callback) {
         std::lock_guard<std::mutex> lock(feedsMutex);
-        wsFeeds.push_back({url, callback, true});
+        auto feed = std::make_unique<WSFeed>();
+        feed->url = url;
+        feed->callback = std::move(callback);
+        feed->active = true;
+        WSFeed* raw = feed.get();
+        wsFeeds.push_back(std::move(feed));
+        if (running) startFeedThread(*raw);
+    }
+
+    /** Number of registered feeds (REST + WebSocket). */
+    size_t getFeedCount() const {
+        std::lock_guard<std::mutex> lock(feedsMutex);
+        return restFeeds.size() + wsFeeds.size();
+    }
+
+    /** Description of the feed at the given index (REST feeds first). */
+    FeedInfo getFeedInfo(size_t index) const {
+        std::lock_guard<std::mutex> lock(feedsMutex);
+        if (index < restFeeds.size()) {
+            const auto& f = *restFeeds[index];
+            return {f.url, "REST", f.active};
+        }
+        const size_t wsIdx = index - restFeeds.size();
+        if (wsIdx < wsFeeds.size()) {
+            const auto& f = *wsFeeds[wsIdx];
+            return {f.url, "WebSocket", f.active};
+        }
+        return {};
+    }
+
+    /**
+     * Stop and remove the feed at the given index (REST feeds first).
+     * No-op when the index is out of range.
+     *
+     * The worker thread is signalled to stop and JOINED WITHOUT holding
+     * feedsMutex, so an in-flight poll (bounded by CURLOPT_TIMEOUT) never
+     * blocks other feed operations or the UI thread.
+     */
+    void removeFeed(size_t index) {
+        // Locate the target, signal stop (active=false + wake) under the lock.
+        bool* activeFlag = nullptr;
+        std::thread* joinTarget = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(feedsMutex);
+            if (index < restFeeds.size()) {
+                auto& f = *restFeeds[index];
+                activeFlag = &f.active;
+                joinTarget = &f.thread;
+            } else {
+                const size_t wsIdx = index - restFeeds.size();
+                if (wsIdx < wsFeeds.size()) {
+                    auto& f = *wsFeeds[wsIdx];
+                    activeFlag = &f.active;
+                    joinTarget = &f.thread;
+                }
+            }
+            if (!activeFlag) return;
+            *activeFlag = false;      // worker loop exits after its wake
+            sleepCv.notify_all();
+        }
+
+        // Join outside the lock: an in-flight poll (bounded by the 10 s curl
+        // timeout) must not block other feed operations or the UI thread.
+        if (joinTarget->joinable()) joinTarget->join();
+
+        // Erase by identity (indices may have shifted while unlocked).
+        std::lock_guard<std::mutex> lock(feedsMutex);
+        if (index < restFeeds.size() && joinTarget == &restFeeds[index]->thread) {
+            restFeeds.erase(restFeeds.begin() + static_cast<ptrdiff_t>(index));
+            return;
+        }
+        const size_t wsIdx = index - restFeeds.size();
+        if (wsIdx < wsFeeds.size() && joinTarget == &wsFeeds[wsIdx]->thread) {
+            wsFeeds.erase(wsFeeds.begin() + static_cast<ptrdiff_t>(wsIdx));
+        }
     }
 
     /**
@@ -91,7 +188,9 @@ public:
         NMEAData result;
         if (sentence.empty() || sentence[0] != '$') return result;
 
-        // Simple $GPRMC parsing: $GPRMC,time,status,lat,N/S,lon,E/W,speed,track,date,...
+        // $GPRMC parsing: $GPRMC,time,status,lat,N/S,lon,E/W,speed,track,date,...
+        // field indices: 0=GPRMC 1=time 2=status 3=lat 4=N/S 5=lon 6=E/W
+        //                7=speed(knots) 8=track 9=date 10=magvar 11=E/W 12=cs
         if (sentence.find("$GPRMC") != std::string::npos) {
             std::vector<std::string> fields;
             size_t start = 1;
@@ -103,40 +202,36 @@ public:
             }
             fields.push_back(sentence.substr(start));
 
-            if (fields.size() >= 8 && fields[1] == "A") { // Active
+            if (fields.size() >= 7 && fields[2] == "A") { // Active
                 result.valid = true;
-                // Parse latitude (fields[2] + fields[3] for N/S)
-                if (fields.size() > 3) {
-                    double lat = std::stod(fields[2]);
+                // Parse latitude (fields[3] + fields[4] for N/S)
+                if (fields.size() > 4) {
+                    const double lat = safeToDouble(fields[3]);
                     result.lat = parseNMEACoord(lat);
-                    if (fields[3] == "S") result.lat = -result.lat;
+                    if (fields[4] == "S") result.lat = -result.lat;
                 }
-                // Parse longitude (fields[4] + fields[5] for E/W)
-                if (fields.size() > 5) {
-                    double lon = std::stod(fields[4]);
+                // Parse longitude (fields[5] + fields[6] for E/W)
+                if (fields.size() > 6) {
+                    const double lon = safeToDouble(fields[5]);
                     result.lon = parseNMEACoord(lon);
-                    if (fields[5] == "W") result.lon = -result.lon;
+                    if (fields[6] == "W") result.lon = -result.lon;
                 }
-                if (fields.size() > 6) result.speed = std::stod(fields[6]) * 0.514444; // knots to m/s
-                if (fields.size() > 7) result.track = std::stod(fields[7]);
+                if (fields.size() > 7) result.speed = safeToDouble(fields[7]) * 0.514444; // knots to m/s
+                if (fields.size() > 8) result.track = safeToDouble(fields[8]);
             }
         }
         return result;
     }
 
     /**
-     * Start all feeds
+     * Start all feeds (idempotent).
      */
     void startAllFeeds() {
+        std::lock_guard<std::mutex> lock(feedsMutex);
+        if (running) return;
         running = true;
-        // Start REST feed threads
-        for (auto& feed : restFeeds) {
-            feed.thread = std::thread([this, &feed]() { restFeedLoop(feed); });
-        }
-        // Start WebSocket feed threads
-        for (auto& feed : wsFeeds) {
-            feed.thread = std::thread([this, &feed]() { wsFeedLoop(feed); });
-        }
+        for (auto& feed : restFeeds) startFeedThread(*feed);
+        for (auto& feed : wsFeeds) startFeedThread(*feed);
     }
 
     /**
@@ -144,11 +239,12 @@ public:
      */
     void stopAllFeeds() {
         running = false;
+        sleepCv.notify_all();
         for (auto& feed : restFeeds) {
-            if (feed.thread.joinable()) feed.thread.join();
+            if (feed->thread.joinable()) feed->thread.join();
         }
         for (auto& feed : wsFeeds) {
-            if (feed.thread.joinable()) feed.thread.join();
+            if (feed->thread.joinable()) feed->thread.join();
         }
     }
 
@@ -190,12 +286,35 @@ private:
         std::thread thread;
     };
 
-    std::vector<RESTFeed> restFeeds;
-    std::vector<WSFeed> wsFeeds;
+    // Feeds are heap-allocated (unique_ptr) so each worker thread's
+    // [this, &feed] capture references a stable object: deque growth does not
+    // move it, and erasing OTHER feeds (from any index) does not invalidate
+    // it. Only the erased feed's own thread is joined before its object dies.
+    std::deque<std::unique_ptr<RESTFeed>> restFeeds;
+    std::deque<std::unique_ptr<WSFeed>> wsFeeds;
     std::queue<GeoDataPoint> dataQueue;
-    std::mutex feedsMutex;
+    mutable std::mutex feedsMutex;
     std::mutex queueMutex;
     std::atomic<bool> running;
+
+    // Wake-up for feed worker threads: removal/shutdown interrupts their poll
+    // sleep so a join never blocks for a full poll interval. Dedicated mutex
+    // (never the feedsMutex) so a joining thread never deadlocks on it.
+    std::mutex sleepMutex;
+    std::condition_variable sleepCv;
+
+    // Start the worker thread for a single feed (call with feedsMutex held).
+    // Templated so it works for both RESTFeed and WSFeed.
+    template <typename Feed>
+    void startFeedThread(Feed& feed) {
+        if (feed.thread.joinable()) return;
+        feed.active = true;
+        if constexpr (std::is_same_v<Feed, RESTFeed>) {
+            feed.thread = std::thread([this, &feed]() { restFeedLoop(feed); });
+        } else {
+            feed.thread = std::thread([this, &feed]() { wsFeedLoop(feed); });
+        }
+    }
 
     // cURL write callback
     static size_t curlWriteCallback(char* ptr, size_t size, size_t nmemb, std::string* data) {
@@ -223,14 +342,20 @@ private:
                 }
                 curl_easy_cleanup(curl);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(feed.intervalMs));
+            // Interruptible sleep: removal/shutdown wakes the thread so the
+            // join never blocks for a full poll interval.
+            std::unique_lock<std::mutex> lk(sleepMutex);
+            sleepCv.wait_for(lk, std::chrono::milliseconds(feed.intervalMs),
+                             [this, &feed] { return !running || !feed.active; });
         }
     }
 
     void wsFeedLoop(WSFeed& feed) {
         // Simplified - in production use libwebsockets or similar
         while (running && feed.active) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::unique_lock<std::mutex> lk(sleepMutex);
+            sleepCv.wait_for(lk, std::chrono::milliseconds(100),
+                             [this, &feed] { return !running || !feed.active; });
         }
     }
 
@@ -252,5 +377,11 @@ private:
         int degrees = static_cast<int>(coord / 100);
         double minutes = coord - (degrees * 100);
         return degrees + minutes / 60.0;
+    }
+
+    // strtod-based parse that never throws on malformed input.
+    static double safeToDouble(const std::string& s) {
+        if (s.empty()) return 0.0;
+        return std::strtod(s.c_str(), nullptr);
     }
 };

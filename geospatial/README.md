@@ -287,16 +287,26 @@ world.update(dt);  // Entities auto-snap to terrain
 3. **TensorFlow Lite optional**: Falls back to Kalman Filter if library/model not found.
 4. **No map tiles**: Satellite imagery overlay not yet implemented.
 
-## Testing
+## 🛠️ Build & Test
+
+From the repository root:
 
 ```bash
-# Build and run geoterrain integration tests
-make geoterrain_test && ./bin/geoterrain_test
-
-# Run main application with map viewport
-make && ./bin/test
-
-# Click "GPS" button to cycle modes
-# Enable "Geo" button to see visualization
-# View map viewport in top-right corner
+make            # build bin/test_runner + bin/engine (debug)
+make editor     # build bin/editor_app (ImGui editor)
+make test       # run the full unit-test suite (731 tests / 99 suites, incl. Geo suites)
+make run        # self-check tests, then boot the engine
+make run-headless  # bounded headless engine run (CI-friendly)
+make geoterrain-test   # bin/geoterrain_test — GeoTerrain Phase 5 demo app
 ```
+
+The engine entry point (`make run`) initializes `geo::GeoAPI` at a Sydney origin with a
+simulated GPS walking track and advances it every frame, alongside the character demo.
+
+GeoHTTP server, NMEA feeds, GPS modes, Kalman/ML prediction and panel persistence are
+covered by `make test` (the `GEO*` suites: `GeoAPIFeeds`, `GeoFeedNmea`, `GeoHTTPServer`,
+`GeoPanelPersistence`, `GeoTerminalCommands`, `GeoTerminalNmea`). See the
+[root README](../README.md#test-suites) for the full target list and prerequisites.
+
+In the editor, click **GPS** to cycle modes and enable **Geo** to see the visualization
+(map viewport in the top-right corner).

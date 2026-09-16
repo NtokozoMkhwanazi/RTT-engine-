@@ -87,7 +87,7 @@ make -j2
 
 ### The engine refuses to boot: `SELF-CHECK FAILED`
 
-`make run` runs all 494 tests first and **will not boot the engine if any fail**.
+`make run` runs all 731 tests first and **will not boot the engine if any fail**.
 That is by design — fix the failure, or force-boot with:
 
 ```bash

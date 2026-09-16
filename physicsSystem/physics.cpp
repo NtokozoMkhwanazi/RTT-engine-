@@ -1,5 +1,6 @@
 #include "Physics.h"
 #include "GJK.h"
+#include "physicsSystem/VelocityConstraints.h"   // opt-in velocity-constraint hinge solver
 #include <glm/gtx/norm.hpp>
 #include <glm/gtx/string_cast.hpp>
 #include <glm/gtx/intersect.hpp>
@@ -17,6 +18,41 @@ static inline std::string vecToStr(const glm::vec3 &v, int prec = 4) {
     ss.precision(prec);
     ss << "(" << v.x << ", " << v.y << ", " << v.z << ")";
     return ss.str();
+}
+
+// Closest points between a line segment [A,B] and an AABB. Robust for any
+// segment orientation (axis-aligned included) - the slab-clamping approach
+// never divides by a zero-length direction on a non-moving axis.
+static void closestSegmentAABB(const glm::vec3& A, const glm::vec3& B,
+                               const glm::vec3& boxMin, const glm::vec3& boxMax,
+                               glm::vec3& outSegPt, glm::vec3& outBoxPt) {
+    glm::vec3 d = B - A;
+    float dLenSq = glm::dot(d, d);
+
+    if (dLenSq < 1e-7f) {
+        outSegPt = A;
+        outBoxPt = glm::clamp(A, boxMin, boxMax);
+        return;
+    }
+
+    // Step 1: Project the bounding box midpoint onto the line trace segment
+    // parameter space — avoids NaN from dividing by zero-length slab axes
+    // (the original per-axis slab clamp fails when the capsule spine is
+    // vertical and d.x == d.z == 0).
+    glm::vec3 boxCenter = (boxMin + boxMax) * 0.5f;
+    float t = glm::dot(boxCenter - A, d) / dLenSq;
+    t = glm::clamp(t, 0.0f, 1.0f);
+
+    glm::vec3 candidateSegPt = A + d * t;
+    glm::vec3 candidateBoxPt = glm::clamp(candidateSegPt, boxMin, boxMax);
+
+    // Step 2: Re-project using the clamped target to capture accurate
+    // perpendicular edge offsets.
+    t = glm::dot(candidateBoxPt - A, d) / dLenSq;
+    t = glm::clamp(t, 0.0f, 1.0f);
+
+    outSegPt = A + d * t;
+    outBoxPt = glm::clamp(outSegPt, boxMin, boxMax);
 }
 
 // -------------------- Raycasting --------------------
@@ -574,92 +610,53 @@ CollisionResult PhysicsWorld::checkCapsuleVsBox(const Capsule& cap, const OBB& b
 {
     CollisionResult result;
 
-    // Full capsule-box collision using closest point on box to capsule line segment
-    // A capsule is defined by a line segment and a radius
-    
-    // Calculate capsule line segment endpoints in world space
-    glm::vec3 capStart = cap.center - cap.axis * (cap.height * 0.5f);
-    glm::vec3 capEnd = cap.center + cap.axis * (cap.height * 0.5f);
-    
-    // Find closest point on box to capsule line segment
-    // First, transform capsule endpoints to box's local space
-    glm::mat3 boxRot = glm::mat3(box.axis[0], box.axis[1], box.axis[2]);
-    glm::mat3 invBoxRot = glm::transpose(boxRot);
-    
-    glm::vec3 localCapStart = invBoxRot * (capStart - box.c);
-    glm::vec3 localCapEnd = invBoxRot * (capEnd - box.c);
-    
-    // Find closest point on line segment to box in local space
-    glm::vec3 closestLocal;
-    
-    // Clamp to box bounds in local space
-    for (int i = 0; i < 3; i++) {
-        // Find closest point on line segment for this axis
-        float t0 = (box.half[i] - localCapStart[i]) / (localCapEnd[i] - localCapStart[i]);
-        float t1 = (-box.half[i] - localCapStart[i]) / (localCapEnd[i] - localCapStart[i]);
-        
-        // Check if line segment intersects box slab
-        if (glm::abs(localCapStart[i]) <= box.half[i] && 
-            glm::abs(localCapEnd[i]) <= box.half[i]) {
-            // Both points inside slab, use midpoint
-            closestLocal[i] = (localCapStart[i] + localCapEnd[i]) * 0.5f;
-        } else {
-            // Find closest point on segment to slab
-            float t = glm::clamp((-localCapStart[i]) / (localCapEnd[i] - localCapStart[i]), 0.0f, 1.0f);
-            float pointOnSeg = localCapStart[i] + t * (localCapEnd[i] - localCapStart[i]);
-            closestLocal[i] = glm::clamp(pointOnSeg, -box.half[i], box.half[i]);
-        }
-    }
-    
-    // Transform closest point back to world space
-    glm::vec3 closestWorld = box.c + boxRot * closestLocal;
-    
-    // Find closest point on capsule segment to closest point on box
-    glm::vec3 segmentVec = capEnd - capStart;
-    float segmentLenSq = glm::dot(segmentVec, segmentVec);
-    
-    glm::vec3 closestOnCapsule;
-    if (segmentLenSq < 1e-6f) {
-        // Capsule is essentially a sphere
-        closestOnCapsule = cap.center;
-    } else {
-        float t = glm::dot(closestWorld - capStart, segmentVec) / segmentLenSq;
-        t = glm::clamp(t, 0.0f, 1.0f);
-        closestOnCapsule = capStart + segmentVec * t;
-    }
-    
-    // Calculate distance between closest points
-    glm::vec3 diff = closestOnCapsule - closestWorld;
-    float distSq = glm::dot(diff, diff);
-    
-    // Check for collision
+    // Capsule is a line segment (center - axis*halfLen .. +) + radius.
+    // Closest points between that segment and the box's AABB give the contact
+    // exactly. The old implementation transformed the segment into box-local
+    // space and clamped per-axis with t = -localStart / (localEnd - localStart)
+    // - for a segment AXIS-ALIGNED to a box face (a standing character vs a
+    // boulder) the denominator is 0 on that axis, producing NaN, so the
+    // collision silently never happened. Robust closest-point-segment-vs-AABB
+    // instead (works for any axis, axis-aligned included).
+    const glm::vec3 capStart = cap.center - cap.axis * (cap.height * 0.5f);
+    const glm::vec3 capEnd   = cap.center + cap.axis * (cap.height * 0.5f);
+
+    // This system's OBBs are built axis-aligned (buildOBBFromIndex uses
+    // identity axes), so the box is exactly its AABB.
+    const glm::vec3 boxMin = box.c - box.half;
+    const glm::vec3 boxMax = box.c + box.half;
+
+    glm::vec3 segPt, boxPt;
+    closestSegmentAABB(capStart, capEnd, boxMin, boxMax, segPt, boxPt);
+
+    const glm::vec3 diff = segPt - boxPt;
+    const float distSq = glm::dot(diff, diff);
+
     if (distSq < cap.radius * cap.radius) {
         result.collided = true;
-        float dist = glm::sqrt(distSq);
+        const float dist = glm::sqrt(distSq);
         result.penetration = cap.radius - dist;
-        
-        // Calculate contact normal
+
         if (dist > 1e-6f) {
+            // Normal points from the box surface TOWARD the capsule (the
+            // direction the capsule must move to separate).
             result.normal = diff / dist;
         } else {
-            // Use box normal based on which face is closest
-            glm::vec3 absLocal = glm::abs(closestLocal);
-            int maxAxis = 0;
-            float maxDist = glm::abs(absLocal[maxAxis] - box.half[maxAxis]);
-            
-            for (int i = 1; i < 3; i++) {
-                float d = glm::abs(absLocal[i] - box.half[i]);
-                if (d < maxDist) {
-                    maxDist = d;
-                    maxAxis = i;
-                }
+            // Capsule center inside the box: push out along the face with the
+            // least penetration (box face normal).
+            glm::vec3 n(0.0f);
+            float best = std::numeric_limits<float>::max();
+            for (int i = 0; i < 3; ++i) {
+                const float dMin = segPt[i] - boxMin[i];
+                const float dMax = boxMax[i] - segPt[i];
+                const float d = std::min(dMin, dMax);
+                if (d < best) { best = d; n = glm::vec3(0.0f); n[i] = (dMin < dMax) ? -1.0f : 1.0f; }
             }
-            
-            result.normal = box.axis[maxAxis] * (closestLocal[maxAxis] > 0 ? 1.0f : -1.0f);
+            result.normal = n;
+            result.penetration = cap.radius + best;
         }
-        
-        // Calculate contact point
-        result.contactPoint = closestWorld;
+
+        result.contactPoint = boxPt;
     }
 
     return result;
@@ -674,6 +671,21 @@ void PhysicsWorld::addConstraint(Constraint* constraint)
 void PhysicsWorld::clearConstraints()
 {
     constraints.clear();
+}
+
+// -------------------- Velocity-constraint hinge pipeline --------------------
+void PhysicsWorld::addHingeConstraint(BodyHandle a, BodyHandle b,
+                                      const glm::vec3& pivotWorld,
+                                      const glm::vec3& hingeAxisWorld,
+                                      float stiffness)
+{
+    HingeJointSpec s;
+    s.idxA = a.index;
+    s.idxB = b.index;
+    s.pivotWorld = pivotWorld;
+    s.axisWorld = hingeAxisWorld;
+    s.stiffness = stiffness;
+    m_hingeJoints.push_back(s);
 }
 // -------------------- OBB SAT --------------------
 bool PhysicsWorld::obbOverlapAndPenetration(const OBB& A, const OBB& B, float& outPen, glm::vec3& outNormal) const {
@@ -1372,6 +1384,25 @@ void PhysicsWorld::step(float dt)
             constraint->postSolve(subdt);
         }
 
+        // --- velocity-constraint joints (5-DOF hinge block, opt-in) ---
+        // Supersede the deprecated Constraint* pipeline when enabled: build a
+        // fresh solver over the contiguous `bodies` array, register every
+        // registered hinge, and solve them as coupled block-mass-matrix joints.
+        // Velocities (and positions, via split impulse) are corrected in place.
+        if (useVelocityConstraints && !m_hingeJoints.empty()) {
+            vel::ConstraintSolver solver(bodies);
+            for (const auto& hj : m_hingeJoints) {
+                if (hj.idxA < 0 || hj.idxB < 0 ||
+                    hj.idxA >= (int)bodies.size() || hj.idxB >= (int)bodies.size()) {
+                    continue;
+                }
+                solver.addHingeConstraint(hj.idxA, hj.idxB,
+                                          hj.pivotWorld, hj.axisWorld, hj.stiffness);
+            }
+            solver.solveHinges(subdt, /*velocityIterations=*/8,
+                               /*positionIterations=*/1);
+        }
+
         // --- collision detection ---
         std::vector<std::pair<int,int>> pairs;
         getPotentialPairs(pairs);
@@ -1411,9 +1442,7 @@ void PhysicsWorld::step(float dt)
             if (isGrounded(i, 1e-3f)) {
                 b.velocity.y = 0.0f;
                 b.onGround = true;
-            }
-
-            if (b.onGround && !b.isModel) {
+            }            if (b.onGround && !b.isModel) {
                 // Use dynamic friction coefficient
                 float friction = b.dynamicFriction * 10.0f; // Scale for simulation
                 b.velocity.x -= b.velocity.x * friction * subdt;
@@ -1424,4 +1453,187 @@ void PhysicsWorld::step(float dt)
             }
         }
     }
+}
+
+// -------------------- Character-vs-world-object collision --------------------
+
+bool PhysicsWorld::resolveCharacterCapsule(glm::vec3& feetPos, float radius,
+                                           float totalHeight, glm::vec3& velocity)
+{
+    bool anyHit = false;
+
+    // Capsule: axis-aligned Y, segment length = totalHeight - 2*radius (the
+    // end caps are spheres of `radius`). Center sits above the feet.
+    const float cylLen = std::max(0.0f, totalHeight - 2.0f * radius);
+    Capsule cap;
+    cap.axis = glm::vec3(0.0f, 1.0f, 0.0f);
+    cap.radius = radius;
+    cap.height = cylLen;
+
+    for (int i = 0; i < static_cast<int>(bodies.size()); ++i) {
+        const RigidBody& b = bodies[i];
+        if (!b.isStatic) continue;   // only world-object colliders
+
+        // Broadphase: capsule AABB vs body AABB before the narrow phase.
+        const glm::vec3 capMin = feetPos - glm::vec3(radius, 0.0f, radius);
+        const glm::vec3 capMax = feetPos + glm::vec3(radius, totalHeight, radius);
+        const glm::vec3 bodyMin = b.position - b.scale * 0.5f;
+        const glm::vec3 bodyMax = b.position + b.scale * 0.5f;
+        if (capMax.x < bodyMin.x || capMin.x > bodyMax.x ||
+            capMax.y < bodyMin.y || capMin.y > bodyMax.y ||
+            capMax.z < bodyMin.z || capMin.z > bodyMax.z) continue;
+
+        CollisionResult col;
+        switch (b.colliderType) {
+            case ColliderType::BOX: {
+                // The world-object OBBs are axis-aligned, so a capsule vs a
+                // box face is resolved against the body AABB directly.
+                // checkCapsuleVsBox uses a STRICT distSq < radius^2, so a
+                // capsule resting with its surface exactly on a face
+                // (distSq == radius^2, penetration == 0) is reported as "no
+                // collision" and the character walks straight through the wall
+                // it is pressing against. For an axis-aligned box that is a
+                // genuine contact: the face whose AABB overlap is smallest is
+                // the face the capsule is resting on, and travel into it is
+                // killed. No positional push is applied on a zero-penetration
+                // graze (feet stay put -> no jitter, no push into a neighbour
+                // body). Real penetration is still handled by the generic
+                // block below via checkCapsuleVsBox.
+                cap.center = feetPos + glm::vec3(0.0f, radius + cylLen * 0.5f, 0.0f);
+                col = checkCapsuleVsBox(cap, buildOBBFromIndex(i));
+                if (!col.collided) {
+                    glm::vec3 n(0.0f);
+                    float pen = std::numeric_limits<float>::max();
+                    for (int k = 0; k < 3; ++k) {
+                        const float overlap = std::min(capMax[k], bodyMax[k])
+                                            - std::max(capMin[k], bodyMin[k]);
+                        if (overlap < pen) {
+                            pen = overlap;
+                            n = glm::vec3(0.0f);
+                            n[k] = ((capMin[k] + capMax[k]) * 0.5f >=
+                                    (bodyMin[k] + bodyMax[k]) * 0.5f) ? 1.0f : -1.0f;
+                        }
+                    }
+                    // pen > 0: the capsule AABB overlaps the body AABB on every
+                    // axis but the round capsule is still clear by > radius --
+                    // a true gap, not a face touch. Leave this body alone.
+                    if (pen > 0.0f) break;
+                    // pen == 0: exact face touch. Kill travel into this face
+                    // (mirror of the generic velocity clamp below).
+                    const float vn = glm::dot(velocity, n);
+                    if (vn < 0.0f) velocity -= n * vn;
+                    anyHit = true;
+                    continue;  // skip the generic penetration block below
+                }
+                break;  // real penetration -> fall through to generic block
+            }
+            case ColliderType::SPHERE:
+                cap.center = feetPos + glm::vec3(0.0f, radius + cylLen * 0.5f, 0.0f);
+                col = checkCapsuleVsSphere(cap, buildSphereFromIndex(i));
+                break;
+            case ColliderType::CAPSULE:
+                cap.center = feetPos + glm::vec3(0.0f, radius + cylLen * 0.5f, 0.0f);
+                col = checkCapsuleVsCapsule(cap, buildCapsuleFromIndex(i));
+                break;
+            default:
+                continue;
+        }
+        if (!col.collided || col.penetration <= 0.0f) continue;
+
+        // Contact normal must point AWAY from the surface (the direction the
+        // capsule must move to separate). checkCapsuleVsBox/…Capsule already
+        // do; checkCapsuleVsSphere returns it pointing INTO the sphere, so
+        // flip it.
+        glm::vec3 n = col.normal;
+        if (b.colliderType == ColliderType::SPHERE) n = -n;
+        const float nLen = glm::length(n);
+        if (nLen < 1e-6f) continue;
+        n /= nLen;
+
+        // Push the feet out of the overlap along the contact normal, and kill
+        // the velocity component heading INTO the surface so the character
+        // slides along / stops at the rock instead of walking through it.
+        feetPos += n * col.penetration;
+        const float vn = glm::dot(velocity, n);
+        if (vn < 0.0f) velocity -= n * vn;
+        anyHit = true;
+    }
+    return anyHit;
+}
+
+float PhysicsWorld::getStaticSurfaceHeightAt(float x, float z) const
+{
+    float top = -std::numeric_limits<float>::infinity();
+    for (const auto& b : bodies) {
+        if (!b.isStatic) continue;
+        const glm::vec3 half = b.scale * 0.5f;
+        if (x < b.position.x - half.x || x > b.position.x + half.x) continue;
+        if (z < b.position.z - half.z || z > b.position.z + half.z) continue;
+        top = std::max(top, b.position.y + half.y);
+    }
+    return top;
+}
+
+// ---------------------------------------------------------------------------
+// Character ground snap via the NEW velocity-constraint plane solver
+// (todo: "apply this new physics to the character"). Grounds a kinematic
+// character capsule onto the physics floor (floor plane + static world-object
+// tops) using a vel::PlaneConstraint, zeroes downward velocity on landing,
+// and clamps a "sitting above the terrain/trees" spawn down onto the surface.
+// Shared by BOTH editors (Vulkan + OpenGL) and test.cpp through
+// WorldManager::resolveCharacterCollision.
+// ---------------------------------------------------------------------------
+bool PhysicsWorld::snapCharacterToGround(glm::vec3& feetPos, float radius,
+                                         float totalHeight, glm::vec3& velocity,
+                                         float surfaceY, bool grounded)
+{
+    // `surfaceY` is the heightmap-aware ground height supplied by the caller
+    // (WorldManager::getSurfaceHeightAt = max(terrain heightmap, static
+    // body/tree tops)). PhysicsWorld only knows the flat physics floor, so we
+    // must NOT recompute a surface here - doing so would sink a character
+    // perched on a real heightmap down to the floor plane (y=0). The caller
+    // passes -inf when no surface covers the point (no ground underfoot).
+    if (surfaceY == -std::numeric_limits<float>::infinity()) return false;
+
+    // A surface directly overhead is a ceiling, not ground - leave the feet.
+    if (surfaceY > feetPos.y + totalHeight) return false;
+
+    // The capsule's bottom sphere (radius) is in contact with the ground when
+    // the feet are within a cap-radius of the surface.
+    const float kContactTol = radius + 0.05f;
+
+    if (grounded) {
+        // Standing (or spawn / level placement) character: rest ON the surface.
+        // This pulls a bot level-placed high above the terrain back down onto
+        // the ground ("sitting above the terrain") and keeps a grounded
+        // character from drifting above the ground on a slope.
+        feetPos.y = surfaceY;
+        if (velocity.y < 0.0f) velocity.y = 0.0f;
+        return true;
+    }
+
+    // Airborne (jumping / falling): only act at/near contact so a jumper high
+    // above the ground is NOT yanked back onto the surface - gravity brings it
+    // down naturally. At the moment of contact, use the new velocity-constraint
+    // plane solver (vel::PlaneConstraint / vel::ConstraintSolver) to settle the
+    // capsule and kill the downward velocity into the surface.
+    if (feetPos.y > surfaceY + kContactTol) return false;  // no contact yet
+
+    RigidBody proxy(feetPos, glm::vec3(1.0f), 1.0f, /*isStatic=*/false,
+                    ColliderType::SPHERE);
+    proxy.velocity      = velocity;
+    proxy.angularDamping = 1.0f;
+    proxy.linearDamping   = 1.0f;
+    std::vector<RigidBody> bodies;
+    bodies.push_back(proxy);
+
+    vel::ConstraintSolver solver(bodies);
+    solver.addPlaneConstraint(/*bodyA=*/0, glm::vec3(0.0f, 1.0f, 0.0f),
+                              /*planeDistance=*/-surfaceY,
+                              /*restitution=*/0.0f, /*baumgarteBeta=*/0.1f);
+    solver.solve(/*dt=*/0.016f, /*velocityIterations=*/4, /*positionIterations=*/4);
+
+    velocity = bodies[0].velocity;
+    feetPos  = bodies[0].position;
+    return true;
 }

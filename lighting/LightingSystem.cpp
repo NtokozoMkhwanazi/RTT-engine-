@@ -1,4 +1,6 @@
 #include "LightingSystem.h"
+#include "lighting/LightData.h"
+#include "lighting/LightingEnvironment.h" // for the sun fallback
 #include <algorithm>
 
 LightingSystem::LightingSystem() 
@@ -78,4 +80,30 @@ void LightingSystem::categorizeLights() {
                 break;
         }
     }
+}
+
+std::vector<GPULightData> LightingSystem::buildGpuLightData(
+        size_t cap, const LightingEnvironment& fallbackEnv) const {
+    const size_t limit = (cap == 0) ? kMaxGpuLights : std::min(cap, (size_t)kMaxGpuLights);
+
+    std::vector<GPULightData> out;
+    out.reserve(limit);
+
+    if (lights.empty()) {
+        // Editor key-light fallback: a single directional sun from the env
+        // passed IN by the caller (#3: no LightingEnvironment::Instance() here).
+        out.push_back(makeDirectionalLight(fallbackEnv.sunDirection,
+                                           fallbackEnv.sunColor,
+                                           fallbackEnv.sunIntensity));
+        return out;
+    }
+
+    for (const Light& l : lights) {
+        if (out.size() >= limit) break;
+        uint32_t t = static_cast<uint32_t>(l.type);
+        out.push_back(makeGpuLight(t, l.position, l.direction, l.color, l.intensity,
+                                   l.constant, l.linear, l.quadratic,
+                                   l.cutOff, l.outerCutOff));
+    }
+    return out;
 }

@@ -164,7 +164,11 @@ TEST_F(FBXAnimationIntegrationTest, ModelPropertiesAreValid) {
     
     std::cout << "Bot size: " << Vec3ToString(botResult.size) << "\n";
     EXPECT_GT(botResult.size.y, 0.1f) << "Height should be positive";
-    EXPECT_LT(botResult.size.y, 200.0f) << "Height should be reasonable (model is ~180 units tall)";
+    // Humanoid characters land between ~1.5m and ~2.2m; bot.fbx is now the
+    // clothed Vampire character (~211 units tall), so keep the upper bound
+    // generous to tolerate different Mixamo characters. (Was 200 for the
+    // original short bot.)
+    EXPECT_LT(botResult.size.y, 500.0f) << "Height should be reasonable (humanoid scale)";
 
     delete botResult.model;
 }

@@ -63,6 +63,106 @@ TEST(SceneManager, SaveLoadRoundTripRestoresBotTransform) {
     std::remove(kTestScene);
 }
 
+TEST(SceneManager, SaveLoadRoundTripRestoresLightEntity) {
+    ecs::World world;
+    world.init();
+
+    // Mirror EntityManager::CreateLight but without the editor singleton.
+    auto e = world.createEntityWithComponents<ecs::TransformComponent,
+                                              ecs::LightComponent,
+                                              ecs::NameComponent>();
+    ASSERT_TRUE(e.isValid());
+    if (auto* n = world.getComponentArchetype<ecs::NameComponent>(e)) n->setName("Point Light 7");
+    if (auto* t = world.getComponentArchetype<ecs::TransformComponent>(e))
+        t->position = glm::vec3(3.0f, 6.0f, -4.0f);
+    if (auto* l = world.getComponentArchetype<ecs::LightComponent>(e)) {
+        l->type = ecs::LightType::POINT;
+        l->color = glm::vec3(1.0f, 0.8f, 0.3f);
+        l->intensity = 3.0f;
+        l->range = 12.0f;
+        l->enabled = true;
+        l->castShadows = false;
+        l->temperature = 4200.0f;
+        l->useTemperature = true;
+    }
+
+    ASSERT_TRUE(SceneManager::SaveScene(kTestScene, world));
+
+    ecs::World world2;
+    world2.init();
+    ASSERT_TRUE(SceneManager::LoadScene(kTestScene, world2));
+
+    bool found = false;
+    world2.forEach<ecs::TransformComponent, ecs::NameComponent>(
+        [&](ecs::EntityID id, ecs::TransformComponent&, ecs::NameComponent& n) {
+            if (std::string(n.name) == "Point Light 7") {
+                found = true;
+                auto* l = world2.getComponentArchetype<ecs::LightComponent>(ecs::Entity{id});
+                ASSERT_NE(l, nullptr) << "light component must be restored";
+                EXPECT_EQ(l->type, ecs::LightType::POINT);
+                EXPECT_NEAR(l->color.x, 1.0f, 1e-4f);
+                EXPECT_NEAR(l->color.y, 0.8f, 1e-4f);
+                EXPECT_NEAR(l->color.z, 0.3f, 1e-4f);
+                EXPECT_NEAR(l->intensity, 3.0f, 1e-4f);
+                EXPECT_NEAR(l->range, 12.0f, 1e-4f);
+                EXPECT_TRUE(l->enabled);
+                EXPECT_FALSE(l->castShadows);
+                EXPECT_NEAR(l->temperature, 4200.0f, 1e-3f);
+                EXPECT_TRUE(l->useTemperature);
+            }
+        });
+    EXPECT_TRUE(found) << "loaded scene must contain the light entity";
+
+    std::remove(kTestScene);
+}
+
+TEST(SceneManager, SaveLoadRoundTripRestoresModelPath) {
+    ecs::World world;
+    world.init();
+
+    auto e = world.createEntityWithComponents<ecs::TransformComponent,
+                                              ecs::ModelComponent,
+                                              ecs::NameComponent>();
+    ASSERT_TRUE(e.isValid());
+    if (auto* n = world.getComponentArchetype<ecs::NameComponent>(e)) n->setName("Imported Bot");
+    if (auto* t = world.getComponentArchetype<ecs::TransformComponent>(e))
+        t->position = glm::vec3(4.0f, 0.5f, 4.0f);
+    if (auto* m = world.getComponentArchetype<ecs::ModelComponent>(e)) {
+        m->setModelPath("assets/bot.fbx");
+        m->visible = true;
+        m->useMaterialOverrides = true;
+        m->albedoOverride = glm::vec3(0.2f, 0.4f, 0.9f);
+        m->metallicOverride = 0.3f;
+        m->roughnessOverride = 0.7f;
+    }
+
+    ASSERT_TRUE(SceneManager::SaveScene(kTestScene, world));
+
+    ecs::World world2;
+    world2.init();
+    ASSERT_TRUE(SceneManager::LoadScene(kTestScene, world2));
+
+    bool found = false;
+    world2.forEach<ecs::TransformComponent, ecs::NameComponent>(
+        [&](ecs::EntityID id, ecs::TransformComponent&, ecs::NameComponent& n) {
+            if (std::string(n.name) == "Imported Bot") {
+                found = true;
+                auto* m = world2.getComponentArchetype<ecs::ModelComponent>(ecs::Entity{id});
+                ASSERT_NE(m, nullptr) << "model component must be restored";
+                EXPECT_TRUE(m->hasModelPath());
+                EXPECT_STREQ(m->getModelPath(), "assets/bot.fbx");
+                EXPECT_TRUE(m->visible);
+                EXPECT_TRUE(m->useMaterialOverrides);
+                EXPECT_NEAR(m->albedoOverride.x, 0.2f, 1e-4f);
+                EXPECT_NEAR(m->metallicOverride, 0.3f, 1e-4f);
+                EXPECT_NEAR(m->roughnessOverride, 0.7f, 1e-4f);
+            }
+        });
+    EXPECT_TRUE(found) << "loaded scene must contain the model entity";
+
+    std::remove(kTestScene);
+}
+
 TEST(SceneManager, LoadSceneDedupesByName) {
     ecs::World world;
     world.init();

@@ -225,20 +225,92 @@ TEST(AnimatedCharacter, MovesForwardWithInput) {
     cc.position = glm::vec3(0.0f, kFlatTerrainY, 0.0f);
 
     CharacterInput ci = IdleInput();
-    ci.moveDirection = glm::vec2(0.0f, 1.0f);  // forward
+    ci.moveDirection = glm::vec2(0.0f, -1.0f);  // forward (local -Z)
     ci.moveMagnitude = 1.0f;
 
     const float dt = 1.0f / 60.0f;
     for (int i = 0; i < 60; ++i) cc.update(dt, ci, FlatTerrain);
 
-    EXPECT_GT(cc.position.z, 0.5f) << "character should move +Z";
+    EXPECT_LT(cc.position.z, -0.5f) << "character should move -Z";
     EXPECT_LT(std::fabs(cc.position.x), 0.1f) << "no lateral drift";
     EXPECT_NEAR(cc.position.y, kFlatTerrainY, 0.01f) << "feet stay on the terrain";
     // The character must face its movement direction. Local -Z is forward, so
-    // facing +Z means heading is +/-PI (the angle wrap lands on either side).
+    // facing -Z means heading settles near 0.
     const glm::vec3 fwd(-std::sin(cc.heading), 0.0f, -std::cos(cc.heading));
-    EXPECT_GT(fwd.z, 0.9f) << "should face +Z (forward vector z)";
+    EXPECT_LT(fwd.z, -0.9f) << "should face -Z (forward vector z)";
     EXPECT_LT(std::fabs(fwd.x), 0.1f) << "no lateral facing";
+}
+
+TEST(AnimatedCharacter, ModelMatrixFacesLogicalForward) {
+    // The bot asset is authored facing +Z (native forward), while the
+    // character logic treats local -Z as forward. The world model matrix must
+    // rotate by heading + 180 degrees so the RENDERED model faces the logical
+    // forward: the follow camera sits behind the logical forward, so the
+    // model's face (local +Z) must point away from the camera. Without the
+    // flip the visible model faces the camera, back-to-front.
+    const float heading = 0.7f;
+    const glm::vec3 pos(1.0f, 2.0f, 3.0f);
+    const glm::mat4 m = AnimatedCharacter::modelMatrix(pos, heading, 0.01f);
+
+    // Logical forward for this heading: local -Z in the character's frame.
+    const glm::vec3 logicalFwd(-std::sin(heading), 0.0f, -std::cos(heading));
+
+    // The model's native face (local +Z) must map to the logical forward.
+    const glm::vec3 renderedFwd =
+        glm::normalize(glm::vec3(m * glm::vec4(0.0f, 0.0f, 1.0f, 0.0f)));
+    EXPECT_NEAR(glm::length(renderedFwd - logicalFwd), 0.0f, 1e-4f)
+        << "Rendered model must face the logical forward (away from the camera)";
+
+    // The model's back (local -Z) must map AWAY from the logical forward,
+    // i.e. toward the camera that sits behind the bot.
+    const glm::vec3 renderedBack =
+        glm::normalize(glm::vec3(m * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f)));
+    EXPECT_NEAR(glm::length(renderedBack - (-logicalFwd)), 0.0f, 1e-4f);
+
+    // Translation is preserved (origin maps to the character position).
+    const glm::vec3 origin = glm::vec3(m * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+    EXPECT_NEAR(glm::length(origin - pos), 0.0f, 1e-4f);
+}
+
+TEST(AnimatedCharacter, RootDoesNotSnapBackAtClipLoop) {
+    // The locomotion clips carry baked root translation. With the root
+    // LOCKED to its bind pose (AnimatedCharacter enables this on load), the
+    // root bone must never jump backward when a clip wraps - the character's
+    // velocity-driven position provides all forward motion, so over several
+    // walk cycles the visual root must move forward monotonically.
+    AnimatedCharacter cc;
+    ASSERT_TRUE(cc.load("assets/bot.fbx"));
+    cc.loadLocomotion("assets");
+    cc.position = glm::vec3(0.0f, kFlatTerrainY, 0.0f);
+
+    CharacterInput ci = IdleInput();
+    ci.moveDirection = glm::vec2(0.0f, -1.0f);  // forward (-Z)
+    ci.moveMagnitude = 1.0f;
+
+    const float dt = 1.0f / 60.0f;
+    const Skeleton* skel = cc.skeleton();
+    ASSERT_NE(skel, nullptr);
+    ASSERT_GE(skel->rootBoneIndex, 0);
+
+    float maxBackStep = 0.0f;
+    glm::vec3 prevRoot(0.0f);
+    bool havePrev = false;
+    for (int i = 0; i < 240; ++i) {  // > 2 walk cycles
+        cc.update(dt, ci, FlatTerrain);
+        const glm::vec3 rootPos =
+            cc.animator()->GetBoneWorldPosition(skel->rootBoneIndex, cc.modelMatrix());
+        if (havePrev) {
+            const float fwd = prevRoot.z - rootPos.z;  // walking -Z (forward)
+            maxBackStep = std::max(maxBackStep, -fwd);
+        }
+        prevRoot = rootPos;
+        havePrev = true;
+    }
+
+    // A clip-loop snap would appear as a large backward jump (a fraction of a
+    // stride). With the root locked there must be none.
+    EXPECT_LT(maxBackStep, 0.02f)
+        << "Root must never snap backward at a clip loop boundary";
 }
 
 TEST(AnimatedCharacter, JumpArcReturnsToGround) {
@@ -375,6 +447,46 @@ TEST(AnimatedCharacter, FsmBlendsIdleWalkRun) {
     EXPECT_EQ(cc.state(), AnimationState::IDLE);
 }
 
+TEST(AnimatedCharacter, FsmLandingCrossfadesInsteadOfHardCut) {
+    AnimatedCharacter cc;
+    ASSERT_TRUE(cc.load("assets/bot.fbx"));
+    cc.loadLocomotion("assets");
+    cc.motionMatchingEnabled = false;  // deterministic FSM path
+    cc.position = glm::vec3(0.0f, kFlatTerrainY, 0.0f);
+    const float dt = 1.0f / 60.0f;
+
+    // Take off.
+    CharacterInput jump = IdleInput();
+    jump.jump = true;
+    cc.update(dt, jump, FlatTerrain);
+    ASSERT_TRUE(cc.mmAirborne()) << "grounded jump must leave the ground";
+
+    // Fall while holding forward input until we touch down again.
+    CharacterInput move = IdleInput();
+    move.moveDirection = glm::vec2(0.0f, 1.0f);
+    move.moveMagnitude = 1.0f;
+    int frames = 0;
+    while (cc.mmAirborne() && frames < 240) {
+        cc.update(dt, move, FlatTerrain);
+        ++frames;
+    }
+    ASSERT_FALSE(cc.mmAirborne()) << "must land within the fall budget";
+    ASSERT_EQ(cc.state(), AnimationState::WALK) << "must land into the walk state";
+
+    // Landing is a crossfade (2+ animator layers: outgoing Jump + incoming
+    // Walk), not the old hard Play() cut which left exactly one layer.
+    // (Fall clip temporarily removed — Jump covers the entire arc.)
+    EXPECT_GE(cc.animator()->GetActiveAnimationLayerCount(), 2)
+        << "Jump->Walk landing must crossfade instead of hard-cutting";
+
+    // The blend completes and the outgoing Jump layer is pruned.
+    for (int i = 0; i < 40; ++i) cc.update(dt, move, FlatTerrain);
+    EXPECT_EQ(cc.animator()->GetActiveAnimationLayerCount(), 1)
+        << "finished crossfade must collapse back to a single layer";
+    EXPECT_EQ(cc.state(), AnimationState::WALK);
+    EXPECT_EQ(cc.activeClipName(), "Walk");
+}
+
 // ---------------------------------------------------------------------------
 // Motion-matching clip selection while moving (regression for the KD-tree
 // representative-pose bug, the world-vs-clip velocity frame mismatch, and the
@@ -397,24 +509,25 @@ TEST(AnimatedCharacter, MotionMatchingSelectsCorrectClipsWhileMoving) {
     for (int i = 0; i < 30; ++i) cc.update(dt, IdleInput(), FlatTerrain);
     EXPECT_EQ(groundedClip(), "Idle");
 
-    // Walking forward (+Z) at full walk speed -> Walk clip, and NEVER an
+    // Walking forward (-Z) at full walk speed -> Walk clip, and NEVER an
     // airborne (Jump/Fall) pose while grounded (the state gate).
     CharacterInput walk = IdleInput();
-    walk.moveDirection = glm::vec2(0.0f, 1.0f);
+    walk.moveDirection = glm::vec2(0.0f, -1.0f);
     walk.moveMagnitude = 1.0f;
     for (int i = 0; i < 90; ++i) cc.update(dt, walk, FlatTerrain);
-    EXPECT_GE(cc.currentSpeed(), 1.9f) << "should be at walk speed";
+    EXPECT_GE(cc.currentSpeed(), 1.4f) << "should be at walk speed";
     EXPECT_EQ(groundedClip(), "Walk");
     EXPECT_TRUE(cc.mmAirborne() == false);
     EXPECT_NE(groundedClip(), "Jump");
     EXPECT_NE(groundedClip(), "Fall");
 
-    // Walking BACKWARD (-Z) must also match Walk - the query velocity is
-    // expressed in the clip frame, so the selection is heading-independent
-    // (regression: the old world-space velocity flipped sign on -Z and the
-    // matcher re-selected Idle/Crouch, causing footskate).
+    // Walking BACKWARD (+Z, opposite the -Z forward axis) must also match
+    // Walk - the query velocity is expressed in the clip frame, so the
+    // selection is heading-independent (regression: the old world-space
+    // velocity flipped sign and the matcher re-selected Idle/Crouch,
+    // causing footskate).
     CharacterInput back = IdleInput();
-    back.moveDirection = glm::vec2(0.0f, -1.0f);
+    back.moveDirection = glm::vec2(0.0f, 1.0f);
     back.moveMagnitude = 1.0f;
     for (int i = 0; i < 90; ++i) cc.update(dt, back, FlatTerrain);
     EXPECT_EQ(groundedClip(), "Walk")
@@ -498,8 +611,10 @@ TEST(AnimatedCharacter, PoseAndPositionChangeWhileWalking) {
     }
 
     // The matcher must be driving the Walk clip at full walk speed.
+    // (speed cap was lowered 2.0 -> 1.5 m/s to stop the matcher from
+    // selecting jog/run clips; see AnimatedCharacter::update)
     EXPECT_EQ(cc.activeClipName(), "Walk");
-    EXPECT_GE(cc.currentSpeed(), 1.9f);
+    EXPECT_GE(cc.currentSpeed(), 1.4f) << "should be at walk speed";
 
     // The character must physically move forward (camera-follow in play mode
     // keeps the bot centered on screen, so this is what proves motion).
@@ -602,11 +717,13 @@ TEST(AnimatedCharacter, FootCycleWhileWalkingMatchesClipsAndPlants) {
     EXPECT_GT(maxLY - minLY, 5.0f) << "left foot must lift/plant during walk";
     EXPECT_GT(maxRY - minRY, 5.0f) << "right foot must lift/plant during walk";
 
-    // Anti-footskate: the Walk clip plays at a rate that makes its stride
-    // match the physics speed. Effective clip speed = mean pose speed * rate
-    // must equal the character speed (within the clamp band).
-    EXPECT_GT(cc.debugClipSpeed(1), 1.0f)
-        << "Walk clip must play slightly faster than real time to match 2 m/s";
+    // Anti-footskate: the Walk clip rate is physicsSpeed/clipStrideSpeed so a
+    // stride's ground coverage matches the character's actual movement. With
+    // the walk speed cap at ~1.5 m/s the Walk clip's natural stride is slightly
+    // faster, so the rate lands just below real-time (within the [0.6,1.5]
+    // clamp) rather than above it.
+    EXPECT_GT(cc.debugClipSpeed(1), 0.8f)
+        << "Walk clip must play at an active anti-footskate rate within the clamp";
     EXPECT_LT(cc.debugClipSpeed(1), 1.5f);
     EXPECT_NEAR(cc.debugClipSpeed(0), 1.0f, 0.01f)
         << "Idle clip must play at real time";
@@ -632,6 +749,151 @@ TEST(AnimatedCharacter, FootCycleWhileWalkingMatchesClipsAndPlants) {
     EXPECT_EQ(cc.activeClipName(), "CrouchWalk");
     EXPECT_GE(cc.debugClipSpeed(6), 0.6f) << "CrouchWalk clip rate must stay in the clamp";
     EXPECT_LE(cc.debugClipSpeed(6), 1.5f) << "CrouchWalk clip rate must stay in the clamp";
+}
+
+// ---------------------------------------------------------------------------
+// Contextual database switching (the suggestions.txt architecture): the
+// character owns a dedicated MotionDatabase per context and the matcher
+// searches ONLY the active context's clips. Combat swings can never bleed
+// into a locomotion walk, the capoeira set loads lazily, and crouch input
+// auto-switches Locomotion<->Crouch.
+// ---------------------------------------------------------------------------
+
+TEST(AnimatedCharacter, LoadsContextDatabases) {
+    AnimatedCharacter cc;
+    ASSERT_TRUE(cc.load("assets/bot.fbx"));
+    ASSERT_GE(cc.loadLocomotion("assets"), 1);
+
+    // The enriched locomotion context carries extra clips (Walk/Run/Jump)
+    // beyond the 7 fixed FSM slots, and is built eagerly as the default
+    // search domain.  (Jog, Catwalk, turns, RunLookBack, and Fall are
+    // temporarily pruned — see ensureContextBuilt.
+    EXPECT_GE(cc.contextClipCount(AnimatedCharacter::MotionContext::LOCOMOTION), 4)
+        << "locomotion context must hold the core locomotion clips";
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::LOCOMOTION);
+    EXPECT_GT(cc.contextPoseCount(AnimatedCharacter::MotionContext::LOCOMOTION), 0u);
+
+    // Every other context is LAZY: not loaded at startup, built on first
+    // request (the suggestions' "only load what the active context needs").
+    EXPECT_EQ(cc.contextClipCount(AnimatedCharacter::MotionContext::CROUCH), 0);
+    EXPECT_EQ(cc.contextClipCount(AnimatedCharacter::MotionContext::COMBAT), 0);
+    EXPECT_EQ(cc.contextClipCount(AnimatedCharacter::MotionContext::DANCE), 0);
+    EXPECT_EQ(cc.contextPoseCount(AnimatedCharacter::MotionContext::CAPOEIRA), 0u);
+
+    // Requesting a context builds its database on demand.
+    cc.setMotionContext(AnimatedCharacter::MotionContext::COMBAT, 0.0f);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::COMBAT);
+    EXPECT_GE(cc.contextClipCount(AnimatedCharacter::MotionContext::COMBAT), 3)
+        << "Boxing/BodyBlock/BoxTurn/Defeated must load on request";
+}
+
+TEST(AnimatedCharacter, MotionContextSwitchingIsolatesSearchDatabase) {
+    AnimatedCharacter cc;
+    ASSERT_TRUE(cc.load("assets/bot.fbx"));
+    ASSERT_GE(cc.loadLocomotion("assets"), 1);
+    cc.position = glm::vec3(0.0f, kFlatTerrainY, 0.0f);
+    const float dt = 1.0f / 60.0f;
+
+    // Settle in the default locomotion context.
+    for (int i = 0; i < 30; ++i) cc.update(dt, IdleInput(), FlatTerrain);
+
+    // Switch to combat instantly and run the pose search: every clip the
+    // matcher selects must come from the combat database - never a locomotion
+    // clip (the non-owning SetDatabase path + effective-database routing).
+    cc.setMotionContext(AnimatedCharacter::MotionContext::COMBAT, 0.0f);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::COMBAT);
+    for (int i = 0; i < 60; ++i) {
+        cc.update(dt, IdleInput(), FlatTerrain);
+        const std::string clip = cc.mmActiveClip();
+        ASSERT_FALSE(clip.empty()) << "matcher must select a combat clip";
+        EXPECT_TRUE(clip == "Boxing" || clip == "BodyBlock" ||
+                    clip == "BoxTurn" || clip == "Defeated")
+            << "combat context must only select combat clips, got '" << clip << "'";
+    }
+
+    // Switch back to locomotion: the search domain returns to the locomotion
+    // clips (and the rest override idles the animator while standing still).
+    cc.setMotionContext(AnimatedCharacter::MotionContext::LOCOMOTION, 0.0f);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::LOCOMOTION);
+    for (int i = 0; i < 30; ++i) cc.update(dt, IdleInput(), FlatTerrain);
+    EXPECT_EQ(cc.activeClipName(), "Idle");
+    const std::string clip = cc.mmActiveClip();
+    EXPECT_FALSE(clip.empty());
+    EXPECT_NE(clip, "Boxing") << "locomotion context must not play combat clips";
+}
+
+TEST(AnimatedCharacter, MotionContextRequestViaInput) {
+    AnimatedCharacter cc;
+    ASSERT_TRUE(cc.load("assets/bot.fbx"));
+    ASSERT_GE(cc.loadLocomotion("assets"), 1);
+    cc.position = glm::vec3(0.0f, kFlatTerrainY, 0.0f);
+    const float dt = 1.0f / 60.0f;
+
+    // A one-shot explicit request (as the editor's 1-5 keys send).
+    CharacterInput ci = IdleInput();
+    ci.motionContext = (int)AnimatedCharacter::MotionContext::DANCE;
+    cc.update(dt, ci, FlatTerrain);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::DANCE);
+
+    // Later frames without a request keep the context (no yanking).
+    for (int i = 0; i < 10; ++i) cc.update(dt, IdleInput(), FlatTerrain);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::DANCE);
+
+    // Requesting the same context again is a no-op (no restart of the blend).
+    ci.motionContext = (int)AnimatedCharacter::MotionContext::DANCE;
+    cc.update(dt, ci, FlatTerrain);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::DANCE);
+}
+
+TEST(AnimatedCharacter, CrouchInputAutoSwitchesToCrouchContext) {
+    AnimatedCharacter cc;
+    ASSERT_TRUE(cc.load("assets/bot.fbx"));
+    ASSERT_GE(cc.loadLocomotion("assets"), 1);
+    cc.position = glm::vec3(0.0f, kFlatTerrainY, 0.0f);
+    const float dt = 1.0f / 60.0f;
+
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::LOCOMOTION);
+
+    // Crouch edge -> dedicated crouch database drives.
+    CharacterInput crouch = IdleInput();
+    crouch.moveDirection = glm::vec2(0.0f, 1.0f);
+    crouch.moveMagnitude = 1.0f;
+    crouch.crouch = true;
+    cc.update(dt, crouch, FlatTerrain);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::CROUCH);
+
+    // Sustained crouch stays in the crouch context (edge-triggered switch).
+    for (int i = 0; i < 30; ++i) cc.update(dt, crouch, FlatTerrain);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::CROUCH);
+    EXPECT_EQ(cc.activeClipName(), "CrouchWalk");
+
+    // Release -> back to locomotion.
+    for (int i = 0; i < 5; ++i) cc.update(dt, IdleInput(), FlatTerrain);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::LOCOMOTION);
+}
+
+TEST(AnimatedCharacter, CapoeiraContextLazilyBuildsOnDemand) {
+    AnimatedCharacter cc;
+    ASSERT_TRUE(cc.load("assets/bot.fbx"));
+    ASSERT_GE(cc.loadLocomotion("assets"), 1);
+    cc.position = glm::vec3(0.0f, kFlatTerrainY, 0.0f);
+    const float dt = 1.0f / 60.0f;
+
+    // Not loaded until requested.
+    EXPECT_EQ(cc.contextPoseCount(AnimatedCharacter::MotionContext::CAPOEIRA), 0u);
+
+    cc.setMotionContext(AnimatedCharacter::MotionContext::CAPOEIRA, 0.0f);
+    EXPECT_EQ(cc.motionContext(), AnimatedCharacter::MotionContext::CAPOEIRA);
+    EXPECT_GE(cc.contextClipCount(AnimatedCharacter::MotionContext::CAPOEIRA), 30)
+        << "the capoeira folder must yield its clips";
+    EXPECT_GT(cc.contextPoseCount(AnimatedCharacter::MotionContext::CAPOEIRA), 0u);
+
+    // The pose search now runs over capoeira clips only.
+    for (int i = 0; i < 30; ++i) cc.update(dt, IdleInput(), FlatTerrain);
+    const std::string clip = cc.mmActiveClip();
+    EXPECT_FALSE(clip.empty());
+    EXPECT_NE(clip, "Walk") << "capoeira context must not select locomotion clips";
+    EXPECT_NE(clip, "Boxing");
 }
 
 // Note: main() is in test_main.cpp - don't duplicate

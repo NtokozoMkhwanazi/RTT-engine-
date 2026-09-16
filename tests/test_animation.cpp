@@ -14,6 +14,8 @@
 #include <vector>
 #include <memory>
 
+#include "animationSystem/Animator.h"  // for the SolveLegIK regression test
+
 /**
  * Test: Animation Blending
  * Verifies linear interpolation between animation poses
@@ -329,4 +331,108 @@ TEST_F(AnimationTest, Crossfade_SmoothTransition) {
         EXPECT_GT(blendWeights[i], blendWeights[i-1]) 
             << "Blend weight should increase monotonically";
     }
+}
+
+/**
+ * Test: Two-bone knee/leg IK must NOT stretch the leg.
+ *
+ * SolveLegIK computes a residual ankle translate so the foot reaches the
+ * (floor) target. When the target is beyond the leg's (L1+L2) reach, the old
+ * code yanked the ankle down UNCLAMPED - the fully-extended leg got dragged
+ * past its joint limit, visually STRETCHING the leg and making the foot
+ * "plant / twitch" mid-stride. The ankle offset is now clamped to
+ * FootIKSettings::maxIKDistance so the leg extends to its max reach instead of
+ * elastically stretching. Regression guard for "knees stretch the legs".
+ */
+TEST_F(AnimationTest, SolveLegIK_DoesNotStretchBeyondMaxDistance) {
+    Animator anim(nullptr);
+    anim.SetIKWorldScale(1.0f);
+    anim.footIKSettings.maxIKDistance = 0.15f;
+    anim.footIKSettings.kneeBendWeight = 1.0f;
+    anim.footIKSettings.ikKneeClampDeg = 175.0f;
+
+    // Straight leg: hip -> knee -> ankle, 0.5m thigh + 0.5m shin (reach = 1.0m).
+    // Identity model matrix => model-space == world-space.
+    const int THIGH = 0, SHIN = 1, ANKLE = 2;
+    // globalBoneMatrices holds the no-IK animated bone transforms; SolveLegIK
+    // samples H/K/A from these (undoing any prior-frame ikRotation), so they
+    // must carry the real bone translations — identity matrices yield
+    // zero-length legs (L1=L2=0) and a degenerate solve.
+    glm::mat4 tHip   = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::mat4 tKnee  = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.5f, 0.0f));
+    glm::mat4 tAnkle = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 0.0f));
+    anim.globalBoneMatrices = { tHip, tKnee, tAnkle };
+    anim.currBoneWorldPos   = { glm::vec3(0.0f, 1.0f, 0.0f),
+                                glm::vec3(0.0f, 0.5f, 0.0f),
+                                glm::vec3(0.0f, 0.0f, 0.0f) };
+
+    glm::mat4 model(1.0f);
+    glm::mat4 thighRot, shinRot;
+    glm::vec3 ankleOff(0.0f), ankleEnd(0.0f), kneeEnd(0.0f);
+
+    // (1) Unreachable target: foot wants to be 0.5m BELOW the ankle - 0.5m
+    // past the leg's 1.0m reach. The ankle offset must be clamped to
+    // maxIKDistance (NOT 0.5m -> no stretch).
+    ASSERT_TRUE(anim.SolveLegIK(THIGH, SHIN, ANKLE, model,
+                                glm::vec3(0.0f, -0.5f, 0.0f),
+                                thighRot, shinRot, ankleOff, ankleEnd, kneeEnd));
+    EXPECT_LE(glm::length(ankleOff), anim.footIKSettings.maxIKDistance + 1e-4f)
+        << "unreachable foot must not stretch the leg past maxIKDistance";
+
+    // (2) Reachable target (at the ankle itself): no ankle translate needed.
+    ASSERT_TRUE(anim.SolveLegIK(THIGH, SHIN, ANKLE, model,
+                                glm::vec3(0.0f, 0.0f, 0.0f),
+                                thighRot, shinRot, ankleOff, ankleEnd, kneeEnd));
+    EXPECT_LE(glm::length(ankleOff), anim.footIKSettings.maxIKDistance + 1e-4f)
+        << "reachable foot must not need ankle translation";
+
+    // (3) Knee never hyperextends/fully locks straight: the two-bone clamp
+    // (ikKneeClampDeg = 175) keeps a bent knee, so the interior knee angle is
+    // <= ikKneeClampDeg (the leg can't straighten to 180) - i.e. no locked/
+    // hyperextended leg on over-reach.
+    const glm::vec3 hipW   = glm::vec3(model * glm::vec4(glm::vec3(0.0f, 1.0f, 0.0f), 1.0f));
+    const float upperLen  = glm::length(hipW - kneeEnd);
+    const float lowerLen  = glm::length(ankleEnd - kneeEnd);
+    if (upperLen > 1e-4f && lowerLen > 1e-4f) {
+        float cosKnee = glm::dot(hipW - kneeEnd, ankleEnd - kneeEnd) / (upperLen * lowerLen);
+        cosKnee = glm::clamp(cosKnee, -1.0f, 1.0f);
+        float kneeAngDeg = glm::degrees(acosf(cosKnee));
+        EXPECT_LE(kneeAngDeg, 175.0f + 1.0f)
+            << "knee must not lock straight past ikKneeClampDeg (hyperextend)";
+        EXPECT_GT(kneeAngDeg, 0.0f)
+            << "knee angle must be valid (no degenerate/NaN solve)";
+    }
+}
+
+// =============================================================================
+// Foot-IK terrain alignment (todo Part 3, Option A)
+// Testable core: ComputeFootTiltQuat maps a +Y-up foot onto a ground normal.
+// Flat -> identity (no-op at eval time); a slope -> the align quat that hugs the
+// foot to the surface. The actual ikXform injection is gated on foot IK being
+// enabled, so the engine/headless path (foot IK off) is unaffected.
+// =============================================================================
+TEST(AnimatorFootIK, FootTilt_FlatGroundIsIdentity) {
+    glm::quat q = ComputeFootTiltQuat(glm::vec3(0.0f, 1.0f, 0.0f));
+    EXPECT_NEAR(q.w, 1.0f, 1e-4f);
+    EXPECT_NEAR(glm::length(glm::vec3(q.x, q.y, q.z)), 0.0f, 1e-4f);
+}
+
+TEST(AnimatorFootIK, FootTilt_AlignsWorldUpToSlopeNormal) {
+    // 45 deg ramp rising in +X: surface normal tilts back from vertical toward -X.
+    glm::vec3 n = glm::normalize(glm::vec3(-1.0f, 1.0f, 0.0f));
+    glm::quat q = ComputeFootTiltQuat(n);
+    EXPECT_NEAR(glm::degrees(glm::angle(q)), 45.0f, 1.0f)
+        << "tilt angle should equal the slope angle";
+    // Rotating world-up by q must reconstruct the slope normal (foot hugs it).
+    glm::vec3 up(0.0f, 1.0f, 0.0f);
+    glm::vec3 tilted = q * up;            // glm: quat * vec3 rotates vec3
+    EXPECT_NEAR(glm::dot(tilted, n), 1.0f, 1e-3f);
+    EXPECT_NEAR(glm::length(tilted), 1.0f, 1e-4f);
+}
+
+TEST(AnimatorFootIK, FootTilt_DegenerateNormalFallsBackFlat) {
+    // A zero-length ground normal must not produce NaN; foot stays flat.
+    glm::quat q = ComputeFootTiltQuat(glm::vec3(0.0f, 0.0f, 0.0f));
+    EXPECT_NEAR(q.w, 1.0f, 1e-4f);
+    EXPECT_TRUE(std::isfinite(q.w) && std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z));
 }

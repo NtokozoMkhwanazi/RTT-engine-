@@ -7,6 +7,10 @@
 //      and desyncing physics from rendering)
 //    - bilinear heightfield sampling (physics matches the rendered surface)
 //    - GPU heightmap texture + RVT material atlas creation and page baking
+//    - bake camera mapping (regression: the old ortho drove the page's
+//      vertical axis with world Y/height instead of world Z, collapsing every
+//      chunk into a thin band and leaving ~96% of each page unwritten)
+//    - packed PBR page carries real EXR normal/roughness data, not placeholders
 //    - material page recycling eviction
 //
 //  CPU tests run everywhere (test runner + engine self-check). GL tests create
@@ -15,6 +19,7 @@
 
 #include <gtest/gtest.h>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
@@ -144,6 +149,50 @@ TEST_F(TerrainHeightfieldTest, HeightQueryBeforeInit_ReturnsZero) {
     EXPECT_EQ(terrain.getNormalAt(0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
 }
 
+TEST_F(TerrainHeightfieldTest, LODHysteresis_DeadBandPreventsBoundaryFlipFlop) {
+    // Chunk at world origin, center at (32, 32) for a 64m chunk. Never meshed
+    // (m_loaded=false), so updateLOD only mutates the LOD index - no GL.
+    TerrainChunk chunk(0, 0, 64.0f, 16);
+    const float L = 60.0f;  // lodDistance
+    auto cam = [](float d) { return glm::vec3(32.0f, 0.0f, 32.0f + d); };
+
+    // Start far -> LOD 3.
+    chunk.updateLOD(cam(5.0f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 3);
+
+    // Refining inward: at the exact 4L boundary the dead band holds LOD 3;
+    // refinement only happens inside 4L * 0.9 (was: flip-flopped every frame
+    // the distance hovered on a threshold, re-uploading the index buffer).
+    chunk.updateLOD(cam(4.0f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 3) << "exact boundary distance must not refine";
+    chunk.updateLOD(cam(3.5f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 2);
+
+    chunk.updateLOD(cam(2.0f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 2) << "2L boundary must not refine";
+    chunk.updateLOD(cam(1.5f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 1);
+
+    chunk.updateLOD(cam(1.0f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 1) << "L boundary must not refine";
+    chunk.updateLOD(cam(0.5f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 0);
+
+    // Coarsening outward: the dead band holds the fine LOD until 1.1x.
+    chunk.updateLOD(cam(0.95f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 0) << "inside L*0.9..L must hold LOD 0 (no flip)";
+    chunk.updateLOD(cam(1.05f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 0) << "dead band must hold LOD 0";
+    chunk.updateLOD(cam(1.2f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 1) << "coarsen only beyond L*1.1";
+
+    // From the coarse side the same dead band holds LOD 1 at the boundary.
+    chunk.updateLOD(cam(1.05f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 1) << "dead band must hold coarse LOD too";
+    chunk.updateLOD(cam(0.85f * L), L);
+    EXPECT_EQ(chunk.getLOD(), 0) << "refine only inside L*0.9";
+}
+
 TEST_F(TerrainHeightfieldTest, ChunkCoord_OrdersLexicographically) {
     std::map<ChunkCoord, int> m;
     m[{1, 0}] = 1;
@@ -159,11 +208,11 @@ TEST_F(TerrainHeightfieldTest, ChunkCoord_OrdersLexicographically) {
 
 TEST_F(TerrainHeightfieldTest, TerrainConfigAndPageConstants) {
     Terrain::TerrainConfig cfg;
-    EXPECT_EQ(cfg.chunkSize, 80.0f);
-    EXPECT_EQ(cfg.chunkResolution, 32);
-    EXPECT_EQ(cfg.viewDistance, 2);
-    EXPECT_EQ(cfg.heightmapSize, 1024);
-    EXPECT_EQ(cfg.heightScale, 25.0f);
+    EXPECT_EQ(cfg.chunkSize, 200.0f);
+    EXPECT_EQ(cfg.chunkResolution, 1080);
+    EXPECT_EQ(cfg.viewDistance, 4);
+    EXPECT_EQ(cfg.heightmapSize, 2040);
+    EXPECT_EQ(cfg.heightScale, 100.0f);
 
     // RVT material atlas: 4096x4096 RGBA8, 128px pages -> 32x32 = 1024 pages.
     EXPECT_EQ(Terrain::kMaterialAtlasSize, 4096);
@@ -274,8 +323,8 @@ TEST_F(TerrainPipelineGLTest, BakedPage_ReadbackHasMaterial) {
     terrain.initialize();
     initTerrainShader();
 
-    // The bake samples the master heightmap (perlin, heights 0..25) at the
-    // chunk's world footprint, so the page should show several material
+    // The bake samples the master heightmap (perlin, heights 0..heightScale)
+    // at the chunk's world footprint, so the page should show several material
     // bands (sand/grass/rock) instead of being empty or uniform.
     TerrainChunk chunk(0, 0, 64.0f, 16);
     std::vector<float> h(17 * 17, 0.0f);
@@ -301,6 +350,138 @@ TEST_F(TerrainPipelineGLTest, BakedPage_ReadbackHasMaterial) {
     EXPECT_GT(nonZero, 0) << "bake produced an empty page";
     EXPECT_GT(maxV, 40) << "baked material must contain a bright layer (sand/grass)";
     EXPECT_LT(minV, maxV) << "baked material should vary across the page (height layers)";
+}
+
+TEST_F(TerrainPipelineGLTest, BakedPbrPage_ReadbackHasNormalRoughness) {
+    // The packed PBR atlas page must carry REAL baked data, not neutral
+    // placeholders: world-space normals (z channel clearly > 0, some x/y
+    // spread from the rock micro-detail) and a varying roughness channel.
+    // A flat page would mean the EXR normal/roughness maps never reached the
+    // render path (the whole point of the PBR terrain upgrade).
+    Terrain terrain(smallConfig());
+    terrain.initialize();
+    initTerrainShader();
+    ASSERT_NE(terrain.getMaterialPbrAtlas(), 0u) << "PBR atlas must exist";
+
+    TerrainChunk chunk(0, 0, 64.0f, 16);
+    std::vector<float> h(17 * 17, 0.0f);
+    chunk.generateHeightmapFromData(std::move(h));
+    const int page = terrain.bakeChunkMaterial(chunk);
+    ASSERT_GE(page, 0);
+
+    // Isolation probe: draw the SAME chunk grid (17x17, step 4m, 16x16 quads)
+    // with a trivial shader - positions pass through unchanged (NO heightmap
+    // displacement, NO LOD) under the same ortho the bake uses. Full coverage
+    // => the bake's VS displacement/LOD is the culprit; a band => the
+    // projection/geometry mapping is broken.
+    {
+        const char* vs = "#version 330 core\nlayout(location=0) in vec3 aPos;"
+                         "uniform mat4 uMvp; void main(){ gl_Position = uMvp * vec4(aPos, 1.0); }";
+        const char* fs = "#version 330 core\nout vec4 c; void main(){ c = vec4(1.0); }";
+        GLuint tv = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(tv, 1, &vs, nullptr); glCompileShader(tv);
+        GLuint tf = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(tf, 1, &fs, nullptr); glCompileShader(tf);
+        GLuint tp = glCreateProgram();
+        glAttachShader(tp, tv); glAttachShader(tp, tf); glLinkProgram(tp);
+        GLuint scratch = 0, scratchTex = 0, vao = 0, vbo = 0, ebo = 0;
+        glGenTextures(1, &scratchTex);
+        glBindTexture(GL_TEXTURE_2D, scratchTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 128, 128, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+        glGenFramebuffers(1, &scratch);
+        glBindFramebuffer(GL_FRAMEBUFFER, scratch);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scratchTex, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);   // explicit: single-attachment draw
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glViewport(0, 0, 128, 128);
+        glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+
+        std::vector<float> verts;
+        for (int y = 0; y <= 16; ++y) for (int x = 0; x <= 16; ++x)
+            verts.insert(verts.end(), { (float)x * 4.0f, 0.0f, (float)y * 4.0f });
+        std::vector<unsigned> idxs;
+        for (int y = 0; y < 16; ++y) for (int x = 0; x < 16; ++x) {
+            int tl = y * 17 + x, tr = tl + 1, bl = (y + 1) * 17 + x, br = bl + 1;
+            idxs.insert(idxs.end(), { (unsigned)tl, (unsigned)bl, (unsigned)tr,
+                                      (unsigned)tr, (unsigned)bl, (unsigned)br });
+        }
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+        glGenBuffers(1, &vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12, (void*)0);
+        glEnableVertexAttribArray(0);
+        glGenBuffers(1, &ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idxs.size() * sizeof(unsigned), idxs.data(), GL_STATIC_DRAW);
+
+        GLint linkOk = 0;
+        glGetProgramiv(tp, GL_LINK_STATUS, &linkOk);
+        const GLint mvpLoc = glGetUniformLocation(tp, "uMvp");
+        const glm::vec3 o = chunk.getWorldPosition();
+        const float half = 32.0f;
+        const glm::vec3 center = o + glm::vec3(half, 0.0f, half);
+        // The SAME top-down camera the fixed bake uses (world X -> right,
+        // world Z -> up, height -> depth). A flat grid at y=0 must cover the
+        // whole page - the old crossed-axis ortho (world Y -> screen Y)
+        // collapsed it to a single row (0/16384), which is exactly the bug
+        // that left 96% of every baked page unwritten.
+        glm::mat4 mvp = glm::ortho(-half, half, -half, half, 10.0f, 1000.0f) *
+                        glm::lookAt(center + glm::vec3(0.0f, 500.0f, 0.0f), center,
+                                    glm::vec3(0.0f, 0.0f, 1.0f));
+        glUseProgram(tp);
+        glUniformMatrix4fv(mvpLoc, 1, GL_FALSE, &mvp[0][0]);
+        glDrawElements(GL_TRIANGLES, (GLsizei)idxs.size(), GL_UNSIGNED_INT, 0);
+        std::vector<unsigned char> pix(128 * 128 * 4, 0);
+        glReadPixels(0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, pix.data());
+        int cov = 0;
+        for (size_t i = 0; i < pix.size(); i += 4) if (pix[i] > 0) ++cov;
+        EXPECT_EQ(cov, 128 * 128) << "bake camera must map the chunk XZ onto the full page";
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &scratch);
+        glDeleteTextures(1, &scratchTex);
+        glDeleteProgram(tp); glDeleteShader(tv); glDeleteShader(tf);
+        glDeleteVertexArrays(1, &vao); glDeleteBuffers(1, &vbo); glDeleteBuffers(1, &ebo);
+    }
+
+    const int px = page % 32;
+    const int py = page / 32;
+    std::vector<unsigned char> buf(128 * 128 * 4, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, terrain.getBakeFramebuffer());
+    glReadBuffer(GL_COLOR_ATTACHMENT1);   // packed PBR page (not the albedo)
+    glReadPixels(px * 128, py * 128, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // The whole page must be written (the old near=-10 ortho clipped every
+    // displaced vertex; the top-down lookAt camera keeps the full height band
+    // inside the frustum).
+    int zeroTexels = 0;
+    for (size_t i = 0; i < buf.size(); i += 4)
+        if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 0) ++zeroTexels;
+    EXPECT_EQ(zeroTexels, 0) << "baked PBR page must be fully covered";
+
+    // Normals are stored as n*0.5+0.5 in WORLD space, where up is +Y (green).
+    // A terrain heightfield must keep y (green) above the neutral 128 - and
+    // the x/z spread shows the rock micro-detail from the EXR normal map
+    // actually reaching the baked path.
+    float yMin = 1e9f, xzSpread = 0.0f, roughMin = 1e9f, roughMax = -1e9f;
+    for (size_t i = 0; i < buf.size(); i += 4) {
+        yMin = std::min(yMin, (float)buf[i + 1]);   // green = world up
+        const float dx = std::abs((float)buf[i] - 128.0f);
+        const float dz = std::abs((float)buf[i + 2] - 128.0f);
+        xzSpread = std::max(xzSpread, std::max(dx, dz));
+        roughMin = std::min(roughMin, (float)buf[i + 3]);
+        roughMax = std::max(roughMax, (float)buf[i + 3]);
+    }
+    EXPECT_GT(yMin, 140.0f) << "baked normals must face up (world +Y > neutral 0.5)";
+    EXPECT_GT(xzSpread, 5.0f) << "baked normals must show rock micro-detail";
+    EXPECT_LT(roughMin, roughMax - 10.0f) << "baked roughness must vary across the page";
 }
 
 TEST_F(TerrainPipelineGLTest, BakeRecycling_EvictsPreviousPageOwner) {
@@ -372,10 +553,12 @@ TEST_F(TerrainPipelineGLTest, HeightTexture_MatchesCPUFallbackExactly) {
     }
 
     // The texture must carry the generated height range, not be empty/zeroed.
+    // Perlin octaves normalize to [0,1], scaled by heightScale (100) - the
+    // peak stays below heightScale even with the sharpest octave summing high.
     float minV = 1e9f, maxV = -1e9f;
     for (float v : tex) { minV = std::min(minV, v); maxV = std::max(maxV, v); }
     EXPECT_GE(minV, 0.0f);
-    EXPECT_LE(maxV, 25.1f);
+    EXPECT_LE(maxV, 100.1f);
     EXPECT_GT(maxV, 1.0f) << "heightmap texture looks empty";
 }
 
@@ -390,9 +573,9 @@ TEST_F(TerrainPipelineGLTest, HeightQuery_ContinuousAcrossChunkBoundary) {
     const float b = terrain.getHeightAt(64.1f, 10.0f);
     EXPECT_NEAR(a, b, 0.5f);
     EXPECT_GE(a, 0.0f);
-    EXPECT_LE(a, 25.0f);
+    EXPECT_LE(a, 100.0f);
     EXPECT_GE(b, 0.0f);
-    EXPECT_LE(b, 25.0f);
+    EXPECT_LE(b, 100.0f);
 }
 
 TEST_F(TerrainPipelineGLTest, HeightQuery_FallbackMatchesMappedMaster) {
@@ -403,7 +586,7 @@ TEST_F(TerrainPipelineGLTest, HeightQuery_FallbackMatchesMappedMaster) {
     // deterministic (the old worldX/size mapping returned texel-0 heights).
     const float h = terrain.getHeightAt(2000.0f, 2000.0f);
     EXPECT_GE(h, 0.0f);
-    EXPECT_LE(h, 25.0f);
+    EXPECT_LE(h, 100.0f);
     EXPECT_EQ(h, terrain.getHeightAt(2000.0f, 2000.0f));
 }
 

@@ -33,7 +33,7 @@ GPU profiler and GPS simulation) and runs its main loop.
 
   (engine core test) Animation Test. pose A to pose B snappy state switches.
   Requires more clips between transitions for a better motion graph 
-
+  
   <img width="400" height="225" alt="TEST2(1)(1)" src="https://github.com/user-attachments/assets/28ad909f-5cc3-4ea2-9459-52c3eacd22f7" />
 
 ---

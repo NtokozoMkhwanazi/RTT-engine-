@@ -28,10 +28,13 @@ GPU profiler and GPS simulation) and runs its main loop.
 ## Current focus on engine:
 
   UV displacement stretching artifact on steep slopes  & Parallax ocllusion mapping test   
-<img width="400" height="225" alt="test(1)" src="https://github.com/user-attachments/assets/5c524fdf-cb1b-45a9-83f5-67ebcc70f257" />
 
-  Animation Test . pose A to pose B snappy state switches. Requires more clips between transitions for a better motion graph 
-<img width="400" height="225" alt="TEST2(1)(1)" src="https://github.com/user-attachments/assets/28ad909f-5cc3-4ea2-9459-52c3eacd22f7" />
+  <img width="400" height="225" alt="test(1)" src="https://github.com/user-attachments/assets/5c524fdf-cb1b-45a9-83f5-67ebcc70f257" />
+
+  Animation Test. pose A to pose B snappy state switches.
+  Requires more clips between transitions for a better motion graph 
+
+  <img width="400" height="225" alt="TEST2(1)(1)" src="https://github.com/user-attachments/assets/28ad909f-5cc3-4ea2-9459-52c3eacd22f7" />
 
 ---
 ## ✨ Features

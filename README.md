@@ -36,6 +36,11 @@ GPU profiler and GPS simulation) and runs its main loop.
   
   <img width="400" height="225" alt="TEST2(1)(1)" src="https://github.com/user-attachments/assets/28ad909f-5cc3-4ea2-9459-52c3eacd22f7" />
 
+  (openGL test) Model Texture binding. disabled root motion
+
+  <img width="400" height="225" alt="view(1)(1)" src="https://github.com/user-attachments/assets/2480229c-f7ab-48be-b4d7-9b092782d18d" />
+
+  
 ---
 ## ✨ Features
 

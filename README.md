@@ -25,7 +25,7 @@ physics, play-mode character with motion matching, follow camera, demo recorder,
 GPU profiler and GPS simulation) and runs its main loop.
 
 ---
-## Current focus on engine:
+## Current focus on engine GIF
 
   (openGL test) UV displacement stretching artifact on steep slopes  & Parallax ocllusion mapping test 
 

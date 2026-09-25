@@ -26,6 +26,8 @@ GPU profiler and GPS simulation) and runs its main loop.
 
 ---
 ## Current focus on engine GIF
+  
+  **note : all tests are ran on a low spec machine AMD RYZEN 3700U vega 10 integrated graphics this engine has been highly optimized for this card to handle the compute power, On higher tier machines the engine will surely render at a substantially higher performance. Development is very restricted to write carefully for low-spec machines specifically this (AMD RYZEN 3700U) card has strict memory-layouts not forgiving to mistakes..in otherwords GPU crashes alot on vulkan graphics mode**  
 
   (openGL test) UV displacement stretching artifact on steep slopes  & Parallax ocllusion mapping test 
 

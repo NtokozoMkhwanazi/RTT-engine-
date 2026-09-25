@@ -27,7 +27,7 @@ GPU profiler and GPS simulation) and runs its main loop.
 ---
 ## Current focus on engine GIF
   
-  **note : all tests are ran on a low spec machine AMD RYZEN 3700U vega 10 integrated graphics this engine has been highly optimized for this card to handle the compute power, On higher tier machines the engine will surely render at a substantially higher performance. Development is very restricted to write carefully for low-spec machines specifically this (AMD RYZEN 3700U) card has strict memory-layouts not forgiving to mistakes..in otherwords GPU crashes alot on vulkan graphics mode**  
+**Hardware Constraint Note**: All benchmarking and tests are conducted on a low-specification machine **AMD Ryzen 3700U with Radeon Vega 10 Integrated Graphics**. This engine has been highly optimized specifically for this hardware architecture. Because this integrated card shares system memory and features exceptionally rigid memory-layout constraints, minor programmatic inaccuracies or oversized data transfers easily trigger full VRAM saturation and GPU driver context losses (crashes). Therefore, data systems—such as our virtualized geometry pipeline—are completely GPU-driven and written using strict, high-performance C++ memory layouts. On discrete, higher-tier desktop graphics cards, the performance will scale substantially higher, but our primary development philosophy remains strictly bound to extracting maximum performance from constrained, low-spec hardware
 
   (openGL test) UV displacement stretching artifact on steep slopes  & Parallax ocllusion mapping test 
 

@@ -8,7 +8,7 @@
 ![Tests](https://img.shields.io/badge/Tests-731%20passing%20across%2099%20suites-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-**Advanced lightweight 3D engine core** built for scalability and high-performance
+**lightweight 3D engine core** built for scalability and high-performance
 systems: real-time rendering, animation, motion matching, physics and geospatial
 simulation and scientific experimentation — written in **C++17** on a **dual-backend RHI** (OpenGL 4.5 for
 low/optimized machines, Vulkan for high-quality rendering) with a **Dear ImGui**

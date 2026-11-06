@@ -2,6 +2,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <GLFW/glfw3.h>
+#include <cmath>
 
 class OrbitCamera {
 public:
@@ -44,6 +45,7 @@ public:
         lastY = ypos;
 
         yaw   += xoffset * sensitivity;
+        yaw   = std::fmod(yaw, 360.0f); // Prevents float precision degradation over time
         pitch += yoffset * sensitivity;
 
         // clamp pitch so we don't flip over top
@@ -53,8 +55,14 @@ public:
 
     void processMouseScroll(double yoffset) {
         radius -= yoffset * zoomSpeed;
-        if (radius < 1.0f) radius = 0.000000000000001f;
+        if (radius < 0.2f) radius = 0.2f; // Keeps look-direction vector math stable
         if (radius > 30.0f) radius = 30.0f;
+    }
+
+    // Reset the first-mouse baseline so re-grabbing the viewport after
+    // interacting with other panels doesn't cause a violent snap.
+    void resetFirstMouse() {
+        firstMouse = true;
     }
 };
 

@@ -1,0 +1,39 @@
+{
+  "world_objects": [
+    {
+      "type": "ROCK_BOULDER",
+      "modelPath": "assets/World_objects/Rock0.fbx",
+      "minScale": 0.8,
+      "maxScale": 1.2,
+      "windSway": 0.0
+    },
+    {
+      "type": "ROCK_STONE",
+      "modelPath": "assets/World_objects/stone.fbx",
+      "minScale": 0.8,
+      "maxScale": 1.2,
+      "windSway": 0.0
+    },
+    {
+      "type": "ROCK_CLIFF",
+      "modelPath": "assets/World_objects/Rock0.fbx",
+      "minScale": 0.8,
+      "maxScale": 1.2,
+      "windSway": 0.0
+    },
+    {
+      "type": "TREE_PINE",
+      "modelPath": "assets/World_objects/pine/pine.obj",
+      "minScale": 0.8,
+      "maxScale": 1.5,
+      "windSway": 0.0
+    },
+    {
+      "type": "LOG",
+      "modelPath": "assets/bot321.fbx",
+      "minScale": 0.8,
+      "maxScale": 1.2,
+      "windSway": 0.0
+    }
+  ]
+}

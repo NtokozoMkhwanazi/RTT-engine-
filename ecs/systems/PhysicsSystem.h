@@ -103,6 +103,7 @@ public:
                 engineBody->dynamicFriction = ecsRb.dynamicFriction;
                 engineBody->rollingResistance = ecsRb.rollingResistance;
                 engineBody->useContinuousCollisionDetection = ecsRb.useCCD;
+                engineBody->layer = ecsRb.collisionLayer;  // verify.txt Module 2: layer filter
 
                 // Set collider dimensions based on type
                 switch (ecsRb.colliderType) {

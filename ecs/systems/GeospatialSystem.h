@@ -18,6 +18,8 @@
 #include "../components/GeospatialComponent.h"
 #include "../components/TransformComponent.h"
 #include "../components/PredictionComponent.h"
+#include "../components/ModelComponent.h"   // forwarded to GeoVisualizationSystem::registerEntity
+#include "../components/AnimatedCharacterComponent.h" // npcChar field + geo-animated-NPC drive
 #include "GeoIngestionSystem.h"
 #include "GeoStorageSystem.h"
 #include "GeoPredictionSystem.h"
@@ -25,6 +27,8 @@
 #include "../../geospatial/GeospatialConverter.h"
 #include "../../geospatial/GeoAPI.h"
 #include <glm/glm.hpp>
+#include <algorithm>
+#include <cmath>
 #include <vector>
 #include <string>
 #include <iostream>
@@ -45,6 +49,9 @@ public:
      * Initialize all geospatial subsystems
      */
     void initialize(double originLat, double originLon, double originAlt = 0.0) {
+        // Stash the origin for per-twin 3D Kalman models (each twin gets its own).
+        geoOriginLat = originLat; geoOriginLon = originLon; geoOriginAlt = originAlt;
+
         // Initialize all subsystems
         ingestionSystem.initialize(originLat, originLon, originAlt);
         storageSystem.initialize("http://localhost", 8086, "geospatial");
@@ -54,6 +61,11 @@ public:
 
         predictionSystem.initialize(originLat, originLon, "geospatial/trajectory_predict.tflite");
         visualizationSystem.init();
+        // Bind the WGS84->local converter so prediction cones render in LOCAL
+        // space in GeoVisualizationSystem::update (else raw lat/lon-as-meters
+        // drifts the cone away from the twin mesh). Available now that
+        // ingestionSystem.initialize() has constructed its converter_.
+        visualizationSystem.setConverter(&ingestionSystem.getConverter());
 
         // Start multithreaded subsystems
         ingestionSystem.startIngestion();
@@ -68,7 +80,9 @@ public:
      * Register an entity for geospatial tracking across all subsystems
      */
     void registerEntity(EntityID id, GeospatialComponent* geo, TransformComponent* transform,
-                        PredictionComponent* prediction = nullptr) {
+                        PredictionComponent* prediction = nullptr,
+                        ModelComponent* model = nullptr,
+                        AnimatedCharacterComponent* npc = nullptr) {
         if (!geo || !transform) {
             std::cout << "[GeospatialSystem] Failed to register entity " << id
                       << ": missing required components\n";
@@ -80,15 +94,18 @@ public:
         state.geo = geo;
         state.transform = transform;
         state.prediction = prediction;
+        state.npcChar = npc;
         state.isActive = true;
+        state.twinModel.initialize(geoOriginLat, geoOriginLon, geoOriginAlt);
 
         entityStates.push_back(state);
         geospatialEntities.push_back(id);
 
         geo->entityId = "entity_" + std::to_string(id);
 
-        // Register with visualization system
-        visualizationSystem.registerEntity(id, geo, transform, prediction);
+        // Register with visualization system (forward ModelComponent so the viz
+        // system can suppress the fallback point-marker for mesh-bearing twins)
+        visualizationSystem.registerEntity(id, geo, transform, prediction, model);
 
         std::cout << "[GeospatialSystem] Registered entity " << id
                   << " (" << geo->entityId << ")\n";
@@ -159,7 +176,8 @@ public:
 
             // Add to prediction model
             predictionSystem.addObservation(data.latitude, data.longitude,
-                                           data.timestamp, data.speed, data.heading);
+                                            data.timestamp, data.speed, data.heading,
+                                            data.altitude);
 
             // Update registered entities
             for (auto& state : entityStates) {
@@ -170,7 +188,26 @@ public:
                         data.latitude, data.longitude, data.altitude);
 
                     if (state.transform) {
-                        state.transform->position = localPos;
+                        if (state.npcChar && state.npcChar->character &&
+                            state.npcChar->character->ready()) {
+                            // Animated NPC geo twin: the geospatial fix OWNS the
+                            // character's absolute position (ENU metres) and feeds
+                            // heading/speed into the locomotion FSM (| FSM derives
+                            // heading from moveDir + plays walk/jog/run by speed).
+                            // TickAnimatedCharacter() mirrors character->position
+                            // back into the ECS transform, so the live lat/lon fix
+                            // is overwritten by the next update -> the NPC tracks
+                            // the feed exactly, no velocity drift.
+                            state.npcChar->character->position = localPos;
+                            state.npcChar->geoDriven = true;
+                            const float h = glm::radians((float)data.heading);
+                            state.npcChar->geoMoveDir =
+                                glm::vec2(-std::sin(h), -std::cos(h));
+                            state.npcChar->geoMoveSpeed = float(std::clamp(
+                                data.speed / 2.0, 0.0, 1.0));
+                        } else {
+                            state.transform->position = localPos;
+                        }
                     }
 
                     state.geo->latitude = data.latitude;
@@ -178,6 +215,12 @@ public:
                     state.geo->altitude = data.altitude;
                     state.geo->horizontalAccuracy = data.accuracy;
                     state.geo->timestamp = data.timestamp;
+
+                    // Feed this twin's live observation into its OWN 3D Kalman
+                    // so its prediction cone leads its real path.
+                    state.twinModel.addObservation(data.latitude, data.longitude,
+                                                   data.timestamp, data.speed,
+                                                   data.heading, data.altitude);
                 }
             }
         }
@@ -196,6 +239,16 @@ public:
                 for (auto& state : entityStates) {
                     if (!state.isActive || !state.prediction) continue;
                     predictionSystem.updatePredictionComponent(*state.prediction, predictionResult);
+                }
+
+                // Per-twin prediction: each tracked twin extrapolates its OWN
+                // future from its own observations (external sim feeds that
+                // matched it by entityId). predictTrajectory returns {} for
+                // twins with no history, so static/unfed twins get no cone.
+                for (auto& state : entityStates) {
+                    if (!state.isActive) continue;
+                    state.lastPredicted = state.twinModel.predictTrajectory(
+                        fix.timestamp, 60.0, 50);
                 }
             }
         }
@@ -276,9 +329,17 @@ public:
             snap.accuracy = s.geo->horizontalAccuracy;
             snap.timestamp = s.geo->timestamp;
             snap.isValid = true;
-            snap.hasPrediction = (s.prediction != nullptr);
-            if (s.prediction) snap.predictionConfidence =
-                static_cast<float>(s.prediction->confidence);
+            // Colour the twin on the dashboard by its AssetKind (Todo 7 mesh
+            // twins -> now tracked geospatial twins, not orphaned stubs).
+            snap.kind = static_cast<geo::AssetKind>(s.geo->assetKind);
+            // Per-twin prediction cone: each twin predicts its own future from
+            // its own observed trajectory (external sim data matched by id).
+            snap.hasPrediction = !s.lastPredicted.empty();
+            snap.predictions = s.lastPredicted;
+            if (snap.hasPrediction) {
+                snap.predictionConfidence =
+                    static_cast<float>(s.lastPredicted.back().confidence);
+            }
             snaps.push_back(snap);
         }
         return snaps;
@@ -286,6 +347,26 @@ public:
 
     void setPredictionInterval(float interval) { predictionInterval = interval; }
     float getPredictionInterval() const { return predictionInterval; }
+
+    /**
+     * Push an explicit observation to a specific tracked twin (by entityId).
+     * Used by external sim endpoints that emit per-entity telemetry, and by the
+     * editor demo to seed a twin's cone. Feeds that twin's own 3D Kalman.
+     */
+    bool addTwinObservation(EntityID id, double lat, double lon, double alt,
+                            double speed = 0.0, double heading = 0.0,
+                            double timestamp = 0.0) {
+        for (auto& state : entityStates) {
+            if (state.id == id && state.isActive && state.geo) {
+                state.twinModel.addObservation(lat, lon, timestamp,
+                                               speed, heading, alt);
+                state.lastPredicted = state.twinModel.predictTrajectory(
+                    timestamp, 60.0, 50);
+                return true;
+            }
+        }
+        return false;
+    }
 
     const char* getName() const override { return "GeospatialSystem"; }
 
@@ -295,7 +376,13 @@ private:
         GeospatialComponent* geo = nullptr;
         TransformComponent* transform = nullptr;
         PredictionComponent* prediction = nullptr;
+        AnimatedCharacterComponent* npcChar = nullptr; // geo-animated Personnel twin (if any)
         bool isActive = false;
+        // Per-twin 3D Kalman (Todo 9/10): each tracked twin predicts its OWN
+        // future from the ingested/sim observations matched to its entityId,
+        // so the dashboard draws a cone per twin instead of one global cone.
+        PredictiveModel twinModel;
+        std::vector<PredictedState> lastPredicted;
     };
 
     GeoIngestionSystem ingestionSystem;
@@ -311,6 +398,10 @@ private:
     float predictionInterval;
     float lastPredictionTime;
     float systemTime;
+
+    // Origin seeded at initialize(); used to initialize each twin's local
+    // WGS84->metric frame for its own 3D Kalman.
+    double geoOriginLat = 0.0, geoOriginLon = 0.0, geoOriginAlt = 0.0;
 };
 
 } // namespace ecs

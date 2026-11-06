@@ -1,4 +1,4 @@
-#include "editor/ui_helpers.h"
+#include "ui_helpers.h"
 
 namespace UI {
 
@@ -14,12 +14,16 @@ void EndPanel() {
 
 bool BeginFixedPanel(const char* name, const ImVec2& pos, const ImVec2& size, ImGuiWindowFlags extraFlags) {
     if (ImGui::GetCurrentContext() == nullptr) return false;
+    // Force position/size every frame for our fixed layout
     ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar
                            | ImGuiWindowFlags_NoResize
                            | ImGuiWindowFlags_NoMove
                            | ImGuiWindowFlags_NoCollapse
+#ifdef ImGuiWindowFlags_NoDocking
+                           | ImGuiWindowFlags_NoDocking
+#endif
                            | extraFlags;
     return ImGui::Begin(name, nullptr, flags);
 }

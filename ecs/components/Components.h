@@ -5,6 +5,7 @@
 #include "TransformComponent.h"
 #include "MeshComponent.h"
 #include "ModelComponent.h"
+#include "LayerComponent.h"
 #include "CameraComponent.h"
 #include "RigidBodyComponent.h"
 #include "AnimatorComponent.h"

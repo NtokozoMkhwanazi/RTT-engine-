@@ -513,25 +513,12 @@ ecs/
 │
 ├── Archetype.h           # Archetype and Chunk classes
 ├── ArchetypeManager.h    # Archetype-based storage manager
-├── BoneSoA.h             # Structure-of-arrays bone cache
-├── DynamicPool.h         # Dynamic component pool
-├── DynamicTypes.h        # Dynamic type registration
-├── ComponentRegistration.cpp # Component type-ID registration
-├── ComponentTypeID.cpp   # Type ID assignment
-├── JobSystem.h           # Multi-threaded job system (work stealing)
+├── JobSystem.h           # Multi-threaded job system
 ├── RelationshipManager.h # Parent-child hierarchies
 ├── EventSystem.h         # Event publishing/subscribing
 ├── Serialization.h       # JSON/binary serialization
-├── Blueprint.h           # Prefab/blueprint system
-│
-├── components/           # Transform, Mesh, RigidBody, Light,
-│   (Animator, MotionMatching, Geospatial, Prediction, Model, Terrain, ...)
-└── systems/              # Render, Physics, Animation, Terrain,
-    (CharacterController, MotionMatching, Geospatial + 4 Geo phases, ...)
+└── Blueprint.h           # Prefab/blueprint system
 ```
-
-> **Build & test:** compiles as part of the engine (`make`). Run ECS suites with
-> `make test` (731 tests / 99 suites) or `--gtest_filter=ArchetypeStorageTest.*|EntityManagerOps.*|RelationshipTest.*|EventSystemTest.*|BlueprintTest.*|JobSystemTest.*|SerializationTest.*|CacheLayoutProfileTest.*`.
 
 ---
 

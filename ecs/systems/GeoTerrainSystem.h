@@ -85,6 +85,15 @@ public:
     }
 
     /**
+     * Bind the live heightmap Terrain so geospatial entities snap to the
+     * actual rendered terrain surface (via Terrain::getHeightAt) instead of
+     * the procedural sine placeholder. Safe to call before/after terrain
+     * init: if left null, sampleTerrainHeight() keeps using the sine fallback.
+     */
+    void setTerrain(Terrain* terrain) noexcept { terrain_ = terrain; }
+    Terrain* getTerrain() const noexcept { return terrain_; }
+
+    /**
      * Generate terrain from geospatial bounds (multithreaded)
      */
     void generateTerrain() {
@@ -204,6 +213,10 @@ private:
 
     GeospatialSystem* geospatialSystem = nullptr;
 
+    // Real heightmap Terrain to sample (set by EditorApplication after
+    // WorldManager::initialize creates the terrain). Null => sine fallback.
+    Terrain* terrain_ = nullptr;
+
     std::queue<TerrainGenRequest> genRequests;
     std::mutex requestMutex;
     std::condition_variable cv;
@@ -211,8 +224,17 @@ private:
     std::atomic<bool> running;
     std::atomic<bool> terrainGenerated;
 
-    // Simple sine-based terrain (replace with real DEM data)
+    // Sample terrain height at a local (x,z) position. Prioritizes the real
+    // heightmap Terrain (wired via setTerrain()) so geospatial entities rest on
+    // the actual rendered surface; falls back to the procedural sine terrain
+    // when no Terrain is bound (e.g. before WorldManager init or with
+    // DISABLE_GEOSPATIAL).
     float sampleTerrainHeight(float x, float z) const {
+        if (terrain_) {
+            return terrain_->getHeightAt(x, z);
+        }
+
+        // Simple sine-based terrain (replace with real DEM data)
         float nx = x / config.terrainSize;
         float nz = z / config.terrainSize;
 

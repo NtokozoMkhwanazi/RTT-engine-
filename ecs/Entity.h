@@ -27,6 +27,14 @@ constexpr EntityID MAX_ENTITIES = 10000;
  */
 struct Entity {
     EntityID id = INVALID_ENTITY_ID;
+    // Packed generation counter (Phase B). createEntity stamps it; destroyEntity
+    // bumps the slot's generation so a recycled id yields a DIFFERENT gen. valid()
+    // compares entity.gen against the slot's current generation, which is what
+    // disambiguates a destroyed handle from the live entity that later reuses
+    // its id. Kept as a distinct field (not bit-packed into id) so EntityID
+    // indexing (m_signatures[id], m_componentManager[id], m_liveEntities) is
+    // unaffected and INVALID_ENTITY_ID still fits.
+    uint8_t gen = 0;
     bool isValid() const { return id != INVALID_ENTITY_ID; }
     bool operator==(const Entity& other) const { return id == other.id; }
     bool operator!=(const Entity& other) const { return id != other.id; }

@@ -18,6 +18,15 @@ struct GeospatialComponent {
 
     std::string entityId = "";
 
+    // Asset-kind twin classification (geo::AssetKind, Unknown=0). Stored as int
+    // to avoid a transitive include of GeoAPI.h here (GeoAPI.h ->
+    // PredictiveModel.h -> GeospatialComponent.h = cycle). GeospatialSystem
+    // Asset-kind twin classification (geo::AssetKind, Unknown=0). Stored as int
+    // to avoid a transitive include of GeoAPI.h here (GeoAPI.h ->
+    // PredictiveModel.h -> GeospatialComponent.h = cycle); GeospatialSystem casts
+    // it back to the enum when emitting EntitySnapshot.kind for the dashboard.
+    int assetKind = 0;
+
     GeospatialComponent() = default;
 
     GeospatialComponent(double lat, double lon, double alt)

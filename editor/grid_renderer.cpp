@@ -56,7 +56,16 @@ void Cleanup() {
 void Draw(const glm::mat4& view, const glm::mat4& projection, GLuint shaderProgram) {
     if (!g_editor.showGrid() || g_gridVAO == 0) return;
 
-    glDisable(GL_DEPTH_TEST);
+    // Floor-like grid: depth-test ON so objects standing on the grid properly
+    // occlude grid lines behind/beneath them (looks like a real floor, not a
+    // transparent overlay). Depth-mask OFF so the grid never steals depth from
+    // scene geometry. glDepthMask is explicitly restored to GL_TRUE before
+    // re-enabling GL_DEPTH_TEST at the end so the forward pass that follows
+    // isn't left with a disabled depth-write (the prior code left depth writes
+    // off, causing z-fighting on the terrain/arena).
+    const bool depthTestWasEnabled = glIsEnabled(GL_DEPTH_TEST) == GL_TRUE;
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
     glUseProgram(shaderProgram);
 
     GLint viewLoc = glGetUniformLocation(shaderProgram, "view");
@@ -69,7 +78,7 @@ void Draw(const glm::mat4& view, const glm::mat4& projection, GLuint shaderProgr
 
     glm::mat4 model = glm::mat4(1.0f);
     glUniformMatrix4fv(modelLoc, 1, GL_FALSE, &model[0][0]);
-    glUniform3f(colorLoc, 0.3f, 0.3f, 0.35f);
+    glUniform3f(colorLoc, 0.25f, 0.25f, 0.28f);
 
     glBindVertexArray(g_gridVAO);
     glDrawArrays(GL_LINES, 0, g_gridLineCount - 4);
@@ -82,7 +91,12 @@ void Draw(const glm::mat4& view, const glm::mat4& projection, GLuint shaderProgr
 
     glBindVertexArray(0);
     glUseProgram(0);
-    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);  // restore depth writes for subsequent forward/terrain passes
+    // verify.txt Fix: restore the caller's GL_DEPTH_TEST enable bit so the grid
+    // (which needs depth testing for its own occlusion) does not leak a stale
+    // glEnable(GL_DEPTH_TEST) into downstream ImGui / debug-text draws, which
+    // broke those passes on strict graphics drivers.
+    if (depthTestWasEnabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
 }
 
 void Show(bool show) { g_editor.setShowGrid(show); }

@@ -117,6 +117,19 @@ public:
     void renderEntity(EntityID entityID, TransformComponent& transform, MeshComponent& mesh) {
         if (!mesh.visible || !m_renderer) return;
 
+        // Cull by scene layer: the Layers panel toggles m_layerVisible[8] each
+        // frame. Entities on a hidden layer (or with an out-of-range layer id)
+        // never reach AddRenderable, so hiding "Props"/"Characters"/etc. is
+        // immediately visible. Entities without a LayerComponent render
+        // unconditionally (Default layer, always visible).
+        if (m_world) {
+            if (const auto* lc = m_world->getComponent<LayerComponent>(Entity{entityID}); lc) {
+                if (lc->layer < 0 || lc->layer >= LayerComponent::kMaxLayers ||
+                    !m_layerVisible[lc->layer])
+                    return;
+            }
+        }
+
         m_visibleCount++;
 
         // Calculate model matrix
@@ -209,6 +222,20 @@ public:
      */
     void setDefaultShaderProgram(GLuint program) { m_defaultShaderProgram = program; }
     void setSkinnedShaderProgram(GLuint program) { m_skinnedShaderProgram = program; }
+
+    /**
+     * Scene-layer culling: the editor drives eight named layers from the Layers
+     * panel (layerVisible[8]). Entities carrying a LayerComponent are skipped
+     * when their layer is hidden, so toggling a layer actually hides its
+     * primitives/models. Entities without a LayerComponent default to the
+     * always-visible Default layer (0).
+     */
+    void setLayerVisibility(bool v[LayerComponent::kMaxLayers]) {
+        for (int i = 0; i < LayerComponent::kMaxLayers; ++i)
+            m_layerVisible[i] = v[i];
+    }
+    bool m_layerVisible[LayerComponent::kMaxLayers] =
+        {true,true,true,true,true,true,true,true};
 
     size_t getVisibleCount() const { return m_visibleCount; }
     const char* getName() const override { return "RenderSystem (Integrated)"; }

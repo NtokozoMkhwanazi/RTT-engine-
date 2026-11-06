@@ -14,11 +14,13 @@
 #include "../ECS.h"
 #include "../../geospatial/TimeSeriesDB.h"
 #include "../../geospatial/GeospatialConverter.h"
+#include "../JobSystem.h"        // async flush dispatcher (Todo 6)
 #include <vector>
 #include <queue>
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <memory>
 #include <condition_variable>
 #include <iostream>
 
@@ -30,6 +32,13 @@ public:
 
     ~GeoStorageSystem() {
         stopStorageThread();
+        // Drain any in-flight async flushes (dispatched to the JobSystem) before
+        // members are torn down: TimeSeriesDB's flush jobs capture its influx
+        // client, so the JobSystem (declared last -> destroyed first) must finish
+        // with them before TimeSeriesDB is destroyed.
+        if (m_jobSystem) {
+            m_jobSystem->waitForAll();
+        }
     }
 
     /**
@@ -39,6 +48,19 @@ public:
                     int influxPort = 8086,
                     const std::string& database = "geospatial") {
         timeSeriesDB.initialize(influxHost, influxPort, database);
+
+        // Own a JobSystem only when the storage system is actually used, so the
+        // default engine loop (which never calls GeospatialSystem::initialize)
+        // pays no thread-pool cost. The dispatcher hands the blocking libcurl
+        // write off to a worker, keeping recordBatch non-blocking.
+        m_jobSystem = std::make_unique<ecs::JobSystem>();
+        m_jobSystem->init();
+        ecs::JobSystem* const js = m_jobSystem.get();
+        timeSeriesDB.setFlushDispatcher(
+            [js](std::function<void()> work) {
+                if (js) js->addJob(std::move(work));
+            });
+
         startStorageThread();
         std::cout << "[GeoStorageSystem] Initialized\n";
     }
@@ -128,6 +150,8 @@ private:
     std::thread storageThread;
     std::atomic<bool> running;
     int batchWriteIntervalMs;
+    std::unique_ptr<ecs::JobSystem> m_jobSystem;  // created in initialize() (declared last
+                                                 // so it destructs/drains before timeSeriesDB)
 
     void startStorageThread() {
         if (running) return;

@@ -26,6 +26,7 @@ struct ModelComponent : public Component {
 
     bool useLOD = true;
     float lodBias = 1.0f;
+    float windSway = 0.0f;   // per-prop wind amplitude (vegetation sway; 0 = static)
 
     char modelPath[MAX_MODEL_PATH_LENGTH];
 

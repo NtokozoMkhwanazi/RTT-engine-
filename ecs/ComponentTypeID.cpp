@@ -1,5 +1,6 @@
 #include "ecs/Entity.h"
 #include "ecs/components/Components.h"
+#include "ecs/components/AnimatedCharacterComponent.h"
 #include "ecs/components/GeospatialComponent.h"
 #include "ecs/components/PredictionComponent.h"
 #include <unordered_map>
@@ -59,6 +60,7 @@ INSTANTIATE_TYPE(ModelAnimatorComponent)
 INSTANTIATE_TYPE(NameComponent)
 INSTANTIATE_TYPE(TagComponent)
 INSTANTIATE_TYPE(TagsComponent)
+INSTANTIATE_TYPE(LayerComponent)
 INSTANTIATE_TYPE(ParentComponent)
 INSTANTIATE_TYPE(ChildrenComponent)
 INSTANTIATE_TYPE(LifetimeComponent)
@@ -75,6 +77,7 @@ INSTANTIATE_TYPE(InstanceDataComponent)
 INSTANTIATE_TYPE(LODComponent)
 INSTANTIATE_TYPE(MotionMatchingComponent)
 INSTANTIATE_TYPE(MotionDatabaseComponent)
+INSTANTIATE_TYPE(AnimatedCharacterComponent)
 INSTANTIATE_TYPE(GeospatialComponent)
 INSTANTIATE_TYPE(PredictionComponent)
 

@@ -52,7 +52,7 @@ ecs::EntityID FindEntityByName(const std::string& name) {
 }
 
 bool EntityAlive(ecs::EntityID id) {
-    return id != ecs::INVALID_ENTITY_ID && World().isAlive(ecs::Entity{id});
+    return id != ecs::INVALID_ENTITY_ID && World().isAlive(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ void PushCommand(Command cmd) {
 
 std::string EntityNameOrEmpty(ecs::EntityID id) {
     if (!EntityAlive(id)) return std::string();
-    if (auto* n = World().getComponentArchetype<ecs::NameComponent>(ecs::Entity{id})) {
+    if (auto* n = World().getComponentArchetype<ecs::NameComponent>(id)) {
         return std::string(n->getName());
     }
     return std::string();
@@ -246,7 +246,7 @@ void RecordCreateMany(const std::vector<ecs::EntityID>& ids) {
         Json::Value entry = SnapshotEntity(id);
         entry["_name"] = name;
         // Parent link (by name) so redo can rebuild the hierarchy.
-        ecs::Entity parent = World().getParent(ecs::Entity{id});
+        ecs::Entity parent = World().getParent(id);
         if (parent.isValid()) {
             if (auto* pn = World().getComponentArchetype<ecs::NameComponent>(parent)) {
                 entry["_parent"] = pn->getName();
@@ -330,14 +330,14 @@ void Undo() {
             for (const auto& entry : cmd.data["entities"]) {
                 const ecs::EntityID eid = FindEntityByName(entry["_name"].asString());
                 if (EntityAlive(eid)) {
-                    World().destroyEntity(ecs::Entity{eid});
+                    World().destroyEntity(eid);
                     if (g_editor.selectedEntity() == eid) {
                         g_editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
                     }
                 }
             }
         } else if (EntityAlive(id)) {
-            World().destroyEntity(ecs::Entity{id});
+            World().destroyEntity(id);
             if (g_editor.selectedEntity() == id) {
                 g_editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
             }
@@ -346,7 +346,7 @@ void Undo() {
         RecreateFromSnapshot(cmd.entityName, cmd.data);
     } else if (cmd.type == CommandType::Transform) {
         if (EntityAlive(id)) {
-            if (auto* t = World().getComponentArchetype<ecs::TransformComponent>(ecs::Entity{id})) {
+            if (auto* t = World().getComponentArchetype<ecs::TransformComponent>(id)) {
                 ApplyTransformFromJson(*t, cmd.data["before"]);
             }
         }
@@ -372,7 +372,7 @@ void Redo() {
                 if (entry.isMember("_parent") && i < (int)created.size()) {
                     const ecs::EntityID parentId = FindEntityByName(entry["_parent"].asString());
                     if (EntityAlive(parentId) && EntityAlive(created[i])) {
-                        World().setParent(ecs::Entity{created[i]}, ecs::Entity{parentId});
+                        World().setParent(created[i], parentId);
                     }
                 }
                 ++i;
@@ -383,7 +383,7 @@ void Redo() {
     } else if (cmd.type == CommandType::Delete) {
         const ecs::EntityID id = FindEntityByName(cmd.entityName);
         if (EntityAlive(id)) {
-            World().destroyEntity(ecs::Entity{id});
+            World().destroyEntity(id);
             if (g_editor.selectedEntity() == id) {
                 g_editor.setSelectedEntity(ecs::INVALID_ENTITY_ID);
             }
@@ -391,7 +391,7 @@ void Redo() {
     } else if (cmd.type == CommandType::Transform) {
         const ecs::EntityID id = FindEntityByName(cmd.entityName);
         if (EntityAlive(id)) {
-            if (auto* t = World().getComponentArchetype<ecs::TransformComponent>(ecs::Entity{id})) {
+            if (auto* t = World().getComponentArchetype<ecs::TransformComponent>(id)) {
                 ApplyTransformFromJson(*t, cmd.data["after"]);
             }
         }
@@ -440,6 +440,34 @@ void DeserializeHistory(const Json::Value& json) {
         cmd.time = std::chrono::steady_clock::now();
         g_undo.push_back(std::move(cmd));
     }
+}
+
+// ---------------------------------------------------------------------------
+// History enumeration (read-only, for the UI History panel)
+// ---------------------------------------------------------------------------
+static HistoryEntry ToEntry(const Command& cmd) {
+    HistoryEntry e;
+    switch (cmd.type) {
+        case CommandType::Create:    e.action = HistoryEntry::Action::Created;  break;
+        case CommandType::Delete:    e.action = HistoryEntry::Action::Deleted;  break;
+        case CommandType::Transform: e.action = HistoryEntry::Action::Modified; break;
+    }
+    e.entityName = cmd.entityName;
+    return e;
+}
+
+std::vector<HistoryEntry> UndoHistory() {
+    std::vector<HistoryEntry> out;
+    out.reserve(g_undo.size());
+    for (const Command& cmd : g_undo) out.push_back(ToEntry(cmd));
+    return out;
+}
+
+std::vector<HistoryEntry> RedoHistory() {
+    std::vector<HistoryEntry> out;
+    out.reserve(g_redo.size());
+    for (const Command& cmd : g_redo) out.push_back(ToEntry(cmd));
+    return out;
 }
 
 } // namespace UndoRedo

@@ -166,10 +166,60 @@ public:
     }
 
     /**
-     * Check if an entity is alive
+     * Id-only destroy (Phase B helper): bare-id sites that only hold an EntityID
+     * (undo snapshot, selected-entity) reconstruct a gen-aware Entity via
+     * generation(id) and delegate. Behavior == destroyEntity(Entity).
+     */
+    void destroyEntity(EntityID entityID) {
+        destroyEntity(Entity{entityID, m_entityManager.generation(entityID)});
+    }
+
+    /**
+     * Gen-aware liveness for a full Entity handle (Phase B): the handle must
+     * carry the slot's current generation, so a destroyed handle — or one whose
+     * id was recycled to a later entity — is rejected even though the id is now
+     * live again under a different gen. Drives the getComponent/hasComponent/
+     * removeComponent guards and valid().
      */
     bool isAlive(Entity entity) const {
-        return m_entityManager.isAlive(entity.id);
+        if (!entity.isValid()) return false;
+        return m_entityManager.isAlive(entity.id) &&
+               m_entityManager.generation(entity.id) == entity.gen;
+    }
+
+    /**
+     * Id-only liveness (Phase B helper): for call sites that only hold a bare
+     * EntityID (selection id, undo snapshot id, serialized id, relationship link)
+     * and want the pre-gen "is this id live" semantics. These sites are migrated
+     * to this overload so they keep working for recycled entities instead of
+     * being null'd by the gen-aware Entity overload above.
+     */
+    bool isAlive(EntityID entityID) const {
+        return m_entityManager.isAlive(entityID);
+    }
+
+    /**
+     * Slot generation for a bare id (Phase B): lets bare-id sites build a full
+     * gen-aware Entity, e.g. World::getComponent(Entity{id, generation(id)}).
+     */
+    uint8_t generation(EntityID entityID) const {
+        return m_entityManager.generation(entityID);
+    }
+
+    /**
+     * Liveness check for an entity handle (Phase B). Entity::isValid() only
+     * rejects the INVALID_ENTITY_ID sentinel; this ALSO rejects (a) a destroyed
+     * entity (removed from the live set but not yet recycled) and (b) a stale
+     * handle whose gen != the slot's current generation — i.e. the entity that
+     * REUSED this id after destruction. Cheap: a hash-set lookup + a byte
+     * compare. (Cheap gen-aware check on the hot getComponent path is deferred
+     * behind the id-only isAlive() guard above; valid() is the strict, opt-in
+     * disambiguation API for callers that hold a full Entity handle.)
+     */
+    bool valid(Entity entity) const {
+        if (!entity.isValid()) return false;
+        return m_entityManager.isAlive(entity.id) &&
+               m_entityManager.generation(entity.id) == entity.gen;
     }
 
     // ========================================================================
@@ -205,6 +255,10 @@ public:
      */
     template<typename T>
     void removeComponent(Entity entity) {
+        // Guard against dangling handles: a destroyed entity has no component to
+        // remove and its id may have been recycled (see valid()). Early-out before
+        // the ComponentManager path, whose remove() asserts on an absent entity.
+        if (!isAlive(entity)) return;
         // Publish event before removal
         ComponentRemovedEvent<T> event;
         event.entityID = entity.id;
@@ -222,11 +276,27 @@ public:
         m_entityManager.removeComponentType<T>(entity.id);
     }
 
+    // Phase B id-only overload: bare-id sites that reconstruct ecs::Entity{id}
+    // and then remove a component. Lenient (id-only liveness) == Phase-A behavior.
+    template<typename T>
+    void removeComponent(EntityID entityID) {
+        if (!isAlive(entityID)) return;
+        ComponentRemovedEvent<T> event;
+        event.entityID = entityID;
+        m_eventSystem.publish(event);
+        if (m_componentManager.hasComponent<T>(entityID)) {
+            m_componentManager.removeComponent<T>(entityID);
+        }
+        m_archetypeManager.removeComponent<T>(entityID);
+        m_entityManager.removeComponentType<T>(entityID);
+    }
+
     /**
      * Get a component from an entity
      */
     template<typename T>
     T* getComponent(Entity entity) {
+        if (!isAlive(entity)) return nullptr;
         if (T* c = m_componentManager.getComponent<T>(entity.id)) return c;
         // Archetype storage is the primary path for createEntityWithComponents;
         // fall back to it so archetype-created entities expose their components
@@ -236,8 +306,27 @@ public:
 
     template<typename T>
     const T* getComponent(Entity entity) const {
+        if (!isAlive(entity)) return nullptr;
         if (const T* c = m_componentManager.getComponent<T>(entity.id)) return c;
         return m_archetypeManager.getComponent<T>(entity.id);
+    }
+
+    // --- Phase B id-only overloads (lenient: "is this bare id live") -------
+    // Bare-id reconstruction sites (ecs::Entity{id}) are migrated to these so
+    // they keep working for recycled entities instead of being nulled by the
+    // gen-aware Entity overload above. Behavior == Phase-A id-only guard.
+    template<typename T>
+    T* getComponent(EntityID entityID) {
+        if (!isAlive(entityID)) return nullptr;
+        if (T* c = m_componentManager.getComponent<T>(entityID)) return c;
+        return m_archetypeManager.getComponent<T>(entityID);
+    }
+
+    template<typename T>
+    const T* getComponent(EntityID entityID) const {
+        if (!isAlive(entityID)) return nullptr;
+        if (const T* c = m_componentManager.getComponent<T>(entityID)) return c;
+        return m_archetypeManager.getComponent<T>(entityID);
     }
 
     /**
@@ -245,10 +334,18 @@ public:
      */
     template<typename T>
     bool hasComponent(Entity entity) const {
+        if (!isAlive(entity)) return false;
         if (m_componentManager.hasComponent<T>(entity.id)) return true;
         // Archetype storage is the primary path for createEntityWithComponents;
         // fall back to it so archetype-created entities report their components.
         return m_archetypeManager.hasComponent<T>(entity.id);
+    }
+
+    template<typename T>
+    bool hasComponent(EntityID entityID) const {
+        if (!isAlive(entityID)) return false;
+        if (m_componentManager.hasComponent<T>(entityID)) return true;
+        return m_archetypeManager.hasComponent<T>(entityID);
     }
 
     // ========================================================================
@@ -305,12 +402,27 @@ public:
      */
     template<typename T>
     T* getComponentArchetype(Entity entity) {
+        if (!isAlive(entity)) return nullptr;
         return m_archetypeManager.getComponent<T>(entity.id);
     }
 
     template<typename T>
     const T* getComponentArchetype(Entity entity) const {
+        if (!isAlive(entity)) return nullptr;
         return m_archetypeManager.getComponent<T>(entity.id);
+    }
+
+    // Phase B id-only overloads (see getComponent id-only note).
+    template<typename T>
+    T* getComponentArchetype(EntityID entityID) {
+        if (!isAlive(entityID)) return nullptr;
+        return m_archetypeManager.getComponent<T>(entityID);
+    }
+
+    template<typename T>
+    const T* getComponentArchetype(EntityID entityID) const {
+        if (!isAlive(entityID)) return nullptr;
+        return m_archetypeManager.getComponent<T>(entityID);
     }
 
     /**
@@ -434,6 +546,12 @@ public:
         m_relationshipManager.setParent(childEntity.id, parentEntity.id);
     }
 
+    // Phase B id-only overload: bare-id call sites (undo_redo) reconstruct from
+    // EntityID. setParent is id-based at RelationshipManager, so no gen check.
+    void setParent(EntityID childID, EntityID parentID) {
+        m_relationshipManager.setParent(childID, parentID);
+    }
+
     /**
      * Remove the parent of an entity (orphan it)
      */
@@ -445,7 +563,15 @@ public:
      * Get the parent of an entity
      */
     Entity getParent(Entity entity) const {
-        return Entity{m_relationshipManager.getParent(entity.id)};
+        EntityID p = m_relationshipManager.getParent(entity.id);
+        return Entity{p, m_entityManager.generation(p)};
+    }
+
+    // Phase B id-only overload: gen-stamp the returned parent so callers that
+    // later gen-check it (valid/getComponent) keep working.
+    Entity getParent(EntityID childID) const {
+        EntityID p = m_relationshipManager.getParent(childID);
+        return Entity{p, m_entityManager.generation(p)};
     }
 
     /**
@@ -456,7 +582,7 @@ public:
         std::vector<Entity> result;
         result.reserve(children.size());
         for (auto childID : children) {
-            result.push_back(Entity{childID});
+            result.push_back(Entity{childID, m_entityManager.generation(childID)});
         }
         return result;
     }
@@ -505,7 +631,8 @@ public:
      * Get the root entity of a hierarchy
      */
     Entity getRoot(Entity entity) const {
-        return Entity{m_relationshipManager.getRoot(entity.id)};
+        EntityID r = m_relationshipManager.getRoot(entity.id);
+        return Entity{r, m_entityManager.generation(r)};
     }
 
     /**

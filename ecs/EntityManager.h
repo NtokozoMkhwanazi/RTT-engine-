@@ -37,7 +37,10 @@ public:
         EntityID id = m_availableEntities.front();
         m_availableEntities.pop();
         
-        Entity entity{id};
+        // Stamp the slot's current generation so the handle carries the epoch it
+        // was created in (Phase B). A slot's gen starts at 0 and is bumped by
+        // destroyEntity, so a recycled id always gets a fresh gen.
+        Entity entity{id, m_generations[id]};
         m_liveEntities.insert(id);
         m_signatures[id] = Signature();
         
@@ -53,6 +56,11 @@ public:
         m_liveEntities.erase(entity.id);
         m_signatures[entity.id].reset();
         m_availableEntities.push(entity.id);
+        // Bump the slot's generation so any handle still holding the OLD gen is
+        // disambiguated from the entity this id is recycled to (Phase B). Mod 256
+        // is safe in practice: with MAX_ENTITIES=10000, the same slot would have
+        // to be destroyed+recreated 256 times — impossible within a session.
+        ++m_generations[entity.id];
         
         // Notify destruction callbacks
         for (auto& callback : m_destructionCallbacks) {
@@ -102,6 +110,17 @@ public:
     }
 
     /**
+     * Slot generation for an entity id (Phase B). Used by World::valid() to
+     * disambiguate a destroyed handle from an id that was later recycled. Only
+     * ever called on a live id (valid() short-circuits via isValid() + isAlive
+     * first; live ids are always < MAX_ENTITIES, so the in-range guard is
+     * belt-and-suspenders against a stray caller).
+     */
+    uint8_t generation(EntityID entityID) const {
+        return entityID < MAX_ENTITIES ? m_generations[entityID] : uint8_t{0};
+    }
+
+    /**
      * Get all live entities
      */
     const std::unordered_set<EntityID>& getLiveEntities() const {
@@ -144,6 +163,9 @@ private:
     std::queue<EntityID> m_availableEntities;
     std::unordered_set<EntityID> m_liveEntities;
     std::array<Signature, MAX_ENTITIES> m_signatures;
+    // Per-slot generation epoch (Phase B): 0 for fresh slots, ++ per destroy.
+    // Bumped in destroyEntity() so a recycled id always carries a new gen.
+    std::array<uint8_t, MAX_ENTITIES> m_generations{};
     std::vector<std::function<void(EntityID)>> m_destructionCallbacks;
 };
 

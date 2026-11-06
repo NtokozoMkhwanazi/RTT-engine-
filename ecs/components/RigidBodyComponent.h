@@ -61,6 +61,11 @@ struct RigidBodyComponent : public Component {
     bool isGrounded = false;
     bool useCCD = false;  // Continuous Collision Detection
 
+    // verify.txt Module 2: collision layer (matches PhysicsWorld::collisionMask).
+    // Default DYNAMIC. Pairs disabled in the matrix are filtered in the
+    // broadphase before the narrow-phase SAT/GJK solvers.
+    int collisionLayer = ::LAYER_DYNAMIC;
+
     // Advanced physics properties (for fluid dynamics, etc.)
     float buoyancyFactor = 0.0f;
     float density = 1000.0f;  // kg/m³

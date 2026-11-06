@@ -15,6 +15,7 @@
 #include "components/GeospatialComponent.h"
 #include "components/LightComponent.h"
 #include "components/MeshComponent.h"
+#include "components/LayerComponent.h"
 #include "components/ModelComponent.h"
 #include "components/MotionMatchingComponent.h"
 #include "components/PredictionComponent.h"
@@ -29,6 +30,7 @@ namespace {
 // (ComponentSizeRegistry::registerType early-outs when already registered).
 ECS_REGISTER_COMPONENT(ecs::TransformComponent);
 ECS_REGISTER_COMPONENT(ecs::MeshComponent);
+ECS_REGISTER_COMPONENT(ecs::LayerComponent);
 ECS_REGISTER_COMPONENT(ecs::SkinnedMeshComponent);
 ECS_REGISTER_COMPONENT(ecs::InstanceDataComponent);
 ECS_REGISTER_COMPONENT(ecs::LODComponent);

@@ -68,8 +68,10 @@ public:
      * Add observation for prediction model
      */
     void addObservation(double lat, double lon, double timestamp,
-                        double speed = 0.0, double heading = 0.0) {
-        predictiveModel.addObservation(lat, lon, timestamp, speed, heading);
+                        double speed = 0.0, double heading = 0.0,
+                        double altitude = 0.0) {
+        predictiveModel.addObservation(lat, lon, timestamp, speed, heading,
+                                       altitude);
     }
 
     /**

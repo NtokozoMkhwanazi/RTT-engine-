@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdint>
+#include <random>
 
 namespace RHI {
 
@@ -227,6 +228,74 @@ inline Vec2 ndcJitter(int frameIndex, int renderWidth, int renderHeight) {
     const Vec2 h = halton23(frameIndex);
     return { (h.x - 0.5f) / static_cast<float>(renderWidth),
              (h.y - 0.5f) / static_cast<float>(renderHeight) };
+}
+
+// ---------------------------------------------------------------------------
+// SSAO helper data (Phase B2: screen-space ambient occlusion).
+// generateSsaoSampleKernel / generateSsaoNoise are PURE, stateless functions
+// shared by BOTH RHI backends so the GL and Vulkan SSAO passes sample the
+// IDENTICAL kernel directions and noise texture -> the two AO output textures
+// are pixel-parity (verified by TerrainBridge.SsaoOnBothBackends). They are
+// generated once and uploaded as a uniform buffer (SsaoUBO: viewProj/invViewProj
+// + the kernel) and a tiny 4x4 noise texture.
+// ---------------------------------------------------------------------------
+
+// std140 UBO the SSAO compute shader reads. Mirrors the GLSL layout exactly:
+//   mat4 viewProj; mat4 invViewProj; vec3 samples[16];
+// std140 pads each vec3 sample to a 16-byte stride, so the C++ side stores the
+// kernel as float[16][4] (3 used + 1 pad) -> sizeof == 64 + 64 + 256 == 384,
+// 16-byte aligned, byte-identical in the UBO glslc emits.
+struct SsaoUBOData {
+    Mat4 viewProj;
+    Mat4 invViewProj;
+    float samples[16][4];    // 16 hemisphere dirs, 16-byte std140 stride (xyz + pad)
+};
+
+// 16-sample hemisphere kernel (scaled to [0.25r..r] radius, stratified by
+// distance so near samples are denser). Returned as 16 (x,y,z) triples.
+inline std::vector<float> generateSsaoSampleKernel(int n = 16, float radius = 0.5f,
+                                                   uint32_t seed = 0x5EED) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    std::vector<float> k;
+    k.reserve(n * 3);
+    for (int i = 0; i < n; ++i) {
+        // cosine-weighted hemisphere around +Z (view direction)
+        float phi    = (2.0f * 3.14159265358979f) * u01(rng);
+        float cosTheta = static_cast<float>(std::sqrt(u01(rng)));
+        float sinTheta = static_cast<float>(std::sqrt(1.0f - cosTheta * cosTheta));
+        float scale    = static_cast<float>(i) / static_cast<float>(n);
+        // push samples toward the origin (denser near the shading point):
+        float w = 0.1f + 0.9f * scale * scale;   // [0.1, 1.0)
+        float x = std::cos(phi) * sinTheta * w;
+        float y = std::sin(phi) * sinTheta * w;
+        float z = cosTheta;
+        // scale to radius
+        k.push_back(x * radius);
+        k.push_back(y * radius);
+        k.push_back(z * radius);
+    }
+    return k;
+}
+
+// 4x4 = 16 noise vectors (RG) for SSAO kernel rotation. Two floats per texel
+// (R8G8_UNORM) -> 32 bytes. Shared by both backends for parity.
+inline std::vector<uint8_t> generateSsaoNoiseR8G8(uint32_t seed = 0xBEEFCAFE) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    std::vector<uint8_t> n;
+    n.reserve(4 * 4 * 2);
+    for (int i = 0; i < 4 * 4; ++i) {
+        // noise vectors live in the XY plane (rotation of the kernel about N)
+        float a = u01(rng) * 2.0f - 1.0f;
+        float b = u01(rng) * 2.0f - 1.0f;
+        float len = std::sqrt(a * a + b * b);
+        if (len > 1e-6f) { a /= len; b /= len; }
+        // R8G8: map [-1,1] -> [0,1] -> [0,255]
+        n.push_back(static_cast<uint8_t>((a * 0.5f + 0.5f) * 255.0f));
+        n.push_back(static_cast<uint8_t>((b * 0.5f + 0.5f) * 255.0f));
+    }
+    return n;
 }
 
 // Flip a row-major RG image (2 floats/pixel) in place, top<->bottom. Used to

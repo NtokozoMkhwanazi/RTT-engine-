@@ -5,6 +5,11 @@
 // Vulkan PBR Mesh Fragment Shader with Parallax Occlusion Mapping (GLSL 4.6)
 // ============================================================================
 
+// APU safety (Ryzen 3700U / Vega 10 UMA): clamp bindless texture indices into
+// [0, K_MAX_BINDLESS_TEXTURES) before nonuniformEXT sampling to stop invalid-
+// descriptor device faults. Value must match C++ kMaxBindlessTextures (1024).
+#define K_MAX_BINDLESS_TEXTURES 1024
+
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec2 outVelocity;
 layout(location = 8) in vec4 vColor;
@@ -42,10 +47,15 @@ const vec3 kLightColor = vec3(1.0, 0.98, 0.92);
 // the height-search loop.
 vec2 CalculatePOM(vec2 initialUV, vec3 viewDirTS, uint texId, vec2 dx, vec2 dy) {
     // Control layer depth density based on looking angle
-    const float minLayers = 12.0;
-    const float maxLayers = 48.0;
+    const float minLayers = 4.0;
+    const float maxLayers = 16.0;   // 48 -> 16 on UMA APUs: 48 layers across millions
+                                   // of fragments saturates shared DDR4 bandwidth,
+                                   // inducing a Windows TDR timeout on Vega 10.
     float numLayers = mix(maxLayers, minLayers, abs(dot(vec3(0.0, 0.0, 1.0), viewDirTS)));
-    
+    // APU safety: clamp the descriptor index so a stale/invalid texId can never
+    // drive an unmapped nonuniformEXT fetch (instant device fault on UMA).
+    uint safeTexId = min(texId, K_MAX_BINDLESS_TEXTURES - 1u);
+
     float layerDepth = 1.0 / numLayers;
     float currentLayerDepth = 0.0;
     
@@ -56,19 +66,19 @@ vec2 CalculatePOM(vec2 initialUV, vec3 viewDirTS, uint texId, vec2 dx, vec2 dy) 
     
     vec2 currentUV = initialUV;
     // Reads height map stored in the texture alpha channel (1.0 - alpha for inverse depth)
-    float currentDepthMapValue = 1.0 - textureGrad(globalTextures[nonuniformEXT(texId)], currentUV, dx, dy).a;
+    float currentDepthMapValue = 1.0 - textureGrad(globalTextures[nonuniformEXT(safeTexId)], currentUV, dx, dy).a;
     
     // Ray-march the layered heights
     while(currentLayerDepth < currentDepthMapValue) {
         currentUV -= deltaUV;
-        currentDepthMapValue = 1.0 - textureGrad(globalTextures[nonuniformEXT(texId)], currentUV, dx, dy).a;
+        currentDepthMapValue = 1.0 - textureGrad(globalTextures[nonuniformEXT(safeTexId)], currentUV, dx, dy).a;
         currentLayerDepth += layerDepth;
     }
     
     // Linear interpolation step to wipe out micro-stepping artifacts
     vec2 prevUV = currentUV + deltaUV;
     float nextDepth = currentDepthMapValue - currentLayerDepth;
-    float prevDepth = (1.0 - textureGrad(globalTextures[nonuniformEXT(texId)], prevUV, dx, dy).a) - (currentLayerDepth - layerDepth);
+    float prevDepth = (1.0 - textureGrad(globalTextures[nonuniformEXT(safeTexId)], prevUV, dx, dy).a) - (currentLayerDepth - layerDepth);
     
     float weight = nextDepth / (nextDepth - prevDepth);
     return mix(currentUV, prevUV, weight);
@@ -119,10 +129,11 @@ void main() {
     vec3 viewDirTS = normalize(transpose(TBN) * viewDirWorld);
 
     // 2. Perform the POM UV offset displacement calculation
+    uint safeAlbedoTex = min(pc.textureId, K_MAX_BINDLESS_TEXTURES - 1u);
     vec2 displacedUV = CalculatePOM(vUV, viewDirTS, pc.textureId, dx, dy);
 
     // 3. Extract your material properties using the newly displaced UV coordinates
-    vec3 albedo = texture(globalTextures[nonuniformEXT(pc.textureId)], displacedUV).rgb * vColor.rgb;
+    vec3 albedo = texture(globalTextures[nonuniformEXT(safeAlbedoTex)], displacedUV).rgb * vColor.rgb;
     vec3 N = N_geom; // Smooth mesh vertex normal baseline
     vec3 V = viewDirWorld;
 

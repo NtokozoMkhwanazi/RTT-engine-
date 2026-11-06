@@ -11,16 +11,24 @@
  * error but its parent's SSE > target — producing a seamless crack-free
  * transition surface.
  *
- * AMD RDNA optimisation: workgroup size 32 matches RDNA's Wave32
- * execution mode, cutting register pressure and doubling active-wave
- * occupancy versus Wave64 (local_size_x was 64).  Subgroup ballot
- * operations coalesce the atomic-counter writes: one atomic per
- * subgroup instead of one per thread.
+ * AMD GCN/Vega optimisation: workgroup size 64 matches the Vega 10's
+ * native 64-lane wavefront (Wave64), keeping subgroup ballot execution
+ * in lock-step with the physical execution units.  One atomic per
+ * subgroup instead of one per thread coalesces the counter writes.
  *
- * Struct layout MUST match the host C++ struct GPULODCluster (see Mesh.h).
+ * Struct is padded to 64 bytes (one Vega cache-line slot) to avoid UMA
+ * cache-line-straddle faults. Mirrored in C++ as VkLODCluster (64 B).
+ * Phase 3 is the LIVE dispatch path (m_naniteLodPipeline); Phase 2
+ * (cluster_cull.comp) is the fallback when the LOD pipeline/buffer are absent.
+ *
+ * Hierarchy: each mesh contributes one root node (parentId=0, draws the whole
+ * mesh, errorSelf = bounding-sphere radius = coarsest level) and N leaf nodes
+ * (parentId=root, errorSelf=0 = exact geometry). At the default 1px target the
+ * leaves render everywhere (identical to flat culling); raise `lodPixelError`
+ * to activate distance culling (far mesh -> single root draw).
  */
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #define PI 3.14159265358979323846
 
@@ -32,8 +40,9 @@ struct LODCluster {
     uint  firstIndex;
     uint  indexCount;
     uint  instanceId;
-    uint  parentId;             // index of parent cluster (0 for root)
-    uint  pad0, pad1, pad2;     // std430 16-byte alignment
+    uint  parentId;             // offset 40  (index of parent cluster, 0 for root)
+    uint  pad0;                 // offset 44  (closes the 32-byte block)
+    uvec4 extraPadding;         // offset 48  (16 bytes -> total struct 64 = Vega cache-line)
 };
 
 struct IndirectCommand {
@@ -87,7 +96,7 @@ layout(push_constant) uniform PushConstants {
  */
 float getScreenSpaceError(vec3 center, float radius, float worldError) {
     float dist = distance(cam.camPos, center);
-    if (dist <= radius) return 99999.0;  // force max detail if inside bounds
+    if (dist <= radius) return 0.0;   // camera inside cluster -> max detail (render)
 
     // vertical fov = 60 deg (must match engine camera; could be a UBO field)
     float fovY = 60.0 * PI / 180.0;
@@ -169,14 +178,20 @@ void main() {
         uint threadOffset = subgroupBallotExclusiveBitCount(activeBallot);
         uint drawIndex    = waveBase + threadOffset;
 
-        uvec4 src = inCommands.cmds[gId];
-        IndirectCommand cmd;
-        cmd.indexCount    = src.z;       // indexCount
-        cmd.instanceCount = 1;
-        cmd.firstIndex    = src.y;       // firstIndex
-        cmd.vertexOffset  = int(src.x);  // firstVertex
-        cmd.firstInstance = src.w;       // instanceId
+        // APU safety: pin the WRITE index against totalNodes so a CPU mis-count
+        // can never drive an out-of-bounds write into shared UMA memory.
+        uint safeDraw = min(drawIndex, pc.totalNodes - 1u);
 
-        outDraws.drawCmds[drawIndex] = cmd;
+        // Each LOD node carries its own draw command (firstVertex/firstIndex/...),
+        // so Phase 3 is self-contained in binding 1 (the hierarchy buffer).
+        // Binding 2 (ClusterCommand) is consumed only by the Phase 2 fallback.
+        IndirectCommand cmd;
+        cmd.indexCount    = node.indexCount;
+        cmd.instanceCount = 1;
+        cmd.firstIndex    = node.firstIndex;
+        cmd.vertexOffset  = int(node.firstVertex);
+        cmd.firstInstance = node.instanceId;
+
+        outDraws.drawCmds[safeDraw] = cmd;
     }
 }

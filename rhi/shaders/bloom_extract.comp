@@ -1,0 +1,35 @@
+#version 460
+// ============================================================================
+// B5 Bloom: brightpass extract (Vulkan RHI, GLSL 4.6 compute)
+// ----------------------------------------------------------------------------
+// Reads the HDR lit scene (sampler2D, bound by the host) and writes the
+// luminance above uThreshold into outExtract (rgba16f). This is the first of
+// the 3-pass bloom twin (extract -> blur -> composite) and a 1:1 GL twin of
+// bloomExtractCsSrc in rhi/RHIGL.cpp.
+//
+// Parity contract: identical brightpass math on GL/Vulkan (same luma weights,
+// same threshold/gain) so a bloomed scene is pixel-identical across backends.
+// ============================================================================
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uSceneHdr;      // lit scene color (HDR)
+layout(std140, set = 0, binding = 1) uniform BloomUBO {
+    float uThreshold;   // luminance cutoff (only brighter-than-this survives)
+    float uStrength;    // bloom multiplier on the extracted band
+};
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D outExtract;
+
+const vec3 kLum = vec3(0.2126, 0.7152, 0.0722);
+
+void main() {
+    ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(outExtract);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+
+    vec2 uv = (vec2(p) + 0.5) / vec2(sz);
+    vec3 c  = texture(uSceneHdr, uv).rgb;
+    float l = dot(c, kLum);
+    float gain = max(0.0, l - uThreshold);
+    vec3 bloom = c * (gain / max(l, 1e-4)) * uStrength;
+    imageStore(outExtract, p, vec4(bloom, 1.0));
+}

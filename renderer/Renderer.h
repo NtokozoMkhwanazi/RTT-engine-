@@ -237,15 +237,6 @@ public:
 
     // Clear all batches
     void ClearBatches();
-    
-    // Culling controls (wired from Editor UI / World Settings)
-    void SetMaxVisibleInstances(int max) { m_maxVisibleInstances = max; }
-    void SetCullingDebug(bool on) { m_cullingDebug = on; }
-    bool IsCullingDebug() const { return m_cullingDebug; }
-    
-    // Culling statistics (updated each SubmitBatches call)
-    size_t getVisibleInstances() const { return m_visibleInstances; }
-    size_t getCulledInstances() const { return m_culledInstances; }
 
     // Set viewport
     void SetViewport(int x, int y, int width, int height);
@@ -298,12 +289,6 @@ private:
     bool depthTestingEnabled = true;
     bool faceCullingEnabled = true;
     bool frustumCullingEnabled = true;
-    
-    // Culling control + stats
-    int m_maxVisibleInstances = 2000;   // 0 = unlimited
-    bool m_cullingDebug = false;
-    size_t m_visibleInstances = 0;
-    size_t m_culledInstances = 0;
     
     // Frustum for culling
     Frustum frustum;

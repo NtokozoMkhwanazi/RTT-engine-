@@ -36,6 +36,9 @@ public:
     void drawPoint(const glm::vec3& position, const glm::vec3& color, float size = 5.0f);
     void drawLine(const glm::vec3& start, const glm::vec3& end, const glm::vec3& color);
 
+    // forUI.txt Pillar 2: wireframe brush circle in the XZ plane.
+    void drawCircleXZ(const glm::vec3& center, float radius, const glm::vec3& color);
+
     // Settings
     void setViewMatrix(const glm::mat4& view) { m_viewMatrix = view; }
     void setProjectionMatrix(const glm::mat4& proj) { m_projectionMatrix = proj; }

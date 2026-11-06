@@ -62,6 +62,15 @@ layout(set = 0, binding = 3000) uniform cbTemporal_t {
     float hist_valid;       // 1.0 = reproject+blend, 0.0 = copy (first frame)
     vec2 depth_uv_scale;    // (1,1) for a half-res depth image sampled at full uv
     vec2 jitterOffset;      // current frame's sub-pixel jitter (NDC, from CameraUBO/jitterOffset)
+    vec2 prevJitter;        // PREV frame's sub-pixel jitter (NDC). The history
+                            // image was written with this jitter baked into
+                            // gl_Position, so each history texel at uv actually
+                            // covers NDC (2*uv-1 + prevJitter). prevUv maps to the
+                            // UN-jittered prev NDC; to fetch the color that was
+                            // really written we sample at prevUv + 0.5*prevJitter.
+                            // Omitting this leaves a one-jitter-sub-texel mis-
+                            // registration on every pixel every frame -> crawl/
+                            // flicker on static geometry (the prev-jitter gap).
 } cbT;
 
 void main() {
@@ -92,6 +101,15 @@ void main() {
         vec4 ndc = vec4(adjustedUv.x * 2.0 - 1.0, adjustedUv.y * 2.0 - 1.0, currD, 1.0);
         vec4 prevClip = cbT.reproject * ndc;
         vec2 prevUv   = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+
+        // Cancel the PREVIOUS frame's sub-pixel jitter. The history image was
+        // rendered with jitter_{N-1} baked into gl_Position, so each history
+        // texel at uv actually covers NDC (2*uv-1 + prevJitter). prevUv
+        // currently maps to the UN-jittered prev NDC; to fetch the color that
+        // was really written we sample at prevUv + 0.5*prevJitter (NDC jitter
+        // -> texel half-pixel space). Without this the reproject is off by a
+        // sub-texel every frame -> crawling edges / flicker.
+        prevUv += 0.5 * cbT.prevJitter;
 
         // REFINEMENT: Reject out-of-bounds history UVs.  When the camera
         // pans or geometry enters/leaves the frame, reprojection naturally

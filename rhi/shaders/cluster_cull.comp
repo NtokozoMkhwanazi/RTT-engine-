@@ -8,7 +8,7 @@
  * a single vkCmdDrawIndexedIndirect call (Multi-Draw Indirect).
  *
  * Struct layout MUST match the host C++ structs in meshSystem/Mesh.h:
- *   GPUClusterBounds  (3 × vec4, std140)  — sphere + AABB
+ *   GPUClusterBounds  (4 × vec4, std140)  — sphere + AABB (padded to 64 bytes, Vega cache-line)
  *   GPUClusterCommand  (4 × uint, std430) — firstVertex/firstIndex/indexCount/instanceId
  *   ClusterIndirectCommand (VkDrawIndexedIndirectCommand, 20 B)
  */
@@ -20,6 +20,7 @@ struct ClusterBounds {
     vec4 sphereCenterRadius;  // xyz = center, w = radius
     vec4 minBounds;           // xyz = min, w = padding
     vec4 maxBounds;           // xyz = max, w = padding
+    vec4 pad;                 // 64-byte cache-line alignment (UMA/APU safety)
 };
 
 // --- Per-cluster draw metadata (read-only) ---
@@ -121,7 +122,11 @@ void main() {
     if (visible) {
         uint drawIndex = atomicAdd(outCounter.drawCount, 1u);
 
-        ClusterCommand src = inCommands.cmds[gId];
+        // APU safety: gId is already range-guarded by the early-return above,
+        // but pin the descriptor index against totalClusters so a CPU
+        // mis-count can never drive an unmapped read on Vega 10 (UMA).
+        uint safeCmdIdx = min(gId, pc.totalClusters - 1u);
+        ClusterCommand src = inCommands.cmds[safeCmdIdx];
         IndirectCommand cmd;
         cmd.indexCount    = src.indexCount;
         cmd.instanceCount = 1;

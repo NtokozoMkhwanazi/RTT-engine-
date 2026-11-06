@@ -76,7 +76,36 @@ public:
 
     glm::vec3 gravity = glm::vec3(0.0f, -9.82f, 0.0f);
 
-    PhysicsWorld() = default;
+    // --- Performance stats (for profiler UI) ---
+    float stepTimeMs = 0.0f;      // Last physics step duration (ms)
+    float avgStepTimeMs = 0.0f;   // Rolling average (ms)
+    int broadphasePairs = 0;      // Number of body-pair broadphase checks
+    int narrowphaseTests = 0;     // Number of narrowphase collision tests
+    int contactCount = 0;         // Active contact points this step
+    int solverIterationCount = 8; // Velocity + position solver iterations
+    bool debugDrawEnabled = false; // Toggle debug wireframe rendering
+
+    // verify.txt Module 2: symmetric layer collision matrix. collisionMask[a][b]
+    // is true when a body on layer `a` is allowed to generate contacts with a
+    // body on layer `b`. Defaults to "all collide"; use setCollisionMask() to
+    // build filtering rules (e.g. gameplay vs. level-structure volumes).
+    bool collisionMask[32][32];
+
+    // Returns true when bodies on layers a/b are allowed to collide.
+    bool shouldLayersCollide(int layerA, int layerB) const {
+        if (layerA < 0 || layerA >= 32 || layerB < 0 || layerB >= 32) return true; // safe default
+        return collisionMask[layerA][layerB];
+    }
+
+    // Set whether two layers collide. Symmetric — sets both [a][b] and [b][a].
+    void setCollisionMask(int layerA, int layerB, bool collide) {
+        if (layerA >= 0 && layerA < 32 && layerB >= 0 && layerB < 32) {
+            collisionMask[layerA][layerB] = collide;
+            collisionMask[layerB][layerA] = collide;
+        }
+    }
+
+    PhysicsWorld();
     ~PhysicsWorld() = default;
 
     // New handle-based API (fast, no shared_ptr overhead)
@@ -133,8 +162,16 @@ public:
     std::vector<BodyHandle> getBodiesInAABB(const glm::vec3& min, const glm::vec3& max) const;
     BodyHandle getBodyAtPoint(const glm::vec3& point, float radius = 0.1f) const;
 
+    // forUI.txt physics Block 4: public read accessor for the (private) island
+    // groups, so the World Settings panel can display the live sleep-island count.
+    int sleepIslandCount() const { return static_cast<int>(sleepIslands.size()); }
+
     // Fluid simulation functions
     void addFluidVolume(const struct FluidVolume& fluid);
+    // forUI.txt physics Block 2: public accessor for the (private) fluid-volume
+    // matrix so the World Settings panel can live-edit each FluidVolume.
+    std::vector<FluidVolume>& getFluidVolumes() { return fluidVolumes; }
+    const std::vector<FluidVolume>& getFluidVolumes() const { return fluidVolumes; }
     bool isInFluid(const glm::vec3& point, struct FluidVolume& outFluid) const;
     
     // Advanced collision response
@@ -210,6 +247,14 @@ private:
     bool spatialGridDirty = true;
     std::unordered_map<uint64_t, SpatialHashCell> spatialGrid;
     std::vector<std::pair<uint64_t, int>> spatialGridEntries; // cache for fast iteration
+
+    // Bodies whose AABB spans more than kMaxCellsPerBody grid cells are NOT
+    // rasterized into the grid (a 75 m tree over 2 m cells touches ~55k cells)
+    // and are instead paired against every other body directly. Without this a
+    // handful of large props floods the broadphase with hundreds of thousands
+    // of duplicate pairs every frame.
+    static constexpr long long kMaxCellsPerBody = 512;
+    std::vector<int> broadphaseLargeBodies;
 
     // Broadphase
     void getPotentialPairs(std::vector<std::pair<int,int>>& outPairs);

@@ -1,5 +1,6 @@
 #include "DebugRenderer.h"
 #include <iostream>
+#include <cmath>
 
 // ============================================================================
 // Shader Sources
@@ -284,4 +285,18 @@ void DebugRenderer::drawLine(const glm::vec3& start, const glm::vec3& end, const
     
     m_vertices.push_back({start, color});
     m_vertices.push_back({end, color});
+}
+
+void DebugRenderer::drawCircleXZ(const glm::vec3& center, float radius, const glm::vec3& color) {
+    if (!m_inFrame) return;
+    const int segments = 32;
+    const float step = (2.0f * glm::pi<float>()) / static_cast<float>(segments);
+    for (int i = 0; i < segments; ++i) {
+        float a0 = step * static_cast<float>(i);
+        float a1 = step * static_cast<float>(i + 1);
+        glm::vec3 p0(center.x + radius * cosf(a0), center.y, center.z + radius * sinf(a0));
+        glm::vec3 p1(center.x + radius * cosf(a1), center.y, center.z + radius * sinf(a1));
+        m_vertices.push_back({p0, color});
+        m_vertices.push_back({p1, color});
+    }
 }

@@ -20,6 +20,7 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <cstdlib>   // getenv (RTT_NO_VSYNC)
 
 struct GLFWwindow;
 struct ImDrawData;
@@ -37,6 +38,28 @@ const char* graphicsApiName(GraphicsAPI api);
 
 // Parse "--graphics opengl|vulkan" style tokens. Returns false for unknown.
 bool parseGraphicsApi(const std::string& token, GraphicsAPI& out);
+
+// VSync control for the OpenGL backend (defaults ON via glfwSwapInterval(1)).
+// Disabling it lets FPS run uncapped — needed to measure the real bottleneck
+// when a context has fallen back to software rasterization (llvmpipe / swrast),
+// which surfaces as a ~3 FPS VSync cap. Toggle with the --no-vsync CLI flag
+// (EditorMain, calls setSkipVSync) or RTT_NO_VSYNC=1 env var (no rebuild).
+inline bool& skipVSyncFlag() { static bool b = false; return b; }
+inline bool skipVSync() {
+    if (skipVSyncFlag()) return true;
+    const char* env = std::getenv("RTT_NO_VSYNC");
+    return env != nullptr && env[0] != '\0';
+}
+inline void setSkipVSync(bool v) { skipVSyncFlag() = v; }
+
+// Software-rasterizer detection (llvmpipe / softpipe / sWRast). The OpenGL
+// backend sets this from GL_RENDERER during context creation; the render
+// pipeline reads it to drop the expensive per-frame passes (3x CSM + SSAO +
+// bloom + deferred) that make a software-GL editor unusably slow (~3 FPS) on a
+// no-GPU host. No-op on real hardware.
+inline bool& softwareRasterizerFlag() { static bool b = false; return b; }
+inline bool isSoftwareRasterizer() { return softwareRasterizerFlag(); }
+inline void setSoftwareRasterizer(bool v) { softwareRasterizerFlag() = v; }
 
 // Camera description for the offscreen scene render.
 struct OffscreenCamera {
@@ -104,7 +127,42 @@ struct OffscreenMesh {
     // around each instance without re-deriving the original model bounds.
     float boundsHalfExtents[3] = { 0.5f, 1.0f, 0.5f };
 
+    // Per-mesh wind sway amplitude (world-vegetation sway). 0 = static;
+    // >0 bends the mesh's vertices in the vertex shader (driven by uWindStrength).
+    // Captured from ModelComponent.windSway so blueprint instances keep swaying.
+    float windSway = 0.0f;
+
+    // --- 4-layer texture splat (terrain) ---
+    // When `splatLayers` is non-empty (typically 4 entries), the mesh renders
+    // with the terrain splat shader instead of the single-albedo pbr_mesh path.
+    // This mesh's `texturePixels` is then reinterpreted as the RGBA control map
+    // (per-layer blend weights), and `splatLayers[k]` supplies layer k's albedo
+    // (+ height in its alpha, driving POM). This is the RHI port of
+    // shaderSystem/terrain_splat's 4-layer blend (artist control map instead
+    // of procedural height-based weights; no triplanar/CSM here).
+    struct SplatLayer {
+        std::vector<uint8_t> texturePixels;
+        int textureWidth = 0;
+        int textureHeight = 0;
+    };
+    std::vector<SplatLayer> splatLayers;
+
+    // --- Skinning (4-bone LBS) -------------------------------------------------
+    // When `skinned` is true the mesh renders through the skinned pipeline
+    // (pbr_skinned.vert + pbr_mesh.frag): each vertex is blended by 4 bones
+    // from `jointPalette` (column-major mat4s, jointCount*16 floats), driven by
+    // per-vertex boneIndices (4 bone ids) + boneWeights (4 weights). This is
+    // the data path that lets the play character (and any animated entity)
+    // render as an ECS entity on the Vulkan RHI. boneIndices/Weights are sized
+    // 4 * vertices.size()/8 (4 floats) each.
+    bool                           skinned = false;
+    std::vector<uint32_t>          boneIndices;   // 4 bone ids per vertex
+    std::vector<float>             boneWeights;   // 4 weights per vertex
+    std::vector<float>             jointPalette;  // jointCount * 16 floats
+    int                            jointCount = 0;
+
     // --- Virtualized Geometry (Phase 1+) ---
+    // Optional cluster list: when non-empty, the renderer uses GPU-driven
     // Optional cluster list: when non-empty, the renderer uses GPU-driven
     // cluster culling (vkCmdDrawIndexedIndirect) instead of the legacy
     // per-instance vkCmdDraw. Each entry describes one 128-triangle cluster
@@ -143,8 +201,58 @@ struct OffscreenScene {
     // textures via the same CameraUBO + per-mesh albedo. Cubes keep the solid
     // color path (they have no normal/uv). Both backends run IDENTICAL PBR
     // math (same light dir/color, GGX, Smith, Fresnel-Schlick, ACESFilm,
-    // gamma 1/2.2, exponential-squared fog) so GL/Vulkan pixel parity holds.
+    // gamma 1/2.2, exponential-squared fog) so GL/Vulkan pixel parity hold.
     bool pbrEnabled = false;
+
+    // ------------------------------------------------------------------
+    // Editor real-time render path (Phase B bridge).
+    //
+    // Step A ports test.cpp's editor render into the RHI layer by building an
+    // OffscreenScene via RenderPipeline::toOffscreenScene() and calling
+    // rhi->renderFrameScene(scene) instead of renderPipeline.renderScene().
+    // These fields describe the editor's extra passes (skybox, CSM shadows,
+    // SSAO, SSR, bloom, deferred) that live ABOVE the shared forward/scene
+    // parity path. They DEFAULT OFF so every existing scene (and the 60/60
+    // GL<->Vulkan parity tests) renders identically to before; only the
+    // RTT_RHI_SCENE test.cpp path and the Vulkan editor viewport populate
+    // them. Each backend honors the flags as follows:
+    //
+    //  - deferred : reroute the scene pass through the G-Buffer + lighting
+    //               path (Vulkan: A1 RTT_DEFERRED_SCENE branch / scene.deferred;
+    //               GL: the renderOffscreenScene deferred twin). Forward-safe:
+    //               when off, the existing forward path is used untouched.
+    //  - skyEnabled + skyboxCubemap : draw a skybox pass. NO-OP (solid clear or
+    //               the existing solid-color path) until Phase B ships the
+    //               cubemap pipeline on both backends.
+    //  - shadows  : CSM shadow-atlas (3 cascades). NO-OP (no shadows) until B1.
+    //  - ssao/ssr/bloom : NO-OP until B2/B3/B5.
+    //
+    // NO backend diverges from the forward path while these are off, so the
+    // bridge is safe to ship compile-verified before Vega GPU validation.
+    // ------------------------------------------------------------------
+    bool skyEnabled        = false;
+    int  skyboxCubemap     = 0;                 // cubemap texture handle (0 = solid clearColor sky)
+    bool deferred          = false;             // G-Buffer + deferred lighting reroute
+    bool shadows           = false;             // CSM 3-cascade shadow atlas
+    bool ssao              = false;             // screen-space ambient occlusion
+    bool ssr               = false;              // screen-space reflections
+    bool bloom             = false;             // bloom composite
+
+    // Canonical sun direction (LightingEnvironment.sunDirection) — sun along
+    // -sunDirection; normalized. Drives BOTH the deferred key light and (Phase
+    // B1) the CSM cascades so shadows and the lit side always agree.
+    float sunDirection[3]   = {0.5f, 1.0f, 0.3f};
+
+    // CSM cascade configuration (3 cascades — matches ShadowMapper::NUM_CASCADES).
+    int   shadowCascades   = 3;
+    // World-space fade fractions (cascade i covers [splits[i-1], splits[i]]
+    // of the camera range, normalized [0..1]); defaults match the editor's
+    // split heuristic so the bridge and the GL RenderPipeline agree.
+    float cascadeSplits[3]   = {0.05f, 0.2f, 0.6f};
+    // Per-cascade light-space VP (column-major, 16 floats each). Populated by
+    // RenderPipeline::toOffscreenScene() from m_shadowMapper (Phase B1 reads
+    // these in the shadow/depth pass).
+    float lightSpaceMatrices[3][16] = {};
 };
 
 // ---------------------------------------------------------------------------
@@ -220,7 +328,9 @@ public:
     // velocity math is identical on both backends.
     virtual bool renderOffscreenScene(int w, int h, const OffscreenScene& scene,
                                       unsigned char* outRGBA,
-                                      float* outVelocityRG = nullptr) = 0;
+                                      float* outVelocityRG = nullptr,
+                                      bool deferred = false,
+                                      unsigned char* outGBufferAlbedo = nullptr) = 0;
 
     // ---------------------------------------------------------------------
     // Offscreen 3D scene render + FSR3 EASU spatial upscale (Phase 4)
@@ -273,11 +383,29 @@ public:
     // imgui_impl_vulkan.
     virtual bool initializeImGui() = 0;
     virtual bool renderFrameImGui(ImDrawData* drawData) = 0;
+
+    // ---------------------------------------------------------------------
+    // Cubemap textures (Phase-B B4 skybox)
+    // ---------------------------------------------------------------------
+    // createCubemapTexture uploads six w*h RGBA8 faces (+X,-X,+Y,-Y,+Z,-Z)
+    // into a single cubemap image and returns an opaque handle the caller
+    // stores in OffscreenScene.skyboxCubemap (0 = null / solid clear). The
+    // handle is valid for both the offscreen (renderOffsceneScene) and
+    // swapchain (renderFrameScene) paths on whichever backend created it.
+    virtual uint32_t createCubemapTexture(int w, int h, const uint8_t* faces[6]) = 0;
+    virtual void destroyCubemapTexture(uint32_t handle) = 0;
 };
 
 // Factory: create the backend for the requested API. Returns nullptr when the
 // API is unavailable on this machine (Vulkan without a driver, etc.).
 std::unique_ptr<IRHI> createRHI(GraphicsAPI api);
+
+// Factory for the Vulkan backend specifically. The Vulkan implementation lives
+// in RHIVulkan.cpp (whose header is intentionally not exposed because it pulls
+// in <vulkan/vulkan.h> and conflicts with the GL headers compiled into the
+// engine). createRHI(Vulkan) delegates to this so the Vulkan backend is
+// actually wired into the runtime toggle and the RHI tests.
+std::unique_ptr<IRHI> createVulkanRHI();
 
 // ---------------------------------------------------------------------------
 // Runtime backend state (editor UI toggle)

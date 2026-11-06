@@ -1,0 +1,25 @@
+#version 460
+// ============================================================================
+// B5 Bloom: additive composite (Vulkan RHI, GLSL 4.6 compute)
+// ----------------------------------------------------------------------------
+// Adds the blurred bloom image back onto the original HDR scene, writing the
+// final tonemap-source color to outFinal (rgba16f). Twin of
+// bloomCompositeCsSrc in rhi/RHIGL.cpp. The host then read-backs / presents
+// outFinal instead of the raw scene color when scene.bloom is true.
+// ============================================================================
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uSceneHdr;   // original lit scene
+layout(set = 0, binding = 1) uniform sampler2D uBloom;     // blurred bloom band
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D outFinal;
+
+void main() {
+    ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(outFinal);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+
+    vec2 uv    = (vec2(p) + 0.5) / vec2(sz);
+    vec3 scene = texture(uSceneHdr, uv).rgb;
+    vec3 bloom = texture(uBloom, uv).rgb;
+    imageStore(outFinal, p, vec4(scene + bloom, 1.0));
+}

@@ -9,6 +9,19 @@ enum class ColliderType {
     MESH
 };
 
+// Collision layer bitmasks (verify.txt Module 2). Each body belongs to one
+// layer; the symmetric collisionMask[32][32] on PhysicsWorld governs whether
+// a pair of layers may generate contact constraints — letting gameplay
+// entities skip heavy collision code against internal level volumes.
+enum CollisionLayer {
+    LAYER_STATIC      = 1 << 0,
+    LAYER_DYNAMIC     = 1 << 1,
+    LAYER_PROJECTILE  = 1 << 2,
+    LAYER_TRIGGER     = 1 << 3,
+    // 28 spare layers (1 << 4 .. 1 << 31) reserved for game-specific groups.
+    LAYER_COUNT       = 32
+};
+
 struct RigidBody {
     glm::vec3 tempPosition;
     glm::vec3 position {0.0f};
@@ -36,6 +49,11 @@ struct RigidBody {
     bool onGround {false};
     bool isModel {false};
     bool isPlayer {false};
+
+    // Collision layer (default: dynamic — most gameplay actors). Pairs of
+    // layers that never collide are filtered cheaply in the broadphase before
+    // reaching the narrow-phase SAT / GJK solvers (verify.txt Module 2).
+    int layer {LAYER_DYNAMIC};
 
     // Sleeping system
     bool isSleeping {false};

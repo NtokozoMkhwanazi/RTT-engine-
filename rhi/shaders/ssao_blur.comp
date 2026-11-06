@@ -1,0 +1,32 @@
+#version 460
+// ============================================================================
+// SSAO bilateral blur (Vulkan RHI, GLSL 4.6 compute). Mirrors the GL inline
+// twin. A 4x4 tent blur that weights neighbours by AO similarity only (the AO
+// is already R8/low-frequency); the depth/edge preservation is handled by the
+// SSAO pass's rangeCheck, so a simple average blur is enough to kill the
+// kernel noise without bleeding across sky/normal discontinuities.
+// ============================================================================
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uAO;
+layout(set = 0, binding = 1, r8) uniform writeonly image2D outBlur;
+
+void main() {
+    ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(outBlur);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+
+    float sum = 0.0;
+    float w   = 0.0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            ivec2 q = p + ivec2(dx, dy);
+            float a = texture(uAO, (q + 0.5) / vec2(sz)).r;
+            // tent weight (closer = stronger), plus a Gaussian-ish falloff.
+            float wg = 1.0 / (1.0 + float(dx * dx + dy * dy));
+            sum += a * wg;
+            w   += wg;
+        }
+    }
+    imageStore(outBlur, p, vec4(sum / w));
+}

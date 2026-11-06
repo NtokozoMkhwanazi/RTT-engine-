@@ -197,10 +197,6 @@ private:
         // Perspective divide
         for (auto& c : corners) c /= c.w;
 
-        // Direction from near to far corner pair
-        glm::vec3 ray = glm::normalize(glm::vec3(corners[4]) - glm::vec3(corners[0]));
-        float totalDist = glm::length(glm::vec3(corners[4]) - glm::vec3(corners[0]));
-
         for (int i = 0; i < NUM_CASCADES; ++i) {
             float splitStart = (i == 0) ? 0.0f : m_splitDistances[i - 1];
             float splitEnd   = m_splitDistances[i];

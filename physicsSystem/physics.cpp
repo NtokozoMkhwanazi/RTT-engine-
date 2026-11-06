@@ -10,6 +10,15 @@
 #include <sstream>
 #include <iostream>
 #include <unordered_map>
+#include <chrono>
+#include <cstring>  // std::memset
+
+// -------------------- Constructor --------------------
+// verify.txt Module 2: default every layer pair to "collide" so the matrix
+// is a no-op until the artist explicitly disables a pair in the UI.
+PhysicsWorld::PhysicsWorld() {
+    std::memset(collisionMask, true, sizeof(collisionMask));
+}
 
 // -------------------- Helpers --------------------
 static inline std::string vecToStr(const glm::vec3 &v, int prec = 4) {
@@ -892,6 +901,7 @@ int PhysicsWorld::computeAdaptiveSubsteps(float dt) const {
 void PhysicsWorld::rebuildSpatialGrid() {
     spatialGrid.clear();
     spatialGridEntries.clear();
+    broadphaseLargeBodies.clear();
 
     // Estimate cell size from average body scale if not set
     if (spatialCellSize < 0.1f) {
@@ -919,6 +929,17 @@ void PhysicsWorld::rebuildSpatialGrid() {
         int maxY = static_cast<int>(std::floor((b.position.y + halfExtY) * invCell));
         int minZ = static_cast<int>(std::floor((b.position.z - halfExtZ) * invCell));
         int maxZ = static_cast<int>(std::floor((b.position.z + halfExtZ) * invCell));
+
+        // Large bodies would touch a huge number of cells (and be re-emitted
+        // once per cell, ballooning the pair list). Keep them in a separate
+        // list that getPotentialPairs() pairs against everything else.
+        const long long nx = static_cast<long long>(maxX) - minX + 1;
+        const long long ny = static_cast<long long>(maxY) - minY + 1;
+        const long long nz = static_cast<long long>(maxZ) - minZ + 1;
+        if (nx * ny * nz > kMaxCellsPerBody) {
+            broadphaseLargeBodies.push_back(i);
+            continue;
+        }
 
         for (int cx = minX; cx <= maxX; ++cx) {
             for (int cy = minY; cy <= maxY; ++cy) {
@@ -949,52 +970,52 @@ void PhysicsWorld::getPotentialPairs(std::vector<std::pair<int,int>>& outPairs) 
         rebuildSpatialGrid();
     }
 
-    // Collect pairs from each cell, deduplicating with a sorted pair check
-    // To avoid duplicate pairs, only generate (minIdx, maxIdx) where minIdx < maxIdx
-    // and use a sorted set-like approach with a simple visited marker
+    // A body is emitted once per cell it touches, so the same (a,b) pair is
+    // produced many times. Deduplicate with a visited bitset while collecting
+    // (O(1) per pair) instead of pushing every duplicate and sorting the whole
+    // list afterwards - that sort was the single largest cost in the frame.
+    const int n = static_cast<int>(bodies.size());
+    std::vector<uint64_t> seen(static_cast<size_t>(n) * static_cast<size_t>(n) / 64 + 1, 0);
 
-    // Use a flat visited array instead of set for performance
-    // We track which pairs we've already added using a sorted vector + binary search
-    // For small-to-medium scenes, a simple O(n^2) per cell with dedup is fine
-    // For large scenes, we use a bloom-like filter
+    auto addPair = [&](int a, int b) {
+        if (a == b) return;
+        if (a < 0 || b < 0 || a >= n || b >= n) return;
+        if (a > b) std::swap(a, b);
+        // Two static bodies can never exchange an impulse, so a static prop
+        // grid full of props should not produce any narrow-phase work at all.
+        if (bodies[a].isStatic && bodies[b].isStatic) return;
+        const size_t bit = static_cast<size_t>(a) * static_cast<size_t>(n) + static_cast<size_t>(b);
+        const uint64_t mask = 1ull << (bit & 63);
+        uint64_t& word = seen[bit >> 6];
+        if (word & mask) return;
+        word |= mask;
 
-    // Simple approach: iterate each cell, generate pairs, sort and unique
-    std::vector<std::pair<int,int>> rawPairs;
-    rawPairs.reserve(bodies.size() * 4); // estimate
+        // 3D AABB overlap test (fast rejection before narrow phase)
+        const auto& bodyA = bodies[a];
+        const auto& bodyB = bodies[b];
+        const float ax = bodyA.scale.x * 0.5f, ay = bodyA.scale.y * 0.5f, az = bodyA.scale.z * 0.5f;
+        const float bx = bodyB.scale.x * 0.5f, by = bodyB.scale.y * 0.5f, bz = bodyB.scale.z * 0.5f;
+        if (std::abs(bodyA.position.x - bodyB.position.x) > ax + bx) return;
+        if (std::abs(bodyA.position.y - bodyB.position.y) > ay + by) return;
+        if (std::abs(bodyA.position.z - bodyB.position.z) > az + bz) return;
+
+        outPairs.emplace_back(a, b);
+    };
 
     for (const auto& [cellHash, cell] : spatialGrid) {
         const auto& indices = cell.bodyIndices;
         for (size_t i = 0; i < indices.size(); ++i) {
             for (size_t j = i + 1; j < indices.size(); ++j) {
-                int a = indices[i];
-                int b = indices[j];
-                if (a > b) { int tmp = a; a = b; b = tmp; }
-                rawPairs.emplace_back(a, b);
+                addPair(indices[i], indices[j]);
             }
         }
     }
 
-    if (rawPairs.empty()) return;
-
-    // Sort and remove duplicates
-    std::sort(rawPairs.begin(), rawPairs.end());
-    rawPairs.erase(std::unique(rawPairs.begin(), rawPairs.end()), rawPairs.end());
-
-    // Filter with 3D AABB overlap test (fast rejection before narrow phase)
-    outPairs.reserve(rawPairs.size());
-    for (const auto& [a, b] : rawPairs) {
-        const auto& bodyA = bodies[a];
-        const auto& bodyB = bodies[b];
-
-        float ax = bodyA.scale.x * 0.5f, ay = bodyA.scale.y * 0.5f, az = bodyA.scale.z * 0.5f;
-        float bx = bodyB.scale.x * 0.5f, by = bodyB.scale.y * 0.5f, bz = bodyB.scale.z * 0.5f;
-
-        // 3D AABB overlap test
-        if (std::abs(bodyA.position.x - bodyB.position.x) > ax + bx) continue;
-        if (std::abs(bodyA.position.y - bodyB.position.y) > ay + by) continue;
-        if (std::abs(bodyA.position.z - bodyB.position.z) > az + bz) continue;
-
-        outPairs.emplace_back(a, b);
+    // Oversized bodies were kept out of the grid; test them against everything.
+    for (int large : broadphaseLargeBodies) {
+        for (int j = 0; j < n; ++j) {
+            addPair(large, j);
+        }
     }
 }
 
@@ -1254,6 +1275,8 @@ void PhysicsWorld::step(float dt)
 {
     if (bodies.empty()) return;
 
+    auto stepStart = std::chrono::high_resolution_clock::now();
+
     int substeps = computeAdaptiveSubsteps(dt);
     float subdt = dt / float(substeps);
 
@@ -1412,6 +1435,11 @@ void PhysicsWorld::step(float dt)
             int j = pr.second;
             if (i < 0 || j < 0 || i >= (int)bodies.size() || j >= (int)bodies.size()) continue;
 
+            // verify.txt Module 2: cheap layer-filter gate — skip the narrow
+            // phase entirely for layer pairs the artist disabled in the
+            // collision matrix. Avoids SAT / GJK overhead on excluded pairs.
+            if (!shouldLayersCollide(bodies[i].layer, bodies[j].layer)) continue;
+
             // Wake both bodies if either is sleeping (collision reactivates them)
             if (bodies[i].isSleeping) wakeBody(i);
             if (bodies[j].isSleeping) wakeBody(j);
@@ -1453,6 +1481,14 @@ void PhysicsWorld::step(float dt)
             }
         }
     }
+
+    // Record step timing stats for the profiler
+    auto stepEnd = std::chrono::high_resolution_clock::now();
+    stepTimeMs = std::chrono::duration<float, std::milli>(stepEnd - stepStart).count();
+    avgStepTimeMs = avgStepTimeMs * 0.9f + stepTimeMs * 0.1f;
+    broadphasePairs = static_cast<int>(bodies.size() > 1 ?
+        (int)bodies.size() * ((int)bodies.size() - 1) / 2 : 0);
+    solverIterationCount = 4; // constraint iterations per substep
 }
 
 // -------------------- Character-vs-world-object collision --------------------

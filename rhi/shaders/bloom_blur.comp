@@ -1,0 +1,33 @@
+#version 460
+// ============================================================================
+// B5 Bloom: separable gaussian blur (Vulkan RHI, GLSL 4.6 compute)
+// ----------------------------------------------------------------------------
+// One 5-tap gaussian pass along uDirection (H or V dispatched in two steps by
+// the host, ping-ponging between the extract and blur images). Identical twin of
+// bloomBlurCsSrc in rhi/RHIGL.cpp. Weights match the SSAO blur (5-tap) so the
+// GL/Vulkan bloom blur is pixel-for-pixel identical.
+// ============================================================================
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uExtract;
+layout(std140, set = 0, binding = 1) uniform BloomBlurUBO {
+    vec2 uDirection;    // (1,0) horizontal or (0,1) vertical, in texels
+};
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D outBlur;
+
+// 5-tap gaussian weights (symmetric), normalized.
+const float w[3] = float[](0.380517, 0.241287, 0.060652);
+
+void main() {
+    ivec2 p  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(outBlur);
+    if (p.x >= sz.x || p.y >= sz.y) return;
+
+    vec2 uv = (vec2(p) + 0.5) / vec2(sz);
+    vec3 s  = texture(uExtract, uv).rgb * w[0];
+    s += texture(uExtract, uv + uDirection * vec2( 1.0)).rgb * w[1];
+    s += texture(uExtract, uv + uDirection * vec2(-1.0)).rgb * w[1];
+    s += texture(uExtract, uv + uDirection * vec2( 2.0)).rgb * w[2];
+    s += texture(uExtract, uv + uDirection * vec2(-2.0)).rgb * w[2];
+    imageStore(outBlur, p, vec4(s, 1.0));
+}

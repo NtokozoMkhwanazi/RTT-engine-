@@ -499,26 +499,6 @@ void Renderer::SubmitBatches() {
             });
     }
     
-    // Apply max-visible limit: cap the number of batches that get rendered.
-    // When the limit is hit, excess batches are dropped (counted as culled).
-    // Accumulate stats across multiple SubmitBatches calls per frame
-    // (shadow pass, SSAO pass, forward pass). The RenderPipeline resets
-    // these at beginFrame() via ClearBatches().
-    if (m_maxVisibleInstances > 0 && batchIndices.size() > (size_t)m_maxVisibleInstances) {
-        m_culledInstances += batches.size() - m_maxVisibleInstances;
-        m_visibleInstances += m_maxVisibleInstances;
-        batchIndices.resize(m_maxVisibleInstances);
-    } else {
-        m_visibleInstances += batches.size();
-    }
-    
-    // Culling debug: when enabled, disable face culling so backfaces are
-    // visible (helps spot geometry issues), and render in wireframe mode
-    // so the batch boundaries are visible.
-    if (m_cullingDebug) {
-        faceCullingEnabled = false;
-    }
-    
     // Reset ring buffer for new frame (syncs GPU fences, wraps ring)
     bufferPool.ResetRing();
     
@@ -556,10 +536,8 @@ void Renderer::Render() {
         std::vector<size_t> fallbackOrder;
         
         if (batchIndices.empty() && !batches.empty()) {
-            size_t limit = m_maxVisibleInstances > 0 ? 
-                std::min(batches.size(), (size_t)m_maxVisibleInstances) : batches.size();
-            fallbackOrder.resize(limit);
-            for (size_t i = 0; i < limit; i++) fallbackOrder[i] = i;
+            fallbackOrder.resize(batches.size());
+            for (size_t i = 0; i < batches.size(); i++) fallbackOrder[i] = i;
             renderOrder = &fallbackOrder;
         }
         
@@ -633,9 +611,6 @@ void Renderer::Render() {
 void Renderer::ClearBatches() {
     batches.clear();
     batchIndices.clear();
-    // Reset culling stats for the next frame's accumulation
-    m_visibleInstances = 0;
-    m_culledInstances = 0;
 }
 
 void Renderer::SetViewport(int x, int y, int width, int height) {
@@ -770,10 +745,8 @@ void Renderer::ExecuteMultiDraw() {
     std::vector<size_t> fallbackOrder;
     
     if (batchIndices.empty()) {
-        size_t limit = m_maxVisibleInstances > 0 ?
-            std::min(batches.size(), (size_t)m_maxVisibleInstances) : batches.size();
-        fallbackOrder.resize(limit);
-        for (size_t i = 0; i < limit; i++) fallbackOrder[i] = i;
+        fallbackOrder.resize(batches.size());
+        for (size_t i = 0; i < batches.size(); i++) fallbackOrder[i] = i;
         renderOrder = &fallbackOrder;
     }
 
@@ -922,8 +895,19 @@ void Renderer::ExecuteMultiDraw() {
                 commands[i].baseInstance = 0;
             }
 
-            // Single multi-draw call for all batches in this group
+            // glMultiDrawElementsIndirect with indirect=NULL reads its commands
+            // from whatever buffer is bound to GL_DRAW_INDIRECT_BUFFER at call
+            // time. Re-bind our own command buffer here: the editor has two
+            // Renderer instances (Editor::renderer_ the forward renderer, and
+            // RenderPipeline::m_renderer the deferred one) each with their own
+            // mdiIndirectBuffer. Without this re-bind, if the deferred pipeline's
+            // Render() ran last it left GL_DRAW_INDIRECT_BUFFER pointing at a
+            // different buffer, so the forward path read the wrong (stale)
+            // commands and drew nothing -> spawned static models (and forward
+            // cubes) appeared invisible while skinned FBX (Model::Draw -> direct
+            // glDrawElements, no MDI) rendered fine.
             if (GLAD_GL_ARB_multi_draw_indirect) {
+                glBindBuffer(GL_DRAW_INDIRECT_BUFFER, mdiIndirectBuffer);
                 glMultiDrawElementsIndirect(group.primitiveType, GL_UNSIGNED_INT,
                                             nullptr, static_cast<GLsizei>(cmdCount), 0);
             }

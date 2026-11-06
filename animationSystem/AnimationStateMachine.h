@@ -80,8 +80,6 @@ struct CharacterInput {
     // down. reset() intentionally leaves it alone - it is a request, not
     // persistent movement state.
     int motionContext = -1;
-    bool attack = false;  // Combat-context trigger: plays a strike clip, then
-                         // auto-returns to Locomotion when the clip finishes.
     
     void reset() {
         moveDirection = glm::vec2(0.0f);
@@ -90,7 +88,6 @@ struct CharacterInput {
         crouch = false;
         sprint = false;
         verticalVelocity = 0.0f;
-        attack = false;
     }
 };
 

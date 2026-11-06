@@ -44,6 +44,10 @@ struct BoneBufferConfig {
 
 class BoneMatrixBuffer {
 public:
+    // Hard ceiling on bone count (FBX-skeleton hardening: a malformed/mismatched
+    // asset can't force a multi-MB UBO/SSBO allocation or index past the buffer).
+    static constexpr size_t kHardMaxBones = 1024;
+
     BoneMatrixBuffer();
     ~BoneMatrixBuffer();
 
@@ -170,6 +174,7 @@ public:
         size_t updateCount{0};
         size_t bindCount{0};
         size_t bytesUploaded{0};
+        size_t rejectionCount{0};   // capacity/guard rejects (mismatched FBX skeleton)
         double avgUpdateTimeMs{0.0};
         double lastUpdateTimeMs{0.0};
     };

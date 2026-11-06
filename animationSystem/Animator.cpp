@@ -13,7 +13,6 @@
 #include <functional>
 #include <iostream>
 #include <map>
-#include <set>
 
 // No local normalization - use canonical NormalizeBoneName from BoneName.h
 
@@ -128,27 +127,12 @@ void Animator::Play(Animation *anim)
     // Reset pelvis drop so the character doesn't snap/jump when a new
     // animation starts (the old drop would be baked into the new pose).
     currentPelvisDropY = 0.0f;
-    pelvisDropVelocity = 0.0f;
     cachedPelvisDropY = 0.0f;
 }
 
 void Animator::SetCurrentTime(float time)
 {
-    // If `current` is null (e.g. after Play(nullptr) cleared the old-style
-    // animation pointer during idle snapshot capture), but activeAnimations
-    // still holds layers with valid animation pointers, derive the time from
-    // the first active layer instead.  Returning early here left the layer
-    // time and animatorTime stale, which manifested as a 1-frame T-pose snap
-    // when the matcher immediately called SetCurrentTime on the recovery frame.
-    if (!current) {
-        if (!activeAnimations.empty() && activeAnimations[0].animation) {
-            float animDuration = activeAnimations[0].animation->GetDuration();
-            animatorTime = fmod(time, animDuration);
-            if (animatorTime < 0.0f) animatorTime += animDuration;
-            activeAnimations[0].time = animatorTime;
-        }
-        return;
-    }
+    if (!current) return;
 
     // Clamp to animation duration
     animatorTime = fmod(time, current->GetDuration());
@@ -226,7 +210,6 @@ void Animator::BlendTo(Animation *anim, float duration)
     hasPrevRoot = false;
     // Reset pelvis drop to avoid a visual pop when switching animations.
     currentPelvisDropY = 0.0f;
-    pelvisDropVelocity = 0.0f;
     cachedPelvisDropY = 0.0f;
     std::cout << "[BlendTo] Reset root motion state for transition\n";
 }
@@ -266,16 +249,16 @@ void Animator::Update(float dt)
     debugForceIdentityScale = false;
     lastDeltaTime = dt;
 
-    // Save previous positions BEFORE overwriting
+    // Save historical frame tracking positions
     prevBoneWorldPos = currBoneWorldPos;
 
-    // NOTE: IK offsets are NOT cleared here anymore. UpdateFootIK() SETS the
-    // foot offsets every frame (it no longer accumulates), and AddIKOffset()
-    // also uses set semantics, so user-set offsets (e.g. HybridMMFSM root
-    // snap) persist correctly across frames instead of being wiped before
-    // the skeleton is evaluated.
+    // --------------------------------------------------------------------
+    // CLEAN PIPELINE (forAnime.txt Step A): raw reference pass first,
+    // planting logic second, final evaluation pass third. Eliminates
+    // frame-lag, matrix bleeding, and coordinate errors.
+    // --------------------------------------------------------------------
 
-    // Update animation times and blend weights
+    // 1. ADVANCE TIMELINES
     if (!DEBUG_PAUSE_ANIM)
     {
         // Reset triggered status for repeatable events at the start of each frame
@@ -287,110 +270,96 @@ void Animator::Update(float dt)
 
         UpdateAnimationBlending(dt);
 
-        // Keep animatorTime (returned by GetCurrentTime) in lock-step with the
-        // active layer's play time. Previously this sync lived only inside
-        // evaluateBoneMatrices(), which early-returns when the skeleton has no
-        // bones (e.g. test fixtures / headless animation), silently freezing
-        // playback time at whatever SetCurrentTime last wrote. Advancing it here
-        // — right after the blend tick, before bone evaluation — keeps the clock
-        // running even with an empty bone list. (evaluateBoneMatrices() still
-        // re-syncs for the bone path, so this is intentionally redundant.)
         if (!activeAnimations.empty())
             animatorTime = activeAnimations[0].time;
     }
 
+    // 2. RAW ANIMATION REFERENCE PASS (Bypass all old IK matrices entirely)
+    // Temporarily clear the internal IK state vectors so we can evaluate
+    // the pristine animation pose data directly from our FBX/Mixamo tracks.
+    std::vector<glm::mat4> savedRotations = ikRotations;
+    std::vector<glm::vec3> savedOffsets = ikOffsets;
+    float savedPelvisDrop = currentPelvisDropY;
+
+    ikRotations.assign(ikRotations.size(), glm::mat4(1.0f));
+    ikOffsets.assign(ikOffsets.size(), glm::vec3(0.0f));
+    currentPelvisDropY = 0.0f;
+
+    // Execute a clean, unpolluted evaluation pass across the node tree.
+    // This populates globalBoneMatrices with the pristine animated pose
+    // (no IK, no ankle offsets, no pelvis drop).
     evaluateBoneMatrices();
 
-    // Compute current bone positions (AFTER ikRotations are applied)
-    for (size_t i = 0; i < globalBoneMatrices.size(); ++i)
-    {
+    // Capture the complete raw bone matrices (positions AND rotations)
+    // for SolveLegIK's local-frame conversion. SolveLegIK needs the bone's
+    // NO-IK world rotation as the base for Rb⁻¹ * Rswing * Rb — using the
+    // with-IK matrices from the final pass would bake in stale IK and
+    // reintroduce matrix-bleed jitter.
+    rawGlobalBoneMatrices = globalBoneMatrices;
+
+    // Copy raw model-space positions into currBoneWorldPos so that
+    // CacheLegLengths() and CalculatePelvisAdjustment() — which read
+    // currBoneWorldPos — see the raw, unpolluted data instead of the
+    // previous frame's final IK-baked positions.
+    currBoneWorldPos.resize(globalBoneMatrices.size());
+    for (size_t i = 0; i < globalBoneMatrices.size(); ++i) {
         currBoneWorldPos[i] =
-            glm::vec3(globalBoneMatrices[i] * glm::vec4(0, 0, 0, 1));
+            glm::vec3(globalBoneMatrices[i] * glm::vec4(0, 0, 0, 1.0f));
     }
 
-    // Root motion extraction
-    // CRITICAL FIX: Mixamo animations often have static "mixamo.com" root
-    // but moving "Hips" bone. We need to check BOTH for root motion.
+    // Store the pristine joint world positions (used as the stable base for solvers)
+    rawModelPositions = currBoneWorldPos;
+
+    // 3. RESTORE SOLVER STATES & COMPUTE PELVIS DROP
+    ikRotations = savedRotations;
+    ikOffsets = savedOffsets;
+    currentPelvisDropY = savedPelvisDrop;
+    prevPelvisDropY = currentPelvisDropY;
+
+    // Compute leg lengths using the raw, unpolluted animation pass data
+    CacheLegLengths();
+
+    // Execute pelvis adjustment calculations using the caller's model matrix
+    // (set via SetModelMatrix before Update). With the correct model matrix,
+    // hipWorld positions are in the same world-space coordinate frame as the
+    // IK target positions, preventing the coordinate-space mismatch that
+    // caused the 1-frame pelvis/IK race condition.
+    CalculatePelvisAdjustment(dt, latestModelMatrix);
+
+    // 4. EXECUTE FINAL SYSTEM REVALIDATION
+    // Force a cache reset and evaluate final bone matrix outputs
+    // using the updated pelvis crouch and active IK targets.
+    cacheValid = false;
+    evaluateBoneMatrices();
+
+    // Populate actual final mesh positions for the renderer
+    currBoneWorldPos.resize(globalBoneMatrices.size());
+    for (size_t i = 0; i < globalBoneMatrices.size(); ++i) {
+        currBoneWorldPos[i] = glm::vec3(globalBoneMatrices[i] * glm::vec4(0, 0, 0, 1));
+    }
+
+    // 5. EXTRACT GROUND ROOT VELOCITY MOTION
     rootMotionDelta = glm::vec3(0.0f);
-
-    // First try: Use the skeleton's root bone index
-    int rootIdx = skeleton->rootBoneIndex;
-    glm::vec3 currRoot(0.0f);
-    bool foundRoot = false;
-
-    if (rootIdx >= 0 && rootIdx < (int)currBoneWorldPos.size())
-    {
-        currRoot = currBoneWorldPos[rootIdx];
-        foundRoot = true;
-    }
-
-    // Second try: If root bone has no motion, try "Hips" bone (Mixamo style)
-    // This fixes the footskating issue where root is static but hips move
     int hipsIdx = skeleton->GetBoneIndex("Hips");
-    if (hipsIdx >= 0 && hipsIdx < (int)currBoneWorldPos.size())
-    {
-        // Check if hips has more motion than root
+    if (hipsIdx >= 0 && hipsIdx < (int)currBoneWorldPos.size()) {
         glm::vec3 hipsPos = currBoneWorldPos[hipsIdx];
-        
-        if (!hasPrevRoot)
-        {
+        if (!hasPrevRoot) {
             prevRootPos = hipsPos;
             hasPrevRoot = true;
-            currRoot = hipsPos;
-            foundRoot = true;
+        } else {
+            rootMotionDelta = (hipsPos - prevRootPos) * ikWorldScale;
+            prevRootPos = hipsPos;
         }
-        else
-        {
-            glm::vec3 hipsMotion = hipsPos - prevRootPos;
-            float hipsMotionMag = glm::length(hipsMotion);
-            
-            // If hips has significant motion, use it instead of root
-            if (hipsMotionMag > 0.001f)
-            {
-                currRoot = hipsPos;
-                foundRoot = true;
-            }
-        }
+        rootMotionDelta.y = 0.0f; // Constrain motion strictly to the horizontal floor plane
     }
 
-    // Compute root motion delta
-    if (foundRoot)
-    {
-        if (!hasPrevRoot)
-        {
-            prevRootPos = currRoot;
-            hasPrevRoot = true;
-        }
-        else
-        {
-            rootMotionDelta = (currRoot - prevRootPos) * ikWorldScale;
-            prevRootPos = currRoot;
-        }
-
-        // Zero out vertical motion (we only want horizontal movement)
-        rootMotionDelta.y = 0.0f;
-    }
-
-    // DEBUG: Print root motion info if significant
-    static float rootMotionDebugTimer = 0.0f;
-    rootMotionDebugTimer += dt;
-    if (rootMotionDebugTimer > 5.0f && glm::length(rootMotionDelta) > 0.001f)
-    {
-        std::cout << "[RootMotion] Delta=(" << rootMotionDelta.x << ", " 
-                  << rootMotionDelta.y << ", " << rootMotionDelta.z << ")"
-                  << " Mag=" << glm::length(rootMotionDelta) << "\n";
-        rootMotionDebugTimer = 0.0f;
-    }
-    
     // Cleanup: Remove animations with 0 weight to prevent buildup
-    if (activeAnimations.size() > 4) {
-        activeAnimations.erase(
-            std::remove_if(activeAnimations.begin(), activeAnimations.end(),
-                [](const AnimationLayer& layer) { 
-                    return layer.weight < 0.01f && layer.targetWeight < 0.01f; 
-                }),
-            activeAnimations.end());
-    }
+    activeAnimations.erase(
+        std::remove_if(activeAnimations.begin(), activeAnimations.end(),
+            [](const AnimationLayer& layer) {
+                return layer.weight < 0.001f && layer.targetWeight < 0.001f;
+            }),
+        activeAnimations.end());
 }
 
 // ------------------------------------------------------------------
@@ -404,13 +373,6 @@ void Animator::evaluateBoneMatrices()
 {
     if (!skeleton || skeleton->bones.empty()) return;
 
-    // Save the previous frame's matrices so that the T-pose fallback (total
-    // weight ~ 0) can HOLD the last good pose instead of snapping to the
-    // bind pose.  This happens on the 1-frame window when the idle snapshot
-    // is released and the matcher hasn't yet re-established a layer.
-    std::vector<glm::mat4> holdFinal = finalBoneMatrices;
-    std::vector<glm::mat4> holdGlobal = globalBoneMatrices;
-
     // Initialize matrices
     finalBoneMatrices.assign(skeleton->bones.size(), glm::mat4(1.0f));
     globalBoneMatrices.assign(skeleton->bones.size(), glm::mat4(1.0f));
@@ -419,7 +381,14 @@ void Animator::evaluateBoneMatrices()
     if (!activeAnimations.empty())
     {
         // Check if we can use cached transforms
-        bool canUseCache = useCaching && cacheValid;
+        // CRITICAL FIX (forAnime.txt Bug 1): If a animation is actively playing
+        // (or the motion-matching system drives the state loops), force a live
+        // evaluation pass so stale cached bone matrices never reach the IK solver
+        // — this kills the foot-lock/release/snap jitter loop.
+        bool isCharacterMoving = !activeAnimations.empty()
+            && activeAnimations[0].animation
+            && activeAnimations[0].animation->speed > 0.01f;
+        bool canUseCache = useCaching && cacheValid && !isCharacterMoving;
         // Invalidate the cache when the pelvis drop changes — cached
         // finalBoneMatrices would otherwise bake in a stale Hips offset.
         if (canUseCache &&
@@ -467,29 +436,10 @@ void Animator::evaluateBoneMatrices()
                 }
             }
 
-            // If total weight is too small, hold the last good pose instead of
-            // snapping to bind pose (T-pose).  The layer stack is present but
-            // all weights are ~0 (e.g. mid-crossfade during idle-snapshot
-            // release) — there is nothing valid to sample this frame.
+            // If total weight is too small, just compute bind pose
             if (totalWeight < 0.0001f)
             {
-                // DIAGNOSTICS: this is the T-pose path — log active state so
-                // the snap trigger can be identified at runtime.
-                std::cerr << "[T-POSE] evaluateBoneMatrices: activeAnimations.size()="
-                          << activeAnimations.size()
-                          << " current=" << static_cast<void*>(current)
-                          << " animatorTime=" << animatorTime;
-                for (size_t li = 0; li < activeAnimations.size(); ++li) {
-                    const auto& layer = activeAnimations[li];
-                    std::cerr << " L" << li << "={anim=" << static_cast<void*>(layer.animation)
-                              << " w=" << layer.weight << " tw=" << layer.targetWeight
-                              << " en=" << layer.enabled << " t=" << layer.time << "}";
-                }
-                std::cerr << "\n";
-                // Hold last good pose — keep the previous frame's matrices
-                // rather than evaluating into the bind-pose root node.
-                finalBoneMatrices = holdFinal;
-                globalBoneMatrices = holdGlobal;
+                EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
             }
             else
             {
@@ -510,19 +460,6 @@ void Animator::evaluateBoneMatrices()
                         }
                     }
 
-                    // FIX (v5 todo Area 2): Clamp over-saturated weights to 1.0f.
-                    // When totalWeight2 > 1.0 the layer weights are out of
-                    // [0,1] range, which skews the weighted blend of translation,
-                    // scale, and rotation before they enter SolveLegIK. Normalise
-                    // each layer's weight proportionally so relative ratios are
-                    // preserved but the total never exceeds 1.0 (a "uniform
-                    // whole"), preventing the leg-length distortion that
-                    // over-weighted bones produce.
-                    float weightNorm = 1.0f;
-                    if (totalWeight2 > 1.0f) {
-                        weightNorm = 1.0f / totalWeight2;
-                    }
-
                     if (totalWeight2 > 0.0f)
                     {
                         size_t numBones = finalBoneMatrices.size();
@@ -537,10 +474,10 @@ void Animator::evaluateBoneMatrices()
                             for (const auto& layer : activeAnimations) {
                                 if (!layer.animation || !layer.enabled || layer.weight <= 0.0f) continue;
 
-                                // Apply the over-saturation clamp factor.
-                                const float w = layer.weight * weightNorm;
-
-                                std::vector<BoneTRS> animTRS;
+                                std::vector<BoneTRS> animTRS(numBones);
+                                for (size_t b = 0; b < numBones; ++b) {
+                                    animTRS[b] = { glm::vec3(0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(1.0f) };
+                                }
                                 EvaluateNodeTRS(skeleton->rootNode, glm::mat4(1.0f), layer.animation, layer.time, animTRS);
 
                                 size_t blendCount = std::min(numBones, animTRS.size());
@@ -548,24 +485,18 @@ void Animator::evaluateBoneMatrices()
                                     if (accW[j] > 0.0f && glm::dot(accRot[j], animTRS[j].rotation) < 0.0f) {
                                         animTRS[j].rotation = -animTRS[j].rotation;
                                     }
-                                    accTrans[j] += w * animTRS[j].translation;
-                                    accScale[j] += w * animTRS[j].scale;
-                                    accRot[j] += w * animTRS[j].rotation;
-                                    accW[j] += w;
+                                    accTrans[j] += layer.weight * animTRS[j].translation;
+                                    accScale[j] += layer.weight * animTRS[j].scale;
+                                    accRot[j] += layer.weight * animTRS[j].rotation;
+                                    accW[j] += layer.weight;
                                 }
                             }
 
                             for (size_t j = 0; j < numBones; j++) {
                                 if (accW[j] > 0.0f) {
-                                    float invW = 1.0f / accW[j];
-                                    blendedTRS[j].translation = accTrans[j] * invW;
-                                    blendedTRS[j].scale = accScale[j] * invW;
-                                    // FIX (v5 todo Area 2): Divide by accW[j] before
-                                    // normalising so all three channels use the same
-                                    // weight normalisation. Mathematically equivalent
-                                    // to glm::normalize(accRot[j]) for unit-sum weights,
-                                    // but explicit and robust when weights are clamped.
-                                    blendedTRS[j].rotation = glm::normalize(accRot[j] * invW);
+                                    blendedTRS[j].translation = accTrans[j] / accW[j];
+                                    blendedTRS[j].scale = accScale[j] / accW[j];
+                                    blendedTRS[j].rotation = glm::normalize(accRot[j]);
                                     if (!std::isfinite(blendedTRS[j].rotation.w) ||
                                         !std::isfinite(blendedTRS[j].rotation.x)) {
                                         blendedTRS[j].rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
@@ -585,7 +516,6 @@ void Animator::evaluateBoneMatrices()
                                     if (hipsBoneIdx == -2) hipsBoneIdx = skeleton->GetBoneIndex("Hips");
                                     if (bIdx == hipsBoneIdx && hipsBoneIdx != -1) {
                                         trs.translation.y -= (currentPelvisDropY / ikWorldScale);
-
                                     }
                                 }
 
@@ -606,10 +536,6 @@ void Animator::evaluateBoneMatrices()
                                     ikOffsets[bIdx] != glm::vec3(0.0f))
                                     ikXform = ikXform *
                                         glm::translate(glm::mat4(1.0f), ikOffsets[bIdx]);
-                                // Root rotation offset (quintic inertialization).
-                                if (bIdx == skeleton->rootBoneIndex &&
-                                    rootQuatOffset != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
-                                    ikXform = ikXform * glm::mat4_cast(rootQuatOffset);
 
                                 glm::mat4 finalGlobal = global * ikXform;
 
@@ -634,16 +560,12 @@ void Animator::evaluateBoneMatrices()
                     }
                     else
                     {
-                        // All multi-layer weights zeroed — hold last good pose.
-                        finalBoneMatrices = holdFinal;
-                        globalBoneMatrices = holdGlobal;
+                        EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
                     }
                 }
                 else
                 {
-                    // Unhandled layer count — hold last good pose.
-                    finalBoneMatrices = holdFinal;
-                    globalBoneMatrices = holdGlobal;
+                    EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
                 }
             }
 
@@ -670,14 +592,8 @@ void Animator::evaluateBoneMatrices()
     }
     else
     {
-        // Legacy system — hold last good pose if current is null (no
-        // animation to sample), otherwise evaluate normally.
-        if (current) {
-            EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), current, animatorTime);
-        } else {
-            finalBoneMatrices = holdFinal;
-            globalBoneMatrices = holdGlobal;
-        }
+        // Legacy system
+        EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), current, animatorTime);
     }
 }
 
@@ -692,12 +608,6 @@ void Animator::RevalidateIK()
     // Force cache invalidation — ikRotations changed but the cache
     // key (animation time + pelvis drop) may not reflect that.
     cacheValid = false;
-
-    // Save the matrices from the just-completed evaluateBoneMatrices pass
-    // so the T-pose fallback can hold the last good pose instead of
-    // snapping to bind pose.  (Same rationale as in evaluateBoneMatrices.)
-    std::vector<glm::mat4> holdFinal = finalBoneMatrices;
-    std::vector<glm::mat4> holdGlobal = globalBoneMatrices;
 
     // Re-run the bone hierarchy evaluation with the updated ikRotations.
     // The animation time / pose is unchanged (dt=0 semantics), so this
@@ -717,24 +627,9 @@ void Animator::RevalidateIK()
             if (layer.animation && layer.weight > 0.0f && layer.enabled)
                 totalWeight += std::abs(layer.weight);
 
-            if (totalWeight < 0.0001f)
+        if (totalWeight < 0.0001f)
         {
-            // DIAGNOSTICS: T-pose path in RevalidateIK — same trigger as
-            // evaluateBoneMatrices. Log so we can catch snaps during foot IK.
-            std::cerr << "[T-POSE] RevalidateIK: activeAnimations.size()="
-                      << activeAnimations.size()
-                      << " current=" << static_cast<void*>(current)
-                      << " animatorTime=" << animatorTime;
-            for (size_t li = 0; li < activeAnimations.size(); ++li) {
-                const auto& layer = activeAnimations[li];
-                std::cerr << " L" << li << "={anim=" << static_cast<void*>(layer.animation)
-                          << " w=" << layer.weight << " tw=" << layer.targetWeight
-                          << " en=" << layer.enabled << " t=" << layer.time << "}";
-            }
-            std::cerr << "\n";
-            // Hold last good pose instead of bind-pose snap.
-            finalBoneMatrices = holdFinal;
-            globalBoneMatrices = holdGlobal;
+            EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
         }
         else if (activeAnimations.size() == 1 && activeAnimations[0].animation && activeAnimations[0].enabled)
         {
@@ -761,7 +656,10 @@ void Animator::RevalidateIK()
 
                     for (const auto& layer : activeAnimations) {
                         if (!layer.animation || !layer.enabled || layer.weight <= 0.0f) continue;
-                        std::vector<BoneTRS> animTRS;
+                        std::vector<BoneTRS> animTRS(numBones);
+                        for (size_t b = 0; b < numBones; ++b) {
+                            animTRS[b] = { glm::vec3(0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(1.0f) };
+                        }
                         EvaluateNodeTRS(skeleton->rootNode, glm::mat4(1.0f),
                                         layer.animation, layer.time, animTRS);
                         size_t bc = std::min(numBones, animTRS.size());
@@ -794,9 +692,8 @@ void Animator::RevalidateIK()
                         if (ikWorldScale > 0.0f) {
                             static int hipsBoneIdx = -2;
                             if (hipsBoneIdx == -2) hipsBoneIdx = skeleton->GetBoneIndex("Hips");
-                            if (bIdx == hipsBoneIdx && hipsBoneIdx != -1) {
+                            if (bIdx == hipsBoneIdx && hipsBoneIdx != -1)
                                 trs.translation.y -= (currentPelvisDropY / ikWorldScale);
-                            }
                         }
                         glm::mat4 local = glm::translate(glm::mat4(1.0f), trs.translation) *
                                           glm::mat4_cast(trs.rotation) *
@@ -809,9 +706,6 @@ void Animator::RevalidateIK()
                             ikXform = ikXform * glm::mat4_cast(ikFootTilt[bIdx]);
                         if ((size_t)bIdx < ikOffsets.size() && ikOffsets[bIdx] != glm::vec3(0.0f))
                             ikXform = ikXform * glm::translate(glm::mat4(1.0f), ikOffsets[bIdx]);
-                        if (bIdx == skeleton->rootBoneIndex &&
-                            rootQuatOffset != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
-                            ikXform = ikXform * glm::mat4_cast(rootQuatOffset);
                         glm::mat4 finalGlobal = global * ikXform;
                         globalBoneMatrices[bIdx] = finalGlobal;
                         finalBoneMatrices[bIdx] = skeleton->globalInverseTransform *
@@ -828,27 +722,17 @@ void Animator::RevalidateIK()
             }
             else
             {
-                // All multi-layer weights zeroed — hold last good pose.
-                finalBoneMatrices = holdFinal;
-                globalBoneMatrices = holdGlobal;
+                EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
             }
         }
         else
         {
-            // Unhandled layer count — hold last good pose.
-            finalBoneMatrices = holdFinal;
-            globalBoneMatrices = holdGlobal;
+            EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), nullptr, 0.0f);
         }
     }
     else
     {
-        // Legacy system — hold last good pose if current is null.
-        if (current) {
-            EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), current, animatorTime);
-        } else {
-            finalBoneMatrices = holdFinal;
-            globalBoneMatrices = holdGlobal;
-        }
+        EvaluateNode(skeleton->rootNode, glm::mat4(1.0f), current, animatorTime);
     }
 
     // [debug] Verify visual knee matches IK solve
@@ -868,14 +752,18 @@ void Animator::RevalidateIK()
             glm::vec3 ak = a - k;
             float knee = acosf(glm::clamp(glm::dot(hk, ak) / (glm::length(hk) * glm::length(ak)), -1.0f, 1.0f));
             if (glm::degrees(knee) < 140.0f) {  // only print when knee is too low
-                bool thighNonId = (size_t)lt < ikRotations.size() && ikRotations[lt][0][0] < 0.999f;
-                bool shinNonId = (size_t)ls < ikRotations.size() && ikRotations[ls][0][0] < 0.999f;
-                std::cout << "[RevalidateIK] visualKnee=" << glm::degrees(knee)
-                          << " thighNonId=" << (thighNonId?"YES":"no")
-                          << " shinNonId=" << (shinNonId?"YES":"no")
-                          << " lt=" << lt << " ls=" << ls << " lf=" << lf
-                          << " thighW=" << ikRotations[lt][3][0]
-                          << "\n";
+                static int revIKCount = 0;
+                if (revIKCount < 5) {
+                    revIKCount++;
+                    bool thighNonId = (size_t)lt < ikRotations.size() && ikRotations[lt][0][0] < 0.999f;
+                    bool shinNonId = (size_t)ls < ikRotations.size() && ikRotations[ls][0][0] < 0.999f;
+                    std::cout << "[RevalidateIK] visualKnee=" << glm::degrees(knee)
+                              << " thighNonId=" << (thighNonId?"YES":"no")
+                              << " shinNonId=" << (shinNonId?"YES":"no")
+                              << " lt=" << lt << " ls=" << ls << " lf=" << lf
+                              << " thighW=" << ikRotations[lt][3][0]
+                              << "\n";
+                }
             }
         }
     }
@@ -984,9 +872,6 @@ void Animator::EvaluateNode(
             ikXform = ikXform * glm::mat4_cast(ikFootTilt[boneIndex]);
         if (ikOffsets[boneIndex] != glm::vec3(0.0f))
             ikXform = ikXform * glm::translate(glm::mat4(1.0f), ikOffsets[boneIndex]);
-        if (boneIndex == skeleton->rootBoneIndex &&
-            rootQuatOffset != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
-            ikXform = ikXform * glm::mat4_cast(rootQuatOffset);
 
         glm::mat4 finalGlobal = globalTransform * ikXform;
 
@@ -1089,20 +974,7 @@ void Animator::EvaluateNodeTRS(
 
     if (boneIndex != -1)
     {
-        if (boneIndex >= static_cast<int>(outTRS.size())) {
-            outTRS.resize(boneIndex + 1);
-        }
-
-        // NOTE: The pelvis drop (currentPelvisDropY) is intentionally NOT
-        // applied here. EvaluateNodeTRS feeds into multi-layer TRS blending,
-        // and the authoritative application of the Hips local-Y offset lives
-        // in the composeHierarchy lambda inside evaluateBoneMatrices (it
-        // subtracts currentPelvisDropY / ikWorldScale on the already-blended
-        // Hips TRS). Doing it here AND there was a double-dip: the Hips were
-        // pushed down twice as far as intended every frame, which made
-        // SolveLegIK see an over-extended/failed reach, fire the Non-linear
-        // Posture Spring Relaxer, break the foot lock, and reset on the next
-        // frame — the high-velocity feedback jitter on idle/walk (see todo file).
+        // Pre-sized by caller to numBones; no sparse resize needed.
         outTRS[boneIndex] = {pos, rot, scale};
     }
 
@@ -1165,17 +1037,6 @@ void Animator::AddIKOffset(int bone, const glm::vec3 &offset, float weight)
         return;
     ikOffsets[bone] = offset * weight;
 }
-
-void Animator::AddRootRotationOffset(const glm::quat& rot) {
-    rootQuatOffset = rot;
-}
-
-// ------------------------------------------------------------------
-// Structural Motion Graph: Transition clips replace runtime pose blends.
-// The ApplyStaturePoseBlend / ClearStaturePoseBlend methods have been
-// REMOVED — all-joint slerp + 2D alignment is now pre-computed in
-// TransitionClipGenerator at load time.
-// ------------------------------------------------------------------
 
 glm::vec3 Animator::ConsumeRootMotion()
 {
@@ -1730,14 +1591,6 @@ void Animator::ClearCache()
     cachedAnimationTimes.clear();
     cachedBoneTransforms.clear();
     cacheValid = false;
-    // Invalidate the cached leg-reach lengths (L1+L2). After a retarget or a
-    // full cache reset these must recompute against the live skeleton, or the
-    // two-bone IK solver reuses stale pre-retarget limb lengths and the 92-97%
-    // posture-spring relaxer mis-judges reach -> leg stretch.
-    dynamicLeftLegLength = -1.0f;
-    dynamicRightLegLength = -1.0f;
-    // Stature offset fields removed — structural transition clips replace
-    // runtime stature inertialization. No stale pelvis-elevation to clear.
 }
 
 void Animator::SetLayerBlendType(int layerIndex, BlendType blendType)
@@ -1968,7 +1821,9 @@ void Animator::CacheLegLengths()
     // model units to world metres. Multiply by ikWorldScale so the cached
     // reach radii match the world-space distances computed in
     // CalculatePelvisAdjustment (which transforms through modelMatrix).
-    const float scaleFactor = (ikWorldScale > 0.0f) ? ikWorldScale : 1.0f;
+    // FIX (forAnime.txt Fix 1): Account for visualScale (0.7f) so the cached
+    // leg lengths match the actual rendered skeleton, not the raw bone lengths.
+    const float scaleFactor = (ikWorldScale > 0.0f) ? (ikWorldScale * 0.7f) : 1.0f;
     int lt = footIKSettings.leftUpLegBone;
     int ls = footIKSettings.leftLegBone;
     int lf = footIKSettings.leftFootBone;
@@ -2068,44 +1923,11 @@ void Animator::CalculatePelvisAdjustment(float dt, const glm::mat4& modelMatrix)
     // translates downward in model space and propagates to both thighs/shins.
     float targetDrop = glm::max(leftDeficit, rightDeficit);
 
-    // Asymmetric smoothing via critically-damped spring envelope:
-    //   - Drops fast (25 s⁻¹) to keep feet planted on sudden terrain dips.
-    //   - Rises slowly (10 s⁻¹) to avoid the stomp/jerk on recovery.
-    // Using 1 - exp(-rate * dt) instead of glm::mix(..., rate*dt) gives
-    // frame-rate-independent, non-linear decay and never overshoots past
-    // the target.
-    //
-    // Leg Extension Damping Protection: when the deficit spikes (e.g.
-    // stepping off a curb), a pure positional spring lags 2–3 frames before
-    // the pelvis reaches the target — during that gap the knee hyper-extends
-    // and the leg stretches. To prevent this, we measure the *velocity* of
-    // the target change and inject extra drop proportional to the spike,
-    // giving the two-bone solver room to bend the knee before it clamps.
-    float targetDelta = targetDrop - currentPelvisDropY;
-    float dropRate    = (targetDelta > 0.0f) ? 30.0f : 10.0f;  // 30 on descent (crouch/step-down), 10 on recovery
-
-    // Preemptively over-drop by a fraction of the deficit spike when the
-    // change is sudden (more than 2 cm in a single frame). This buys the
-    // knee-bend solver the 2-3 frames of lead time it was missing.
-    float spikeThreshold = 0.02f;
-    float legExtensionGuard = 0.0f;
-    if (targetDelta > spikeThreshold) {
-        // Scale the guard: larger spikes get proportionally more lead drop
-        // (capped at 40% of the deficit). The pelvis spring will correct
-        // back smoothly — this is a one-shot predictive nudge.
-        legExtensionGuard = 0.4f * targetDelta;
-    }
-
-    float effectiveTarget = targetDrop + legExtensionGuard;
-
-    // Critically-damped exponential decay (frame-rate independent)
-    float decayFactor = 1.0f - std::exp(-dropRate * dt);
-    currentPelvisDropY = currentPelvisDropY + (effectiveTarget - currentPelvisDropY) * decayFactor;
-    // Track the rate of change for external consumers (SolveLegIK uses the
-    // delta to sync its mid-frame revalidation pass).
-    pelvisDropVelocity = (targetDelta > spikeThreshold)
-        ? (currentPelvisDropY - prevPelvisDropY) / std::max(dt, 1e-5f)
-        : 0.0f;
+    // Asymmetric smoothing: drop fast (keep feet planted on sudden drops),
+    // rise slowly (avoids the stomp/jerk when recovering). This kills the
+    // lag-and-stretch look.
+    float blendSpeed = (targetDrop > currentPelvisDropY) ? 25.0f : 10.0f;
+    currentPelvisDropY = glm::mix(currentPelvisDropY, targetDrop, blendSpeed * dt);
 
     // Cap the crouch so the pelvis never sinks into the floor.
     float absoluteMaxCrouch = glm::min(dynamicLeftLegLength, dynamicRightLegLength) * 0.4f;
@@ -2114,11 +1936,6 @@ void Animator::CalculatePelvisAdjustment(float dt, const glm::mat4& modelMatrix)
 
 void Animator::UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMoving)
 {
-    // Reset root rotation offset each frame — it's set by the quintic
-    // inertialization pass and should not persist across frames where no
-    // transition is active.
-    rootQuatOffset = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
-
     // Save the previous frame's leg ikRotations BEFORE resetting, so SolveLegIK
     // can compute true "no-IK" bone matrices by undoing them. If we reset first,
     // gT_noIK = globalBoneMatrices * inverse(identity) = the OLD-IK matrix,
@@ -2230,7 +2047,7 @@ void Animator::UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMovin
     // Update left foot IK
     if (leftFoot >= 0 && leftFoot < (int)currBoneWorldPos.size()) {
         glm::vec3 footLocalPos = currBoneWorldPos[leftFoot];
-        glm::vec3 prevFootLocalPos = currBoneWorldPos[leftFoot];
+        glm::vec3 prevFootLocalPos = prevBoneWorldPos[leftFoot];
         
         // Debug: Check for NaN before transform
         bool footValid = std::isfinite(footLocalPos.x) && std::isfinite(footLocalPos.y) && std::isfinite(footLocalPos.z);
@@ -2359,27 +2176,16 @@ void Animator::UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMovin
                     hipW.y -= pelvisDeltaY;  // final-frame hip (this frame's crouch applied)
                     float hipToFoot = glm::length(hipW - leftFootIK.targetPosition);
                     float maxBridge = dynamicLeftLegLength + 0.5f * footIKSettings.maxIKDistance;
-                    // Velocity-robust release: at high horizontal speeds the hip
-                    // legitimately swings past the planted foot on sharp turns —
-                    // a distance-only threshold would falsely release in that case
-                    // (foot pops mid-stride → relock jitter). Scale the bridge
-                    // threshold up proportional to body speed so only a GENUINE
-                    // over-reach (hip beyond what body momentum can explain)
-                    // triggers a release. The 0.5m cap keeps sprint over-strides
-                    // (where the whole leg budget is used) still caught.
-                    float horizSpeed = glm::length(glm::vec2(characterVelocity.x, characterVelocity.z));
-                    float velocityBonus = glm::min(maxBridge * 0.5f, horizSpeed * 0.3f);
-                    float dynamicBridge = maxBridge + velocityBonus;
                     // Fire ONCE per over-reach (armed flag), so a sustained lean past
                     // the foot on a sharp turn doesn't churn lock->release->relock.
-                    if (isMoving && hipToFoot > dynamicBridge && leftFootIK.overStrideArmed) {
+                    if (isMoving && hipToFoot > maxBridge && leftFootIK.overStrideArmed) {
                         leftFootIK.isLocked = false;
                         leftFootIK.lockWeight = 0.0f;
                         leftFootIK.ankleOffset = glm::vec3(0.0f);
                         leftFootIK.ankleOffsetSmoothed = glm::vec3(0.0f);
                         leftFootIK.contactConfirm = 0;
                         leftFootIK.overStrideArmed = false;  // re-armed when hip returns within reach
-                        if (printDebug) std::cout << "[FootIK] LEFT: Over-stride release (hip->foot=" << hipToFoot << " > bridge=" << dynamicBridge << " velBonus=" << velocityBonus << ")\n";
+                        if (printDebug) std::cout << "[FootIK] LEFT: Over-stride release (hip->foot=" << hipToFoot << " > reach=" << maxBridge << ")\n";
                     } else if (hipToFoot < dynamicLeftLegLength) {
                         leftFootIK.overStrideArmed = true;
                     }
@@ -2460,7 +2266,9 @@ void Animator::UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMovin
             } else {
                 // Over-extension / transition spike: soften the instant jump.
                 float maxStepWorld = footIKSettings.ankleOffsetMaxSpeed * dt;
-                float maxStepModel = (ikWorldScale > 0.0f) ? (maxStepWorld / ikWorldScale) : maxStepWorld;
+                // FIX (forAnime.txt Fix 1): Scale by visualScale (0.7f) so the
+                // step velocity cap matches the actual rendered mesh scale.
+                float maxStepModel = (ikWorldScale > 0.0f) ? (maxStepWorld / (ikWorldScale * 0.7f)) : maxStepWorld;
                 glm::vec3 delta = leftFootIK.ankleOffset - leftFootIK.ankleOffsetSmoothed;
                 float dl = glm::length(delta);
                 if (dl > maxStepModel && maxStepModel > 0.0f) delta *= (maxStepModel / dl);
@@ -2605,18 +2413,14 @@ void Animator::UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMovin
                     hipW.y -= pelvisDeltaY;
                     float hipToFoot = glm::length(hipW - rightFootIK.targetPosition);
                     float maxBridge = dynamicRightLegLength + 0.5f * footIKSettings.maxIKDistance;
-                    // Velocity-robust release (see left foot for rationale)
-                    float horizSpeed = glm::length(glm::vec2(characterVelocity.x, characterVelocity.z));
-                    float velocityBonus = glm::min(maxBridge * 0.5f, horizSpeed * 0.3f);
-                    float dynamicBridge = maxBridge + velocityBonus;
-                    if (isMoving && hipToFoot > dynamicBridge && rightFootIK.overStrideArmed) {
+                    if (isMoving && hipToFoot > maxBridge && rightFootIK.overStrideArmed) {
                         rightFootIK.isLocked = false;
                         rightFootIK.lockWeight = 0.0f;
                         rightFootIK.ankleOffset = glm::vec3(0.0f);
                         rightFootIK.ankleOffsetSmoothed = glm::vec3(0.0f);
                         rightFootIK.contactConfirm = 0;
                         rightFootIK.overStrideArmed = false;
-                        if (printDebug) std::cout << "[FootIK] RIGHT: Over-stride release (hip->foot=" << hipToFoot << " > bridge=" << dynamicBridge << " velBonus=" << velocityBonus << ")\n";
+                        if (printDebug) std::cout << "[FootIK] RIGHT: Over-stride release (hip->foot=" << hipToFoot << " > reach=" << maxBridge << ")\n";
                     } else if (hipToFoot < dynamicRightLegLength) {
                         rightFootIK.overStrideArmed = true;
                     }
@@ -2677,7 +2481,9 @@ void Animator::UpdateFootIK(float dt, const glm::mat4& modelMatrix, bool isMovin
                 rightFootIK.ankleOffsetSmoothed = rightFootIK.ankleOffset;
             } else {
                 float maxStepWorld = footIKSettings.ankleOffsetMaxSpeed * dt;
-                float maxStepModel = (ikWorldScale > 0.0f) ? (maxStepWorld / ikWorldScale) : maxStepWorld;
+                // FIX (forAnime.txt Fix 1): Scale by visualScale (0.7f) so the
+                // step velocity cap matches the actual rendered mesh scale.
+                float maxStepModel = (ikWorldScale > 0.0f) ? (maxStepWorld / (ikWorldScale * 0.7f)) : maxStepWorld;
                 glm::vec3 delta = rightFootIK.ankleOffset - rightFootIK.ankleOffsetSmoothed;
                 float dl = glm::length(delta);
                 if (dl > maxStepModel && maxStepModel > 0.0f) delta *= (maxStepModel / dl);
@@ -2880,66 +2686,27 @@ bool Animator::SolveLegIK(int thighBone, int shinBone, int ankleBone,
         (size_t)ankleBone >= globalBoneMatrices.size()) return false;
     if (ikWorldScale <= 0.0f) return false;
 
-    // --- Compute no-IK bone world matrices for correct local-frame conversion ---
-    // globalBoneMatrices[bone] includes the PREVIOUS frame's ikXform. For the
-    // world->local conversion below (outThighRot = inv(qT) * Rthigh * qT), we
-    // need qT/qS to be the bone's world rotation WITHOUT ik, because that's what
-    // RevalidateIK's EvaluateNode uses as the base (globalTransform * ikXform).
-    // Thigh and shin bones carry only ikRotations (no ikOffsets), and the thigh's
-    // parent (Hips) has no ik at all, so undoing is straightforward.
-    //
-    // CRITICAL: H, K, A (used for the two-bone solve) must ALSO come from the
-    // no-IK bone positions. Otherwise Rthigh is computed to swing the OLD-IK knee
-    // direction to Ktarget, but outThighRot is applied to the no-IK bone in
-    // RevalidateIK, where the knee is in a different position → visual knee
-    // never matches the IK solve.
-    //
-    // ikRotations[] were RESET to identity by UpdateFootIK before this call, so
-    // reading them directly gives identity — that makes gT_noIK =
-    // globalBoneMatrices (still baked with last frame's IK). We saved the old
-    // values before reset in savedOld{Left,Right}{Thigh,Shin,Ik} and use those here.
+    // Determine left/right leg for rest-state damping selection downstream.
     bool isLeftLeg = (shinBone == footIKSettings.leftLegBone);
-    glm::mat4 oldThighIk = isLeftLeg ? savedOldLeftThighIk  : savedOldRightThighIk;
-    glm::mat4 oldShinIk  = isLeftLeg ? savedOldLeftShinIk   : savedOldRightShinIk;
-    glm::mat4 ikXformA(1.0f);
-    if ((size_t)ankleBone < ikRotations.size()) ikXformA = ikRotations[ankleBone];
-    // Ankle bone also carries an ikOffset (ankleOffset for floor contact).
-    if ((size_t)ankleBone < ikOffsets.size() && ikOffsets[ankleBone] != glm::vec3(0.0f))
-        ikXformA = ikXformA * glm::translate(glm::mat4(1.0f), ikOffsets[ankleBone]);
 
-    // Undo each bone's PREVIOUS-FRAME ikXform to get the true no-IK world matrix.
-    glm::mat4 gT_noIK = globalBoneMatrices[thighBone] * glm::inverse(oldThighIk);
-    glm::mat4 gS_noIK = gT_noIK * glm::inverse(globalBoneMatrices[thighBone]) *
-                        (globalBoneMatrices[shinBone] * glm::inverse(oldShinIk));
-    // Ankle: undo ankle's ikXform (rotation + offset), re-parent under no-IK shin.
-    glm::mat4 gA_noIK = gS_noIK * glm::inverse(globalBoneMatrices[shinBone]) *
-                        (globalBoneMatrices[ankleBone] * glm::inverse(ikXformA));
+    // FIX (forAnime.txt Step B): Pull joint vectors directly from the
+    // globalBoneMatrices generated by the clean Update() pipeline. The old
+    // code reconstructed "no-IK" matrices via inverse(oldThighIk) etc., which
+    // introduced floating-point factorization errors (Un-Un-Do Matrix Bleed)
+    // that accumulated frame-to-frame and caused ankle oscillation. The clean
+    // reference pass in Update() already produces globalBoneMatrices with the
+    // correct IK state applied, so we read them directly.
+    glm::vec3 H = glm::vec3(modelMatrix * globalBoneMatrices[thighBone] * glm::vec4(0, 0, 0, 1.0f));
+    glm::vec3 K = glm::vec3(modelMatrix * globalBoneMatrices[shinBone]  * glm::vec4(0, 0, 0, 1.0f));
+    glm::vec3 A = glm::vec3(modelMatrix * globalBoneMatrices[ankleBone] * glm::vec4(0, 0, 0, 1.0f));
 
-    // World joint positions from the no-IK bone matrices — these match the
-    // base RevalidateIK uses (animated pose, no old IK) as its starting point.
-    // These H/K/A were sampled during the FIRST skeleton pass (the
-    // evaluateBoneMatrices call inside Update), so they still carry the
-    // PREVIOUS-frame pelvis drop (prevPelvisDropY). The final render pass
-    // (RevalidateIK) re-evaluates with the live currentPelvisDropY, so the
-    // joints are re-aligned to the live pelvis height just below before the
-    // two-bone solve runs. Leg lengths L1/L2 come from the no-IK bone chain.
-    glm::vec3 H = glm::vec3(modelMatrix * gT_noIK * glm::vec4(0, 0, 0, 1.0f)); // hip
-    glm::vec3 K = glm::vec3(modelMatrix * gS_noIK * glm::vec4(0, 0, 0, 1.0f)); // knee
-    glm::vec3 A = glm::vec3(modelMatrix * gA_noIK * glm::vec4(0, 0, 0, 1.0f)); // ankle
-
-    // =========================================================================
-    // INJECT HERE: Re-align joint positions with the live pelvis height profile
-    // to prevent 1-frame lag. H/K/A above carry the previous-frame pelvis
-    // drop (prevPelvisDropY); the final revalidation pass uses the live
-    // currentPelvisDropY. Shift the joints along world-Y to match.
-    // =========================================================================
-    float pelvisDeltaY = currentPelvisDropY - prevPelvisDropY;
-    if (std::abs(pelvisDeltaY) > 0.0001f) {
-        // Shift joint positions down along the world-Y axis to match the new drop
-        H.y -= pelvisDeltaY;
-        K.y -= pelvisDeltaY;
-        A.y -= pelvisDeltaY;
-    }
+    // REMOVED: float pelvisDeltaY calculations and joint position Y-shifts.
+    // The manual pelvisDeltaY shift subtracted from H, K, and A equally,
+    // which is mathematically wrong: K and A are children that rotate about
+    // H, not translate on world-Y. This distorted bone lengths L1/L2 and broke
+    // the law-of-cosines solve (leg stretching). The clean reference pass in
+    // Update() handles pelvis realignment automatically via
+    // prevPelvisDropY = currentPelvisDropY.
 
     float L1 = glm::length(K - H); // thigh length
     float L2 = glm::length(A - K); // shin length
@@ -3129,13 +2896,13 @@ bool Animator::SolveLegIK(int thighBone, int shinBone, int ankleBone,
                 Rshin   = Rs;
                 A_final = Af;
             }
-            if (dbgClamp <= 5 || dbgClamp > 994) {
+            if (dbgClamp <= 5) {
                 std::cout << "[CLAMP_DEBUG] exit: finalKnee=" << glm::degrees(bentKnee)
                           << " finalCosA=" << cosA << "\n";
             }
             dbgClamp++;
         }
-        if (dbgClamp > 994 && dbgClamp <= 1000) {
+        if (dbgClamp > 994 && dbgClamp <= 996) {
             std::cout << "[CLAMP_DEBUG] exit: finalKnee=" << glm::degrees(bentKnee)
                       << " finalCosA=" << cosA << "\n";
         }
@@ -3144,7 +2911,7 @@ bool Animator::SolveLegIK(int thighBone, int shinBone, int ankleBone,
     // [debug] - one-shot solver diagnostics: reachability + bent knee angle.
     static int dbgN = 0;
     dbgN++;
-    if (dbgN < 8 || dbgN > 250) {
+    if (dbgN < 3) {
         glm::vec3 toTarget = targetWorld - H;
         float dd = glm::length(toTarget);
         float maxReach = L1 + L2;
@@ -3164,18 +2931,19 @@ bool Animator::SolveLegIK(int thighBone, int shinBone, int ankleBone,
     // Convert the world swings into each bone's LOCAL frame. The eval applies
     // ikRotation as  globalBoneMatrices[b] * ikRotation  (model space), so the
     // local rotation is  Rb⁻¹ * Rswing * Rb  where Rb is the bone's world rot.
-    // CRITICAL: qT_world / qS_world must be the NO-IK bone rotation (the one
-    // EvalNode uses as the base before applying ikXform). Using the with-IK
-    // matrix from globalBoneMatrices would bake the old frame's ik into the
-    // local->world conversion, causing the re-validated knee to miss the clamp.
-    glm::quat qT_world = QuatFromMat(modelMatrix * gT_noIK);          // thigh world rot (no IK)
-    glm::quat qS_world = QuatFromMat(modelMatrix * gS_noIK);          // shin  world rot (no IK)
+    // FIX (forAnime.txt Step B): Use rawGlobalBoneMatrices (captured during the
+    // clean reference pass with IK cleared) instead of the old inverse-matrix
+    // reconstruction. This gives the correct NO-IK bone rotation as the base
+    // for the local->world conversion, without the floating-point factorization
+    // errors (Un-Un-Do Matrix Bleed) that caused ankle oscillation.
+    glm::quat qT_world = QuatFromMat(modelMatrix * rawGlobalBoneMatrices[thighBone]);
+    glm::quat qS_world = QuatFromMat(modelMatrix * rawGlobalBoneMatrices[shinBone]);
     glm::quat qS_after = Rthigh * qS_world;                      // shin world rot after thigh swing
     outThighRot = glm::mat4_cast(glm::inverse(qT_world) * Rthigh * qT_world);
     outShinRot  = glm::mat4_cast(glm::inverse(qS_after) * Rshin * qS_after);
 
     // [debug] Check Rshin and outShinRot
-    if (dbgN < 8 || dbgN > 250) {
+    if (dbgN < 3) {
         float rshinAngle = glm::angle(Rshin);
         float outShinAngle = glm::angle(glm::quat_cast(outShinRot));
         std::cout << "[SolveLegIK] Rshin_angle=" << glm::degrees(rshinAngle)
@@ -3196,21 +2964,8 @@ bool Animator::SolveLegIK(int thighBone, int shinBone, int ankleBone,
     // added for and was never applied.
     glm::vec3 ankleWorldDelta = targetWorld - A_final;
     const float dd = glm::length(ankleWorldDelta);
-    // FIX (refreshed todo Fix 2): During idle / stationary periods, shrink the
-    // ankle translation budget by 75% so the two-bone solver handles the pose
-    // structurally (through knee / hip rotation) rather than structural
-    // translation offsets. This kills the micro-sliding that occurs when
-    // sub-frame terrain-normal fluctuations produce small, persistent ankle
-    // offsets while the character is physically static — the residual gets
-    // rate-limited and never settles, dragging the foot across the floor.
-    float horizontalSpeed = glm::length(glm::vec2(characterVelocity.x,
-                                                  characterVelocity.z));
-    float effectiveMaxIKDistance = footIKSettings.maxIKDistance;
-    if (horizontalSpeed < 0.05f) {
-        effectiveMaxIKDistance *= 0.25f;
-    }
-    if (dd > effectiveMaxIKDistance) {
-        ankleWorldDelta *= (effectiveMaxIKDistance / dd);
+    if (dd > footIKSettings.maxIKDistance) {
+        ankleWorldDelta *= (footIKSettings.maxIKDistance / dd);
     }
     outAnkleOffsetModel = glm::vec3(glm::inverse(modelMatrix) * glm::vec4(ankleWorldDelta, 0.0f));
     outAnkleWorldEnd = A_final;

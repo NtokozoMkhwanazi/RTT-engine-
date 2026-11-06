@@ -169,49 +169,52 @@ Animation AssimpAnimationLoader::ApplyPoseCorrections(const Animation& anim)
     
     for (auto& [boneName, boneAnim] : correctedAnim.boneAnimations) {
         std::string normName = NormalizeBoneName(boneName);
-        
+
         // Correct arm rotations for T-pose to A-pose conversion
-        if (normName.find("arm") != std::string::npos || 
+        if (normName.find("arm") != std::string::npos ||
             normName.find("upperarm") != std::string::npos ||
             normName.find("forearm") != std::string::npos) {
-            
-            // Apply corrective rotation to bring arms from T-pose to A-pose
+
+            // Apply corrective rotation to bring arms from T-pose to A-pose.
+            // Use pure quaternion composition instead of Euler conversion to
+            // preserve the sign-flip continuity established during loading
+            // (q = -q). Converting to/from Euler angles re-aligns to the
+            // positive hemisphere unconditionally, wiping out sign corrections
+            // and causing 360-degree joint flips during playback.
             for (auto& rot : boneAnim.rotationValues) {
-                glm::vec3 euler = glm::eulerAngles(rot);
-                
                 // For left arm, rotate slightly inward toward body
                 if (normName.find("left") != std::string::npos) {
-                    euler.y -= glm::radians(20.0f); // Rotate inward
-                    euler.z -= glm::radians(10.0f); // Slight forward rotation
+                    glm::quat correctiveY = glm::angleAxis(glm::radians(-20.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                    glm::quat correctiveZ = glm::angleAxis(glm::radians(-10.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+                    rot = glm::normalize(rot * correctiveY * correctiveZ);
                 }
                 // For right arm, rotate slightly inward toward body (opposite direction)
                 else if (normName.find("right") != std::string::npos) {
-                    euler.y += glm::radians(20.0f); // Rotate inward
-                    euler.z -= glm::radians(10.0f); // Slight forward rotation
+                    glm::quat correctiveY = glm::angleAxis(glm::radians(20.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                    glm::quat correctiveZ = glm::angleAxis(glm::radians(-10.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+                    rot = glm::normalize(rot * correctiveY * correctiveZ);
                 }
-                
-                rot = glm::quat(euler);
             }
         }
-        
+
         // Correct hand rotations that are often off in Mixamo exports
         if (normName.find("hand") != std::string::npos) {
             for (auto& rot : boneAnim.rotationValues) {
-                glm::vec3 euler = glm::eulerAngles(rot);
-                // Adjust hand orientation to be more natural
-                euler.x += glm::radians(5.0f);
-                euler.y += glm::radians(5.0f);
-                rot = glm::quat(euler);
+                // Adjust hand orientation to be more natural, via quaternion
+                // composition to preserve sign-flip continuity.
+                glm::quat correctiveX = glm::angleAxis(glm::radians(5.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+                glm::quat correctiveY = glm::angleAxis(glm::radians(5.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                rot = glm::normalize(rot * correctiveX * correctiveY);
             }
         }
-        
+
         // Correct foot rotations for better ground contact
         if (normName.find("foot") != std::string::npos) {
             for (auto& rot : boneAnim.rotationValues) {
-                glm::vec3 euler = glm::eulerAngles(rot);
-                // Adjust foot orientation to be flatter on ground
-                euler.x -= glm::radians(10.0f);
-                rot = glm::quat(euler);
+                // Adjust foot orientation to be flatter on ground, via
+                // quaternion composition to preserve sign-flip continuity.
+                glm::quat correctiveRotation = glm::angleAxis(glm::radians(-10.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+                rot = glm::normalize(rot * correctiveRotation);
             }
         }
     }

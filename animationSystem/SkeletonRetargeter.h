@@ -9,11 +9,9 @@
 
 #include "../boneSystem/Skeleton.h"
 #include "../boneSystem/BoneName.h"
-#include "Animator.h"  // Animator::ClearCache() - invalidate IK bone-length cache on retarget
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <unordered_map>
-#include <algorithm>
 #include <vector>
 #include <string>
 #include <iostream>
@@ -60,31 +58,31 @@ public:
     
     /**
      * Initialize retargeter with source and target skeletons.
-     * @param targetAnimator (optional) the live target Animator whose cached
-     *        bone-length / IK-reach state must be invalidated when a retarget
-     *        scale is applied - otherwise the leg solver reuses stale L1+L2
-     *        lengths and the posture-spring relaxer mis-judges reach.
+     * Returns/validates via ok(): mismatched FBX skeleton pairs (different bone
+     * counts) are refused rather than building a degenerate -1 hole map that
+     * reads past the smaller target.
      */
-    void initialize(const Skeleton* source, const Skeleton* target,
-                    Animator* targetAnimator = nullptr) {
+    void initialize(const Skeleton* source, const Skeleton* target) {
         sourceSkeleton = source;
         targetSkeleton = target;
-        
-        if (source && target) {
-            std::cout << "[Retargeter] Source: " << source->bones.size() << " bones\n";
-            std::cout << "[Retargeter] Target: " << target->bones.size() << " bones\n";
-            
-            // Build bone mapping + scale cache
-            buildBoneMapping();
-            
-            // Invalidate the target Animator's cached skeletal-length state so
-            // any retarget-driven scale change forces a recompute of L1+L2.
-            if (targetAnimator) {
-                targetAnimator->ClearCache();
-                std::cout << "[Retargeter] Target Animator bone-length cache invalidated.\n";
-            }
+        mismatched = false;
+
+        if (!source || !target ||
+            source->bones.size() != target->bones.size()) {
+            mismatched = true;   // mismatched FBX skeleton pair: refuse to map
+            return;
         }
+
+        std::cout << "[Retargeter] Source: " << source->bones.size() << " bones\n";
+        std::cout << "[Retargeter] Target: " << target->bones.size() << " bones\n";
+
+        // Build bone mapping
+        buildBoneMapping();
     }
+
+    // Validity query for callers/tests after initialize(): true iff both
+    // skeletons are present AND compatible (matching bone count).
+    bool ok() const { return !mismatched && sourceSkeleton && targetSkeleton; }
     
     // =========================================================================
     // BONE MAPPING
@@ -117,24 +115,6 @@ public:
         return boneScales[sourceBoneIndex];
     }
     
-    /**
-     * Check if a bone is a root-level tracking joint (root or hips).
-     * Only these bones receive translation scaling during retargeting;
-     * intermediate bones keep their native local translations to prevent
-     * leg-stretch artifacts in the two-bone IK solver.
-     */
-    bool isRootBone(int sourceBoneIndex) const {
-        if (!sourceSkeleton || sourceBoneIndex < 0 ||
-            sourceBoneIndex >= (int)sourceSkeleton->bones.size()) {
-            return false;
-        }
-        const std::string name = getBoneNameByIndex(*sourceSkeleton, sourceBoneIndex);
-        std::string lower = name;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        return lower == "root" || lower == "hips" ||
-               lower.find("root") != std::string::npos;
-    }
-    
     // =========================================================================
     // ANIMATION RETARGETING
     // =========================================================================
@@ -150,36 +130,19 @@ public:
             // No target bone - return identity
             return glm::mat4(1.0f);
         }
-
+        
         float scale = getBoneScale(sourceBoneIndex);
-        // Defensive per-bone cap: keep each joint's scale multiplier in a safe
-        // band so no single bone can push a leg segment outside the IK
-        // posture-relaxer's reach bounds (defense-in-depth beside the solver's
-        // 97% extension floor).
-        scale = glm::clamp(scale, 0.5f, 2.0f);
-
+        
         // Extract translation, rotation, scale from source
         glm::vec3 translation;
         glm::quat rotation;
         glm::vec3 boneScale;
         decomposeTransform(sourceTransform, translation, rotation, boneScale);
-
-        // ── Phase 1 (Retargeting): Isolate Joint Scaling ────────────────
-        // Only scale the root/hips translation to adjust ground velocity.
-        // Intermediate joints retain their original local translations so
-        // the two-bone IK solver's leg-length cache (L₁ + L₂) stays valid
-        // and legs don't stretch out under retargeting.
-        // (Previously: translation *= scale; boneScale *= scale; for ALL
-        //  bones — shifting intermediate joint centers and hyper-extending
-        //  the posture-spring relaxer.)
-        if (isRootBone(sourceBoneIndex)) {
-            translation *= scale;
-        }
-        // boneScale is left UNscaled for non-root joints — preserving the
-        // native local rig space that EvaluateNodeTRS / the IK solver expect.
-        // Root scale is still propagated so overall height is correct.
+        
+        // Apply retargeting scale
+        translation *= scale;
         boneScale *= scale;
-
+        
         // Recompose with target bone's bind pose
         return composeTransform(translation, rotation, boneScale);
     }
@@ -246,6 +209,7 @@ public:
 private:
     const Skeleton* sourceSkeleton{nullptr};
     const Skeleton* targetSkeleton{nullptr};
+    bool mismatched{false};            // true when source/target bone counts differ
     
     // Source bone index -> Target bone index
     std::vector<int> boneMap;
@@ -306,13 +270,6 @@ private:
         if (sourceSize > 0.001f && targetSize > 0.001f) {
             float globalScale = targetSize / sourceSize;
             
-            // Scale-boundary safeguard: clamp the retarget ratio so a wildly
-            // different source/target height can't inflate bone lengths past
-            // what the IK posture-spring relaxer (the 92-97% asymptotic knee
-            // bend in SolveLegIK) can absorb - keeping leg segments within
-            // native bounds and preventing stretch pops under retargeting.
-            globalScale = glm::clamp(globalScale, 0.5f, 2.0f);
-            
             // Apply global scale to all bones
             for (float& scale : boneScales) {
                 scale *= globalScale;
@@ -351,34 +308,32 @@ private:
     void decomposeTransform(const glm::mat4& m, glm::vec3& t, glm::quat& r, glm::vec3& s) const {
         // Extract translation
         t = glm::vec3(m[3][0], m[3][1], m[3][2]);
-        
-        // Extract scale (length of basis vectors)
+
+        // Extract scale (length of basis vectors) — column-major in GLM, so
+        // columns 0/1/2 are the basis vectors.
         s.x = glm::length(glm::vec3(m[0][0], m[0][1], m[0][2]));
         s.y = glm::length(glm::vec3(m[1][0], m[1][1], m[1][2]));
         s.z = glm::length(glm::vec3(m[2][0], m[2][1], m[2][2]));
-        
-        // Extract rotation
-        glm::mat4 rotationMatrix = m;
-        rotationMatrix[0][0] /= s.x; rotationMatrix[0][1] /= s.x; rotationMatrix[0][2] /= s.x;
-        rotationMatrix[1][0] /= s.y; rotationMatrix[1][1] /= s.y; rotationMatrix[1][2] /= s.y;
-        rotationMatrix[2][0] /= s.z; rotationMatrix[2][1] /= s.z; rotationMatrix[2][2] /= s.z;
-        
-        r = glm::quat_cast(rotationMatrix);
+
+        // Extract rotation by dividing out the scale, then normalise the basis
+        // vectors to guarantee a clean orthonormal rotation matrix (no shear).
+        glm::mat3 rotMatrix(1.0f);
+        rotMatrix[0] = glm::vec3(m[0][0], m[0][1], m[0][2]) / s.x;
+        rotMatrix[1] = glm::vec3(m[1][0], m[1][1], m[1][2]) / s.y;
+        rotMatrix[2] = glm::vec3(m[2][0], m[2][1], m[2][2]) / s.z;
+        rotMatrix[0] = glm::normalize(rotMatrix[0]);
+        rotMatrix[1] = glm::normalize(rotMatrix[1]);
+        rotMatrix[2] = glm::normalize(rotMatrix[2]);
+        r = glm::quat_cast(rotMatrix);
     }
     
     glm::mat4 composeTransform(const glm::vec3& t, const glm::quat& r, const glm::vec3& s) const {
-        glm::mat4 mat = glm::mat4(1.0f);
-        
-        // Apply scale
-        mat[0][0] = s.x; mat[1][1] = s.y; mat[2][2] = s.z;
-        
-        // Apply rotation
-        glm::mat4 rot = glm::mat4_cast(r);
-        mat = mat * rot;
-        
-        // Apply translation
-        mat[3][0] = t.x; mat[3][1] = t.y; mat[3][2] = t.z;
-        
+        // Use standard SRT order (T * R * S) so scale is applied in local space
+        // before rotation. The previous code computed S * R which applies scale
+        // in parent/world space, causing shear distortion with non-uniform scale.
+        glm::mat4 mat = glm::translate(glm::mat4(1.0f), t)
+                      * glm::mat4_cast(r)
+                      * glm::scale(glm::mat4(1.0f), s);
         return mat;
     }
 };
@@ -393,8 +348,7 @@ private:
     
     // Create retargeter
     SkeletonRetargeter retargeter;
-    retargeter.initialize(&sourceModel->GetSkeleton(), &targetModel->GetSkeleton(),
-                          targetAnimator);  // clears stale IK bone-length cache
+    retargeter.initialize(&sourceModel->GetSkeleton(), &targetModel->GetSkeleton());
     
     // Check mapping quality
     auto stats = retargeter.getStats();

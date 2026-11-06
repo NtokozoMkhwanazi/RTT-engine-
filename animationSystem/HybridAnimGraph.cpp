@@ -430,7 +430,7 @@ void HybridAnimGraph::ApplyLayerBlending(float dt) {
 
         // Additive blending
         // In a full implementation, this would use additive blend mode
-        animator->SetAnimationWeight(2, layer.currentWeight);  // Layer 2 = additive
+        animator->SetAnimationWeight(4, layer.currentWeight);  // Layer 4 = additive (isolated from UB 1-3)
     }
 }
 

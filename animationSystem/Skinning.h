@@ -123,8 +123,14 @@ inline void SkinVerticesSIMD(const std::vector<float>& bindVertices,
         if (wsum < 0.001f) {
             // Static vertex - keep the bind pose.
 #if defined(__GNUC__) && defined(__x86_64__)
-            __m256 v = _mm256_loadu_ps(s);   // unaligned - safe for std::vector<float>
-            _mm256_storeu_ps(d, v);
+            if (i < vertCount - 1) {
+                __m256 v = _mm256_loadu_ps(s);   // unaligned - safe for std::vector<float>
+                _mm256_storeu_ps(d, v);
+            } else {
+                // Safe scalar fallback for the final vertex to prevent
+                // _mm256_loadu_ps reading past the allocation boundary.
+                for (int k = 0; k < kFloatsPerVertex; ++k) d[k] = s[k];
+            }
 #else
             for (int k = 0; k < kFloatsPerVertex; ++k) d[k] = s[k];
 #endif
@@ -142,8 +148,12 @@ inline void SkinVerticesSIMD(const std::vector<float>& bindVertices,
             // No in-range bone contributed - the GL shader falls back to
             // identity (validSkin == false -> skin = mat4(1.0)), i.e. bind pose.
 #if defined(__GNUC__) && defined(__x86_64__)
-            __m256 v = _mm256_loadu_ps(s);
-            _mm256_storeu_ps(d, v);
+            if (i < vertCount - 1) {
+                __m256 v = _mm256_loadu_ps(s);
+                _mm256_storeu_ps(d, v);
+            } else {
+                for (int k = 0; k < kFloatsPerVertex; ++k) d[k] = s[k];
+            }
 #else
             for (int k = 0; k < kFloatsPerVertex; ++k) d[k] = s[k];
 #endif

@@ -396,12 +396,8 @@ void AnimationLayerSystem::ApplyLayerToAnimator(Animator* animator, const Animat
         sampledPose[boneIndex] = transform;
     }
 
-    // Get the current pose from the animator (base pose).
-    // FIX: Pull from globalBoneMatrices (un-skinned) instead of
-    // GetFinalBoneMatrices() (post-skinning). The post-skinned matrices
-    // have globalInverseTransform and bone.offset baked in — decomposing
-    // them destroys IK offsets (root snap/skate/floating on state transitions).
-    const std::vector<glm::mat4>& basePose = animator->globalBoneMatrices;
+    // Get the current pose from the animator (base pose)
+    const std::vector<glm::mat4>& basePose = animator->GetFinalBoneMatrices();
 
     // Blend sampled pose with base pose using bone mask and weight
     // For proper skeletal blending, blend TRS components separately
@@ -412,36 +408,46 @@ void AnimationLayerSystem::ApplyLayerToAnimator(Animator* animator, const Animat
             continue;
         }
 
-        // Decompose both matrices to TRS for proper blending
-        glm::vec3 baseScale, baseTranslation;
-        glm::quat baseRotation;
-        glm::vec3 baseSkew;
-        glm::vec4 basePerspective;
-        glm::decompose(basePose[i], baseScale, baseRotation, baseTranslation, baseSkew, basePerspective);
+        // Extract translation directly from the matrix's 4th column (W axis),
+        // which is always layout-identical regardless of scale/rotation content.
+        glm::vec3 finalTranslation = glm::mix(
+            glm::vec3(basePose[i][3]), glm::vec3(sampledPose[i][3]), weight);
 
-        glm::vec3 sampledScale, sampledTranslation;
-        glm::quat sampledRotation;
-        glm::vec3 sampledSkew;
-        glm::vec4 sampledPerspective;
-        glm::decompose(sampledPose[i], sampledScale, sampledRotation, sampledTranslation, sampledSkew, sampledPerspective);
+        // Extract non-uniform scale by measuring basis vector lengths.
+        glm::vec3 baseScale(
+            glm::length(glm::vec3(basePose[i][0])),
+            glm::length(glm::vec3(basePose[i][1])),
+            glm::length(glm::vec3(basePose[i][2]))
+        );
+        glm::vec3 sampledScale(
+            glm::length(glm::vec3(sampledPose[i][0])),
+            glm::length(glm::vec3(sampledPose[i][1])),
+            glm::length(glm::vec3(sampledPose[i][2]))
+        );
 
-        // Blend TRS components
-        glm::vec3 finalTranslation = glm::mix(baseTranslation, sampledTranslation, weight);
+        // Strip out scale to isolate pure orthonormal rotation vectors.
+        // glm::decompose is fragile with non-uniform scaling; normalising the
+        // 3x3 basis directly yields a clean rotation quaternion.
+        glm::mat3 rotMatrixBase(basePose[i]);
+        rotMatrixBase[0] = glm::normalize(rotMatrixBase[0]);
+        rotMatrixBase[1] = glm::normalize(rotMatrixBase[1]);
+        rotMatrixBase[2] = glm::normalize(rotMatrixBase[2]);
+        glm::quat baseRotation = glm::quat_cast(rotMatrixBase);
+
+        glm::mat3 rotMatrixSampled(sampledPose[i]);
+        rotMatrixSampled[0] = glm::normalize(rotMatrixSampled[0]);
+        rotMatrixSampled[1] = glm::normalize(rotMatrixSampled[1]);
+        rotMatrixSampled[2] = glm::normalize(rotMatrixSampled[2]);
+        glm::quat sampledRotation = glm::quat_cast(rotMatrixSampled);
+
         glm::quat finalRotation = glm::slerp(baseRotation, sampledRotation, weight);
         glm::vec3 finalScale = glm::mix(baseScale, sampledScale, weight);
 
-        // Rebuild final matrix in un-skinned global space
+        // Rebuild final matrix
         glm::mat4 finalMatrix = glm::translate(glm::mat4(1.0f), finalTranslation);
         finalMatrix *= glm::mat4_cast(finalRotation);
         finalMatrix *= glm::scale(glm::mat4(1.0f), finalScale);
 
-        // Write clean un-skinned matrix back to the animator and keep
-        // finalBoneMatrices in sync so skinning doesn't use stale data.
-        animator->globalBoneMatrices[i] = finalMatrix;
-        auto& finalMats = animator->GetFinalBoneMatricesMutable();
-        if (i < finalMats.size() && skeleton) {
-            finalMats[i] = skeleton->globalInverseTransform * finalMatrix * skeleton->bones[i].offset;
-        }
         blendedMatrices[i] = finalMatrix;
     }
 
@@ -518,24 +524,44 @@ void AnimationLayerSystem::ApplyAdditiveLayer(Animator* animator, const Animatio
         // Get reference pose (bind pose)
         glm::mat4 referencePose = skeleton->bones[i].bindTransform;
 
-        // Decompose matrices to TRS for proper additive blending
-        glm::vec3 baseScale, baseTranslation;
-        glm::quat baseRotation;
-        glm::vec3 baseSkew;
-        glm::vec4 basePerspective;
-        glm::decompose(basePose[i], baseScale, baseRotation, baseTranslation, baseSkew, basePerspective);
+        // Extract TRS without glm::decompose to avoid shear drift.
+        glm::vec3 baseScale(
+            glm::length(glm::vec3(basePose[i][0])),
+            glm::length(glm::vec3(basePose[i][1])),
+            glm::length(glm::vec3(basePose[i][2]))
+        );
+        glm::vec3 additiveScale(
+            glm::length(glm::vec3(additivePose[i][0])),
+            glm::length(glm::vec3(additivePose[i][1])),
+            glm::length(glm::vec3(additivePose[i][2]))
+        );
+        glm::vec3 refScale(
+            glm::length(glm::vec3(referencePose[0])),
+            glm::length(glm::vec3(referencePose[1])),
+            glm::length(glm::vec3(referencePose[2]))
+        );
 
-        glm::vec3 additiveScale, additiveTranslation;
-        glm::quat additiveRotation;
-        glm::vec3 additiveSkew;
-        glm::vec4 additivePerspective;
-        glm::decompose(additivePose[i], additiveScale, additiveRotation, additiveTranslation, additiveSkew, additivePerspective);
+        glm::vec3 baseTranslation = glm::vec3(basePose[i][3]);
+        glm::vec3 additiveTranslation = glm::vec3(additivePose[i][3]);
+        glm::vec3 refTranslation = glm::vec3(referencePose[3]);
 
-        glm::vec3 refScale, refTranslation;
-        glm::quat refRotation;
-        glm::vec3 refSkew;
-        glm::vec4 refPerspective;
-        glm::decompose(referencePose, refScale, refRotation, refTranslation, refSkew, refPerspective);
+        glm::mat3 rotBase(basePose[i]);
+        rotBase[0] = glm::normalize(rotBase[0]);
+        rotBase[1] = glm::normalize(rotBase[1]);
+        rotBase[2] = glm::normalize(rotBase[2]);
+        glm::quat baseRotation = glm::quat_cast(rotBase);
+
+        glm::mat3 rotAdd(additivePose[i]);
+        rotAdd[0] = glm::normalize(rotAdd[0]);
+        rotAdd[1] = glm::normalize(rotAdd[1]);
+        rotAdd[2] = glm::normalize(rotAdd[2]);
+        glm::quat additiveRotation = glm::quat_cast(rotAdd);
+
+        glm::mat3 rotRef(referencePose);
+        rotRef[0] = glm::normalize(rotRef[0]);
+        rotRef[1] = glm::normalize(rotRef[1]);
+        rotRef[2] = glm::normalize(rotRef[2]);
+        glm::quat refRotation = glm::quat_cast(rotRef);
 
         // Calculate additive offset (additive - reference)
         glm::vec3 positionOffset = additiveTranslation - refTranslation;

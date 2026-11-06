@@ -407,7 +407,7 @@ glm::mat4 AnimationRetargeting::MapBoneTransform(
     }
     
     // Step 5: Apply relative transform to target bind pose
-    glm::quat finalRotation = relativeRotation * targetBindRotation;
+    glm::quat finalRotation = targetBindRotation * relativeRotation;
     glm::vec3 finalScale;
     for (int i = 0; i < 3; i++) {
         finalScale[i] = relativeScale[i] * targetBindScale[i];

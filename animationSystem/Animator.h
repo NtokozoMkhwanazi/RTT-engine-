@@ -44,6 +44,8 @@ public:
     
     // Time control
     void SetCurrentTime(float time);
+    // Rewind: reset the current animation time to the start (0.0f)
+    void Rewind() { SetCurrentTime(0.0f); }
     float GetCurrentTime() const { return animatorTime; }
 
     void Update(float dt);
@@ -63,36 +65,20 @@ public:
     // so the knee bend carries the foot down instead. Run AFTER bone eval,
     // BEFORE UpdateFootIK, using the previous frame's IK targets.
     void CalculatePelvisAdjustment(float dt, const glm::mat4& modelMatrix);
+    // Set the model matrix used by the clean reference pass inside Update()
+    // so CalculatePelvisAdjustment can transform bone positions to world space.
+    void SetModelMatrix(const glm::mat4& mm) { latestModelMatrix = mm; }
     float getPelvisDropY() const { return currentPelvisDropY; }
-    float getPelvisDropVelocity() const { return pelvisDropVelocity; }
     float getLeftLegReach()  const { return dynamicLeftLegLength;  }
     float getRightLegReach() const { return dynamicRightLegLength; }
     float getIKWorldScale()  const { return ikWorldScale; }
-
-    // ---- VELOCITY-ROBUST RELEASES ----
-    // Feed the character's horizontal world velocity to the animator so the
-    // IK / over-stride release logic can scale its release thresholds with
-    // body speed (prevents false releases on high-speed turns where the hip
-    // swings further past the planted foot naturally).
-    void SetCharacterVelocity(const glm::vec3& velocity) {
-        characterVelocity = velocity;
-    }
-
-    // ---- Structural Motion Graph: Transition clip playback ----
-    // Previously, walk→crouch transitions used runtime patches:
-    //   - SetInertialStatureOffset() — held pelvis up during database swap
-    //   - ApplyStaturePoseBlend() — blended leg bone shapes from walk→crouch
-    //   - ClearStaturePoseBlend() — released the blend on completion
-    // These are REMOVED. Transitions are now pre-computed as smooth blend
-    // clips (TransitionClipGenerator) that structurally handle all-joint
-    // slerp + 2D alignment + height differences at load time.
+    const glm::mat4& getModelMatrix() const { return latestModelMatrix; }
 
     void UploadToTexture(GLuint texID);
     void Upload(Shader &shader);
 
     // -------- FOOT LOCKING / IK --------
     void AddIKOffset(int bone, const glm::vec3 &offset, float weight);
-    void AddRootRotationOffset(const glm::quat& rot);  // quintic inertialization root rot
     bool IsFootPlanted(int bone) const;
     bool IsCharacterGrounded() const;  // Check if character has at least one foot planted
     glm::vec3 GetBoneWorldPosition(int bone, const glm::mat4 &modelMat) const;
@@ -122,7 +108,7 @@ public:
         // frames (~3 frames at 60fps) is far shorter than a real stance and
         // longer than a passing slow swing, so only a foot that is genuinely
         // settled on the ground locks.
-        int footLockConfirmFrames = 5;
+        int footLockConfirmFrames = 8;
         int leftFootBone = -1;
         int rightFootBone = -1;
         int leftToeBone = -1;
@@ -219,10 +205,6 @@ public:
 
     const std::vector<glm::mat4> &GetFinalBoneMatrices() const;
 
-    // Mutable accessor for layer blending / batched uploads that need to write
-    // back blended bone matrices (kept in sync with globalBoneMatrices).
-    std::vector<glm::mat4> &GetFinalBoneMatricesMutable() { return finalBoneMatrices; }
-
     // =========================================================================
     // BONE MATRIX BUFFER (UBO/SSBO) - PREFERRED METHOD
     // =========================================================================
@@ -255,6 +237,10 @@ public:
      * Check if bone buffer is available
      */
     bool HasBoneBuffer() const { return boneBuffer != nullptr && boneBuffer->IsInitialized(); }
+    // forUI.txt Anim Block 3: exposes the live skinning vertex buffer handle
+    // for VRAM-interface / bone-limit telemetry.
+    BoneMatrixBuffer* GetBoneBuffer() { return boneBuffer.get(); }
+    const BoneMatrixBuffer* GetBoneBuffer() const { return boneBuffer.get(); }
     
     /**
      * Get bone buffer statistics
@@ -430,19 +416,24 @@ private:
 
 public: // temporarily for debug purposes
     std::vector<glm::mat4> globalBoneMatrices;
+    // Raw (no-IK) global bone matrices captured during the clean reference
+    // pass in Update(). SolveLegIK uses these for the local-frame rotation
+    // conversion (Rb⁻¹ * Rswing * Rb), since it needs the bone's NO-IK world
+    // rotation as the base — NOT the with-IK matrices, which would bake in
+    // stale IK and reintroduce the matrix-bleed jitter.
+    std::vector<glm::mat4> rawGlobalBoneMatrices;
     // -------- FOOT STATE --------
     std::vector<glm::vec3> prevBoneWorldPos;
     std::vector<glm::vec3> currBoneWorldPos;
+    // Raw (pristine, no-IK) bone world positions from the clean reference pass
+    // in Update(). Saved so SolveLegIK can read stable joint positions without
+    // the inverse-matrix reconstruction that introduced floating-point bleed.
+    std::vector<glm::vec3> rawModelPositions;
     std::vector<glm::vec3> ikOffsets;
     std::vector<glm::mat4> ikRotations;  // per-bone LOCAL-frame knee-bend rotations (two-bone IK)
     // Per-bone ground-normal tilt quat (foot bones only; identity elsewhere).
     // Set in UpdateFootIK per planted foot; applied to the ankle ikXform so feet
     // hug slopes (todo Part 3, Option A).
-    // Root rotation offset quaternion (for quintic inertialization). Applied
-    // after translation in EvaluateNode so the root bone rotates smoothly
-    // during state transitions — eliminates the "snap" when the old pose and
-    // new pose face different headings.
-    glm::quat rootQuatOffset{1.0f, 0.0f, 0.0f, 0.0f};
     std::vector<glm::quat> ikFootTilt;
 
     // -------- FOOT IK STATE --------
@@ -481,15 +472,17 @@ private:                                  // temporarily
     std::set<AnimationEventTrigger> animationEvents;
     AnimationEventCallback eventCallback;
 
-    // Animation blending improvements
+    // Animation blending improvements — the perf / compression / cache controls
+    // below are exposed publicly so the editor Details-panel (forUI.txt) can
+    // drive them live; the data members they mutate stay private.
+public:
     void UpdateAnimationBlending(float dt);
     
     // Performance optimizations
     void SetCachingEnabled(bool enabled) { useCaching = enabled; }
-public:
-    // Public so retargeting/scaling can invalidate Animator IK state (see
-    // SkeletonRetargeter::initialize). Resets animation caches AND the cached
-    // L1+L2 leg-reach lengths so the IK solver re-derives limb reach.
+    // forUI.txt Anim Block 3: readback for the "Freeze Immutable Evaluation Cache"
+    // checkbox (the setter already exists above).
+    bool IsCachingEnabled() const { return useCaching; }
     void ClearCache();
     
     // Animation compression utilities
@@ -513,19 +506,18 @@ private:
     // Empty on the engine/headless path -> feet stay flat (no tilt).
     std::function<float(float,float)> m_terrainFn;
 
+    // Latest model matrix (set by caller before Update()). Used inside Update's
+    // clean reference pass to transform bone positions to world space for the
+    // pelvis-reach comparison in CalculatePelvisAdjustment. Without this,
+    // CalculatePelvisAdjustment is called with identity, causing a model-space
+    // vs world-space mismatch against the IK target positions.
+    glm::mat4 latestModelMatrix = glm::mat4(1.0f);
+
     // ---- PELVIS HEIGHT ADJUSTMENT (knee-bend fix) ----
     // Smoothed world-space pelvis drop (negative = down). Applied as a local-Y
     // translation on the "Hips" bone in EvaluateNode / EvaluateNodeTRS / the
     // TRS blend compose lambda, so it propagates down both leg chains.
     float currentPelvisDropY = 0.0f;
-    // Velocity of the pelvis drop itself — tracked so the non-linear spring
-    // envelope in CalculatePelvisAdjustment has a proper critically-damped
-    // state with velocity, not just a positional lerp.
-    float pelvisDropVelocity = 0.0f;
-    // Character's horizontal world velocity, fed in by MotionMatcher before
-    // the IK / pelvis passes so the over-stride release can be made
-    // velocity-robust.
-    glm::vec3 characterVelocity{0.0f};
     // Pelvis drop sampled during the frame's FIRST skeleton pass (the value of
     // currentPelvisDropY when evaluateBoneMatrices ran inside Update). Paired
     // with currentPelvisDropY (the final revalidation pass) by SolveLegIK to

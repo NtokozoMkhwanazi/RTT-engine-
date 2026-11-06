@@ -1,4 +1,5 @@
 #include "BoneMatrixBuffer.h"
+#include "gl_context_lifecycle.h"   // glctx::isAlive() - skip GL teardown after glfwTerminate
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -73,6 +74,11 @@ void BoneMatrixBuffer::SelectBufferType(size_t requestedBones) {
 }
 
 bool BoneMatrixBuffer::Initialize(size_t maxBones, const BoneBufferConfig& cfg) {
+    if (maxBones == 0 || maxBones > kHardMaxBones) {
+        std::cerr << "[BoneMatrixBuffer] Refusing bone count " << maxBones
+                  << " (hard cap " << kHardMaxBones << ")\n";
+        return false;
+    }
     if (initialized) {
         std::cerr << "[BoneMatrixBuffer] Already initialized!\n";
         return false;
@@ -122,11 +128,16 @@ bool BoneMatrixBuffer::Initialize(size_t maxBones, const BoneBufferConfig& cfg) 
 }
 
 void BoneMatrixBuffer::Shutdown() {
-    if (buffer != 0) {
+    // GL calls are undefined after the context is torn down. ModelRegistry is a
+    // static singleton destroyed via atexit *after* glfwTerminate (see
+    // gl_context_lifecycle.h), and skinned models (e.g. Shaw.fbx geo NPCs) own
+    // a BoneMatrixBuffer as a Model member -> ~BoneMatrixBuffer runs here at
+    // exit. Guard the delete exactly like Model::~Model's texture cleanup.
+    if (buffer != 0 && glctx::isAlive()) {
         glDeleteBuffers(1, &buffer);
-        buffer = 0;
     }
-    
+    buffer = 0;
+
     bufferType = BoneBufferType::NONE;
     maxBoneCount = 0;
     currentBoneCount = 0;
@@ -155,8 +166,9 @@ bool BoneMatrixBuffer::Update(const std::vector<glm::mat4>& boneMatrices, bool f
 
     // Check capacity
     if (boneMatrices.size() > maxBoneCount) {
-        std::cerr << "[BoneMatrixBuffer] Too many bones: " << boneMatrices.size() 
+        std::cerr << "[BoneMatrixBuffer] Too many bones: " << boneMatrices.size()
                   << " > " << maxBoneCount << "!\n";
+        ++stats.rejectionCount;   // mismatched FBX skeleton (observe the guard)
         return false;
     }
 
@@ -206,8 +218,9 @@ bool BoneMatrixBuffer::UpdateRaw(const float* matrices, size_t count) {
 
     // Check capacity
     if (count > maxBoneCount) {
-        std::cerr << "[BoneMatrixBuffer] Too many bones: " << count 
+        std::cerr << "[BoneMatrixBuffer] Too many bones: " << count
                   << " > " << maxBoneCount << "!\n";
+        ++stats.rejectionCount;   // mismatched FBX skeleton (observe the guard)
         return false;
     }
 
@@ -284,6 +297,7 @@ bool BoneMatrixBuffer::UpdateBatched(
         std::cerr << "[BoneMatrixBuffer] Batched bone count " << newCount
                   << " exceeds buffer capacity " << maxBoneCount
                   << " (Initialize() a shared buffer sized for the full frame)\n";
+        ++stats.rejectionCount;   // mismatched FBX skeleton (observe the guard)
         return false;
     }
 
@@ -327,6 +341,11 @@ void BoneMatrixBuffer::Bind(GLuint bindingPoint) const {
         // drivers when the buffer is smaller than the declared array.
         size_t size = ((currentBoneCount * 64 + 255) / 256) * 256;
         if (size == 0) size = 64;
+        // Clamp to the shader-declared block size (maxBoneCount * 64 bytes).
+        // The alignment round-up above can exceed the shader's uniform array
+        // declaration on strict drivers, triggering GL_INVALID_OPERATION.
+        size_t maxSize = maxBoneCount * 64;
+        if (size > maxSize) size = maxSize; // Keep the buffer size within shader declaration limits
         glBindBufferRange(GL_UNIFORM_BUFFER, bindingPoint, buffer, 0, size);
     } else {
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, bindingPoint, buffer);
@@ -336,15 +355,10 @@ void BoneMatrixBuffer::Bind(GLuint bindingPoint) const {
 }
 
 void BoneMatrixBuffer::Unbind() const {
-    // FIX: Was unbinding binding point 0, which left the shader reading from
-    // binding point 3 (BONE_BUFFER_BINDING) still pointing at the stale buffer.
-    // This could cause the character to fall back to T-pose when a stale buffer
-    // was accidentally rebound, or to read garbage matrices after a model
-    // switch.  Now unbinds the CORRECT binding point.
     if (bufferType == BoneBufferType::UBO) {
-        glBindBufferBase(GL_UNIFORM_BUFFER, BONE_BUFFER_BINDING, 0);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 0, 0);
     } else {
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BONE_BUFFER_BINDING, 0);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
     }
 }
 

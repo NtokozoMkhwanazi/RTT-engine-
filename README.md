@@ -53,7 +53,8 @@ GPU profiler and GPS simulation) and runs its main loop.
   <img width="400" height="225" alt="2026-11-05 17-59-47" src="https://github.com/user-attachments/assets/7b51f224-556b-4a71-9171-64b202b3a42e" />
 
 (Engine core) Legacy tests
-<img width="400" height="225" alt="test4(1)" src="https://github.com/user-attachments/assets/593200b7-430f-4294-b564-c2b10f05888d" />
+
+  <img width="400" height="225" alt="test4(1)" src="https://github.com/user-attachments/assets/593200b7-430f-4294-b564-c2b10f05888d" />
 
 ---
 ## ✨ Features

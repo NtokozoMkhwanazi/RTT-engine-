@@ -1,4 +1,5 @@
 #include "Skybox.h"
+#include <GLFW/glfw3.h>   // glfwGetCurrentContext (verify.txt: shutdown context guard)
 #include <iostream>
 #include "stb_image.h"
 #include "lighting/LightingEnvironment.h"   // canonical sky tint + sun direction
@@ -130,6 +131,15 @@ unsigned int Skybox::loadCubemap(const std::vector<std::string>& faces) {
     return texID;
 }
 
+// forUI.txt Pillar 1: hot-swap the day cubemap. Deletes the old GL texture first
+// so repeated swaps do not leak GPU memory, then re-uploads all 6 faces.
+// (PBR diffuse-irradiance re-bake is intentionally stubbed: the skybox tint is
+//  driven by LightingEnvironment's env fields, which the atmosphere panel edits.)
+void Skybox::UpdateSkyboxTexture(const std::vector<std::string>& facePaths) {
+    if (dayTexture != 0) glDeleteTextures(1, &dayTexture);
+    dayTexture = loadCubemap(facePaths);
+}
+
 void Skybox::update(float dt) {
     blend += dt*0.05f;  // slow transition
     if(blend>1.0f) blend=0.0f;
@@ -148,15 +158,7 @@ void Skybox::render(const glm::mat4& view, const glm::mat4& projection,
         std::cerr << "[Skybox] Re-initialized cube (vao was 0)\n" << std::endl;
     }
 
-    // Render the skybox as a true background, drawn first (renderScene runs
-    // before worldManager.render). Depth WRITES must be off: the unit skybox
-    // cube is held at the camera via viewNoTrans, so with depth writes ON its
-    // near-facing faces sit at the near depth and fill the depth buffer, which
-    // then fails the terrain / scene depth test — the skybox appears ON THE
-    // FLOOR, blocking the terrain. Masking depth off keeps the sky behind the
-    // scene: geometry drawn afterward overwrites it wherever it exists.
     glDepthFunc(GL_LEQUAL);
-    glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
 
     shader->use();
@@ -188,30 +190,16 @@ void Skybox::render(const glm::mat4& view, const glm::mat4& projection,
         glBindVertexArray(0);
     }
 
-    // Unbind the cube-map textures + reset the active texture unit to 0.
-    // Skybox binds day/night cubemaps to units 0/1; if they are left bound, the
-    // NEXT draw call (terrain splat / glTF models rendered afterwards) samples a
-    // skybox *cube map* on a unit it expects to hold a 2D texture -> the terrain
-    // and boulders inherit the skybox colors ("skybox textures attach to the
-    // terrain", white boulders). The depth-mask fix above keeps the cube behind
-    // geometry, but WITHOUT this unbind the colors still bleed. Reset unit 0/1
-    // to "no texture" so the following render pass binds its own 2D textures
-    // cleanly.
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
-    glActiveTexture(GL_TEXTURE0);
-
-    // Restore depth writes + func for the opaque scene drawn next frame.
-    glDepthMask(GL_TRUE);
-    glDepthFunc(GL_LESS);
-
     glDepthFunc(GL_LESS);
     glEnable(GL_CULL_FACE);
 }
 
 void Skybox::cleanup() {
+    // verify.txt Fix: if there is no current GL context (static teardown,
+    // std::exit, abort), the glDelete* calls below would segfault at exit.
+    // Guarding here also makes Skybox::~Skybox() safe, since it delegates to
+    // cleanup().
+    if (glfwGetCurrentContext() == nullptr) return;
     if (vao) {
         glDeleteVertexArrays(1, &vao);
         vao = 0;

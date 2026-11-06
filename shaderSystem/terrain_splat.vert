@@ -45,6 +45,7 @@ uniform vec3 uViewPos;
 uniform sampler2D uHeightMap;
 uniform vec2 uHeightMapSize;
 uniform float uTexScale;
+uniform float uHeightScale;   // world-Y range of the heightmap (for FS POM normalization; VS displacement uses the CPU-scaled texture directly)
 
 // World XZ (meters) -> heightmap UV in [0,1]. Mirrors the CPU bilinear sampler
 // in TerrainChunk.h (terrain::worldToTexel + sampleHeightBilinear).
@@ -75,8 +76,13 @@ vec3 terrainNormal(vec2 worldXZ) {
 
 void main() {
     vec2 worldXZ = aPos.xz;
+    // Heightmap texture already contains world-Y in metres (the CPU remaps the
+    // authored [0,1] data to [0, heightScale] before upload — see
+    // loadHeightmap() lines 443-449). So sampleHeight() returns the final
+    // world-Y directly; no extra scaling needed here. uHeightScale is used by
+    // the fragment shader to NORMALIZE [0, heightScale] -> [0,1] for POM.
     float h = sampleHeight(worldXZ);
-    vec3 worldPos = vec3(worldXZ.x, h, worldXZ.y);  // worldXZ.y == world z
+    vec3 worldPos = vec3(worldXZ.x, h, worldXZ.y);
 
     vWorldPos    = worldPos;
     vWorldNormal = terrainNormal(worldXZ);

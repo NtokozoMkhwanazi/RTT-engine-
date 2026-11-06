@@ -14,6 +14,17 @@ class Shader
 public:
     unsigned int ID;
 
+    // True once glLinkProgram() succeeded for the most recently constructed
+    // program. checkCompileErrors() sets this in its PROGRAM branch.
+    //
+    // This exists because `ID != 0` is NOT a link-success signal: glCreateProgram()
+    // always returns a non-zero handle even when linking fails (checkCompileErrors
+    // only logs the failure). Callers that previously treated `ID != 0` as
+    // "ready" (e.g. terrainSplatLoad) silently used a broken program, which made
+    // terrain render invisible with no fallback and no GL error. Prefer
+    // isLinked() over raw ID checks for link/readiness decisions.
+    bool isLinked() const { return m_linked; }
+
     // Constructor (from file paths)
     Shader(const char* vertexPath, const char* fragmentPath);
 
@@ -45,6 +56,9 @@ private:
 
     // Cached uniform locations (populated on first use)
     mutable std::unordered_map<std::string, GLint> m_uniformLocations;
+
+    // Set by checkCompileErrors() in its PROGRAM branch to reflect GL_LINK_STATUS.
+    bool m_linked = false;
 };
 
 #endif // SHADER_H

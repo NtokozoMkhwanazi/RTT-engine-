@@ -77,6 +77,10 @@ Shader::Shader(const char* vertexPath, const char* fragmentPath)
     glDeleteShader(fragment);
 }
 
+// ------------------------------------------------------------
+// Constructor (4 stages: vertex + tessellation control +
+// tessellation evaluation + fragment)
+// ------------------------------------------------------------
 Shader::Shader(const char* vertexPath, const char* tessCtrlPath,
                const char* tessEvalPath, const char* fragmentPath)
     : ID(0)
@@ -91,7 +95,6 @@ Shader::Shader(const char* vertexPath, const char* tessCtrlPath,
     std::ifstream teShaderFile;
     std::ifstream fShaderFile;
 
-    // Ensure ifstream objects can throw exceptions
     vShaderFile.exceptions(std::ifstream::failbit | std::ifstream::badbit);
     tcShaderFile.exceptions(std::ifstream::failbit | std::ifstream::badbit);
     teShaderFile.exceptions(std::ifstream::failbit | std::ifstream::badbit);
@@ -99,7 +102,6 @@ Shader::Shader(const char* vertexPath, const char* tessCtrlPath,
 
     try
     {
-        // Open files
         vShaderFile.open(vertexPath);
         tcShaderFile.open(tessCtrlPath);
         teShaderFile.open(tessEvalPath);
@@ -116,18 +118,18 @@ Shader::Shader(const char* vertexPath, const char* tessCtrlPath,
         teShaderFile.close();
         fShaderFile.close();
 
-        vertexCode     = vShaderStream.str();
-        tessCtrlCode   = tcShaderStream.str();
-        tessEvalCode   = teShaderStream.str();
-        fragmentCode   = fShaderStream.str();
+        vertexCode   = vShaderStream.str();
+        tessCtrlCode = tcShaderStream.str();
+        tessEvalCode = teShaderStream.str();
+        fragmentCode = fShaderStream.str();
     }
     catch (std::ifstream::failure&)
     {
-        std::cerr << "ERROR::SHADER::FILE_NOT_SUCCESSFULLY_READ (4-stage)\n";
-        std::cerr << "Vertex Path:     " << vertexPath     << "\n";
-        std::cerr << "TessCtrl Path:   " << tessCtrlPath   << "\n";
-        std::cerr << "TessEval Path:   " << tessEvalPath   << "\n";
-        std::cerr << "Fragment Path:   " << fragmentPath   << "\n";
+        std::cerr << "ERROR::SHADER::FILE_NOT_SUCCESSFULLY_READ\n";
+        std::cerr << "Vertex Path:   " << vertexPath << "\n";
+        std::cerr << "TessCtrl Path: " << tessCtrlPath << "\n";
+        std::cerr << "TessEval Path: " << tessEvalPath << "\n";
+        std::cerr << "Fragment Path: " << fragmentPath << "\n";
         return;
     }
 
@@ -136,58 +138,40 @@ Shader::Shader(const char* vertexPath, const char* tessCtrlPath,
     const char* teShaderCode  = tessEvalCode.c_str();
     const char* fShaderCode   = fragmentCode.c_str();
 
-    // ------------------------------------------------------------
-    // Compile Vertex Shader
-    // ------------------------------------------------------------
     unsigned int vertex = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vertex, 1, &vShaderCode, nullptr);
     glCompileShader(vertex);
     checkCompileErrors(vertex, "VERTEX");
 
-    // ------------------------------------------------------------
-    // Compile Tessellation Control Shader
-    // ------------------------------------------------------------
-    unsigned int tessControl = glCreateShader(GL_TESS_CONTROL_SHADER);
-    glShaderSource(tessControl, 1, &tcShaderCode, nullptr);
-    glCompileShader(tessControl);
-    checkCompileErrors(tessControl, "TESS_CONTROL");
+    unsigned int tessCtrl = glCreateShader(GL_TESS_CONTROL_SHADER);
+    glShaderSource(tessCtrl, 1, &tcShaderCode, nullptr);
+    glCompileShader(tessCtrl);
+    checkCompileErrors(tessCtrl, "TESS_CONTROL");
 
-    // ------------------------------------------------------------
-    // Compile Tessellation Evaluation Shader
-    // ------------------------------------------------------------
     unsigned int tessEval = glCreateShader(GL_TESS_EVALUATION_SHADER);
     glShaderSource(tessEval, 1, &teShaderCode, nullptr);
     glCompileShader(tessEval);
     checkCompileErrors(tessEval, "TESS_EVALUATION");
 
-    // ------------------------------------------------------------
-    // Compile Fragment Shader
-    // ------------------------------------------------------------
     unsigned int fragment = glCreateShader(GL_FRAGMENT_SHADER);
     glShaderSource(fragment, 1, &fShaderCode, nullptr);
     glCompileShader(fragment);
     checkCompileErrors(fragment, "FRAGMENT");
 
-    // ------------------------------------------------------------
-    // Shader Program (4 stages)
-    // ------------------------------------------------------------
     ID = glCreateProgram();
     glAttachShader(ID, vertex);
-    glAttachShader(ID, tessControl);
+    glAttachShader(ID, tessCtrl);
     glAttachShader(ID, tessEval);
     glAttachShader(ID, fragment);
     glLinkProgram(ID);
     checkCompileErrors(ID, "PROGRAM");
 
     glDeleteShader(vertex);
-    glDeleteShader(tessControl);
+    glDeleteShader(tessCtrl);
     glDeleteShader(tessEval);
     glDeleteShader(fragment);
 }
 
-// ------------------------------------------------------------
-// Constructor (from raw source strings)
-// ------------------------------------------------------------
 Shader::Shader(const std::string& vertexSource, const std::string& fragmentSource, bool fromString)
 {
     (void)fromString;
@@ -220,7 +204,13 @@ Shader::Shader(const std::string& vertexSource, const std::string& fragmentSourc
 // ------------------------------------------------------------
 void Shader::use() const
 {
-    if (ID != 0) {
+    // Don't glUseProgram() a program that failed to link. glUseProgram on a
+    // non-linked program is a no-op that emits GL_INVALID_OPERATION, so a
+    // broken shader would silently draw nothing every frame (the exact cause
+    // of "terrain invisible despite loaded"). Gating on m_linked makes a
+    // link failure explicit: the caller gets no shader bound rather than a
+    // silently-invalid draw. (Callers should also check isLinked() before use.)
+    if (ID != 0 && m_linked) {
         glUseProgram(ID);
     }
 }
@@ -286,6 +276,7 @@ void Shader::checkCompileErrors(unsigned int shader, const std::string& type)
     else
     {
         glGetProgramiv(shader, GL_LINK_STATUS, &success);
+        m_linked = (success != 0);
         if (!success)
         {
             glGetProgramInfoLog(shader, 1024, nullptr, infoLog);

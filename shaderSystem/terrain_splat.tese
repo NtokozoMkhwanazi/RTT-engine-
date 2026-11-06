@@ -35,6 +35,7 @@ uniform vec3 uViewPos;
 uniform sampler2D uHeightMap;
 uniform vec2 uHeightMapSize;   // heightmap texel dims (== world extent in metres)
 uniform float uTexScale;       // metres per detail tile (for vWorldUV)
+uniform float uHeightScale;    // world-Y range of the heightmap (for FS POM normalization; displacement uses the CPU-scaled texture directly)
 
 // World XZ (metres) -> heightmap UV in [0,1]. Mirrors toHeightUV() in the VS.
 vec2 toHeightUV(vec2 worldXZ) {
@@ -62,7 +63,9 @@ void main() {
                  + gl_TessCoord.y * tcWorldPos[1].xz
                  + gl_TessCoord.z * tcWorldPos[2].xz;
 
-    // Re-displace at subdivided density for smooth geometry.
+    // Heightmap texture already contains world-Y in metres (CPU remap
+    // [0,1] -> [0, heightScale] before upload). No extra scaling needed;
+    // uHeightScale is for the fragment shader's POM normalization only.
     float h = sampleHeight(worldXZ);
     vec3 worldPos = vec3(worldXZ.x, h, worldXZ.y);
 

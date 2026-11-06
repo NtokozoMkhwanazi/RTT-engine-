@@ -360,6 +360,22 @@ vec2 CalculateTerrainPOM(vec2 detailUV, vec3 viewDirWorld, float heightScale, fl
 // Main
 // ----------------------------------------------------------------------------
 void main() {
+    // ============================================================================
+    // UNDER-TERRAIN WATER LAYER OCCLUSION CULLING (forUI.txt §B)
+    // ---------------------------------------------------------------------------
+    if (uWaterLevel > 0.001) {
+        // Evaluate depth immersion below the sea-level bounds.
+        float immersionDepth = uWaterLevel - vWorldPos.y;
+        if (immersionDepth > 12.0) {
+            // Fragment sits deeper than 12 world meters beneath the water surface;
+            // only cull when the camera is looking down into the submerged bed.
+            vec3 V = normalize(vViewDir);
+            if (V.y < -0.05) {
+                discard; // terminate the pixel pipeline, bypassing triplanar/PBR work
+            }
+        }
+    }
+
     float height = vWorldPos.y;
     vec3  Ngeom  = normalize(vWorldNormal);
     float slope  = 1.0 - Ngeom.y;                 // 0 flat, 1 vertical

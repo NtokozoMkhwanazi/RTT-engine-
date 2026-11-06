@@ -19,7 +19,11 @@ static bool g_splatTried = false;
 static bool g_tessLoaded = false;   // true when the 4-stage (VS+TCS+TES+FS) program linked
 
 Shader* terrainSplatLoad() {
-    if (g_splatTried) return g_splatShader.get();
+    if (g_splatTried) {
+        // g_splatTried is sticky, but only hand back a linked program; a
+        // previously-loaded-but-broken program must not be re-reported as good.
+        return (g_splatShader && g_splatShader->isLinked()) ? g_splatShader.get() : nullptr;
+    }
     g_splatTried = true;
 
     // --- Attempt the full 4-stage pipeline (vertex displacement + POM +
@@ -27,22 +31,40 @@ Shader* terrainSplatLoad() {
     //     the program fails to link (e.g. driver without GL 4.3 tessellation,
     //     or a shader error), fall back to the plain VS+FS path — vertex
     //     displacement + POM still apply, tessellation is simply skipped.
+    //
+    // NOTE: we test isLinked(), NOT `ID != 0`. glCreateProgram() always
+    // returns a non-zero handle even on link failure, and checkCompileErrors
+    // only logs — so the old `tess->ID != 0` check was true even for a
+    // broken program, which made the VS+FS fallback (and thus the terrain)
+    // unreachable and the terrain rendered invisible under GL_PATCHES against
+    // a non-linked program (glUseProgram -> GL_INVALID_OPERATION, no pixels).
+    // Keep the resolved path strings alive for the lifetime of the Shader
+    // constructions below. Config::getShaderPath() returns by value (a
+    // temporary std::string); binding its .c_str() to a const char* would dangle
+    // once the temporary is destroyed at the end of the statement, causing the
+    // Shader file-loader to read freed memory (seen as a garbled path /
+    // FILE_NOT_SUCCESSFULLY_READ) and silently disabling the splat path.
+    const std::string vsPath  = Config::getShaderPath("terrain_splat.vert");
+    const std::string tcsPath = Config::getShaderPath("terrain_splat.tesc");
+    const std::string tesPath = Config::getShaderPath("terrain_splat.tese");
+    const std::string fsPath  = Config::getShaderPath("terrain_splat.frag");
     try {
-        auto tess = std::make_unique<Shader>(
-            Config::getShaderPath("terrain_splat.vert").c_str(),
-            Config::getShaderPath("terrain_splat.tesc").c_str(),
-            Config::getShaderPath("terrain_splat.tese").c_str(),
-            Config::getShaderPath("terrain_splat.frag").c_str());
+        auto tess = std::make_unique<Shader>(vsPath.c_str(), tcsPath.c_str(),
+                                             tesPath.c_str(), fsPath.c_str());
 
-        if (tess && tess->ID != 0) {
+        if (tess && tess->isLinked()) {
             std::cerr << "[TerrainSplat] loaded 4-stage pipeline (VS+TCS+TES+FS)\n";
             g_splatShader = std::move(tess);
             g_tessLoaded = true;
         } else {
-            std::cerr << "[TerrainSplat] tessellation link unavailable, falling back to VS+FS\n";
-            g_splatShader = std::make_unique<Shader>(
-                Config::getShaderPath("terrain_splat.vert").c_str(),
-                Config::getShaderPath("terrain_splat.frag").c_str());
+            std::cerr << "[TerrainSplat] 4-stage program failed to link (or a "
+                         "stage file was unreadable), falling back to VS+FS\n";
+            auto vsfs = std::make_unique<Shader>(vsPath.c_str(), fsPath.c_str());
+            if (vsfs && vsfs->isLinked()) {
+                g_splatShader = std::move(vsfs);
+                g_tessLoaded = false;
+            }
+            // else: leave g_splatShader null -> render() drops to the legacy path
         }
     } catch (const std::exception& e) {
         std::cerr << "[TerrainSplat] failed to load shader: " << e.what() << "\n";
@@ -50,8 +72,8 @@ Shader* terrainSplatLoad() {
     }
 
     Shader* sh = g_splatShader.get();
-    if (!sh || sh->ID == 0) {
-        std::cerr << "[TerrainSplat] shader did not link (ID==0)\n";
+    if (!sh || !sh->isLinked()) {
+        std::cerr << "[TerrainSplat] shader did not link — splat path disabled\n";
         g_splatShader.reset();
         g_tessLoaded = false;
         return nullptr;

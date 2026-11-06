@@ -36,6 +36,7 @@ uniform mat4 uProjection;
 uniform float uTessFactorOuter; // max outer tessellation level (e.g. 4)
 uniform float uTessFactorInner; // max inner tessellation level
 uniform float uTessFadeDist;    // distance (metres) over which tess fades to 1
+uniform float uWaterLevel;          // sea level (forUI.txt: underwater patch clip)
 
 void main() {
     // Pass through the control-point data unchanged.
@@ -47,14 +48,35 @@ void main() {
     // Set tessellation levels once (invocation 0). Distance-adaptive: closer
     // triangles subdivide more, far ones collapse to ~1 (no subdivision).
     if (gl_InvocationID == 0) {
-        vec3 center = (vWorldPos[0] + vWorldPos[1] + vWorldPos[2]) / 3.0;
-        float dist  = distance(uViewPos, center);
-        float f     = 1.0 - smoothstep(0.0, uTessFadeDist, dist);
-        float tess  = max(1.0, mix(2.0, uTessFactorOuter, f));
+        // Early patch clip: if all 3 corner vertices are deep below the water line
+        // (uWaterLevel - 2.0), collapse tessellation to 0.0 so the TES/fragment
+        // pipe never runs for the submerged patch — saving vertex processing.
+        float h0 = vWorldPos[0].y;
+        float h1 = vWorldPos[1].y;
+        float h2 = vWorldPos[2].y;
+        if (h0 < (uWaterLevel - 2.0) && h1 < (uWaterLevel - 2.0) && h2 < (uWaterLevel - 2.0)) {
+            // Underwater patch: collapse tessellation to the minimum (1.0).
+            // Per the OpenGL spec, tessellation levels are clamped to [1, max];
+            // setting 0.0 is undefined behavior (some drivers drop the patch,
+            // others treat it as 1) and previously let an invalid level leak
+            // into the TES. Clamp explicitly so the spec-violation is gone.
+            // Full patch culling (skipping TES/FS for submerged terrain) is
+            // better done via gl_ClipDistance — deferred to the deferred pass.
+            gl_TessLevelOuter[0] = 1.0;
+            gl_TessLevelOuter[1] = 1.0;
+            gl_TessLevelOuter[2] = 1.0;
+            gl_TessLevelInner[0] = 1.0;
+        } else {
+            // Distance-adaptive: closer triangles subdivide more, far ones collapse to ~1.
+            vec3 center = (vWorldPos[0] + vWorldPos[1] + vWorldPos[2]) / 3.0;
+            float dist  = distance(uViewPos, center);
+            float f     = 1.0 - smoothstep(0.0, uTessFadeDist, dist);
+            float tess  = max(1.0, mix(2.0, uTessFactorOuter, f));
 
-        gl_TessLevelOuter[0] = tess;
-        gl_TessLevelOuter[1] = tess;
-        gl_TessLevelOuter[2] = tess;
-        gl_TessLevelInner[0] = max(1.0, mix(1.0, uTessFactorInner, f));
+            gl_TessLevelOuter[0] = tess;
+            gl_TessLevelOuter[1] = tess;
+            gl_TessLevelOuter[2] = tess;
+            gl_TessLevelInner[0] = max(1.0, mix(1.0, uTessFactorInner, f));
+        }
     }
 }

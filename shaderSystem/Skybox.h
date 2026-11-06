@@ -25,6 +25,8 @@ public:
 
     void setBlend(float amount) { blend = glm::clamp(amount, 0.0f, 1.0f); }
     void cleanup();
+    // forUI.txt Pillar 1: hot-swap the day cubemap (deletes the old GL texture first).
+    void UpdateSkyboxTexture(const std::vector<std::string>& facePaths);
     unsigned int getShaderID() const { return shader ? shader->ID : 0; }
 
 private:

@@ -51,7 +51,7 @@
 #define PHOSPHR_ARROW_DOWN "\xe03e"
 #define PHOSPHR_WARNING_CIRCLE "\xea48"
 #define PHOSPHR_CHECK_CIRCLE "\xe184"
-#define PHOSPHR_INFO "\x9e4"
+#define PHOSPHR_INFO "\ue9e4"  // Fixed: was "\x9e4" which greedily consumed hex digits and produced a truncated byte
 #define PHOSPHR_BUG "\xe5f4"
 #define PHOSPHR_GEAR "\xe988"
 #define PHOSPHR_GEAR_SIX "\xe98c"

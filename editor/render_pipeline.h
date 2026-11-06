@@ -5,7 +5,6 @@
 #include <vector>
 #include <string>
 #include "config.h"
-#include "../animationSystem/BoneMatrixBuffer.h"
 #include "../../shaderSystem/Skybox.h"
 #include "../../renderer/ShadowMapper.h"
 #include "../../renderer/PostProcess.h"
@@ -13,6 +12,9 @@
 #include "../../renderer/DeferredRenderer.h"
 #include "../../renderer/SSR.h"
 #include "../../lighting/LightingEnvironment.h"  // #3: renderScene takes the env ref, not Instance()
+#include "../../rhi/RHI.h"                      // Phase B: OffscreenScene bridge (returns RHI::OffscreenScene)
+#include "../../world/Terrain.h"               // Phase B: bridge Terrain chunks -> OffscreenScene (Terrain* handle)
+#include "../../world/VegetationSystem.h"       // Phase B: bridge foliage (VegetationSystem::Tree) into OffscreenScene
 
 class Renderer;
 class Shader;
@@ -38,11 +40,20 @@ namespace Render {
         size_t drawCalls = 0;
         size_t triangleCount = 0;
         size_t entityCount = 0;
-        // Culling / LOD debug stats (pushed from engine UI each frame)
-        size_t visibleInstances = 0;
-        size_t culledInstances = 0;
     };
     
+    // ---- Instanced ECS-primitive draw (forRenderer.txt Part 2) -------------
+    // Per-instance payload uploaded to m_primitiveInstanceVBO. The byte layout
+    // MUST match shaderSystem/primitive_gbuffer.vert:
+    //   offset  0 : modelMatrix    (aInstanceModel,     layout(location=3) mat4 -> 3/4/5/6)
+    //   offset 64 : materialData   (aInstanceMaterial,  layout(location=7) vec4)
+    //   offset 80 : roughnessData  (aInstanceRoughness, layout(location=8) vec4)
+    struct PrimitiveInstanceData {
+        glm::mat4 modelMatrix;
+        glm::vec4 materialData;   // rgb = albedo, a = metallic
+        glm::vec4 roughnessData;  // r = roughness, (g,b,a) = 0
+    };
+
     // Render pipeline - manages all rendering operations
     class RenderPipeline {
     public:
@@ -66,6 +77,22 @@ namespace Render {
                         const glm::vec3& cameraPosition, float fov,
                         const LightingEnvironment& lighting =
                             LightingEnvironment::Instance());
+
+        // Phase B (Step A): project the live editor scene (ECS MeshComponent
+        // primitives + ModelComponent/AnimatedCharacterComponent meshes, the
+        // active LightingEnvironment, camera and editor render flags) into the
+        // backend-agnostic RHI::OffscreenScene so the same scene can render
+        // through rhi->renderFrameScene(scene) on GL and Vulkan. The returned
+        // scene carries the forward+skinned+deferred subset that already has
+        // GL<->Vulkan pixel parity; CSM/SSAO/SSR/skybox/bloom flags are threaded
+        // through (NO-OP on backends until Phase B ships them) so the bridge is
+        // forward-safe: with RTT_RHI_SCENE off, renderScene() is unchanged.
+        RHI::OffscreenScene toOffscreenScene(const glm::mat4& view,
+                                            const glm::mat4& projection,
+                                            const glm::vec3& cameraPosition,
+                                            float fov,
+                                            const LightingEnvironment& lighting =
+                                                LightingEnvironment::Instance()) const;
         
         // Render UI overlay
         void renderUI();
@@ -77,6 +104,19 @@ namespace Render {
         void resizeViewport(int width, int height);
         int getViewportWidth() const { return m_viewportWidth; }
         int getViewportHeight() const { return m_viewportHeight; }
+        int getFramebufferAllocWidth() const { return m_framebufferAllocWidth; }
+        int getFramebufferAllocHeight() const { return m_framebufferAllocHeight; }
+
+        // 1-frame-lagged viewport resize latch. RenderViewport (UI phase)
+        // latches the target pixel size here; the frame owner applies it at
+        // frame start -- BEFORE renderSceneOnly -- so the FBO is drawn into
+        // before ImGui::Image samples it. This eliminates the one-frame
+        // "viewport blank while dragging the splitter" that happened when the
+        // framebuffer was re-allocated in the UI phase (post draw): glTexImage2D
+        // re-allocates the texture storage (clearing it), so ImGui::Image then
+        // sampled an empty texture for every drag frame.
+        void setPendingViewportSize(int w, int h);
+        void applyPendingViewportResize();
         
         // Camera control
         void setCameraMode(CameraMode mode) { m_cameraMode = mode; }
@@ -96,17 +136,21 @@ namespace Render {
         ShadowMapper* getShadowMapper() { return m_shadowMapper.get(); }
         const ShadowMapper* getShadowMapper() const { return m_shadowMapper.get(); }
 
-        // Register a callback for scene-level world rendering (terrain,
-        // vegetation, etc.) so it executes inside the geometry pass of
-        // renderScene() — bound to the correct FBO BEFORE post-processing,
-        // not after (which caused world geometry to render as a raw overlay
-        // on top of the post-processed image).
-        void setSceneRenderCallback(std::function<void(const glm::mat4&,
-                                                       const glm::mat4&,
-                                                       const glm::vec3&,
-                                                       const LightingEnvironment&)> cb) {
-            m_sceneRenderCallback = std::move(cb);
-        }
+        // Terrain wire-in for the RHI offscreen bridge (Phase B). The editor
+        // (EditorApplication::render, via WorldManager::getTerrain()) sets this
+        // so toOffscreenScene() can convert world/Terrain chunks into
+        // OffscreenMesh meshes that BOTH the GL offscreen (renderOffsceneScene)
+        // and Vulkan (renderFrameSceneScene) render -> terrain visible on
+        // rhivulkan + GL<->Vulkan pixel parity. nullptr when unwired (headless
+        // tests) -> bridge is a no-op.
+        void setTerrain(Terrain* terrain) { m_terrain = terrain; }
+        void addTerrainToScene(RHI::OffscreenScene& scene, const glm::vec3& cameraPosition) const;
+
+        // Phase B: wire procedural vegetation (foliage/brush instances) into the
+        // offscreen scene, mirroring addTerrainToScene -> visible on rhivulkan.
+        void setVegetation(VegetationSystem* veg) { m_vegetation = veg; }
+        void addVegetationToScene(RHI::OffscreenScene& scene,
+                                  const glm::vec3& cameraPosition) const;
         
         // Shader access
         Shader* getDefaultShader() { return m_defaultShader.get(); }
@@ -116,27 +160,20 @@ namespace Render {
         Shader* getSSAOShader() { return m_ssaoShader.get(); }
         Shader* getSSAOBlurShader() { return m_ssaoBlurShader.get(); }
         Shader* getGBufferShader() { return m_gBufferShader.get(); }
+        // forUI.txt Part 3: analytic procedural-sky shader (fullscreen quad).
+        Shader* getProceduralSkyShader() { return m_proceduralSkyShader.get(); }
         
         // Skybox
         void setSkyboxEnabled(bool enabled) { m_skyboxEnabled = enabled; }
         bool isSkyboxEnabled() const { return m_skyboxEnabled; }
+        Skybox* getSkybox() { return m_skybox.get(); }
+        const Skybox* getSkybox() const { return m_skybox.get(); }
+        // forUI.txt Pillar 1: hot-swap the skybox cubemap faces at runtime.
+        void UpdateSkyboxTexture(const std::vector<std::string>& facePaths);
         
         // Wireframe mode
         void setWireframeMode(bool enabled) { m_wireframeMode = enabled; }
         bool isWireframeMode() const { return m_wireframeMode; }
-        
-        // Culling / LOD debug controls (wired from World Settings UI)
-        void setCullingDebug(bool on) { m_cullingDebug = on; }
-        bool isCullingDebug() const { return m_cullingDebug; }
-        void setMaxVisibleInstances(int n) { m_maxVisibleInstances = n; }
-        int getMaxVisibleInstances() const { return m_maxVisibleInstances; }
-        void setLODBands(float b1, float b2, float b3) {
-            m_lodBand1 = b1; m_lodBand2 = b2; m_lodBand3 = b3;
-        }
-        float getLODBand(int i) const {
-            return i == 0 ? m_lodBand1 : (i == 1 ? m_lodBand2 : m_lodBand3);
-        }
-        void setLODCount(int n) { m_lodCount = n; }
         
         // Post-processing controls
         void setBloomEnabled(bool enabled) { m_bloomEnabled = enabled; }
@@ -191,33 +228,27 @@ namespace Render {
         static RenderPipeline& getInstance();
         
     private:
+        // ---- ECS primitive rendering (forRenderer.txt Part 1 + Part 2) ----
+        // renderEcsPrimitivesInstanced draws spawned MeshComponent primitives
+        // with a single glDrawElementsInstanced per MeshType; it falls back to
+        // the file-local non-instanced renderEcsPrimitivesToGBuffer (Part 1)
+        // when the instanced shader / instance VBO are unavailable.
+        void renderEcsPrimitivesInstanced(Shader* gbufShader,
+                                          const glm::mat4& view,
+                                          const glm::mat4& projection);
+
+        // forUI.txt Part 3: analytic procedural-sky fullscreen dispatch.
+        // No-op unless editor.uiState.physicalSkyParams.useProceduralOverCubemap
+        // is engaged (defaults false -> headless gate renders the cubemap as before).
+        bool renderProceduralSky(const glm::mat4& view, const glm::vec3& sunDir);
+
         // Core rendering
         std::unique_ptr<Renderer> m_renderer;
         std::unique_ptr<Shader> m_defaultShader;
         std::unique_ptr<Shader> m_modelShader;
         std::unique_ptr<Skybox> m_skybox;
-        
-        // Shared bone matrix buffer for batched GPU transfers (Phase 2).
-        // Replaces N per-Animator Update() calls with one UpdateBatched() per frame.
-        std::unique_ptr<BoneMatrixBuffer> m_sharedBoneBuffer;
-
-    public:
-        // ── Phase 2: Batched GPU Transfers ──────────────────────────────
-        // Collects every active character's final bone matrices and uploads
-        // them in a SINGLE glBufferSubData call via BoneMatrixBuffer::UpdateBatched.
-        // This replaces the prior per-character Update() path that issued one
-        // sub-data per animator — compressing driver overhead by N×.
-        void uploadBatchedBoneMatrices(
-            const std::vector<const std::vector<glm::mat4>*>& boneMatrices) {
-            if (!m_sharedBoneBuffer) {
-                m_sharedBoneBuffer = std::make_unique<BoneMatrixBuffer>();
-                m_sharedBoneBuffer->Initialize(256, BoneBufferConfig());
-            }
-            if (m_sharedBoneBuffer) {
-                m_sharedBoneBuffer->UpdateBatched(boneMatrices, /*forceUpdate=*/false);
-                m_sharedBoneBuffer->Bind(0);
-            }
-        }
+        std::unique_ptr<Shader> m_proceduralSkyShader;   // forUI.txt Part 3
+        GLuint m_procSkyQuadVAO = 0;                      // gl_VertexID fullscreen quad (no VBO)
         
         // PBR + Shadow + Post-Processing
         std::unique_ptr<Shader> m_pbrShader;
@@ -234,11 +265,21 @@ namespace Render {
         std::unique_ptr<Shader> m_ssaoShader;
         std::unique_ptr<Shader> m_ssaoBlurShader;
         std::unique_ptr<SSAO> m_ssao;
+
+        // ---- Spawned-primitive instancing (forRenderer.txt Part 2) ----
+        std::unique_ptr<Shader> m_primitiveInstanceShader;   // instanced G-Buffer shader
+        GLuint m_primitiveInstanceVBO = 0;                    // streaming instance buffer (STREAM_DRAW)
+        static constexpr int m_maxPrimitiveInstances = 1024; // cap per MeshType
+        PrimitiveInstanceData m_instanceBuffer[1024];        // 96 KiB staging, one type per frame
         
-        // Deferred renderer (optional path)
+        // Deferred renderer (optional path). Default OFF — the deferred G-Buffer
+        // pass re-lit terrain/props a second time and clashed with the forward
+        // PBR lighting (double-darkening the heightfield), so the engine now
+        // runs the single forward path unless an engineer explicitly re-enables
+        // deferred via the World Settings "Single Forward Renderer" toggle.
         std::unique_ptr<DeferredRenderer> m_deferredRenderer;
         std::unique_ptr<Shader> m_deferredLightingShader;
-        bool m_deferredEnabled = true;
+        bool m_deferredEnabled = false;
 
         // Screen-Space Reflections
         std::unique_ptr<Shader> m_ssrShader;
@@ -253,15 +294,15 @@ namespace Render {
         // Allocated once in initialize(); the per-frame light set is pushed
         // with a single glBufferSubData (mirrors DeferredRenderer::m_lightSSBO).
         GLuint m_forwardLightSSBO = 0;
+        GLuint m_whiteTexture     = 0;   // 1x1 white bound to uSSAOMap (unit 8) in forward mode
         
         // Vegetation shadow callback (renders vegetation/terrain for shadow pass)
         std::function<void(const glm::mat4&, const glm::mat4&)> m_shadowRenderCallback;
-        // Scene-level world render callback (terrain/vegetation, etc.) —
-        // invoked inside renderScene() during the active FBO binding segment
-        // so world geometry is subject to lighting and post-processing.
-        std::function<void(const glm::mat4&, const glm::mat4&,
-                           const glm::vec3&, const LightingEnvironment&)>
-            m_sceneRenderCallback;
+
+        // Terrain (world/Terrain) for the RHI offscreen bridge; nullptr when the
+        // editor hasn't wired WorldManager::getTerrain() (headless tests, etc.).
+        Terrain* m_terrain = nullptr;
+        VegetationSystem* m_vegetation = nullptr;
         bool m_ssaoEnabled = true;
         float m_ssaoRadius = 0.5f;
         float m_ssaoBias = 0.025f;
@@ -283,6 +324,22 @@ namespace Render {
         // Viewport dimensions
         int m_viewportWidth = 1280;
         int m_viewportHeight = 720;
+
+        // Live REGION (m_viewportWidth/Height) vs. the GL allocation
+        // (m_framebufferAlloc*). The colour/depth attachments are GROW-ONLY:
+        // storage is only re-created when the viewport grows beyond the current
+        // allocation (e.g. a maximised window). On a shrink the existing (larger)
+        // storage is re-used and confine-rendered into via glViewport(0,0,w,h);
+        // the ImGui viewport Image UV-crops to the live region. This removes the
+        // per-drag-frame glTexImage2D/glRenderbufferStorage re-alloc churn that
+        // made splitter drags feel laggy, and the cleared-texture blank-on-drag.
+        int m_framebufferAllocWidth = 0;
+        int m_framebufferAllocHeight = 0;
+
+        // Pending size latched by RenderViewport (UI phase) and applied the
+        // next frame by EditorApplication::render() before renderSceneOnly().
+        int m_pendingViewportWidth = 0;
+        int m_pendingViewportHeight = 0;
         
         // Camera
         CameraMode m_cameraMode = CameraMode::FreeFly;
@@ -290,14 +347,6 @@ namespace Render {
         // Options
         bool m_skyboxEnabled = true;
         bool m_wireframeMode = false;
-        
-        // Culling / LOD debug state (synced from World Settings UI)
-        bool m_cullingDebug = false;
-        int m_maxVisibleInstances = 2000;
-        float m_lodBand1 = 10.0f;   // distance where LOD 1 kicks in
-        float m_lodBand2 = 30.0f;   // distance where LOD 2 kicks in
-        float m_lodBand3 = 80.0f;   // distance where LOD 3 kicks in
-        int m_lodCount = 3;
         
         // Statistics
         RenderStats m_stats;

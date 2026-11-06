@@ -44,7 +44,10 @@ ImVec2 GetIconSize(PhosphorIcons::Icon icon, float size = 16.0f);
 void Shutdown();
 
 inline void Render(PhosphorIcons::Icon icon, float size, ImU32 color) {
-    Render(GetCodepointSafe(icon), size, color);
+    // Force resolution to the raw const char* signature so the call can never
+    // accidentally match the Icon overload (infinite recursion).
+    void (*rawRender)(const char*, float, ImU32) = Render;
+    rawRender(GetCodepointSafe(icon), size, color);
 }
 
 inline void RenderCentered(PhosphorIcons::Icon icon, float size, float centerX, ImU32 color) {

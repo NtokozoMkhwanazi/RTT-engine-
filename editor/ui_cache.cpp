@@ -1,7 +1,9 @@
 #include "ui_cache.h"
 
 #include "ecs/components/Components.h"
+#include "geospatial/GeoAPI.h"   // geo::AssetKindToString for unnamed geo twins
 #include <cstring>
+#include <cstdio>                // snprintf for synthesized kind labels
 #include <GLFW/glfw3.h>
 
 void EntityCache::clear() {
@@ -103,6 +105,20 @@ void RebuildEntityCache(EntityCache& cache, const ecs::World& world) {
             if (n && n[0]) {
                 std::strncpy(entry.name, n, sizeof(entry.name) - 1);
                 entry.name[sizeof(entry.name) - 1] = '\0';
+            }
+        }
+
+        // Geo telemetry twins without a NameComponent still get a distinct,
+        // AssetKind-derived label ("HeavyMachinery #42", "Personnel #7", ...) so
+        // the outliner never lumps machinery + personnel into one blank "None"
+        // row. (CreateGeospatialTwin sets an explicit name; this covers any twin
+        // that was registered with the geo system but never named.)
+        if (entry.hasGeo && !entry.name[0]) {
+            if (const auto* g = world.getComponentArchetype<ecs::GeospatialComponent>(e)) {
+                const char* kindName = geo::AssetKindToString(
+                    static_cast<geo::AssetKind>(g->assetKind));
+                std::snprintf(entry.name, sizeof(entry.name), "%s #%u",
+                              kindName ? kindName : "Geo", entry.id);
             }
         }
 

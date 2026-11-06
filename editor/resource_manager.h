@@ -48,6 +48,24 @@ namespace Resources {
         // Asset scanning
         std::vector<std::string> scanModels(const std::string& directory);
         std::vector<std::string> scanTextures(const std::string& directory);
+
+        // Asset scanning — NON-BLOCKING (content browser). The recursive
+        // directory walk is CPU/IO-bound (opendir/readdir/stat) and blocks the
+        // render thread when called synchronously over the whole assets/ tree
+        // (the "content browser loads props/textures and freezes the engine"
+        // bug). Use the async variants below: they kick the walk on a worker,
+        // then the UI polls isAsyncScanReady() (wait_for(0), non-blocking) each
+        // frame and fetchAsyncScan()s the result. No GL is touched, so the
+        // worker is context-safe.
+        void scanModelsAsync(const std::string& directory);
+        void scanTexturesAsync(const std::string& directory);
+        bool isAsyncScanReady(const std::string& directory) const;
+        std::vector<std::string> fetchAsyncScan(const std::string& directory);
+
+        // Join every in-flight async scan. Called by tests (TearDown) and at
+        // shutdown so std::async worker threads never leak across the sweep or
+        // survive past the ResourceManager singleton's lifetime.
+        void drainAsyncScans();
         
         // Cache management
         void clearCache();
@@ -67,8 +85,15 @@ namespace Resources {
         std::unordered_map<std::string, std::shared_ptr<Shader>> m_shaders;
         std::unordered_map<std::string, std::shared_ptr<Texture>> m_textures;
         
-        std::vector<std::string> scanDirectory(const std::string& path, 
+        std::vector<std::string> scanDirectory(const std::string& path,
                                               const std::vector<std::string>& extensions);
+
+        // In-flight async directory scans keyed by directory (content browser).
+        // The scan worker only calls scanDirectory() (pure CPU/IO, no shared
+        // mutable state), so the scan itself runs lock-free; only the map of
+        // futures is mutex-guarded.
+        std::unordered_map<std::string, std::future<std::vector<std::string>>> m_pendingScans;
+        mutable std::mutex scanMutex_;
     };
     
     // Helper functions

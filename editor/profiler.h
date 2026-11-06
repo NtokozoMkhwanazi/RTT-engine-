@@ -21,6 +21,8 @@
 #include <unordered_map>
 #include <functional>
 #include <cstdint>
+#include <mutex>
+#include <atomic>
 
 // Forward declarations for optional stats providers
 class GPUProfiler;
@@ -79,6 +81,10 @@ public:
 
     // --- Frame lifecycle ---
     // Call at the start of each frame (resets per-frame timers).
+    // Re-entrant: the OUTERMOST beginFrame()/endFrame() pair owns the frame
+    // timer, so subsystems that already open a frame scope (RenderPipeline::
+    // beginFrame/endFrame from inside the editor loop) nest instead of
+    // restarting the clock and reporting a partial frame.
     void beginFrame();
     // Call at the end of each frame (computes frame time, flushes periodic
     // stats to the console, updates rolling averages).
@@ -111,8 +117,8 @@ public:
     void registerProvider(ProviderFn fn) { m_providers.push_back(std::move(fn)); }
 
     // --- Configuration ---
-    void setEnabled(bool e)         { m_enabled = e; }
-    bool isEnabled() const          { return m_enabled; }
+    void setEnabled(bool e)         { m_enabled.store(e, std::memory_order_release); }
+    bool isEnabled() const          { return m_enabled.load(std::memory_order_acquire); }
     void setLogIntervalSeconds(float s) { m_logInterval = s; }
     float getLogIntervalSeconds() const { return m_logInterval; }
     void setLogLevel(int lvl)       { m_logLevel = lvl; }   // 0=all, 1=warn+, 2=err only
@@ -131,12 +137,13 @@ private:
     Profiler();
     ~Profiler() = default;
 
-    bool m_enabled{true};
+    std::atomic<bool> m_enabled{true};
     float m_logInterval{5.0f};       // seconds between console stat flushes
     float m_timeSinceFlush{0.0f};
     int   m_logLevel{0};
 
     // Frame timing (rolling window)
+    std::atomic<int> m_frameDepth{0};   // nested beginFrame()/endFrame() pairing
     std::chrono::high_resolution_clock::time_point m_frameStart;
     double m_rollingFrameMs{16.67};
     double m_minFrameMs{1e9};
@@ -144,8 +151,13 @@ private:
     int    m_frameCount{0};
     double m_frameAccum{0.0};
 
-    // Per-region CPU stats, keyed by region name
-    std::unordered_map<std::string, TimingStat> m_cpuStats;
+    // Per-region CPU stats, keyed by region name. Double-buffered so that
+    // flushToConsole() can hand the just-filled buffer to the main thread for
+    // logging while worker-thread ScopedTimer scopes immediately resume writing
+    // into the other (cleared) slot. The live write buffer is NEVER wiped while a
+    // worker may be mid-write -- the data race that the flat clear() caused.
+    std::unordered_map<std::string, TimingStat> m_cpuStats[2];
+    std::atomic<int> m_cpuWriteIndex{0};
 
     // Generic numeric stats (last value)
     std::unordered_map<std::string, StatValue> m_numericStats;
@@ -156,8 +168,19 @@ private:
     // Provider callbacks (called before building a Snapshot)
     std::vector<ProviderFn> m_providers;
 
-    // Track active ScopedTimer regions to support nesting
-    std::vector<TimingStat*> m_activeStack;
+    // Guards m_cpuStats / m_numericStats / m_stringStats, which are mutated by
+    // worker-thread ScopedTimer scopes (PROFILE_CPU_SCOPE) and read by the
+    // main-thread snapshot()/flushToConsole().  Previously a shared, unlocked
+    // std::vector<TimingStat*> m_activeStack was pushed/popped here from every
+    // worker thread (data race).  It is removed: flat per-region stats do not
+    // need nesting depth, and the mutex below now serialises all stat access.
+    mutable std::mutex m_statsMutex;
+
+    // Cached snapshot built by snapshot() so its std::vector scratch capacity is
+    // reused across frames instead of re-reserving on a fresh Snapshot each
+    // call (the old `snap.cpuRegions.reserve(...)` churned the heap inside the
+    // render loop we are trying to measure).
+    mutable Snapshot m_snapCache;
 };
 
 // --- Convenience macros ---

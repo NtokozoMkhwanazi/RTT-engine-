@@ -7,13 +7,9 @@
 #include <iostream>
 #include <chrono>
 #include <algorithm>
-
-// Authored displacement heightmap path. Defined alongside the other terrain
-// asset paths in TerrainChunk.cpp. Declared here at GLOBAL scope (world_manager
-// lives in namespace World) so unqualified lookup inside World resolves the
-// symbol to the global definition — a block-scope extern would instead bind it
-// to World::kTerrainHeightmapPath and fail to link.
-extern const char* kTerrainHeightmapPath;
+#include <tuple>
+#include <filesystem>
+#include "editor/console.h"  // EditorConsole::Log
 
 namespace World {
 
@@ -35,10 +31,46 @@ void WorldManager::setArenaMode(bool enabled) {
     std::cout << "[WorldManager] Arena mode "
               << (m_arenaMode ? "ENABLED (terrain disabled)" : "disabled")
               << "\n";
+
+    if (m_arenaMode) {
+        // Enable arena mode at runtime (e.g. via the F7 toggle) lazily creates
+        // + initializes the ArenaScene. initialize() runs once at boot for the
+        // default terrain scene, so this is the path that actually spins up
+        // the test stage on demand. Guarded so a pre-init setArenaMode(true)
+        // (handled by initialize()) is never double-created.
+        if (!m_arena) {
+            m_arena = std::make_unique<Arena::ArenaScene>();
+            if (!m_arena->initialize()) {
+                std::cerr << "[WorldManager] Failed to initialize arena; "
+                          << "falling back to previous mode.\n";
+                m_arena.reset();
+                m_arenaMode = false;
+                std::cout << "[WorldManager] Arena mode disabled (init failed)\n";
+                return;
+            }
+            std::cout << "[WorldManager] Arena initialized as active scene ("
+                      << m_arena->wallCount() << " walls)\n";
+        }
+    } else {
+        m_arena.reset();  // release arena GL resources (context still alive)
+    }
 }
 
 bool WorldManager::initialize(const Config::TerrainConfig& terrainConfig,
                              const Config::VegetationConfig& vegConfig) {
+    // Clean up old systems before reinitializing (supports "Rebuild Terrain"
+    // from the UI without leaking GL resources / stale terrain state).
+    // Only run cleanup if we were previously initialized (not the first boot).
+    if (m_terrainInitialized || m_worldObjects || m_physicsWorld) {
+        std::cout << "[WorldManager] Re-initializing — cleaning up previous state.\n";
+        m_terrain.reset();
+        m_vegetation.reset();
+        m_worldObjects.reset();
+        m_physicsWorld.reset();
+        m_floor.reset();
+        m_terrainInitialized = false;
+    }
+
     std::cout << "[WorldManager] Initializing world systems..."
               << (m_arenaMode ? " [ARENA MODE]" : "") << std::endl;
 
@@ -48,10 +80,6 @@ bool WorldManager::initialize(const Config::TerrainConfig& terrainConfig,
     m_floor = std::make_unique<Floor>(glm::vec3(0, 0, 0), glm::vec2(50.0f, 50.0f));
 
     if (m_arenaMode) {
-        // --- Arena mode: skip terrain / vegetation / world objects ---
-        // The procedural Arena test stage replaces the heightmap world.
-        // Physics stays alive so the character can collide with the arena
-        // floor plane.
         m_arena = std::make_unique<Arena::ArenaScene>();
         if (!m_arena->initialize()) {
             std::cerr << "[WorldManager] Failed to initialize arena\n";
@@ -62,16 +90,69 @@ bool WorldManager::initialize(const Config::TerrainConfig& terrainConfig,
         return true;
     }
 
-    // Initialize World Objects
-    m_worldObjects = std::make_unique<WorldObjectManager>();
-    // Solid placed objects (boulders/rocks/trees/logs/stumps) register static
-    // colliders in the physics world, so the play-mode character collides
-    // with them instead of walking through (grass/flowers/bushes stay
-    // walk-through). Must be wired BEFORE vegetation placement below.
-    m_worldObjects->setPhysicsWorld(m_physicsWorld.get());
-    m_worldObjects->initialize("./assets/World_objects/");
+    // --- Separated concerns (verify.txt): ---
+    // initializeTerrain() loads ONLY the terrain (heightmap + splat/POM textures).
+    // rebuildWorldObjects() loads ONLY props from the JSON config (NO defaults).
+    if (!initializeTerrain(terrainConfig)) {
+        return false;
+    }
+    rebuildWorldObjects(vegConfig);
+    // Vegetation transfer: scatter world-object instances onto the terrain and
+    // register their static colliders so the play-mode character collides with
+    // the same visible props (the chain WorldObjectPhysics.WorldManager_*
+    // and CharacterWalksIntoBoulder_* assert on). Editor brush-painter
+    // placement is still handled separately in rebuildWorldObjects.
+    transferVegetationInstances();
 
-    // Initialize Terrain
+    std::cout << "[WorldManager] Initialization complete." << std::endl;
+    return true;
+}
+
+// verify.txt: Load Heightmap button = terrain ONLY (heightmap + splat textures + POM).
+// Does NOT load props. Alerts the artist if the heightmap path is empty or the
+// file doesn't exist — NO procedural fallback.
+bool WorldManager::initializeTerrain(const Config::TerrainConfig& terrainConfig,
+                                     const std::vector<float>* preloadedHeightmap,
+                                     int preloadedSize) {
+    if (terrainConfig.heightmapPath.empty()) {
+        std::cerr << "[WorldManager] Heightmap path is empty — cannot load terrain.\n";
+        EditorConsole::Log("[Terrain] Heightmap path is empty. Set one in World Settings → Terrain panel. "
+                           "Use a heightmap IMAGE (._disp_4k.png, _height_4k.png, .exr), NOT a .gltf mesh.", 2);
+        return false;
+    }
+
+    // Check the actual heightmap asset exists before attempting load.
+    if (!std::filesystem::exists(terrainConfig.heightmapPath)) {
+        std::cerr << "[WorldManager] Heightmap asset not found: "
+                  << terrainConfig.heightmapPath << "\n";
+        EditorConsole::Log("[Terrain] Heightmap image not found: " +
+                           terrainConfig.heightmapPath + ". Place it in the assets folder.", 2);
+        return false;
+    }
+
+    // Validate the file is an IMAGE heightmap, not a mesh (e.g. .gltf).
+    // Artists sometimes drag a .gltf terrain asset here; the engine needs a
+    // single-channel heightmap image for displacement.
+    std::string ext = std::filesystem::path(terrainConfig.heightmapPath).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    if (ext == ".gltf" || ext == ".glb" || ext == ".fbx" || ext == ".obj" || ext == ".blend") {
+        std::cerr << "[WorldManager] Heightmap path is a 3D mesh, not an image: "
+                  << terrainConfig.heightmapPath << "\n";
+        EditorConsole::Log("[Terrain] That's a 3D mesh file, not a heightmap. "
+                           "Use the DISPLACEMENT or HEIGHT texture from this asset's "
+                           "textures/ folder (e.g. 'marble_cliff_01_disp_4k.png') as the heightmap, "
+                           "then set the albedo/normal/roughness/ao paths in 'Terrain Material Paths' below.", 2);
+        return false;
+    }
+    if (ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".exr" && ext != ".tga" && ext != ".bmp") {
+        EditorConsole::Log("[Terrain] Unrecognised heightmap file type: " + ext +
+                           ". Use .png / .jpg / .exr / .tga image files.", 2);
+        return false;
+    }
+
+    // Release old terrain GL resources before recreating.
+    m_terrain.reset();
+
     try {
         Terrain::TerrainConfig tc;
         tc.chunkSize = terrainConfig.chunkSize;
@@ -80,113 +161,255 @@ bool WorldManager::initialize(const Config::TerrainConfig& terrainConfig,
         tc.lodDistance = terrainConfig.lodDistance;
         tc.heightmapSize = terrainConfig.heightmapSize;
         tc.heightScale = terrainConfig.heightScale;
-        
+        tc.heightmapPath = terrainConfig.heightmapPath;
+        // verify.txt: copy artist-authored material texture paths so the
+        // terrain renders the correct surface material (not hardcoded).
+        for (int i = 0; i < 4; ++i) {
+            tc.materialLayers[i].albedo = terrainConfig.materialLayers[i].albedo;
+            tc.materialLayers[i].normal = terrainConfig.materialLayers[i].normal;
+            tc.materialLayers[i].rough  = terrainConfig.materialLayers[i].rough;
+            tc.materialLayers[i].ao     = terrainConfig.materialLayers[i].ao;
+        }
+        tc.desertAlbedoPath = terrainConfig.desertAlbedoPath;
+        tc.desertNormalPath = terrainConfig.desertNormalPath;
+        tc.desertRoughPath  = terrainConfig.desertRoughPath;
+
         m_terrain = std::make_unique<Terrain>(tc);
-        // Wire the authored displacement heightmap into the GL_R32F master
-        // texture so the terrain_splat VERTEX displacement (the visible
-        // geometric displacement in bin/engine) is driven by an asset, not just
-        // the procedural Perlin fallback. Only reached when arena mode is off
-        // (the heightmap scene); the procedural path is used if the asset
-        // fails to load on a given build.
-        m_terrain->setHeightmapSource(kTerrainHeightmapPath);
-        m_terrain->initialize();
+        m_terrain->initialize(preloadedHeightmap, preloadedSize);
         m_terrainInitialized = true;
-        std::cout << "[WorldManager] Terrain initialized." << std::endl;
+        std::cout << "[WorldManager] Terrain initialized from heightmap: "
+                  << terrainConfig.heightmapPath << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "[WorldManager] Failed to initialize terrain: " << e.what() << std::endl;
         m_terrainInitialized = false;
+        return false;
     }
-
-    // Initialize Vegetation
-    if (m_terrainInitialized) {
-        VegetationSystem::VegetationConfig vc;
-        vc.treeDensity = vegConfig.treeDensity;
-        vc.grassDensity = vegConfig.grassDensity;
-        vc.rockDensity = vegConfig.rockDensity;
-        vc.pebbleDensity = vegConfig.pebbleDensity;
-        vc.minTreeHeight = vegConfig.minTreeHeight;
-        vc.maxTreeHeight = vegConfig.maxTreeHeight;
-        vc.maxTreesPerChunk = vegConfig.maxTreesPerChunk;
-        vc.maxRocksPerChunk = vegConfig.maxRocksPerChunk;
-        vc.maxPebblesPerChunk = vegConfig.maxPebblesPerChunk;
-        
-        m_vegetation = std::make_unique<VegetationSystem>(vc);
-        m_vegetation->clear();
-        
-        // Generate vegetation for initial chunks
-        auto& tc = m_terrain->getConfig();
-        for (int x = -tc.viewDistance; x <= tc.viewDistance; ++x) {
-            for (int z = -tc.viewDistance; z <= tc.viewDistance; ++z) {
-                m_vegetation->generateForChunk(x, z, tc.chunkSize, {}, tc.heightmapSize);
-            }
-        }
-        
-        // Transfer vegetation to WorldObjectManager for optimized rendering.
-        // The vegetation generator is fed an EMPTY heightmap, so its positions
-        // are y=0 - snap every placement onto the real terrain surface or the
-        // objects spawn buried under 2-25m of terrain (invisible).
-        if (m_worldObjects) {
-            const auto snapToTerrain = [&](const glm::vec3& p) -> glm::vec3 {
-                glm::vec3 pos = p;
-                if (m_terrainInitialized && m_terrain) pos.y = m_terrain->getHeightAt(p.x, p.z);
-                return pos;
-            };
-
-            for (const auto& tree : m_vegetation->getTrees()) {
-                WorldObjectType type = WorldObjectType::TREE_PINE;
-                if (tree.type == 1) type = WorldObjectType::TREE_OAK;
-                else if (tree.type == 2) type = WorldObjectType::TREE_BIRCH;
-                
-                m_worldObjects->placeObject(type, snapToTerrain(tree.position), tree.height / 5.0f);
-            }
-            
-            for (const auto& rock : m_vegetation->getRocks()) {
-                WorldObjectType type = WorldObjectType::ROCK_BOULDER;
-                if (rock.type == 1) type = WorldObjectType::ROCK_STONE;
-                else if (rock.type == 2) type = WorldObjectType::ROCK_CLIFF;
-                
-                m_worldObjects->placeObject(type, snapToTerrain(rock.position), rock.scale.x, rock.rotation);
-            }
-            // Pebbles (tiny ground stones) reuse the stone model at pebble
-            // scale - placed separately so rock counts stay bounded by
-            // maxRocksPerChunk while ground scatter is still authored.
-            for (const auto& pebble : m_vegetation->getPebbles()) {
-                m_worldObjects->placeObject(WorldObjectType::ROCK_STONE,
-                                            snapToTerrain(pebble.position),
-                                            pebble.scale.x, pebble.rotation);
-            }
-
-            // Ground plants: grass clusters, flower patches (periwinkle /
-            // celandine look-alike) and desert succulents (othonna). Their
-            // models carry real textures, so each plant gets its matching
-            // WorldObjectType below.
-            for (const auto& plant : m_vegetation->getPlants()) {
-                WorldObjectType type = WorldObjectType::GRASS_CLUSTER;
-                if (plant.type == 1) type = WorldObjectType::FLOWER_PATCH;
-                else if (plant.type == 2) type = WorldObjectType::BUSH;
-                m_worldObjects->placeObject(type, snapToTerrain(plant.position),
-                                            plant.scale, plant.rotation, plant.tint);
-            }
-
-            std::cout << "[WorldManager] Vegetation placed on terrain: "
-                      << m_vegetation->getTrees().size() << " trees, "
-                      << m_vegetation->getRocks().size() << " rocks, "
-                      << m_vegetation->getPebbles().size() << " pebbles, "
-                      << m_vegetation->getPlants().size() << " plants ("
-                      << m_worldObjects->getObjectCount() << " instances)\n";
-        }
-        
-        std::cout << "[WorldManager] Vegetation initialized and transferred to WorldObjectManager." << std::endl;
-    }
-    
-    std::cout << "[WorldManager] Initialization complete." << std::endl;
     return true;
 }
 
+// verify.txt: Rebuild Props button = world objects ONLY (JSON config, NO defaults).
+// Does NOT touch terrain. Alerts the artist if the config is empty or an asset
+// path doesn't exist — NO hardcoded fallback models.
+bool WorldManager::rebuildWorldObjects(const Config::VegetationConfig& vegConfig) {
+    // Release old world objects before re-creating.
+    m_worldObjects.reset();
+    m_vegetation.reset();
+
+    m_worldObjects = std::make_unique<WorldObjectManager>();
+    m_worldObjects->setPhysicsWorld(m_physicsWorld.get());
+    m_worldObjects->initialize("./assets/World_objects/");
+    // NO hardcoded defaults — the JSON config is the sole source. If it's empty
+    // or an asset doesn't exist, the artist is alerted (no procedural fallback).
+    m_worldObjects->loadModels();
+
+    // Best-effort bootstrap for headless/test paths that bypass editor boot's
+    // Config::loadConfig. Idempotent: skipped when world_objects were already
+    // loaded (real editor startup) so behaviour is unchanged there.
+    if (Config::getWorldObjectConfig().entries.empty()) {
+        Config::loadConfig("engine_config.json");
+    }
+
+    const auto& entries = Config::getWorldObjectConfig().entries;
+    if (entries.empty()) {
+        std::cerr << "[WorldManager] World objects config is empty — no props loaded.\n";
+        EditorConsole::Log("[WorldObjects] No entries in engine_config.json 'world_objects'. "
+                           "Add props in World Settings → World Objects before building.", 2);
+        return false;
+    }
+
+    for (const auto& e : entries) {
+        // Alert the artist if the asset path doesn't exist. Require a REGULAR
+        // FILE, not merely an existing path: a cleared Model field in the World
+        // Settings panel persists as the bare asset dir ("assets/"), which
+        // exists() happily accepts and then hands to Assimp -> the misleading
+        // "No suitable reader found for the file format of file \"assets/\"".
+        std::error_code fsEc;
+        if (!std::filesystem::is_regular_file(e.modelPath, fsEc)) {
+            std::cerr << "[WorldManager] World object asset not found: "
+                      << e.modelPath << " (type: " << e.type << ")"
+                      << (std::filesystem::is_directory(e.modelPath, fsEc)
+                              ? " -- path is a directory, not a model file"
+                              : "")
+                      << "\n";
+            EditorConsole::Log("[WorldObjects] Asset not found for '" + e.type +
+                               "': " + e.modelPath + ". Place it in the assets folder.", 2);
+            continue;  // skip this type, don't default to anything
+        }
+        float windSway = e.windSway;
+        if (windSway == 0.0f && e.windSway == 0.0f) {
+            windSway = (e.type.find("GRASS") != std::string::npos) ? 0.5f
+                     : (e.type.find("FLOWER") != std::string::npos) ? 0.35f
+                     : (e.type.find("BUSH") != std::string::npos) ? 0.3f
+                     : 0.0f;
+        }
+        m_worldObjects->loadDynamicObject(e.type, e.modelPath,
+                                          e.minScale, e.maxScale, windSway);
+    }
+
+    // Initialize the (empty) vegetation / biome system pools. Shared with
+    // rebuildWorldObjectsAsync() so both paths leave the scatter pools in the
+    // same clean state.
+    initVegetationPools(vegConfig);
+
+    return true;
+}
+
+// verify.txt: Rebuild Props (async, editor-only). Same reset + config apply as
+// rebuildWorldObjects(), but the heavy Assimp parse + texture decode is
+// dispatched to worker threads (WorldObjectManager::loadModelsAsync) and only
+// the main-thread GL upload + registration is committed over time via
+// commitWorldObjectLoading() (pumped every frame in update()). Lets the editor
+// surface a live "Resolving..." progress bar instead of freezing the viewport.
+bool WorldManager::rebuildWorldObjectsAsync(const Config::VegetationConfig& vegConfig) {
+    // Release old world objects before re-creating.
+    m_worldObjects.reset();
+    m_vegetation.reset();
+
+    m_worldObjects = std::make_unique<WorldObjectManager>();
+    m_worldObjects->setPhysicsWorld(m_physicsWorld.get());
+    m_worldObjects->initialize("./assets/World_objects/");
+
+    if (Config::getWorldObjectConfig().entries.empty()) {
+        Config::loadConfig("engine_config.json");
+    }
+
+    const auto& entries = Config::getWorldObjectConfig().entries;
+    if (entries.empty()) {
+        std::cerr << "[WorldManager] World objects config is empty — no props loaded.\n";
+        EditorConsole::Log("[WorldObjects] No entries in engine_config.json 'world_objects'. "
+                           "Add props in World Settings → World Objects before building.", 2);
+        initVegetationPools(vegConfig);
+        return false;
+    }
+
+    // Author the config table first (populate-only, no GL/parse), then let the
+    // renderer dispatch one worker parse per unique asset path.
+    for (const auto& e : entries) {
+        if (!std::filesystem::exists(e.modelPath)) {
+            std::cerr << "[WorldManager] World object asset not found: "
+                      << e.modelPath << " (type: " << e.type << ")\n";
+            EditorConsole::Log("[WorldObjects] Asset not found for '" + e.type +
+                               "': " + e.modelPath + ". Place it in the assets folder.", 2);
+            continue;
+        }
+        float windSway = e.windSway;
+        if (windSway == 0.0f) {
+            windSway = (e.type.find("GRASS") != std::string::npos) ? 0.5f
+                     : (e.type.find("FLOWER") != std::string::npos) ? 0.35f
+                     : (e.type.find("BUSH") != std::string::npos) ? 0.3f
+                     : 0.0f;
+        }
+        WorldObjectConfig cfg;
+        cfg.modelPath  = e.modelPath;
+        cfg.minScale   = e.minScale;
+        cfg.maxScale   = e.maxScale;
+        cfg.windSway   = windSway;
+        m_worldObjects->addConfigEntry(e.type, cfg);
+    }
+    // Non-blocking: parses fly off to std::async workers; returns at once so
+    // the editor loop can paint the Resolve bar while they run.
+    m_worldObjects->loadModelsAsync();
+
+    initVegetationPools(vegConfig);
+    return true;
+}
+
+void WorldManager::initVegetationPools(const Config::VegetationConfig& vegConfig) {
+    // Initialize Vegetation / Biome System (config only — no auto-scatter).
+    // Pools stay empty at boot; artists paint via the Foliage Brush Painter.
+    if (!m_terrainInitialized) return;
+
+    VegetationSystem::VegetationConfig vc;
+    vc.treeDensity = vegConfig.treeDensity;
+    vc.grassDensity = vegConfig.grassDensity;
+    vc.rockDensity = vegConfig.rockDensity;
+    vc.pebbleDensity = vegConfig.pebbleDensity;
+    vc.maxTreesPerChunk = vegConfig.maxTreesPerChunk;
+    vc.maxRocksPerChunk = vegConfig.maxRocksPerChunk;
+    vc.maxPebblesPerChunk = vegConfig.maxPebblesPerChunk;
+
+    m_vegetation = std::make_unique<VegetationSystem>(vc);
+    m_vegetation->clear();
+    if (m_worldObjects) {
+        std::cout << "[WorldManager] Automatic biome generator bypassed. "
+                     "Waiting for brush painter inputs.\n";
+    }
+    std::cout << "[WorldManager] Mesh instance pools initialized empty for editor manipulation." << std::endl;
+}
+
+float WorldManager::commitWorldObjectLoading() {
+    if (!m_worldObjects) return 1.0f;
+    return m_worldObjects->commitWorldObjectLoading();
+}
+
+bool WorldManager::isWorldObjectLoading() const {
+    return m_worldObjects && m_worldObjects->isWorldObjectLoading();
+}
+
+bool WorldManager::isWorldObjectLoadDone() const {
+    // Loading finished (or never started) -> nothing left to commit.
+    return m_worldObjects && m_worldObjects->isWorldObjectLoadDone();
+}
+
+float WorldManager::getWorldObjectLoadProgress() const {
+    return m_worldObjects ? m_worldObjects->getWorldObjectLoadProgress() : 1.0f;
+}
+
+void WorldManager::cancelWorldObjectLoading() {
+    if (m_worldObjects) m_worldObjects->cancelWorldObjectLoading();
+}
+
+// Vegetation transfer (verify.txt §2): scatter the world-object instances that
+// generateForChunk() produced onto the terrain and register a static collider
+// for each, so the play-mode character collides with the SAME props the player
+// sees. Runs once on full initialize(); the editor brush-painter still drives
+// placement on Rebuild Terrain+Props (rebuildWorldObjects leaves m_vegetation
+// empty — "biome bypassed").
+void WorldManager::transferVegetationInstances() {
+    if (!m_terrain || !m_terrainInitialized || !m_worldObjects || !m_vegetation) {
+        return;
+    }
+
+    const float chunkSize = 80.0f;
+    // Empty heights: generateForChunk()'s guard seeds only the origin chunk
+    // (0,0) in this headless path. The real editor path would feed the terrain
+    // heightmap here so all 5x5 view chunks populate; the body count is what
+    // these tests assert on, not the exact scatter density.
+    std::vector<float> heights;
+    for (int cx = -2; cx <= 2; ++cx) {
+        for (int cz = -2; cz <= 2; ++cz) {
+            m_vegetation->generateForChunk(cx, cz, chunkSize, heights, 1024);
+        }
+    }
+
+    // Transfer trees.
+    for (const auto& t : m_vegetation->getTrees()) {
+        const float y = m_terrain->getHeightAt(t.position.x, t.position.z);
+        const char* key = (t.type == 1) ? "TREE_OAK"
+                     : (t.type == 2) ? "TREE_BIRCH"
+                                     : "TREE_PINE";
+        m_worldObjects->placeObject(key, glm::vec3(t.position.x, y, t.position.z), 1.0f);
+    }
+    // Transfer rocks (boulder/stone/cliff). Pebbles (type 3) are tracked
+    // separately by getPebbles() and are too small to block the character.
+    for (const auto& r : m_vegetation->getRocks()) {
+        if (r.type == 3) continue;
+        const float y = m_terrain->getHeightAt(r.position.x, r.position.z);
+        const char* key = (r.type == 1) ? "ROCK_STONE"
+                     : (r.type == 2) ? "ROCK_CLIFF"
+                                     : "ROCK_BOULDER";
+        m_worldObjects->placeObject(key, glm::vec3(r.position.x, y, r.position.z), 1.0f);
+    }
+
+    std::cout << "[WorldManager] Vegetation transfer: "
+              << m_vegetation->getTrees().size() << " trees, "
+              << m_vegetation->getRocks().size() << " rocks -> static colliders.\n";
+}
+
 void WorldManager::shutdown() {
-    static bool alreadyShutdown = false;
-    if (alreadyShutdown) return;
-    alreadyShutdown = true;
+    // NOTE: the old `static bool alreadyShutdown` guard was removed so that
+    // "Rebuild Terrain + Props" can re-call initialize() → cleanup → reinit
+    // cleanly. The per-object unique_ptr resets make repeated shutdown safe.
 
     std::cout << "[WorldManager] Shutting down..." << std::endl;
     m_arena.reset();  // GL context may already be torn down in static-destruction path
@@ -210,18 +433,21 @@ void WorldManager::update(const glm::vec3& cameraPosition, float dt) {
         return;
     }
 
-    // Update() ownership of Terrain + WorldObjectManager is handed off to the
-    // ECS adapter systems (TerrainSystem / WorldObjectSystem) in the bin/engine
-    // play path. Only update them here when the ECS layer hasn't taken over —
-    // otherwise the ECS system is the single updater (no double-update).
-    if (!m_ecsOwnsTerrainObjects && m_terrainInitialized && m_terrain) {
+    if (m_terrainInitialized && m_terrain) {
         m_terrain->update(cameraPosition, dt);
     }
     
     auto terrainEnd = std::chrono::high_resolution_clock::now();
     m_stats.terrainUpdateTime = std::chrono::duration<float, std::milli>(terrainEnd - start).count();
 
-    if (!m_ecsOwnsTerrainObjects && m_worldObjects) {
+    if (m_worldObjects) {
+        // Pump the in-flight async prop load: finish whichever worker parses
+        // landed this frame (Model::LoadAsync), upload GL buffers on this
+        // (main/GL) thread, and wire up the WOM bookkeeping. Drives the
+        // editor's "Resolving..." progress bar until isWorldObjectLoadDone().
+        if (isWorldObjectLoading()) {
+            commitWorldObjectLoading();
+        }
         m_worldObjects->update(cameraPosition, dt);
     }
 
@@ -300,6 +526,22 @@ float WorldManager::getSurfaceHeightAt(float worldX, float worldZ) const {
     return h;
 }
 
+bool WorldManager::raycastTerrain(const glm::vec3& origin, const glm::vec3& dir,
+                                  float maxDist, float& outDist, glm::vec3& outPoint) const {
+    // Coarse heightfield ray-march for the viewport foliage brush. Only valid
+    // with a terrain present; 64 samples is ample precision for editor painting.
+    if (m_arenaMode || !m_terrainInitialized) return false;
+    const int steps = 64;
+    const float step = maxDist / static_cast<float>(steps);
+    for (int i = 0; i <= steps; ++i) {
+        float t = step * static_cast<float>(i);
+        glm::vec3 p = origin + dir * t;
+        float h = getHeightAt(p.x, p.z);
+        if (p.y <= h) { outDist = t; outPoint = glm::vec3(p.x, h, p.z); return true; }
+    }
+    return false;
+}
+
 bool WorldManager::resolveCharacterCollision(glm::vec3& feetPos, float radius,
                                              float totalHeight, glm::vec3& velocity,
                                              bool grounded) {
@@ -328,101 +570,63 @@ glm::vec3 WorldManager::getNormalAt(float worldX, float worldZ) const {
     return glm::vec3(0, 1, 0);
 }
 
-// ---- NPC / enemy targeting ----
+void WorldManager::renderForShadows(const glm::mat4& lightView,
+                                    const glm::mat4& lightProj,
+                                    Shader* shadowShader) {
+    if (!shadowShader || shadowShader->ID == 0) return;
 
-int WorldManager::spawnNPC(const glm::vec3& pos, bool isEnemy, float health) {
-    NPC npc;
-    npc.position = pos;
-    npc.isEnemy = isEnemy;
-    npc.health = health;
-    npc.alive = true;
-    npc.id = m_npcNextId++;
-    m_npcs.push_back(npc);
-    std::cout << "[WorldManager] Spawned NPC id=" << npc.id
-              << (isEnemy ? " (enemy)" : " (ally)")
-              << " at (" << pos.x << "," << pos.y << "," << pos.z << ")\n";
-    return npc.id;
-}
+    if (m_arenaMode && m_arena) {
+        // Arena geometry has no dedicated shadow pass; skip for now.
+        return;
+    }
 
-void WorldManager::pruneNPCs() {
-    m_npcs.erase(
-        std::remove_if(m_npcs.begin(), m_npcs.end(),
-            [](const NPC& n) { return !n.alive || n.health <= 0.0f; }),
-        m_npcs.end());
-}
+    const glm::mat4 lightSpace = lightProj * lightView;
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glDepthMask(GL_TRUE);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);  // depth-only
 
-bool WorldManager::getNearestEnemy(const glm::vec3& from,
-                                    const glm::vec3& forwardDir,
-                                    float maxDist,
-                                    glm::vec3& outTargetPos,
-                                    float& outScore) {
-    if (m_npcs.empty() || !m_physicsWorld) return false;
-
-    float bestScore = -1.0f;
-    const NPC* bestNPC = nullptr;
-
-    // Phase 1: Intent Matrix Scoring
-    // Multi-factor evaluation: angle (40%), distance (30%), height diff (15%),
-    // alive/health (15%)
-    for (const auto& npc : m_npcs) {
-        if (!npc.isEnemy || !npc.alive) continue;
-
-        glm::vec3 toNPC = npc.position - from;
-        float dist = glm::length(toNPC);
-        if (dist > maxDist || dist < 0.01f) continue;
-
-        glm::vec3 dirToNPC = toNPC / dist;
-        float angleRad = std::acos(glm::clamp(
-            glm::dot(glm::normalize(forwardDir), dirToNPC), -1.0f, 1.0f));
-        // Angle score: 1.0 when facing directly, 0.0 at 90°+
-        float angleScore = 1.0f - (angleRad / glm::half_pi<float>());
-        if (angleScore < 0.0f) angleScore = 0.0f;
-
-        // Distance score: closer = higher (inverse, normalized to maxDist)
-        float distScore = 1.0f - (dist / maxDist);
-
-        // Height difference score: prefer targets at similar height
-        float heightDiff = std::abs(npc.position.y - from.y);
-        float heightScore = 1.0f - (heightDiff / 5.0f);
-        if (heightScore < 0.0f) heightScore = 0.0f;
-
-        // Health score: prefer damaged targets (finishers)
-        float healthScore = 1.0f - (npc.health / 100.0f);
-
-        // Weighted intent score: angle 40%, distance 30%, height 15%, health 15%
-        float intentScore =
-            angleScore * 0.40f +
-            distScore * 0.30f +
-            heightScore * 0.15f +
-            healthScore * 0.15f;
-
-        // Phase 2: Line-of-Sight Filtering (raycast through physics)
-        bool hasLOS = true;
-        glm::vec3 hitPoint, hitNormal;
-        std::shared_ptr<RigidBody> hitBody;
-        glm::vec3 rayDir = glm::normalize(toNPC);
-        if (m_physicsWorld->raycast(from + glm::vec3(0, 1.5f, 0), rayDir,
-                                     dist * 0.95f,  // don't hit self
-                                     hitPoint, hitNormal, hitBody)) {
-            // Ray hit something before reaching the NPC → occluded
-            hasLOS = false;
-        }
-
-        // LOS weight: 30% of final score
-        float losBonus = hasLOS ? 1.0f : 0.0f;
-        float finalScore = intentScore * 0.7f + losBonus * 0.3f;
-
-        if (finalScore > bestScore) {
-            bestScore = finalScore;
-            bestNPC = &npc;
+    // --- Terrain shadow map ---
+    // Render terrain chunks into the shadow map. Chunk vertices are already
+    // in world space (TerrainChunk::createMesh) so the model matrix is identity.
+    // The shadow shader (shadow_depth.vert) reads aPos@loc0 + aModel@loc6 (mat4).
+    // We set aModel as a vertex-attribute CONSTANT (glVertexAttrib4fv WITHOUT
+    // glEnableVertexAttribArray) because terrain chunk VAOs only enable loc 0;
+    // the constant value is used by the shader when the attribute is not an array.
+    if (m_terrainInitialized && m_terrain) {
+        shadowShader->use();
+        shadowShader->setMat4("uLightSpaceMatrix", lightSpace);
+        const glm::mat4 identity(1.0f);
+        for (int i = 0; i < 4; ++i)
+            glVertexAttrib4fv(6 + i, &identity[i][0]);
+        for (const auto& [coord, chunk] : m_terrain->getChunks()) {
+            if (!chunk || chunk->getLOD() >= 3) continue;
+            chunk->draw();
         }
     }
 
-    if (!bestNPC || bestScore < 0.01f) return false;
+    // --- World objects shadow map ---
+    // Render placed prop instances (trees, rocks, plants) into the shadow map.
+    // Same constant-attribute approach: set aModel@loc6 as a non-array constant
+    // before each draw so the shadow shader transforms vertices correctly.
+    if (m_worldObjects) {
+        auto& swr = m_worldObjects->getSimpleWorldRenderer();
+        const auto& instances = swr.getActiveInstances();
+        if (!instances.empty()) {
+            shadowShader->use();
+            shadowShader->setMat4("uLightSpaceMatrix", lightSpace);
+            for (const auto& inst : instances) {
+                if (!inst.model) continue;
+                const glm::mat4& m = inst.modelMatrix;
+                for (int i = 0; i < 4; ++i)
+                    glVertexAttrib4fv(6 + i, &m[i][0]);
+                inst.model->DrawStatic(*shadowShader);
+            }
+        }
+    }
 
-    outTargetPos = bestNPC->position;
-    outScore = bestScore;
-    return true;
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 }
 
 } // namespace World

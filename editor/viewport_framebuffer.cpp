@@ -1,6 +1,8 @@
 #include "viewport_framebuffer.h"
 
 #include <iostream>
+#include <glad/glad.h>
+#include "gl_context_lifecycle.h"  // for glctx::isAlive() lifecycle guard
 
 namespace Editor {
 
@@ -57,7 +59,7 @@ bool ViewportFramebuffer::initialize(int width, int height) {
 
     glGenTextures(1, &colorTex_);
     glBindTexture(GL_TEXTURE_2D, colorTex_);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width_, height_, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width_, height_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex_, 0);
@@ -81,6 +83,8 @@ void ViewportFramebuffer::resize(int width, int height) {
 }
 
 void ViewportFramebuffer::cleanup() noexcept {
+    // Context lifecycle guard: GL may already be torn down at shutdown.
+    if (!glctx::isAlive()) return;
     if (fbo_) glDeleteFramebuffers(1, &fbo_);
     if (colorTex_) glDeleteTextures(1, &colorTex_);
     if (rbo_) glDeleteRenderbuffers(1, &rbo_);
@@ -97,14 +101,31 @@ void ViewportFramebuffer::bind() const {
 }
 
 void ViewportFramebuffer::unbind() const {
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // Restore the caller's framebuffer AND viewport dimensions so unbinding
+    // from the editor viewport doesn't clobber the previous render target.
+    // FIX (forPrimitives.txt Fix 1): Capture the true active state BEFORE
+    // changing anything, then restore to the captured FBO (NOT 0). The old
+    // code queried state then bound to 0, which clobbered the caller's active
+    // render target and routed subsequent forward passes into the wrong buffer.
+    GLint previousFbo = 0;
+    GLint previousViewport[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFbo);
+    glGetIntegerv(GL_VIEWPORT, previousViewport);
+    glBindFramebuffer(GL_FRAMEBUFFER, previousFbo);
+    glViewport(previousViewport[0], previousViewport[1],
+               static_cast<GLsizei>(previousViewport[2]),
+               static_cast<GLsizei>(previousViewport[3]));
 }
 
 bool ViewportFramebuffer::isComplete() const {
     if (fbo_ == 0) return false;
+    // Save/restore the previously bound framebuffer instead of unconditionally
+    // unbinding to 0, which discards the caller’s active FBO.
+    GLint previousFbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     const bool complete = (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFbo));
     return complete;
 }
 

@@ -47,9 +47,10 @@ void RenderToolbar(Editor::Editor& editor);
 // Left panel (Outliner / Layers / World)
 void RenderLeftPanel(Editor::Editor& editor);
 
-void RenderOutlinerPanel(ecs::EntityID& selected, EntityCache& entityCache, const char* searchBuffer);
+void RenderOutlinerPanel(ecs::EntityID& selected, EntityCache& entityCache);
 void RenderDetailsPanel(ecs::World& world, ecs::EntityID& selected);
 void RenderWorldSettingsPanel(Editor::Editor& editor);
+void RenderEngineSettingsPanel(Editor::Editor& editor);
 
 // Right panel (Details). When in play mode and a PlayModeController is
 // supplied, the play-mode debug section (character state, speed, active clip,
@@ -57,7 +58,7 @@ void RenderWorldSettingsPanel(Editor::Editor& editor);
 // panel instead of as a floating overlay on the viewport - keeping the 3D
 // view clear so the character stays visible.
 void RenderRightPanel(Editor::Editor& editor,
-                      const Editor::PlayModeController* play = nullptr,
+                      Editor::PlayModeController* play = nullptr,
                       const char* camMode = nullptr);
 void RenderModelSection(ecs::ModelComponent* model);
 
@@ -65,8 +66,25 @@ void RenderModelSection(ecs::ModelComponent* model);
 void RenderBottomPanel(Editor::Editor& editor, float fps);
 
 void RenderConsolePanel();
-void RenderContentBrowserPanel();
+void RenderContentBrowserPanel(Editor::Editor& editor);
 void RenderProfilerPanel(Editor::Editor& editor, float fps);
+
+// forUI.txt Step 2: Blueprint / Prefab authoring workspace. Lists discovered
+// .json blueprint templates in assets/blueprints/, handles on-demand disk
+// scans, reads them via ecs::Blueprint::loadFromFile, and binds
+// double-click instantiate + right-click delete + Save modal.
+void RenderBlueprintBrowserTab(Editor::Editor& editor);
+
+// verify.txt Module 1: Time-of-Day Sequencer panel. Renders a horizontal
+// timeline slider (0–24h), keyframe channels, and a "snapshot current
+// lighting" button. Updates LightingEnvironment::Instance() every frame.
+void RenderTimeOfDaySequencer(Editor::Editor& editor);
+
+// verify.txt Module 1: Evaluate the time-of-day system — blends
+// LightingEnvironment fields between keyframes at the current clock time.
+// Called every frame from renderSceneOnly so lighting stays live even when
+// the ToD panel is closed.
+void EvaluateTimeOfDay(Editor::Editor& editor);
 
 // Viewport (Editor-based, hardened signature). io is nullable: without an
 // ImGui context (or explicit ImGuiIO*) the function early-outs safely.
@@ -91,6 +109,10 @@ void RenderViewport(Editor::Editor& editor, GLuint viewportTexture,
 // the engine hand the camera (orbit / zoom / fly) ownership of the mouse +
 // keyboard instead of ImGui swallowing it. Popups/menus on top still win.
 bool IsViewport3DHovered();
+
+// True (last frame) while the mouse is over / dragging any splitter strip.
+// overViewport gates exclude this so the camera never steals a splitter drag.
+bool IsSplitterHovering();
 
 // Rect of the FBO image inside the viewport (below the header), in window
 // coordinates, as captured by the last RenderViewport call. Returns false
@@ -120,9 +142,18 @@ inline void RenderViewport(ecs::EntityID& selected, flyCamera* camera, bool& isV
     (void)viewportTexture; (void)windowW; (void)windowH; (void)window; (void)io; (void)projection;
 }
 
-// Status bar (reads from cached data, no ECS iteration)
-void RenderStatusBar(size_t entityCount, ecs::EntityID selected, float fps,
-                     bool isPlaying, bool wasPlaying, int windowW, int windowH);
+// Status bar (reads from cached data, no ECS iteration). Displays FPS,
+// entity count, camera position/distance, camera mode, tool/gizmo state,
+// grid/gizmo toggles, viewport resolution, selected entity, and play state.
+void RenderStatusBar(Editor::Editor& editor, size_t entityCount, ecs::EntityID selected,
+                     float fps, bool isPlaying, bool wasPlaying, int windowW, int windowH,
+                     const glm::vec3* cameraPos, const glm::vec3* cameraTarget,
+                     const char* camModeName);
+
+// forUI.txt §1: shrink the right/bottom panels so the viewport keeps
+// >= 320x200 (in UI units) without the viewport window overflowing its region.
+// Call BEFORE the panel renderers (each frame).
+void EnforceGlobalLayoutConstraints(Editor::Editor& editor);
 
 // About dialog
 void RenderAboutDialog(bool& showAbout);

@@ -5,6 +5,8 @@ namespace ShaderManager {
 
 static GLuint g_mainShaderProg = 0;
 static GLuint g_gizmoShaderProg = 0;
+static GLuint g_unlitShaderProg = 0;
+static GLuint g_normalsShaderProg = 0;
 
 void InitShaders() {
     // Main PBR shader. The model transform comes from a UNIFORM (uModel/model),
@@ -88,7 +90,12 @@ vec3 calculatePBR() {
     
     vec3 F0 = vec3(0.04);
     F0 = mix(F0, baseColor, metallic);
-    vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(viewDir, reflectDir), 0.0), 5.0);
+    // Schlick Fresnel (N·V form). NOTE: the original referenced `reflectDir`,
+    // which was only declared later (inside the per-light loop body) — a use-
+    // before-declaration that is a hard GLSL compile error on every driver
+    // (glslc: "'reflectDir' : undeclared identifier"). Since the Fresnel term
+    // needs only the view direction, use the standard N·V Schlick approximation.
+    vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(viewDir, norm), 0.0), 5.0);
     
     vec3 diffuse = baseColor * (1.0 - F) * (1.0 - metallic);
     
@@ -157,28 +164,89 @@ void main() {
     glAttachShader(g_mainShaderProg, vsObj);
     glAttachShader(g_mainShaderProg, fsObj);
     glLinkProgram(g_mainShaderProg);
-    
+
+    {
+        GLint mainLinkOk = 0;
+        glGetProgramiv(g_mainShaderProg, GL_LINK_STATUS, &mainLinkOk);
+        if (mainLinkOk == GL_FALSE) {
+            char log[1024];
+            glGetProgramInfoLog(g_mainShaderProg, sizeof(log), nullptr, log);
+            std::cerr << "[ShaderManager] Main PBR shader link failed: " << log
+                      << "\nGetMainShaderProgram() will return 0; the editor "
+                      << "falls back to the next available flat program.\n";
+            glDeleteProgram(g_mainShaderProg);
+            g_mainShaderProg = 0;
+        }
+    }
+
     glDeleteShader(vsObj);
     glDeleteShader(fsObj);
-    
-    // Gizmo shader (unlit)
+
+    // Gizmo shader (AAA aesthetic: fake cylindrical shading, Fresnel rim,
+    // hover glow, dual-pass X-Ray occlusion). forGizmo.txt Step 2/3.
     const char* gizmoVS = R"(
 #version 430 core
 layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal; // Optional for future 3D tube upgrades
+
 uniform mat4 uView;
 uniform mat4 uProjection;
 uniform mat4 uModel;
+
+out vec3 vFragPos;
+out vec3 vLocalPos;
+out vec3 vViewDir;
+
 void main() {
-    gl_Position = uProjection * uView * uModel * vec4(aPos, 1.0);
+    vec4 worldPos = uModel * vec4(aPos, 1.0);
+    vFragPos = worldPos.xyz;
+    vLocalPos = aPos;
+
+    mat4 invView = inverse(uView);
+    vec3 camPos = invView[3].xyz;
+    vViewDir = normalize(camPos - worldPos.xyz);
+
+    gl_Position = uProjection * uView * worldPos;
 }
 )";
     
     const char* gizmoFS = R"(
 #version 430 core
+in vec3 vFragPos;
+in vec3 vLocalPos;
+in vec3 vViewDir;
+
 uniform vec3 uColor;
+uniform float uHoverGlow = 0.0;
+uniform float uIsOccludedPass = 0.0;
+
 out vec4 FragColor;
+
 void main() {
-    FragColor = vec4(uColor, 1.0);
+    vec3 viewDir = normalize(vViewDir);
+
+    vec3 fakeNormal = normalize(cross(viewDir, vec3(0.0, 1.0, 0.0)));
+    if(length(fakeNormal) < 0.1) fakeNormal = vec3(1.0, 0.0, 0.0);
+    float lightIntensity = max(dot(fakeNormal, viewDir), 0.0);
+    float pseudoSpec = pow(lightIntensity, 16.0);
+
+    float fresnel = 1.0 - max(dot(fakeNormal, viewDir), 0.0);
+    fresnel = pow(fresnel, 3.0) * 0.4;
+
+    vec3 coreColor = mix(uColor, uColor * 1.3 + vec3(0.15), uHoverGlow);
+    vec3 finalColor = coreColor * (0.6 + 0.4 * lightIntensity) + (pseudoSpec * 0.3) + (fresnel * coreColor);
+    finalColor += (uHoverGlow * 0.25) * vec3(1.0);
+
+    if (uIsOccludedPass > 0.5) {
+        float luminance = dot(finalColor, vec3(0.2126, 0.7152, 0.0722));
+        vec3 desaturatedColor = mix(vec3(luminance), uColor, 0.2);
+        if (mod(gl_FragCoord.x + gl_FragCoord.y, 8.0) > 3.0) {
+            discard;
+        }
+        FragColor = vec4(desaturatedColor, 0.35);
+    } else {
+        FragColor = vec4(finalColor, 1.0);
+    }
 }
 )";
     
@@ -195,19 +263,181 @@ void main() {
     glAttachShader(g_gizmoShaderProg, gfs);
     glLinkProgram(g_gizmoShaderProg);
     
+    { GLint gizmoLinkOk = 0;
+      glGetProgramiv(g_gizmoShaderProg, GL_LINK_STATUS, &gizmoLinkOk);
+      if (gizmoLinkOk == GL_FALSE) {
+          std::cerr << "[ShaderManager] Gizmo shader link failed; falling back to flat unlit.\n";
+          glDeleteProgram(g_gizmoShaderProg);
+          g_gizmoShaderProg = 0;
+      } }
+    
     glDeleteShader(gvs);
     glDeleteShader(gfs);
+
+    // Unlit (Viewport -> Unlit mode): a flat, lighting-free forward shader that
+    // reuses the Renderer's CameraBlock UBO (binding 0, same layout as the main
+    // PBR shader) + the "model" uniform (Renderer::SetModelUniform, name-based)
+    // + albedo at location 0 (Renderer hardcodes glUniform3f(0, batch.albedo)).
+    // That lets the batched forward renderer draw static meshes without a
+    // separate code path. Link-failure is recoverable: fall back to the main
+    // shader in renderSceneOnly if this program is 0.
+    const char* unlitVS = R"(
+#version 430 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec2 aTexCoord;
+uniform mat4 model;
+layout(std140, binding = 0) uniform CameraBlock {
+    mat4 view;
+    mat4 projection;
+    mat4 viewProjection;
+    vec4 viewPos;
+    vec4 lightPositions[8];
+    vec4 lightColors[8];
+    int lightCount;
+    int pad0;
+    int pad1;
+    int pad;
+} camera;
+void main() {
+    gl_Position = camera.projection * camera.view * model * vec4(aPos, 1.0);
+}
+)";
+
+    const char* unlitFS = R"(
+#version 430 core
+layout(std140, binding = 0) uniform CameraBlock {
+    mat4 view;
+    mat4 projection;
+    mat4 viewProjection;
+    vec4 viewPos;
+    vec4 lightPositions[8];
+    vec4 lightColors[8];
+    int lightCount;
+    int pad0;
+    int pad1;
+    int pad;
+} camera;
+layout(location = 0) uniform vec3 albedo;
+out vec4 FragColor;
+void main() {
+    FragColor = vec4(albedo, 1.0);
+}
+)";
+
+    GLuint uvs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(uvs, 1, &unlitVS, nullptr);
+    glCompileShader(uvs);
+    GLuint ufs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(ufs, 1, &unlitFS, nullptr);
+    glCompileShader(ufs);
+
+    GLuint unlitProg = glCreateProgram();
+    glAttachShader(unlitProg, uvs);
+    glAttachShader(unlitProg, ufs);
+    glLinkProgram(unlitProg);
+    GLint unlitLinkOk = 0;
+    glGetProgramiv(unlitProg, GL_LINK_STATUS, &unlitLinkOk);
+    if (unlitLinkOk == GL_FALSE) {
+        std::cerr << "[ShaderManager] Unlit shader link failed (glsl log below); "
+                     "Unlit mode will fall back to the main PBR shader.\n";
+        glDeleteProgram(unlitProg);
+    } else {
+        g_unlitShaderProg = unlitProg;
+    }
+    glDeleteShader(uvs);
+    glDeleteShader(ufs);
+
+    // Normals viewport mode (renderMode()==2): visualize mesh normals as RGB
+    // (world-space normal * 0.5 + 0.5). Shares the same CameraBlock UBO (binding
+    // 0) + "model" uniform as the main shader so the batched forward renderer
+    // feeds it for free. Link-checked; falls back to main on failure.
+    const char* normalsVS = R"(
+#version 430 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec2 aTexCoord;
+uniform mat4 model;
+layout(std140, binding = 0) uniform CameraBlock {
+    mat4 view;
+    mat4 projection;
+    mat4 viewProjection;
+    vec4 viewPos;
+    vec4 lightPositions[8];
+    vec4 lightColors[8];
+    int lightCount;
+    int pad0;
+    int pad1;
+    int pad;
+} camera;
+out vec3 vNormal;
+void main() {
+    vec4 wp = model * vec4(aPos, 1.0);
+    vNormal = mat3(model) * aNormal;
+    gl_Position = camera.projection * camera.view * wp;
+}
+)";
+
+    const char* normalsFS = R"(
+#version 430 core
+layout(std140, binding = 0) uniform CameraBlock {
+    mat4 view;
+    mat4 projection;
+    mat4 viewProjection;
+    vec4 viewPos;
+    vec4 lightPositions[8];
+    vec4 lightColors[8];
+    int lightCount;
+    int pad0;
+    int pad1;
+    int pad;
+} camera;
+in vec3 vNormal;
+out vec4 FragColor;
+void main() {
+    FragColor = vec4(normalize(vNormal) * 0.5 + 0.5, 1.0);
+}
+)";
+
+    GLuint nvs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(nvs, 1, &normalsVS, nullptr);
+    glCompileShader(nvs);
+    GLuint nfs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(nfs, 1, &normalsFS, nullptr);
+    glCompileShader(nfs);
+
+    GLuint normalsProg = glCreateProgram();
+    glAttachShader(normalsProg, nvs);
+    glAttachShader(normalsProg, nfs);
+    glLinkProgram(normalsProg);
+    GLint normalsLinkOk = 0;
+    glGetProgramiv(normalsProg, GL_LINK_STATUS, &normalsLinkOk);
+    if (normalsLinkOk == GL_FALSE) {
+        std::cerr << "[ShaderManager] Normals shader link failed; "
+                     "Normals mode will fall back to the main PBR shader.\n";
+        glDeleteProgram(normalsProg);
+    } else {
+        g_normalsShaderProg = normalsProg;
+    }
+    glDeleteShader(nvs);
+    glDeleteShader(nfs);
 }
 
 void CleanupShaders() {
     if (g_mainShaderProg) glDeleteProgram(g_mainShaderProg);
     if (g_gizmoShaderProg) glDeleteProgram(g_gizmoShaderProg);
+    if (g_unlitShaderProg) glDeleteProgram(g_unlitShaderProg);
+    if (g_normalsShaderProg) glDeleteProgram(g_normalsShaderProg);
     g_mainShaderProg = 0;
     g_gizmoShaderProg = 0;
+    g_unlitShaderProg = 0;
+    g_normalsShaderProg = 0;
 }
 
 GLuint GetMainShaderProgram() { return g_mainShaderProg; }
 GLuint GetGizmoShaderProgram() { return g_gizmoShaderProg; }
+GLuint GetUnlitShaderProgram() { return g_unlitShaderProg; }
+GLuint GetNormalsShaderProgram() { return g_normalsShaderProg; }
 
 void UseMainShader() { glUseProgram(g_mainShaderProg); }
 void UseGizmoShader() { glUseProgram(g_gizmoShaderProg); }
@@ -220,6 +450,11 @@ void SetMat4(GLuint program, const char* name, const glm::mat4& mat) {
 void SetVec3(GLuint program, const char* name, const glm::vec3& vec) {
     GLint loc = glGetUniformLocation(program, name);
     if (loc >= 0) glUniform3fv(loc, 1, &vec[0]);
+}
+
+void SetFloat(GLuint program, const char* name, float v) {
+    GLint loc = glGetUniformLocation(program, name);
+    if (loc >= 0) glUniform1f(loc, v);
 }
 
 } // namespace ShaderManager

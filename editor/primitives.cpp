@@ -222,7 +222,7 @@ MeshData CreateCone(int radialSegments, float radius, float height) {
     }
 
     for (int i = 1; i <= radialSegments; i++) {
-        indices.insert(indices.end(), {0, i, i + 1});
+        indices.insert(indices.end(), {0u, static_cast<unsigned>(i), static_cast<unsigned>(i + 1)});
     }
 
     mesh.indexCount = indices.size();

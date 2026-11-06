@@ -5,6 +5,9 @@
 
 namespace UI {
 
+// Drive async model-loader spawns (parse off-thread, GL commit main-thread).
+void CommitModelLoaderSpawns();
+
 /**
  * Render Model Loader Dialog
  *

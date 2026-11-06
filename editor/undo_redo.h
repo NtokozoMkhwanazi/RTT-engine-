@@ -43,6 +43,24 @@ void RecordTransformEnd(ecs::EntityID id, const ecs::TransformComponent& after);
 void Undo();
 void Redo();
 
+// Read-only history enumeration for the UI History panel. Returns the stack
+// oldest-first (a timeline); the LAST entry is the next action Undo acts on.
+struct HistoryEntry {
+    enum class Action { Created, Deleted, Modified };
+    Action action = Action::Modified;
+    std::string entityName;  // empty when the entity has no name component
+    const char* actionName() const {
+        switch (action) {
+            case Action::Created:  return "Create";
+            case Action::Deleted:  return "Delete";
+            case Action::Modified: return "Modify";
+        }
+        return "?";
+    }
+};
+std::vector<HistoryEntry> UndoHistory();   // past actions (oldest -> newest)
+std::vector<HistoryEntry> RedoHistory();   // future actions (oldest -> newest)
+
 // Scene persistence (called by SceneManager::SaveScene/LoadScene). Returns the
 // "history" JSON node, or clears both stacks when the node is absent/empty.
 Json::Value SerializeHistory();

@@ -5,6 +5,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <algorithm>
+#include <chrono>
+#include <utility>
 
 namespace Resources {
 
@@ -144,13 +146,70 @@ std::vector<std::string> ResourceManager::scanModels(const std::string& director
 }
 
 std::vector<std::string> ResourceManager::scanTextures(const std::string& directory) {
-    std::string fullPath = Config::getPaths().texturePath;
-    if (!directory.empty()) {
-        fullPath = directory;
-    }
-    
-    return scanDirectory(fullPath, {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr"});
+    return scanDirectory(directory, {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr"});
 }
+
+void ResourceManager::scanModelsAsync(const std::string& directory) {
+    // Kick the (slow) recursive walk on a detached std::async worker. The walk
+    // touches only the filesystem + the per-call local result vector, so it is
+    // safe to run off the render thread; the future is stashed here so the UI
+    // can poll isAsyncScanReady() / fetchAsyncScan() without owning the future.
+    std::lock_guard<std::mutex> lock(scanMutex_);
+    if (m_pendingScans.count(directory)) return;            // already in flight
+    m_pendingScans[directory] = std::async(std::launch::async, [this, directory]() {
+        return scanDirectory(directory, {".fbx", ".gltf", ".glb", ".obj", ".dae"});
+    });
+}
+
+void ResourceManager::scanTexturesAsync(const std::string& directory) {
+    std::lock_guard<std::mutex> lock(scanMutex_);
+    if (m_pendingScans.count(directory)) return;
+    m_pendingScans[directory] = std::async(std::launch::async, [this, directory]() {
+        return scanDirectory(directory, {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr"});
+    });
+}
+
+bool ResourceManager::isAsyncScanReady(const std::string& directory) const {
+    // Non-blocking poll suitable for the render loop: returns true only once the
+    // worker has fulfilled the promise. Never blocks the frame.
+    std::lock_guard<std::mutex> lock(scanMutex_);
+    auto it = m_pendingScans.find(directory);
+    if (it == m_pendingScans.end()) return false;
+    return it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+}
+
+std::vector<std::string> ResourceManager::fetchAsyncScan(const std::string& directory) {
+    // Caller must only call once isAsyncScanReady() is true; get() then cannot
+    // block. The future is moved out + erased under the lock, then the lock is
+    // RELEASED before get() so the future wait cannot deadlock against another
+    // poll of the scanMutex_ and a second fetch is a clean no-op (the entry is
+    // erased).
+    std::future<std::vector<std::string>> fut;
+    {
+        std::lock_guard<std::mutex> lock(scanMutex_);
+        auto it = m_pendingScans.find(directory);
+        if (it == m_pendingScans.end()) return {};
+        fut = std::move(it->second);
+        m_pendingScans.erase(it);
+    }
+    return fut.get();
+}
+
+void ResourceManager::drainAsyncScans() {
+    // Move every pending future out, then get() each to JOIN its worker before
+    // the scanMutex_ is touched again. Used at test TearDown/shutdown to keep
+    // std::async threads from leaking across the long-running test sweep.
+    std::vector<std::future<std::vector<std::string>>> pending;
+    {
+        std::lock_guard<std::mutex> lock(scanMutex_);
+        for (auto& kv : m_pendingScans) pending.emplace_back(std::move(kv.second));
+        m_pendingScans.clear();
+    }
+    for (auto& fut : pending) {
+        try { (void)fut.get(); } catch (...) { /* worker reported an error */ }
+    }
+}
+
 
 std::vector<std::string> ResourceManager::scanDirectory(const std::string& path,
                                                        const std::vector<std::string>& extensions) {

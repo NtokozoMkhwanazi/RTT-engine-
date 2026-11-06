@@ -225,7 +225,12 @@ void TreeNodeIcon(PhosphorIcons::Icon icon, const char* label, bool* open) {
         if (open) {
             ImGui::SetNextItemOpen(*open);
         }
-        ImGui::TreeNode(label);
+        if (ImGui::TreeNode(label)) {
+            if (open) *open = true;
+            ImGui::TreePop();
+        } else {
+            if (open) *open = false; // Sync closure state back to graph variables
+        }
         return;
     }
 
@@ -245,6 +250,9 @@ void TreeNodeIcon(PhosphorIcons::Icon icon, const char* label, bool* open) {
 
     if (ImGui::TreeNode(label)) {
         if (open) *open = true;
+        ImGui::TreePop();
+    } else {
+        if (open) *open = false; // Sync closure state back to graph variables
     }
 }
 
@@ -280,7 +288,7 @@ ImVec2 GetIconSize(PhosphorIcons::Icon icon, float size) {
     if (!cp) return ImVec2{size, size};
 
     if (g_iconFont) {
-        ImFont* prev = ImGui::GetFont();
+        [[maybe_unused]] ImFont* prev = ImGui::GetFont();
         ImGui::PushFont(g_iconFont);
         ImVec2 result = ImGui::CalcTextSize(cp);
         ImGui::PopFont();

@@ -5,6 +5,7 @@
 #include "config.h"
 #include "lighting/LightingEnvironment.h"  // #3: world render thread env, not Instance()
 #include "arena.h"
+#include "shaderSystem/Shader.h"  // Shader* for shadow render callback
 
 class Terrain;
 class VegetationSystem;
@@ -15,17 +16,6 @@ struct Floor;
 
 namespace World {
     
-    // Simple NPC/enemy tracker — supports intent matrix scoring and
-    // line-of-sight filtering for combat targeting.
-    struct NPC {
-        glm::vec3 position{0.0f};
-        float health = 100.0f;
-        bool isEnemy = true;
-        bool alive = true;
-        float radius = 0.5f;  // collision radius for LOS checks
-        int id = 0;
-    };
-       
     // World statistics for profiling
     struct WorldStats {
         size_t activeTerrainChunks = 0;
@@ -45,10 +35,49 @@ namespace World {
         
         ~WorldManager();
         
-        // Initialize with configuration
+        // Initialize with configuration (full boot path: terrain + props).
         bool initialize(const Config::TerrainConfig& terrainConfig,
                        const Config::VegetationConfig& vegConfig);
-        
+
+        // Load terrain ONLY — heightmap + splat textures + POM. Does NOT touch
+        // world objects or vegetation. This is what the "Load Heightmap"
+        // button calls. Alerts the artist (via return false + console) if the
+        // heightmap path is missing or the asset doesn't exist.
+        //
+        // `preloadedHeightmap` / `preloadedSize`: optional height grid already
+        // decoded off the main thread (Terrain::DecodeHeightmapFile). When
+        // supplied, the terrain skips the blocking 4K file decode — used by the
+        // editor's staged "Reload Complete Stage" job so the rebuild doesn't
+        // freeze the viewport.
+        bool initializeTerrain(const Config::TerrainConfig& terrainConfig,
+                               const std::vector<float>* preloadedHeightmap = nullptr,
+                               int preloadedSize = 0);
+
+        // Rebuild world objects ONLY — loads props from the JSON config
+        // (engine_config.json "world_objects" array) with NO hardcoded
+        // defaults. Alerts the artist if the config is empty or an asset
+        // path doesn't exist. Does NOT touch terrain or heightmap.
+        //
+        // This SYNCHRONOUS variant blocks the calling thread for the full
+        // Assimp parse + GL upload — used by engine boot and the test path
+        // (which expects props loaded before update()/placement runs).
+        bool rebuildWorldObjects(const Config::VegetationConfig& vegConfig);
+
+        // Non-blocking variant of rebuildWorldObjects: dispatches the heavy
+        // Assimp parse + texture decode to worker threads and returns
+        // immediately. Poll commitWorldObjectLoading() every frame (also pumped
+        // automatically inside update()) until isWorldObjectLoadDone();
+        // getWorldObjectLoadProgress() drives the UI "Resolving..." bar.
+        bool rebuildWorldObjectsAsync(const Config::VegetationConfig& vegConfig);
+
+        // Pump one main-thread (GL) commit step of the in-flight async prop
+        // load. Safe to call every frame; no-ops when nothing is loading.
+        float commitWorldObjectLoading();
+        bool isWorldObjectLoading() const;
+        bool isWorldObjectLoadDone() const;
+        float getWorldObjectLoadProgress() const;
+        void cancelWorldObjectLoading();
+
         // Shutdown and cleanup
         void shutdown();
         
@@ -63,6 +92,15 @@ namespace World {
                    ShadowMapper* shadow = nullptr,   // forwarded to terrain (CSM receive)
                    const LightingEnvironment& lighting = LightingEnvironment::Instance());
         
+        // Depth-only render into the active shadow-map framebuffer (called by
+        // RenderPipeline's shadow pass via the registered m_shadowRenderCallback).
+        // Renders terrain chunks + world-object instances with the shadow shader
+        // so they cast CSM shadows. `lightView` / `lightProj` are the light's
+        // view and projection matrices for the current cascade.
+        void renderForShadows(const glm::mat4& lightView,
+                              const glm::mat4& lightProj,
+                              Shader* shadowShader);
+        
         // Terrain access
         Terrain* getTerrain() { return m_terrain.get(); }
         const Terrain* getTerrain() const { return m_terrain.get(); }
@@ -74,17 +112,6 @@ namespace World {
         // World objects access
         WorldObjectManager* getWorldObjectManager() { return m_worldObjects.get(); }
         const WorldObjectManager* getWorldObjectManager() const { return m_worldObjects.get(); }
-
-        // Update()-ownership handoff: when true, WorldManager::update() skips
-        // the Terrain::update / WorldObjectManager::update calls and lets the
-        // ECS adapter systems (TerrainSystem / WorldObjectSystem) drive them
-        // instead. Defaults to false so every entry path keeps the original
-        // behavior unchanged; only the bin/engine play path opts in. The flag
-        // is only meaningful when the modules have actually been instantiated
-        // (i.e. a non-arena scene — in the default arena scene both are null
-        // and the adapters are no-ops either way).
-        void setEcsOwnsTerrainObjects(bool enabled) { m_ecsOwnsTerrainObjects = enabled; }
-        bool ecsOwnsTerrainObjects() const { return m_ecsOwnsTerrainObjects; }
         
         // -----------------------------------------------------------------
         // Arena mode — the default engine start scene.
@@ -115,6 +142,11 @@ namespace World {
         // height when no solid object covers the point.
         float getSurfaceHeightAt(float worldX, float worldZ) const;
 
+        // Ray-march a ray against the terrain heightfield; returns the first
+        // crossing. (forUI.txt Pillar 2 foliage-brush raycasts.)
+        bool raycastTerrain(const glm::vec3& origin, const glm::vec3& dir,
+                            float maxDist, float& outDist, glm::vec3& outPoint) const;
+
         // Resolve the play-mode character's capsule against the static
         // world-object colliders (boulders/rocks/trees): pushes feetPos out of
         // any overlap and zeroes the velocity component heading into the
@@ -127,25 +159,6 @@ namespace World {
         bool resolveCharacterCollision(glm::vec3& feetPos, float radius,
                                        float totalHeight, glm::vec3& velocity,
                                        bool grounded = true);
-
-        // ---- NPC / enemy targeting ----
-        // Spawn an NPC (enemy or ally) at the given world position.
-        // Returns the NPC's unique ID for later reference.
-        int spawnNPC(const glm::vec3& pos, bool isEnemy = true, float health = 100.0f);
-        // Remove all dead / out-of-range NPCs.
-        void pruneNPCs();
-        // Get live NPC count (for diagnostics).
-        size_t npcCount() const { return m_npcs.size(); }
-        const std::vector<NPC>& npcs() const { return m_npcs; }
-
-        // Intent Matrix Scoring + Line-of-Sight Filtering target selection.
-        // Finds the best enemy target near `from` within `maxDist` in the
-        // cone around `forwardDir`. Scores by angle (40%), distance (30%),
-        // and visibility/LOS (30%), then raycasts through physics to confirm
-        // the target is not occluded by terrain/world objects.
-        bool getNearestEnemy(const glm::vec3& from, const glm::vec3& forwardDir,
-                             float maxDist, glm::vec3& outTargetPos,
-                             float& outScore);
         
         // Check if terrain is initialized
         bool isTerrainInitialized() const { return m_terrainInitialized; }
@@ -157,10 +170,12 @@ namespace World {
         void setLODEnabled(bool enabled) { m_enableLOD = enabled; }
         void setCullingEnabled(bool enabled) { m_enableCulling = enabled; }
         void setDrawDistance(float distance) { m_drawDistance = distance; }
+        void setMaxVisibleInstances(int count) { m_maxVisibleInstances = count; }
         
         bool isLODEnabled() const { return m_enableLOD; }
         bool isCullingEnabled() const { return m_enableCulling; }
         float getDrawDistance() const { return m_drawDistance; }
+        int getMaxVisibleInstances() const { return m_maxVisibleInstances; }
         
     private:
         WorldManager();
@@ -176,17 +191,20 @@ namespace World {
         // the GL VAOs/shader are torn down with the WorldManager.
         std::unique_ptr<Arena::ArenaScene> m_arena;
         bool m_arenaMode = false;
-        bool m_ecsOwnsTerrainObjects = false;   // see setEcsOwnsTerrainObjects
         
+        void transferVegetationInstances();
+
+        // Shared by rebuildWorldObjects() (sync) and rebuildWorldObjectsAsync()
+        // (non-blocking): re-initialises the (empty) vegetation scatter pools so
+        // the biome generator starts from a clean slate regardless of path.
+        void initVegetationPools(const Config::VegetationConfig& vegConfig);
+
         // State
         bool m_terrainInitialized = false;
         bool m_enableLOD = true;
         bool m_enableCulling = true;
         float m_drawDistance = 500.0f;
-        
-        // NPC / enemy tracking for combat targeting
-        std::vector<NPC> m_npcs;
-        int m_npcNextId = 1;
+        int m_maxVisibleInstances = 500;
         
         // Statistics
         WorldStats m_stats;

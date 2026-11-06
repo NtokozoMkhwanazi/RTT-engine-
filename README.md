@@ -1,3 +1,4 @@
+
 # RTT Engine — 3D Engine
 
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
@@ -40,9 +41,16 @@ GPU profiler and GPS simulation) and runs its main loop.
 
   (openGL test) Model Texture binding. disabled root motion
 
-  <img width="400" height="225" alt="view(1)(1)" src="https://github.com/user-attachments/assets/2480229c-f7ab-48be-b4d7-9b092782d18d" />
-
+  <img width="400" height="225" alt="view(1)(1)" src="https://github.com/user-attachments/assets/2480229c-f7ab-48be-b4d7-9b092782d18d" /> 
   
+  (engine core) Tessellation tests using wireframe
+  
+<img width="400" height="225" alt="2026-11-05 18-01-19" src="https://github.com/user-attachments/assets/cce5bf46-af1a-4999-b3e1-098227f6b364" />
+  
+  (Engine core) Splat tests and POM
+
+  <img width="400" height="225" alt="2026-11-05 17-59-47" src="https://github.com/user-attachments/assets/7b51f224-556b-4a71-9171-64b202b3a42e" />
+
 ---
 ## ✨ Features
 

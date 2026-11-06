@@ -67,6 +67,13 @@ void LightingSystem::categorizeLights() {
     pointLights.clear();
     spotLights.clear();
 
+    // Pre-reserve to the source capacity so push_back never triggers
+    // heap reallocation + memory moves during frame-driven level changes.
+    size_t count = lights.size();
+    directionalLights.reserve(count);
+    pointLights.reserve(count);
+    spotLights.reserve(count);
+
     for (const auto& light : lights) {
         switch (light.type) {
             case LightType::DIRECTIONAL:

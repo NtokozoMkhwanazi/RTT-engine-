@@ -9,8 +9,6 @@
 #include <unordered_map>
 #include <memory>
 #include <cstdint>
-#include <fstream>
-#include <cstring>
 
 #include "../shaderSystem/Shader.h"
 #include "../animationSystem/AnimationConfig.h"
@@ -212,6 +210,66 @@ struct BoundingSphere
 };
 
 // ============================================================
+// Cluster / Virtualized Geometry
+// ============================================================
+// A single fixed-triangle-count cluster. Indices reference cluster-local
+// (deduplicated) vertices, not the original mesh vertex pool.
+struct MeshCluster
+{
+    std::vector<Vertex>   vertices;      // cluster-local, deduplicated
+    std::vector<uint32_t> indices;       // cluster-local indices into `vertices`
+    BoundingBox           boundingBox;
+    BoundingSphere        boundingSphere;
+};
+
+// Result of splitting a mesh into clusters.
+struct ClusterPackedPayload
+{
+    std::vector<MeshCluster> clusters;
+    size_t totalVertices{0};
+    size_t totalIndices{0};
+};
+
+// GPU-side per-cluster bounds. Matches the GLSL `ClusterBounds` block used by
+// rhi/shaders/cluster_cull.comp. Padded to 64 bytes (one Vega/GCN cache-line
+// slot) to prevent cache-line-straddle faults on shared-memory (UMA) APUs —
+// cluster_cull reads only .sphereCenterRadius, so the pad is ignored by the
+// shader and only enlarges the array stride for alignment.
+struct GPUClusterBounds
+{
+    glm::vec4 sphereCenterRadius;   // (center.xyz, radius)
+    glm::vec4 minBounds;            // (min.xyz, pad)
+    glm::vec4 maxBounds;            // (max.xyz, pad)
+    glm::vec4 pad;                  // aligns struct to a 64-byte cache-line (APU)
+};
+static_assert(sizeof(GPUClusterBounds) == 64,
+              "GPUClusterBounds must be 64 bytes (4 x vec4) for APU cache-line alignment");
+
+// Per-cluster draw command (std430-friendly: 4 x uint32_t = 16 bytes).
+struct GPUClusterCommand
+{
+    uint32_t firstVertex;
+    uint32_t firstIndex;
+    uint32_t indexCount;
+    uint32_t instanceId;
+};
+static_assert(sizeof(GPUClusterCommand) == 16,
+              "GPUClusterCommand must be 16 bytes");
+
+// Indirect draw command. Matches VkDrawIndexedIndirectCommand layout:
+// (indexCount, instanceCount, firstIndex, vertexOffset, firstInstance).
+struct ClusterIndirectCommand
+{
+    uint32_t indexCount;
+    uint32_t instanceCount;
+    uint32_t firstIndex;
+    uint32_t vertexOffset;
+    uint32_t firstInstance;
+};
+static_assert(sizeof(ClusterIndirectCommand) == 20,
+              "ClusterIndirectCommand must be 20 bytes (5 x uint32_t)");
+
+// ============================================================
 // Mesh Configuration
 // ============================================================
 enum class MeshFlags
@@ -331,69 +389,6 @@ private:
 };
 
 // ============================================================
-// Virtualized Geometry — Cluster Data Structures (Phase 1)
-// ============================================================
-
-// A single 128-triangle cluster: sub-set of vertices (locally reindexed)
-// plus its bounding volumes for GPU frustum/occlusion culling.
-struct MeshCluster {
-    std::vector<Vertex> vertices;       // max ~128 unique (sub-set of parent mesh)
-    std::vector<unsigned int> indices;  // exactly 128 triangles (384 indices)
-                                        // (except possibly the last cluster)
-    BoundingBox boundingBox;
-    BoundingSphere boundingSphere;
-};
-
-// Packed payload: all clusters from one mesh, ready for GPU upload or
-// binary serialization (.meshpack format).
-struct ClusterPackedPayload {
-    std::vector<MeshCluster> clusters;
-    size_t totalVertices = 0;
-    size_t totalIndices = 0;
-};
-
-// --- GPU-side structures for the cluster-culling compute shader (Phase 2) ---
-// These MUST match the GLSL std430 layout in rhi/shaders/cluster_cull.comp.
-
-// std140-compatible: 2 × vec4 = 32 bytes
-struct GPUClusterBounds {
-    glm::vec4 sphereCenterRadius;  // xyz = center, w = radius
-    glm::vec4 minBounds;           // xyz = min, w = padding
-    glm::vec4 maxBounds;           // xyz = max, w = padding
-};
-
-// std430-compatible: 4 × uint = 16 bytes
-struct GPUClusterCommand {
-    uint32_t firstVertex;   // offset in the global vertex pool
-    uint32_t firstIndex;    // offset in the global index pool
-    uint32_t indexCount;    // usually 384 (128 triangles * 3)
-    uint32_t instanceId;    // maps back to object model matrix
-};
-
-// std430-compatible: matches LODCluster in rhi/shaders/nanite_lod.comp
-// 4 vec4s (16) + 5 uints + 3 pad = 80 bytes (16-byte aligned)
-struct GPULODCluster {
-    glm::vec4 sphereCenterRadius;  // xyz = center, w = radius
-    float     errorSelf;
-    float     errorParent;
-    uint32_t  firstVertex;
-    uint32_t  firstIndex;
-    uint32_t  indexCount;
-    uint32_t  instanceId;
-    uint32_t  parentId;
-    uint32_t  pad0, pad1, pad2;
-};
-
-// Matches VkDrawIndexedIndirectCommand (20 bytes, 4-byte aligned)
-struct ClusterIndirectCommand {
-    uint32_t indexCount;
-    uint32_t instanceCount;
-    uint32_t firstIndex;
-    int32_t  vertexOffset;
-    uint32_t firstInstance;
-};
-
-// ============================================================
 // Mesh Utilities (Free Functions)
 // ============================================================
 namespace MeshUtils
@@ -466,39 +461,30 @@ namespace MeshUtils
         size_t targetCacheSize = 24;
     };
 
-    void OptimizeMeshForRendering(Mesh& mesh,
+    void OptimizeMeshForRendering(Mesh& mesh, 
                                   const MeshOptimizationConfig& config);
 
     // ============================================================
-    // Virtualized Geometry — Cluster Builder & Serializer (Phase 1)
+    // Virtualized Geometry / Cluster Mesh API (Phase 1 + Phase 2)
     // ============================================================
-
-    // Splits a raw mesh into 128-triangle clusters with local vertex
-    // reindexing and bounding volumes. Each cluster has at most
-    // kTrianglesPerCluster triangles (default 128, the industry standard).
-    // Runs on the existing (Forsyth-optimized) index buffer so cluster
-    // boundaries respect vertex-cache ordering.
+    // Split a mesh into fixed-triangle-count clusters. Each cluster owns a
+    // locally-deduplicated vertex pool and cluster-local indices. Returns 0
+    // clusters for an empty mesh or a 0 clusterTriangleCount.
     ClusterPackedPayload BuildMeshClusters(const std::vector<Vertex>& vertices,
                                            const std::vector<unsigned int>& indices,
-                                           size_t trianglesPerCluster = 128);
+                                           uint32_t clusterTriangleCount);
 
-    // Serializes a ClusterPackedPayload to a .meshpack binary file.
-    // Layout: [clusterCount:u64][per-cluster: sphereCenter(3) radius(1)
-    //          vCount:u64 iCount:u64 vertices... indices...]
-    void ExportClusterMeshFile(const std::string& binaryPath,
-                               const ClusterPackedPayload& payload);
-
-    // Loads a .meshpack file back into a ClusterPackedPayload.
-    // Returns false on file/parse errors.
-    bool ImportClusterMeshFile(const std::string& binaryPath,
-                               ClusterPackedPayload& outPayload);
-
-    // Flattens a ClusterPackedPayload into global pooled buffers (vertices
-    // concatenated,  indices remapped to global vertex offsets) suitable for
-    // upload to a single GPU storage buffer. Returns the per-cluster commands
-    // (firstVertex / firstIndex / indexCount) for the MDI indirect buffer.
+    // Flatten a cluster payload into contiguous vertex/index pools and emit one
+    // GPUClusterCommand per cluster with cumulative firstVertex/firstIndex
+    // offsets, the cluster's index count, and instanceId == cluster index.
     std::vector<GPUClusterCommand> FlattenClustersToBuffers(
         const ClusterPackedPayload& payload,
-        std::vector<Vertex>& outVertices,
-        std::vector<unsigned int>& outIndices);
+        std::vector<Vertex>&    flatVertices,
+        std::vector<unsigned int>& flatIndices);
+
+    // Binary I/O for pre-baked cluster meshes (export/import round-trip).
+    void ExportClusterMeshFile(const char* path,
+                               const ClusterPackedPayload& payload);
+    bool ImportClusterMeshFile(const char* path,
+                               ClusterPackedPayload& outPayload);
 }

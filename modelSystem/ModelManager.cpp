@@ -3,14 +3,19 @@
 #include <algorithm>
 
 Model* ModelManager::loadModel(const std::string& filePath) {
-    // Check if already loaded
-    auto it = loadedModels.find(filePath);
-    if (it != loadedModels.end()) {
-        std::cout << "[ModelManager] Using cached model: " << filePath << "\n";
-        return it->second.model.get();
+    // Fast path: another thread may have already loaded this path.
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        auto it = loadedModels.find(filePath);
+        if (it != loadedModels.end()) {
+            std::cout << "[ModelManager] Using cached model: " << filePath << "\n";
+            return it->second.model.get();
+        }
     }
 
-    // Load new model
+    // Load new model. The heavy Assimp parse (Model ctor) runs OUTSIDE the lock
+    // so concurrent callers (e.g. NPC-pack background workers) do not serialize
+    // on the expensive parse.
     std::cout << "[ModelManager] Loading model: " << filePath << "\n";
     
     try {
@@ -27,7 +32,17 @@ Model* ModelManager::loadModel(const std::string& filePath) {
         entry.model = std::move(model);
         entry.filePath = filePath;
         entry.isProcedural = false;
-        
+
+        // Re-check under the lock: a concurrent worker may have inserted the
+        // same path while we were parsing. Dedupe to avoid double ownership.
+        std::lock_guard<std::mutex> lk(m_mutex);
+        auto it = loadedModels.find(filePath);
+        if (it != loadedModels.end()) {
+            std::cout << "[ModelManager] De-duplicating concurrent load: " << filePath << "\n";
+            modelIndex.push_back(it->second.model.get());
+            return it->second.model.get();
+        }
+
         loadedModels[filePath] = std::move(entry);
         modelIndex.push_back(modelPtr);
 
@@ -44,6 +59,7 @@ Model* ModelManager::loadModel(const std::string& filePath) {
 }
 
 Model* ModelManager::getModel(const std::string& filePath) const {
+    std::lock_guard<std::mutex> lk(m_mutex);
     auto it = loadedModels.find(filePath);
     if (it != loadedModels.end()) {
         return it->second.model.get();
@@ -52,6 +68,7 @@ Model* ModelManager::getModel(const std::string& filePath) const {
 }
 
 Model* ModelManager::getModelByIndex(size_t index) const {
+    std::lock_guard<std::mutex> lk(m_mutex);
     if (index < modelIndex.size()) {
         return modelIndex[index];
     }
@@ -59,11 +76,13 @@ Model* ModelManager::getModelByIndex(size_t index) const {
 }
 
 bool ModelManager::isModelLoaded(const std::string& filePath) const {
+    std::lock_guard<std::mutex> lk(m_mutex);
     return loadedModels.find(filePath) != loadedModels.end();
 }
 
 bool ModelManager::isModelPointerValid(const Model* modelPtr) const {
     if (!modelPtr) return false;
+    std::lock_guard<std::mutex> lk(m_mutex);
     for (const auto& [path, entry] : loadedModels) {
         if (entry.model.get() == modelPtr) {
             return true;
@@ -78,6 +97,7 @@ bool ModelManager::isModelPointerValid(const Model* modelPtr) const {
 }
 
 void ModelManager::unloadModel(const std::string& filePath) {
+    std::lock_guard<std::mutex> lk(m_mutex);
     auto it = loadedModels.find(filePath);
     if (it != loadedModels.end()) {
         // Remove from index
@@ -93,6 +113,7 @@ void ModelManager::unloadModel(const std::string& filePath) {
 }
 
 void ModelManager::unloadAll() {
+    std::lock_guard<std::mutex> lk(m_mutex);
     std::cout << "[ModelManager] Unloading all models (" << loadedModels.size() << ")\n";
     loadedModels.clear();
     modelIndex.clear();
@@ -100,6 +121,7 @@ void ModelManager::unloadAll() {
 }
 
 std::vector<std::string> ModelManager::getLoadedModelPaths() const {
+    std::lock_guard<std::mutex> lk(m_mutex);
     std::vector<std::string> paths;
     paths.reserve(loadedModels.size());
     for (const auto& [path, entry] : loadedModels) {
@@ -109,6 +131,7 @@ std::vector<std::string> ModelManager::getLoadedModelPaths() const {
 }
 
 ModelManager::ModelStats ModelManager::getStatistics() const {
+    std::lock_guard<std::mutex> lk(m_mutex);
     ModelStats stats;
     stats.totalModels = loadedModels.size();
 
@@ -136,12 +159,16 @@ Model* ModelManager::createProceduralModel(GLuint VAO, GLsizei indexCount) {
     model->setDebugIndexCount(indexCount);
     
     Model* modelPtr = model.get();
-    proceduralModels.push_back(std::move(model));
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        proceduralModels.push_back(std::move(model));
+    }
     
     return modelPtr;
 }
 
 void ModelManager::printLoadedModels() const {
+    std::lock_guard<std::mutex> lk(m_mutex);
     std::cout << "\n========== LOADED MODELS ==========\n";
     std::cout << "Total models: " << loadedModels.size() << "\n\n";
     

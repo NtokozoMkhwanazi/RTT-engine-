@@ -61,6 +61,55 @@ void LightingEnvironment::applyCvars() {
     }
 }
 
+void LightingEnvironment::syncTargetsFromLive() {
+    // Mirror the current live values into the private target snapshot so a
+    // direct editor edit (e.g. a slider mutating env.sunDirection) is not
+    // lerped back toward the stale target by the next update(dt). The bool
+    // toggles already commit live-on-write in applyCvars(), so they need no
+    // sync here.
+    m_targets.sunDirection         = sunDirection;
+    m_targets.sunColor           = sunColor;
+    m_targets.sunIntensity       = sunIntensity;
+    m_targets.skyLightColor      = skyLightColor;
+    m_targets.groundBounce       = groundBounce;
+    m_targets.ambientStrength    = ambientStrength;
+    m_targets.skyLightFillColor  = skyLightFillColor;
+    m_targets.skyLightStrength   = skyLightStrength;
+    m_targets.fogHorizon         = fogHorizon;
+    m_targets.fogZenith          = fogZenith;
+    m_targets.fogNear            = fogNear;
+    m_targets.fogFar             = fogFar;
+    m_targets.fogHeight          = fogHeight;
+    m_targets.fogHeightFalloff   = fogHeightFalloff;
+    m_targets.fogMaxOpacity      = fogMaxOpacity;
+    m_targets.detailNormalStrength = detailNormalStrength;
+}
+
+void LightingEnvironment::syncCvarsFromLive() {
+    // Inverse of applyCvars(): bridge the EDITOR's live lighting fields back into
+    // the CVar registry under the keys applyCvars() reads, so "Save cvars.ini"
+    // persists live slider edits. Only panel-edited fields are written; unedited
+    // cvars keep their loaded values. Types must match loadFromFile's inference
+    // (vec3 = 3 tokens, float = scalar, "fog_enabled" = string bool).
+    auto& c = CVar::Instance();
+    c.setVec3  ("sun_direction",            sunDirection);
+    c.setVec3  ("sun_color",                sunColor);
+    c.setFloat ("sun_intensity",            sunIntensity);
+    c.setVec3  ("sky_light_color",          skyLightColor);
+    c.setVec3  ("ground_bounce",            groundBounce);
+    c.setFloat ("ambient_strength",         ambientStrength);
+    c.setFloat ("sky_light_strength",       skyLightStrength);
+    c.setString("fog_enabled",              fogEnabled ? "true" : "false");
+    c.setVec3  ("fog_horizon",              fogHorizon);
+    c.setVec3  ("fog_zenith",               fogZenith);
+    c.setFloat ("fog_near",                 fogNear);
+    c.setFloat ("fog_far",                  fogFar);
+    c.setFloat ("fog_height",               fogHeight);
+    c.setFloat ("fog_height_falloff",       fogHeightFalloff);
+    c.setFloat ("fog_max_opacity",          fogMaxOpacity);
+    c.setFloat ("detail_normal_strength",   detailNormalStrength);
+}
+
 void LightingEnvironment::update(float dt) {
     if (dt <= 0.0f) return;
     // Exponential approach: t = 1 - exp(-speed * dt) is frame-rate

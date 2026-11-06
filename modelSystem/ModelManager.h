@@ -5,12 +5,18 @@
 #include <unordered_map>
 #include <memory>
 #include <vector>
+#include <mutex>
 
 /**
  * ModelManager - Central resource manager for 3D models
  * 
  * Handles loading, caching, and providing access to loaded models.
  * Prevents duplicate loading and manages memory efficiently.
+ * 
+ * Thread-safety: loadModel() uses double-checked locking. The heavy
+ * Model() Assimp parse is performed OUTSIDE the lock so concurrent
+ * callers (e.g. an NPC-pack background worker) do not serialize on
+ * parsing — only the cache lookup + insert are guarded.
  */
 class ModelManager {
 public:
@@ -71,7 +77,10 @@ public:
     /**
      * Get loaded model count
      */
-    size_t getModelCount() const { return loadedModels.size(); }
+    size_t getModelCount() const {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        return loadedModels.size();
+    }
 
     /**
      * Get all loaded model paths
@@ -120,6 +129,12 @@ private:
 
     // Procedural models (not file-based)
     std::vector<std::unique_ptr<Model>> proceduralModels;
+
+    // Guards loadedModels / modelIndex / proceduralModels against concurrent
+    // access from loader worker threads. The heavy Model() parse in loadModel()
+    // is performed OUTSIDE this lock (double-checked locking) so background NPC
+    // pack loading stays genuinely parallel.
+    mutable std::mutex m_mutex;
 };
 
 // Convenience functions

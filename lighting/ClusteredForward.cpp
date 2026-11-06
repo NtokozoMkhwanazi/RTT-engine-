@@ -166,15 +166,58 @@ BinResult LightBinning::binLights(const ClusterGrid& grid,
     // First pass: count per cluster (capped). Two-pass keeps the flat list
     // tightly packed so a GPU can consume offsets/counts/indices directly.
     std::vector<uint32_t> rawCounts(count, 0);
+
+    const float tanHalfY = std::tan(0.5f * grid.fovY);
+
     for (size_t i = 0; i < lights.size(); ++i) {
         const Light& l = lights[i];
         const glm::vec3 pview = worldToView(grid.view, l.position);
         const float radius = lightRadius(l);
-        for (int c = 0; c < count; ++c) {
-            bool inside = true;
-            for (int pl = 0; pl < 6 && inside; ++pl)
-                if (signedDist(grid, c, pl, pview) < -radius) inside = false;
-            if (inside) ++rawCounts[c];
+
+        // Prune clusters using the light's bounding sphere: only iterate
+        // over the (x, y, z) cluster range that the sphere can touch,
+        // reducing complexity from O(N*M) to O(N*Localized_AABB).
+        for (int z = 0; z < grid.layers; ++z) {
+            const int zBase = grid.index(0, 0, z);
+            const float zrX = grid.zRange[zBase].x; // -farK  (more negative)
+            const float zrY = grid.zRange[zBase].y; // -nearK
+            // Sphere Z extent [pview.z - r, pview.z + r] must overlap [zrX, zrY].
+            if (pview.z + radius < zrX || pview.z - radius > zrY) continue;
+
+            // Conservative XY tile range at the layer's far plane (widest extent).
+            const float farDist = -zrX; // farK (positive)
+            const float halfW = farDist * tanHalfY * grid.aspect;
+            const float halfH = farDist * tanHalfY;
+            const float tileW = (grid.columns > 0) ? (2.0f * halfW / grid.columns) : 1.0f;
+            const float tileH = (grid.rows > 0) ? (2.0f * halfH / grid.rows) : 1.0f;
+
+            const float xMin = pview.x - radius;
+            const float xMax = pview.x + radius;
+            const float yMin = pview.y - radius;
+            const float yMax = pview.y + radius;
+
+            int minX = (tileW > 0.0f)
+                           ? std::max(0, (int)std::floor((xMin + halfW) / tileW))
+                           : 0;
+            int maxX = (tileW > 0.0f)
+                           ? std::min(grid.columns - 1, (int)std::ceil((xMax + halfW) / tileW))
+                           : grid.columns - 1;
+            int minY = (tileH > 0.0f)
+                           ? std::max(0, (int)std::floor((yMin + halfH) / tileH))
+                           : 0;
+            int maxY = (tileH > 0.0f)
+                           ? std::min(grid.rows - 1, (int)std::ceil((yMax + halfH) / tileH))
+                           : grid.rows - 1;
+
+            for (int y = minY; y <= maxY; ++y) {
+                for (int x = minX; x <= maxX; ++x) {
+                    const int c = grid.index(x, y, z);
+                    bool inside = true;
+                    for (int pl = 0; pl < 6 && inside; ++pl)
+                        if (signedDist(grid, c, pl, pview) < -radius) inside = false;
+                    if (inside) ++rawCounts[c];
+                }
+            }
         }
     }
     uint32_t totalClipped = 0;
@@ -198,14 +241,48 @@ BinResult LightBinning::binLights(const ClusterGrid& grid,
         const Light& l = lights[i];
         const glm::vec3 pview = worldToView(grid.view, l.position);
         const float radius = lightRadius(l);
-        for (int c = 0; c < count; ++c) {
-            if (emitted[c] >= R.counts[c]) continue;
-            bool inside = true;
-            for (int pl = 0; pl < 6 && inside; ++pl)
-                if (signedDist(grid, c, pl, pview) < -radius) inside = false;
-            if (inside) {
-                R.indices[R.offsets[c] + emitted[c]] = uint16_t(i);
-                ++emitted[c];
+        for (int z = 0; z < grid.layers; ++z) {
+            const int zBase = grid.index(0, 0, z);
+            const float zrX = grid.zRange[zBase].x;
+            const float zrY = grid.zRange[zBase].y;
+            if (pview.z + radius < zrX || pview.z - radius > zrY) continue;
+
+            const float farDist = -zrX;
+            const float halfW = farDist * tanHalfY * grid.aspect;
+            const float halfH = farDist * tanHalfY;
+            const float tileW = (grid.columns > 0) ? (2.0f * halfW / grid.columns) : 1.0f;
+            const float tileH = (grid.rows > 0) ? (2.0f * halfH / grid.rows) : 1.0f;
+
+            const float xMin = pview.x - radius;
+            const float xMax = pview.x + radius;
+            const float yMin = pview.y - radius;
+            const float yMax = pview.y + radius;
+
+            int minX = (tileW > 0.0f)
+                           ? std::max(0, (int)std::floor((xMin + halfW) / tileW))
+                           : 0;
+            int maxX = (tileW > 0.0f)
+                           ? std::min(grid.columns - 1, (int)std::ceil((xMax + halfW) / tileW))
+                           : grid.columns - 1;
+            int minY = (tileH > 0.0f)
+                           ? std::max(0, (int)std::floor((yMin + halfH) / tileH))
+                           : 0;
+            int maxY = (tileH > 0.0f)
+                           ? std::min(grid.rows - 1, (int)std::ceil((yMax + halfH) / tileH))
+                           : grid.rows - 1;
+
+            for (int y = minY; y <= maxY; ++y) {
+                for (int x = minX; x <= maxX; ++x) {
+                    const int c = grid.index(x, y, z);
+                    if (emitted[c] >= R.counts[c]) continue;
+                    bool inside = true;
+                    for (int pl = 0; pl < 6 && inside; ++pl)
+                        if (signedDist(grid, c, pl, pview) < -radius) inside = false;
+                    if (inside) {
+                        R.indices[R.offsets[c] + emitted[c]] = static_cast<uint32_t>(i);
+                        ++emitted[c];
+                    }
+                }
             }
         }
     }

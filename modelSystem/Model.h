@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <mutex>
 #include <cfloat>
 #include <iostream>
 #include <future>
@@ -158,12 +159,24 @@ public:
     explicit Model(const std::string& path = "");
     ~Model();
 
-    // Async loading handle
+    // Async loading handle.
+    //
+    // `future` is fulfilled once the CPU-side Assimp parse + texture decode
+    // (LoadModelData) has finished on a worker thread. `progress` is the SAME
+    // atomic float the worker writes as it walks the parse stages — the main
+    // thread can read it every frame for a live "Resolving..." progress bar
+    // WITHOUT blocking on the future (which only completes at the very end).
     struct AsyncLoadHandle {
         std::future<std::unique_ptr<AsyncModelData>> future;
-        float progress{0.0f};
+        std::shared_ptr<std::atomic<float>> progress;   // 0..1, worker-written
+
         bool isValid() const { return future.valid(); }
         bool isComplete() const { return future.valid() && future.wait_for(std::chrono::seconds(0)) == std::future_status::ready; }
+
+        // Live parse progress (0..1). Returns 0 for an unlaunched handle.
+        float getProgress() const {
+            return progress ? progress->load(std::memory_order_relaxed) : 0.0f;
+        }
     };
 
     // Factory method for programmatic mesh creation
@@ -172,7 +185,17 @@ public:
     // Async loading factory methods
     static AsyncLoadHandle LoadAsync(const std::string& path);
     static Model* CreateFromAsync(AsyncLoadHandle& handle, std::string* outError = nullptr);
-    static std::unique_ptr<AsyncModelData> LoadModelData(const std::string& path, float* outProgress = nullptr);
+    // Take already-parsed AsyncModelData (e.g. produced by a worker that called
+    // LoadModelData directly) and perform ONLY the main-thread GL upload. Lets
+    // callers that don't want the std::async hop still split CPU parse from GL.
+    static Model* CreateFromAsync(std::unique_ptr<AsyncModelData> data, std::string* outError = nullptr);
+    // `maxTextureSize` (0 = no cap) caps each decoded texture to a streaming
+    // budget on the CPU worker — a 4K prop texture's glTextureSubImage2D +
+    // glGenerateMipmap in the GL commit would otherwise stall one frame. Downscaling
+    // here (parallel, on the worker pool) makes each main-thread upload ~4x cheaper.
+    static std::unique_ptr<AsyncModelData> LoadModelData(const std::string& path,
+                                                         std::atomic<float>* outProgress = nullptr,
+                                                         int maxTextureSize = 0);
 
     // Debug methods for programmatic mesh creation
     void setDebugVAO(GLuint VAO) { m_debugVAO = VAO; }
@@ -242,6 +265,9 @@ private:
     // work per model. Path -> GL texture id (0 = failed, cached to avoid
     // repeating the lookup).
     std::unordered_map<std::string, unsigned int> m_textureCache;
+    // Guards m_textureCache: loadTexture may be called from the main thread
+    // (sync path) while async setupFromAsyncData runs on a worker thread.
+    mutable std::mutex m_textureCacheMutex;
     
     // Scratch buffer that keeps downsampled texture pixels alive for the
     // duration of loadTexture() when a 4K+ map is reduced to 1024 before

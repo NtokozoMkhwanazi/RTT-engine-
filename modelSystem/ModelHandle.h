@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <iostream>
 #include <filesystem>
+#include <mutex>
 
 #include "Model.h"
 
@@ -32,6 +33,13 @@ struct ModelHandle {
 
 /**
  * ModelRegistry - Manages models with handles (singleton)
+ *
+ * Thread-safety: load() uses double-checked locking. The heavy Model() Assimp
+ * parse is performed OUTSIDE the lock so concurrent callers (e.g. an NPC-pack
+ * background worker) do not serialize on parsing — only the slot allocation +
+ * bookkeeping are guarded. get()/release()/getLoadedModelPaths()/getModelCount()
+ * and clear() are all mutually exclusive with a load so the entry table and
+ * path index never change underneath a concurrent reader.
  */
 class ModelRegistry {
 public:
@@ -66,33 +74,94 @@ public:
             std::cout << "[ModelRegistry] Load failed (file not found): " << path << "\n";
             return {};
         }
-        
+
+        // Fast path: a concurrent worker may have already parsed this path.
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            auto it = m_pathIndex.find(path);
+            if (it != m_pathIndex.end()) {
+                uint32_t idx = it->second;
+                if (idx < m_entries.size() && m_entries[idx].inUse) {
+                    ModelHandle h;
+                    h.index = idx;
+                    h.generation = m_entries[idx].generation;
+                    return h;
+                }
+            }
+        }
+
+        // Heavy Assimp parse OUTSIDE the lock so concurrent callers don't
+        // serialize on model construction.
+        Model* parsed = new Model(path);
+        if (parsed->GetMeshCount() == 0) {
+            delete parsed;
+            std::cout << "[ModelRegistry] Load failed (empty model): " << path << "\n";
+            return {};
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            // Re-check: a racer may have inserted the same path while parsing.
+            auto it = m_pathIndex.find(path);
+            if (it != m_pathIndex.end()) {
+                uint32_t idx = it->second;
+                if (idx < m_entries.size() && m_entries[idx].inUse) {
+                    delete parsed;  // de-dup duplicate parse
+                    std::cout << "[ModelRegistry] De-duplicating concurrent load: " << path << "\n";
+                    ModelHandle h;
+                    h.index = idx;
+                    h.generation = m_entries[idx].generation;
+                    return h;
+                }
+            }
+            ModelHandle h;
+            h.index = allocateSlot();
+            h.generation = m_entries[h.index].generation;
+            m_entries[h.index].model = parsed;
+            m_entries[h.index].path = path;
+            m_entries[h.index].inUse = true;
+            m_pathIndex[path] = h.index;
+            std::cout << "[ModelRegistry] Loaded: " << path << " handle=" << h.index << ":" << h.generation << "\n";
+            return h;
+        }
+    }
+    
+    // Adopt a pre-parsed, GL-uploaded Model* (the output of
+    // Model::CreateFromAsync on the main thread) into the registry under
+    // `path`. Ownership of `model` transfers here (the registry deletes it in
+    // ~ModelRegistry / release / clear). If `path` is already registered by a
+    // live entry, the duplicate `model` is deleted and the existing handle is
+    // returned (double-checked locking; allocateSlot() is private and requires
+    // the lock, which we hold). Returns an invalid handle for null/empty input.
+    ModelHandle registerModel(Model* model, const std::string& path) {
+        if (!model || path.empty()) return {};
+        std::lock_guard<std::mutex> lk(m_mutex);
         auto it = m_pathIndex.find(path);
         if (it != m_pathIndex.end()) {
             uint32_t idx = it->second;
             if (idx < m_entries.size() && m_entries[idx].inUse) {
+                delete model;  // caller's parse already satisfied by cached entry
+                std::cout << "[ModelRegistry] registerModel de-dup: " << path << "\n";
                 ModelHandle h;
                 h.index = idx;
                 h.generation = m_entries[idx].generation;
                 return h;
             }
         }
-        
         ModelHandle h;
         h.index = allocateSlot();
         h.generation = m_entries[h.index].generation;
-        
-        m_entries[h.index].model = new Model(path);
+        m_entries[h.index].model = model;
         m_entries[h.index].path = path;
         m_entries[h.index].inUse = true;
-        
         m_pathIndex[path] = h.index;
-        
-        std::cout << "[ModelRegistry] Loaded: " << path << " handle=" << h.index << ":" << h.generation << "\n";
+        std::cout << "[ModelRegistry] Registered (async): " << path
+                  << " handle=" << h.index << ":" << h.generation << "\n";
         return h;
     }
-    
+
     ModelHandle createProcedural() {
+        std::lock_guard<std::mutex> lk(m_mutex);
         ModelHandle h;
         h.index = allocateSlot();
         h.generation = m_entries[h.index].generation;
@@ -105,6 +174,7 @@ public:
     }
     
     Model* get(ModelHandle h) const {
+        std::lock_guard<std::mutex> lk(m_mutex);
         if (!h.isValid()) return nullptr;
         if (h.index >= m_entries.size()) return nullptr;
         if (h.generation != m_entries[h.index].generation) return nullptr;
@@ -113,6 +183,7 @@ public:
     }
     
     void release(ModelHandle h) {
+        std::lock_guard<std::mutex> lk(m_mutex);
         if (!h.isValid()) return;
         if (h.index >= m_entries.size()) return;
         if (h.generation != m_entries[h.index].generation) return;
@@ -129,6 +200,7 @@ public:
     }
     
     size_t getModelCount() const {
+        std::lock_guard<std::mutex> lk(m_mutex);
         size_t count = 0;
         for (const auto& e : m_entries) {
             if (e.inUse) count++;
@@ -137,6 +209,7 @@ public:
     }
     
     void clear() {
+        std::lock_guard<std::mutex> lk(m_mutex);
         for (auto& e : m_entries) {
             delete e.model;
             e.model = nullptr;
@@ -149,8 +222,15 @@ public:
 private:
     std::vector<Entry> m_entries;
     std::unordered_map<std::string, uint32_t> m_pathIndex;
+
+    // Guards m_entries / m_pathIndex against concurrent access from loader
+    // worker threads. The heavy Model() parse in load() is performed OUTSIDE
+    // this lock (double-checked locking) so background NPC pack loading stays
+    // genuinely parallel.
+    mutable std::mutex m_mutex;
     
     uint32_t allocateSlot() {
+        // Caller MUST hold m_mutex.
         for (uint32_t i = 0; i < m_entries.size(); i++) {
             if (!m_entries[i].inUse) {
                 m_entries[i].inUse = true;
@@ -183,7 +263,7 @@ struct MeshHandle {
     
     bool isValid() const { return index != INVALID; }
     bool operator==(const MeshHandle& other) const { return index == other.index; }
-    bool operator!=(const MeshHandle& other) const { return index != other.index; }
+    bool operator!=(const MeshHandle& other) const { return !(*this == other); }
 };
 
 /**

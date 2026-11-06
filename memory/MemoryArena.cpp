@@ -143,6 +143,10 @@ DualArena::DualArena(size_t sizePerArena)
     : arenas{MemoryArena(sizePerArena), MemoryArena(sizePerArena)}
     , currentIndex(0)
 {
+    // With move-only MemoryArena (deleted copy, defined move), the brace
+    // initialization above invokes move construction, properly transferring
+    // buffer ownership from the temporaries into the array slots. The moved-
+    // from temporaries have buffer = nullptr so their destructors are safe.
 }
 
 DualArena::~DualArena() {

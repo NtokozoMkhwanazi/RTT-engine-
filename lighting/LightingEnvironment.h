@@ -80,6 +80,19 @@ struct LightingEnvironment {
     // normalise the sun direction once.
     void applyCvars();
 
+    // Copy every live field into the private `m_targets` snapshot so a direct
+    // editor edit (e.g. a slider writing env.sunDirection) survives the next
+    // update(dt) fade — without it the live value is lerped back toward the
+    // unchanged target. Call after mutating live lighting fields.
+    void syncTargetsFromLive();
+
+    // Bridge the editor's LIVE lighting fields back into the CVar registry
+    // under the exact keys applyCvars() reads, so "Save cvars.ini" persists the
+    // artist's slider edits (inverse of applyCvars). Only the fields the World
+    // Settings atmosphere panel edits are written; unedited cvars (ground_bounce,
+    // fog_zenith, terrain_pom_*, ...) keep their loaded values.
+    void syncCvarsFromLive();
+
 private:
     // Per-field targets written by applyCvars(); `update()` blends toward these.
     struct Targets {

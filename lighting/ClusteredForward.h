@@ -56,7 +56,7 @@ struct ClusterGrid {
 struct BinResult {
     std::vector<uint32_t> offsets;   // per cluster: start into `indices`
     std::vector<uint16_t> counts;    // per cluster: #lights (capped at maxPerCluster)
-    std::vector<uint16_t> indices;   // flat light-index lists (capped per cluster)
+    std::vector<uint32_t> indices;   // flat light-index lists (capped per cluster) — 32-bit to avoid truncation
     uint32_t              totalLists = 0; // clusters that received >=1 light
     uint32_t              clipped    = 0; // lights clipped by the per-cluster cap
 };

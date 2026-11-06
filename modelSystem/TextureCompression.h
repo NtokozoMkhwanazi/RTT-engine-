@@ -214,9 +214,11 @@ static std::vector<uint8_t> CompressBC1(
             // Extract 4x4 block
             for (int y = 0; y < 4; y++) {
                 for (int x = 0; x < 4; x++) {
-                    int px = std::min(bx * 4 + x, width - 1);
-                    int py = std::min(by * 4 + y, height - 1);
-                    int idx = (py * width + px) * 3;
+                    int px = bx * 4 + x;
+                    int py = by * 4 + y;
+                    if (px >= width) px = width - 1;
+                    if (py >= height) py = height - 1;
+                    size_t idx = (static_cast<size_t>(py) * width + px) * 3;
                     block[(y * 4 + x) * 3 + 0] = rgbData[idx + 0];
                     block[(y * 4 + x) * 3 + 1] = rgbData[idx + 1];
                     block[(y * 4 + x) * 3 + 2] = rgbData[idx + 2];
@@ -251,12 +253,17 @@ static void EncodeBC3AlphaBlock(
         // Not enough range - store as explicit alphas
         outBlock[0] = maxA;
         outBlock[1] = minA;
-        // 3 bits per pixel
+        // 3 bits per pixel packed into 6 bytes (48 bits for 16 alpha values).
         memset(outBlock + 2, 0, 6);
         for (int i = 0; i < 16; i++) {
-            int shift = (i % 8) * 3;
-            int byte = 2 + (i / 8) * 3;
-            outBlock[byte] |= (alphas[i] >> (5 - shift % 8));
+            uint32_t quant = static_cast<uint32_t>(std::min<int>(alphas[i], 7));
+            uint32_t bitPos = static_cast<uint32_t>(i) * 3;
+            uint32_t byteIdx = 2 + bitPos / 8;
+            uint32_t bitOff = bitPos % 8;
+            outBlock[byteIdx] |= static_cast<uint8_t>((quant << bitOff) & 0xFF);
+            if (bitOff + 3 > 8 && byteIdx + 1 < 8) {
+                outBlock[byteIdx + 1] |= static_cast<uint8_t>(quant >> (8 - bitOff));
+            }
         }
     } else {
         outBlock[0] = maxA;
@@ -309,9 +316,11 @@ static std::vector<uint8_t> CompressBC3(
         for (int bx = 0; bx < blockW; bx++) {
             for (int y = 0; y < 4; y++) {
                 for (int x = 0; x < 4; x++) {
-                    int px = std::min(bx * 4 + x, width - 1);
-                    int py = std::min(by * 4 + y, height - 1);
-                    int idx = (py * width + px) * 4;
+                    int px = bx * 4 + x;
+                    int py = by * 4 + y;
+                    if (px >= width) px = width - 1;
+                    if (py >= height) py = height - 1;
+                    size_t idx = (static_cast<size_t>(py) * width + px) * 4;
                     alphaBlock[y * 4 + x] = rgbaData[idx + 3];
                     rgbBlock[(y * 4 + x) * 3 + 0] = rgbaData[idx + 0];
                     rgbBlock[(y * 4 + x) * 3 + 1] = rgbaData[idx + 1];
@@ -439,6 +448,7 @@ static GLuint LoadDDS(const std::string& path) {
 /**
  * Generate a cache filename for compressed texture
  */
+[[maybe_unused]]
 static std::string GetCompressedCachePath(const std::string& originalPath, bool hasAlpha) {
     std::string cacheDir = originalPath + ".cache";
     return cacheDir + (hasAlpha ? ".bc3" : ".bc1");
@@ -453,6 +463,7 @@ static std::string GetCompressedCachePath(const std::string& originalPath, bool 
  * 3. Load original image and compress to BC1/BC3
  * 4. Save compressed data to cache for next time
  */
+[[maybe_unused]]
 static GLuint LoadCompressedTexture(const std::string& path, bool compressEnabled = true) {
     if (!glGenTextures) {
         return 0;
@@ -477,6 +488,7 @@ static GLuint LoadCompressedTexture(const std::string& path, bool compressEnable
     
     // Check for compressed cache
     std::string originalPath = path;
+    [[maybe_unused]]
     bool hasAlpha = false;
     
     // Quick check: if path contains "normal", "metallic", or "roughness", it likely has useful alpha
@@ -501,6 +513,7 @@ static GLuint LoadCompressedTexture(const std::string& path, bool compressEnable
 /**
  * Select the best compressed internal format based on texture type
  */
+[[maybe_unused]]
 static GLenum SelectCompressedFormat(int channels, bool isNormalMap, bool isSRGB, bool hasAlpha = false) {
     if (isNormalMap) {
         // Normal maps benefit from BC5 (2-channel RG compression)

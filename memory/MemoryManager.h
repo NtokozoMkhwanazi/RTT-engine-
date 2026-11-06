@@ -40,11 +40,12 @@ public:
 
     // Release an object back to the pool
     void release(T* obj) {
-        if (obj) {
-            obj->reset(); // Reset object state if T has a reset() method
-            std::lock_guard<std::mutex> lock(mutex_);
-            freeObjects_.push(obj);
-        }
+        if (!obj) return;
+        // Hold the mutex for the entire release so concurrent callers can't
+        // race on obj->reset() or corrupt the queue during vector growth.
+        std::lock_guard<std::mutex> lock(mutex_);
+        obj->reset();
+        freeObjects_.push(obj);
     }
 
     // Get current pool statistics

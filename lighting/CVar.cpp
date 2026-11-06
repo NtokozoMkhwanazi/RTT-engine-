@@ -7,6 +7,7 @@
 // ============================================================================
 #include "CVar.h"
 #include <fstream>
+#include <iostream>
 #include <algorithm>
 #include <cctype>
 #include <vector>
@@ -110,6 +111,7 @@ void CVar::setStringFast(CVarHandle h, const std::string& v) {
 void CVar::setFloat(const std::string& name, float v) {
     CVarHandle h = findOrCreate(name, CVarType::Float, v, glm::vec3(0.0f), std::string());
     if (h.valid()) m_floatValues[h.id] = v;
+    else std::cerr << "[CVar] Type mismatch: '" << name << "' is not a Float — update config\n";
 }
 float CVar::getFloat(const std::string& name, float fallback) const {
     CVarHandle h = handleOf(name);
@@ -121,6 +123,7 @@ float CVar::getFloat(const std::string& name, float fallback) const {
 void CVar::setVec3(const std::string& name, const glm::vec3& v) {
     CVarHandle h = findOrCreate(name, CVarType::Vec3, 0.0f, v, std::string());
     if (h.valid()) m_vec3Values[h.id] = v;
+    else std::cerr << "[CVar] Type mismatch: '" << name << "' is not a Vec3 — update config\n";
 }
 glm::vec3 CVar::getVec3(const std::string& name, const glm::vec3& fallback) const {
     CVarHandle h = handleOf(name);
@@ -136,6 +139,7 @@ bool CVar::hasVec3(const std::string& name) const {
 void CVar::setString(const std::string& name, const std::string& v) {
     CVarHandle h = findOrCreate(name, CVarType::String, 0.0f, glm::vec3(0.0f), v);
     if (h.valid()) m_stringValues[h.id] = v;
+    else std::cerr << "[CVar] Type mismatch: '" << name << "' is not a String — update config\n";
 }
 std::string CVar::getString(const std::string& name, const std::string& fallback) const {
     CVarHandle h = handleOf(name);
@@ -160,14 +164,17 @@ void CVar::loadFromFile(const std::string& path) {
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
         trim(key); trim(val);
+        // Skip lines with empty values completely (prevents unsafe access).
+        if (val.empty()) continue;
         // Strip an inline comment (everything from the first '#' or ';' that
         // is not part of a value). This matters: without it, a vec3 like
         // "0.4 0.5 0.6  # warm" tokenises to 4 tokens and silently falls back
         // to the default, and a boolean like "false  # temp" is misread.
-        for (size_t i = 0; i < val.size(); ++i) {
-            if (val[i] == '#' || val[i] == ';') { val.resize(i); break; }
+        size_t commentPos = val.find_first_of("#;");
+        if (commentPos != std::string::npos) {
+            val.resize(commentPos);
+            trim(val);
         }
-        trim(val);
         if (key.empty()) continue;
 
         auto toks = splitWs(val);

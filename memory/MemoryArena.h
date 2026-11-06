@@ -23,6 +23,40 @@ public:
     explicit MemoryArena(size_t sizeBytes);
     ~MemoryArena();
 
+    // Non-copyable (raw buffer ownership).
+    MemoryArena(const MemoryArena&) = delete;
+    MemoryArena& operator=(const MemoryArena&) = delete;
+
+    // Move-only: transfers buffer ownership, nulls the source.
+    MemoryArena(MemoryArena&& other) noexcept
+        : buffer(other.buffer)
+        , totalSize(other.totalSize)
+        , offset(other.offset)
+        , allocationCount(other.allocationCount)
+        , peakUsage(other.peakUsage) {
+        other.buffer = nullptr;
+        other.totalSize = 0;
+        other.offset = 0;
+        other.allocationCount = 0;
+        other.peakUsage = 0;
+    }
+    MemoryArena& operator=(MemoryArena&& other) noexcept {
+        if (this != &other) {
+            delete[] buffer;
+            buffer = other.buffer;
+            totalSize = other.totalSize;
+            offset = other.offset;
+            allocationCount = other.allocationCount;
+            peakUsage = other.peakUsage;
+            other.buffer = nullptr;
+            other.totalSize = 0;
+            other.offset = 0;
+            other.allocationCount = 0;
+            other.peakUsage = 0;
+        }
+        return *this;
+    }
+
     // Allocate memory (fast bump allocation)
     void* allocate(size_t bytes, size_t alignment = alignof(std::max_align_t));
     

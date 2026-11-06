@@ -248,8 +248,18 @@ Model::~Model()
     // Guard on glctx::isAlive(): global model caches (ResourceManager) are
     // destroyed at static-destruction time, AFTER the RHI has torn down the
     // context - issuing GL calls there is a SIGSEGV.
-    if (boneTexID != 0 && glctx::isAlive()) {
-        glDeleteTextures(1, &boneTexID);
+    if (glctx::isAlive()) {
+        if (boneTexID != 0) {
+            glDeleteTextures(1, &boneTexID);
+        }
+
+        // Clear all leaked texture objects out of VRAM — the per-model texture
+        // cache holds GL texture IDs that were never released on destruction.
+        for (auto& [key, texID] : m_textureCache) {
+            if (texID != 0) {
+                glDeleteTextures(1, &texID);
+            }
+        }
     }
 }
 
@@ -270,10 +280,12 @@ Model* Model::CreateFromVAO(GLuint VAO, GLsizei indexCount)
 Model::AsyncLoadHandle Model::LoadAsync(const std::string& path)
 {
     AsyncLoadHandle handle;
-    handle.progress = 0.0f;
-    
-    auto dataPtr = std::make_shared<float>(0.0f);
-    
+    // Shared atomic the worker writes as it progresses through the parse
+    // stages; the main thread reads getProgress() each frame for a live bar.
+    handle.progress = std::make_shared<std::atomic<float>>(0.0f);
+
+    auto dataPtr = handle.progress;
+
     handle.future = std::async(std::launch::async, [path, dataPtr]() -> std::unique_ptr<AsyncModelData> {
         try {
             auto result = LoadModelData(path, dataPtr.get());
@@ -297,12 +309,57 @@ Model::AsyncLoadHandle Model::LoadAsync(const std::string& path)
     return handle;
 }
 
-std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, float* outProgress)
+// Cap a decoded texture to `maxTextureSize` pixels on its long axis using a
+// dependency-free 2x2 box downscale, halving repeatedly until it fits. This is
+// a texture-streaming resolution policy applied on the CPU worker (parallel,
+// before any GL): a 4K prop texture's glTextureSubImage2D + glGenerateMipmap in
+// the main-thread commit would otherwise stall one frame to ~tens of ms. Moving
+// the pixel work to the worker and shrinking 4K->2K cuts each commit upload ~4x.
+// maxTextureSize <= 0 leaves the texture untouched.
+static void DownscaleTextureToFit(TexturePixelData& tex, int maxTextureSize) {
+    if (maxTextureSize <= 0) return;
+    if (tex.width <= 0 || tex.height <= 0 || tex.channels <= 0) return;
+    const int needBytes = tex.width * tex.height * tex.channels;
+    if ((int)tex.data.size() < needBytes) return;  // malformed; leave as-is
+    if (std::max(tex.width, tex.height) <= maxTextureSize) return;
+
+    const int c = tex.channels;
+    auto boxHalve = [&](int& w, int& h, std::vector<uint8_t>& px) {
+        const int nw = (w + 1) / 2, nh = (h + 1) / 2;
+        std::vector<uint8_t> out((size_t)nw * nh * c);
+        for (int oy = 0; oy < nh; ++oy) {
+            const int sy0 = oy * 2;
+            const int sy1 = (oy * 2 + 1 < h) ? oy * 2 + 1 : oy * 2;
+            for (int ox = 0; ox < nw; ++ox) {
+                const int sx0 = ox * 2;
+                const int sx1 = (ox * 2 + 1 < w) ? ox * 2 + 1 : ox * 2;
+                uint8_t* dst = &out[((size_t)oy * nw + ox) * c];
+                for (int k = 0; k < c; ++k) {
+                    const int a00 = (sy0 * w + sx0) * c + k;
+                    const int a01 = (sy0 * w + sx1) * c + k;
+                    const int a10 = (sy1 * w + sx0) * c + k;
+                    const int a11 = (sy1 * w + sx1) * c + k;
+                    dst[k] = (uint8_t)((uint32_t)px[a00] + px[a01] + px[a10] + px[a11]) / 4;
+                }
+            }
+        }
+        w = nw; h = nh;
+        px = std::move(out);
+    };
+
+    while (std::max(tex.width, tex.height) > maxTextureSize) {
+        boxHalve(tex.width, tex.height, tex.data);
+    }
+}
+
+std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path,
+                                                     std::atomic<float>* outProgress,
+                                                     int maxTextureSize)
 {
     auto data = std::make_unique<AsyncModelData>();
     data->sourcePath = path;
-    
-    if (outProgress) *outProgress = 0.0f;
+
+    if (outProgress) outProgress->store(0.0f, std::memory_order_relaxed);
 
     // Step 1: Assimp file parsing (heavy CPU work)
     Assimp::Importer importer;
@@ -310,21 +367,20 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
         path,
         aiProcess_Triangulate |
             aiProcess_GenSmoothNormals |
-            aiProcess_FlipUVs |
             aiProcess_CalcTangentSpace |
             aiProcess_LimitBoneWeights);
 
     if (!scene || !scene->mRootNode) {
         data->error = importer.GetErrorString();
         data->success = false;
-        if (outProgress) *outProgress = 1.0f;
+        if (outProgress) outProgress->store(1.0f, std::memory_order_relaxed);
         return data;
     }
 
     std::string directory = path.substr(0, path.find_last_of('/'));
     data->directory = directory;
 
-    if (outProgress) *outProgress = 0.2f;
+    if (outProgress) outProgress->store(0.2f, std::memory_order_relaxed);
 
     // Step 2: Build skeleton hierarchy (boneIndex is filled in Step 5, then
     // copied into the Skeleton so the animator sees the node->bone map).
@@ -333,7 +389,7 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
     // animated bone position (deformed legs/hands on the play character).
     BuildCollapsedHierarchyStatic(data->rootNode, scene->mRootNode);
 
-    if (outProgress) *outProgress = 0.3f;
+    if (outProgress) outProgress->store(0.3f, std::memory_order_relaxed);
 
     // Step 3: Process meshes (vertices, indices, bones, materials)
     std::vector<AsyncModelData::RawMeshData> rawMeshes;
@@ -464,7 +520,7 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
     data->meshes = std::move(rawMeshes);
     data->meshMaterials = std::move(materials);
 
-    if (outProgress) *outProgress = 0.5f;
+    if (outProgress) outProgress->store(0.5f, std::memory_order_relaxed);
 
     // Step 4: Load textures on background thread (file I/O, no GL)
     {
@@ -624,13 +680,14 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
                         }
                     }
                     
+                    DownscaleTextureToFit(texData, maxTextureSize);
                     data->textures.push_back(std::move(texData));
                 }
             }
         }
     }
 
-    if (outProgress) *outProgress = 0.7f;
+    if (outProgress) outProgress->store(0.7f, std::memory_order_relaxed);
 
     // Step 5: Build bone maps
     auto normMap = BuildNormalizedBoneMap(data->skeleton);
@@ -646,7 +703,7 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
     data->globalInverseTransform = glm::inverse(rootTransform);
     data->skeleton.globalInverseTransform = data->globalInverseTransform;
 
-    if (outProgress) *outProgress = 0.8f;
+    if (outProgress) outProgress->store(0.8f, std::memory_order_relaxed);
 
     // Step 6: Load animation metadata
     for (unsigned i = 0; i < scene->mNumAnimations; ++i) {
@@ -672,7 +729,7 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
         }
     }
 
-    if (outProgress) *outProgress = 0.9f;
+    if (outProgress) outProgress->store(0.9f, std::memory_order_relaxed);
 
     // Step 8: Calculate bounding volumes
     BoundingBox bbox;
@@ -693,7 +750,7 @@ std::unique_ptr<AsyncModelData> Model::LoadModelData(const std::string& path, fl
     data->totalTriangles = totalTris;
     data->success = true;
 
-    if (outProgress) *outProgress = 1.0f;
+    if (outProgress) outProgress->store(1.0f, std::memory_order_relaxed);
     return data;
 }
 
@@ -703,7 +760,7 @@ Model* Model::CreateFromAsync(AsyncLoadHandle& handle, std::string* outError)
         if (outError) *outError = "Invalid async handle";
         return nullptr;
     }
-    
+
     // Block until loading is complete
     auto data = handle.future.get();
     
@@ -719,6 +776,36 @@ Model* Model::CreateFromAsync(AsyncLoadHandle& handle, std::string* outError)
     
     // Create model on main thread (GL resources)
     try {
+        Model* model = new Model("");
+        std::string setupError;
+        model->setupFromAsyncData(std::move(data), setupError);
+        if (!setupError.empty()) {
+            if (outError) *outError = setupError;
+            delete model;
+            return nullptr;
+        }
+        return model;
+    } catch (const std::exception& e) {
+        if (outError) *outError = std::string("Exception during GL setup: ") + e.what();
+        return nullptr;
+    } catch (...) {
+        if (outError) *outError = "Unknown exception during GL setup";
+        return nullptr;
+    }
+}
+
+Model* Model::CreateFromAsync(std::unique_ptr<AsyncModelData> data, std::string* outError)
+{
+    // Same GL-only upload step as the handle-based overload, but for callers
+    // that already hold parsed AsyncModelData (e.g. a JobSystem worker that ran
+    // LoadModelData directly) and therefore have no shared future to block on.
+    try {
+        bool ok = data && data->success;
+        if (!ok) {
+            if (outError) *outError = (data && data->error.empty())
+                ? "Loading failed" : (data ? "Loading failed: " + data->error : std::string("Null async model data"));
+            return nullptr;
+        }
         Model* model = new Model("");
         std::string setupError;
         model->setupFromAsyncData(std::move(data), setupError);
@@ -828,39 +915,28 @@ void Model::setupFromAsyncData(std::unique_ptr<AsyncModelData> data, std::string
         
         // Set default textures if needed
         if (!mat.hasAlbedoMap) { mat.albedoMap = DefaultTexture::GetGreyTexture(); mat.hasAlbedoMap = true; }
-        if (!mat.hasNormalMap) { mat.normalMap = DefaultTexture::GetFlatNormalTexture(); mat.hasNormalMap = true; }
+        if (!mat.hasNormalMap) { mat.normalMap = DefaultTexture::GetWhiteTexture(); mat.hasNormalMap = true; }
         if (!mat.hasMetallicMap) { mat.metallicMap = DefaultTexture::GetGreyTexture(); mat.hasMetallicMap = true; }
         if (!mat.hasRoughnessMap) { mat.roughnessMap = DefaultTexture::GetGreyTexture(); mat.hasRoughnessMap = true; }
         if (!mat.hasAOMap) { mat.aoMap = DefaultTexture::GetGreyTexture(); mat.hasAOMap = true; }
     }
 
-    // CRITICAL FIX: push the FULL PBR texture set into each mesh's texture list,
-    // matching the sync path in processMesh (pushMap). Mesh::Draw binds
-    // mesh.textures as texture_<semantic>N samplers, so if normal/metallic/
-    // roughness/ao are missing from this list the shader samples whatever was
-    // stale on those texture units — cross-contaminated maps from previously-
-    // drawn meshes, which is why "some parts aren't properly textured" (flat
-    // Minecraft shading, wrong normals, incorrect metal/roughness). Each
-    // semantic is guaranteed present via the per-mesh pushMap with safe
-    // fallbacks, so no shader ever reads an unbound or stale sampler.
+    // CRITICAL FIX: propagate the loaded albedo texture into the mesh's
+    // texture list. Mesh::Draw binds meshes[i].textures as texture_diffuse1
+    // (the FS samples it), but the meshes were created above WITHOUT textures,
+    // so animated models drew with zero bound textures and the fragment
+    // shader sampled whatever was still on unit 0 - the terrain heightmap
+    // (GL_R32F = red) - which is why the bot rendered solid red instead of
+    // its real material.
     for (size_t meshIdx = 0; meshIdx < meshes.size() && meshIdx < meshMaterials.size(); ++meshIdx) {
         const auto& mat = meshMaterials[meshIdx];
-        auto pushMap = [&](unsigned int id, unsigned int fallback,
-                           const char* semantic, Texture::Type texType) {
-            unsigned int texId = (id != 0) ? id : fallback;
-            if (texId != 0) {
-                Texture tex;
-                tex.id = texId;
-                tex.type = semantic;
-                tex.textureType = texType;
-                meshes[meshIdx].textures.push_back(tex);
-            }
-        };
-        pushMap(mat.albedoMap,     DefaultTexture::GetGreyTexture(),          "diffuse",  Texture::Type::DIFFUSE);
-        pushMap(mat.normalMap,     DefaultTexture::GetFlatNormalTexture(),    "normal",   Texture::Type::NORMAL);
-        pushMap(mat.metallicMap,   DefaultTexture::GetBlackTexture(),         "metallic", Texture::Type::METALLIC);
-        pushMap(mat.roughnessMap,  DefaultTexture::GetGreyTexture(),          "roughness",Texture::Type::ROUGHNESS);
-        pushMap(mat.aoMap,         DefaultTexture::GetWhiteTexture(),          "ao",       Texture::Type::AO);
+        if (mat.albedoMap != 0) {
+            Texture tex;
+            tex.id = mat.albedoMap;
+            tex.type = "diffuse";
+            tex.textureType = Texture::Type::DIFFUSE;
+            meshes[meshIdx].textures.push_back(tex);
+        }
     }
     
     // Copy skeleton and animation data
@@ -1207,7 +1283,6 @@ void Model::loadModel(const std::string &path)
         path,
         aiProcess_Triangulate |
             aiProcess_GenSmoothNormals |
-            aiProcess_FlipUVs |
             aiProcess_CalcTangentSpace |
             aiProcess_LimitBoneWeights);
     // REMOVED: aiProcess_PreTransformVertices - this destroys skinning!
@@ -1587,9 +1662,12 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
     // filter, GL_RG/BC5 packing) from diffuse/metallic/ao - reusing the wrong
     // type's GL object would silently apply the wrong sampling state.
     const std::string key = path + "\n" + std::to_string((int)type);
-    auto cacheIt = m_textureCache.find(key);
-    if (cacheIt != m_textureCache.end()) {
-        return cacheIt->second;
+    {
+        std::lock_guard<std::mutex> cacheLock(m_textureCacheMutex);
+        auto cacheIt = m_textureCache.find(key);
+        if (cacheIt != m_textureCache.end()) {
+            return cacheIt->second;
+        }
     }
 
     // Check if OpenGL context is available
@@ -1614,6 +1692,10 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
         fclose(ddsTest);
         textureID = LoadDDS(ddsPath);
         if (textureID) {
+            {
+                std::lock_guard<std::mutex> cacheLock(m_textureCacheMutex);
+                m_textureCache[key] = textureID;
+            }
             return textureID;
         }
     }
@@ -1642,7 +1724,10 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
                 std::cout << "[Model] EXR texture loaded: " << exrPath
                           << " (" << exrW << "x" << exrH << ")\n";
                 textureID = uploadImageData(exrRGBA.data(), exrW, exrH, 4, type, /*ownedByStbi=*/false);
-                m_textureCache[key] = textureID;
+                {
+                    std::lock_guard<std::mutex> cacheLock(m_textureCacheMutex);
+                    m_textureCache[key] = textureID;
+                }
                 return textureID;
             }
         }
@@ -1662,7 +1747,10 @@ unsigned int Model::loadTexture(const std::string& path, aiTextureType type)
         std::cerr << "Texture failed to load at path: " << path << std::endl;
     }
 
-    m_textureCache[key] = textureID;
+    {
+        std::lock_guard<std::mutex> cacheLock(m_textureCacheMutex);
+        m_textureCache[key] = textureID;
+    }
     return textureID;
 }
 
@@ -1700,67 +1788,38 @@ unsigned int Model::uploadImageData(unsigned char* data, int width, int height,
     // Cap huge (4K+) textures to 1024 before CPU BC1 compression. Decoding
     // + box-filtering a 16M-pixel RGBA buffer is microseconds; compressing
     // it to BC1 is the expensive part (seconds per texture), and 4K maps
-    // on small plant meshes gain nothing visually.
-    // Cache-friendly single-pass downsampler: reads and writes memory in
-    // strict contiguous row-major lines, avoiding the pointer-jumping
-    // (non-unit stride) that stalled L1/L2 on the old integer-step loop.
+    // on small plant meshes gain nothing visually. Box-average downsample.
     const int kMaxTexSize = 1024;
     if (width > kMaxTexSize || height > kMaxTexSize) {
         const int newW = std::min(width, kMaxTexSize);
         const int newH = std::min(height, kMaxTexSize);
         const int c = nrComponents > 0 ? nrComponents : 4;
-
-        // Fractional steps in fixed-point space — prevents floating-point
-        // accumulation drift and ensures every source pixel contributes.
-        const float stepX = static_cast<float>(width) / static_cast<float>(newW);
-        const float stepY = static_cast<float>(height) / static_cast<float>(newH);
-
-        m_resizedTexBuffer.assign(static_cast<size_t>(newW) * newH * c, 0);
-        unsigned char* dPtr = m_resizedTexBuffer.data();
-
-        // Cache-friendly row-major streaming loop — each inner kernel
-        // iteration walks a tightly localised, contiguous row window.
+        const int sx = std::max(1, width / newW);
+        const int sy = std::max(1, height / newH);
+        m_resizedTexBuffer.assign((size_t)newW * newH * c, 0);
         for (int y = 0; y < newH; ++y) {
-            const int srcYStart = static_cast<int>(y * stepY);
-            const int srcYEnd   = std::min(height, static_cast<int>((y + 1) * stepY));
-            const int filterHeight = std::max(1, srcYEnd - srcYStart);
-
             for (int x = 0; x < newW; ++x) {
-                const int srcXStart = static_cast<int>(x * stepX);
-                const int srcXEnd   = std::min(width, static_cast<int>((x + 1) * stepX));
-                const int filterWidth  = std::max(1, srcXEnd - srcXStart);
-
-                int r = 0, g = 0, b = 0, a = 0;
-
-                // Kernel aggregation — operates on a tightly localised,
-                // contiguous row window (rowPtr walks unit-stride).
-                for (int sy = srcYStart; sy < srcYEnd; ++sy) {
-                    const unsigned char* rowPtr = data + (static_cast<size_t>(sy) * width + srcXStart) * c;
-
-                    for (int sx = srcXStart; sx < srcXEnd; ++sx) {
-                        r += rowPtr[0];
-                        if (c > 1) g += rowPtr[1];
-                        if (c > 2) b += rowPtr[2];
-                        if (c > 3) a += rowPtr[3];
-                        rowPtr += c; // Safe, linear stride stepping
+                int r = 0, g = 0, b = 0, a = 0, n = 0;
+                for (int j = 0; j < sy; ++j) {
+                    const int yy = std::min(height - 1, y * sy + j);
+                    for (int i = 0; i < sx; ++i) {
+                        const int xx = std::min(width - 1, x * sx + i);
+                        const unsigned char* p = data + ((size_t)yy * width + xx) * c;
+                        r += p[0]; if (c > 1) g += p[1]; if (c > 2) b += p[2]; if (c > 3) a += p[3];
+                        ++n;
                     }
                 }
-
-                // Compute box-average division over the accumulated kernel footprint
-                const int divisor = filterWidth * filterHeight;
-                dPtr[0] = static_cast<unsigned char>(r / divisor);
-                if (c > 1) dPtr[1] = static_cast<unsigned char>(g / divisor);
-                if (c > 2) dPtr[2] = static_cast<unsigned char>(b / divisor);
-                if (c > 3) dPtr[3] = static_cast<unsigned char>(a / divisor);
-
-                dPtr += c; // Stream straight to the next output memory address
+                unsigned char* d = &m_resizedTexBuffer[((size_t)y * newW + x) * c];
+                d[0] = (unsigned char)(r / n);
+                if (c > 1) d[1] = (unsigned char)(g / n);
+                if (c > 2) d[2] = (unsigned char)(b / n);
+                if (c > 3) d[3] = (unsigned char)(a / n);
             }
         }
-
         if (ownedByStbi) {
-            stbi_image_free(data);  // Safely clean up original STB allocation
+            stbi_image_free(data);   // free the ORIGINAL stbi buffer
         }
-        data = m_resizedTexBuffer.data();
+        data = m_resizedTexBuffer.data(); // borrow from the member vector
         ownedByStbi = false;
         width = newW;
         height = newH;
@@ -1800,13 +1859,10 @@ unsigned int Model::uploadImageData(unsigned char* data, int width, int height,
         glTextureSubImage2D(textureID, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, data);
         glGenerateTextureMipmap(textureID);
     } else if (isNormalMap && nrComponents == 3) {
-        // === Normal map RGB8 ===
-        // Use GL_RGB8 + GL_RGB (not GL_RG8 + GL_RG) — the source data from
-        // stbi / embedded textures is 3-bytes-per-pixel RGB, and packing it
-        // into a 2-component GL_RG upload causes a row-stride mismatch (OpenGL
-        // expects W*2 bytes/row for RG but the data is W*3 bytes/row),
-        // producing garbled normals and "some parts not properly textured."
-        // The async path (uploadTextureFromPixels) already does this correctly.
+        // FIX (forAnime.txt Fix 5): Allocate full RGB (GL_RGB8) for 3-component
+        // normal maps. The old code packed RG (2-channel) from a 3-component
+        // source, shifting the data read window and corrupting surface
+        // tangents / causing UV/stretch artifacts.
         glTextureStorage2D(textureID, levels, GL_RGB8, width, height);
         glTextureSubImage2D(textureID, 0, 0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, data);
         glGenerateTextureMipmap(textureID);
@@ -1831,20 +1887,6 @@ unsigned int Model::uploadImageData(unsigned char* data, int width, int height,
         glTextureStorage2D(textureID, levels, internalFormat, width, height);
         glTextureSubImage2D(textureID, 0, 0, 0, width, height, format, GL_UNSIGNED_BYTE, data);
         glGenerateTextureMipmap(textureID);
-    }
-
-    // ── Phase 2 (Texture): Unify Anisotropic Filtering ────────────────
-    // The async path (uploadTextureFromPixels) already sets max anisotropy,
-    // but the SYNC Model path (this function) was missing it. Textures loaded
-    // on the main thread (environment objects, editor UI assets, etc.) get
-    // default 1× filtering, causing grazing-angle shimmer on floors/walls/boots
-    // that disrupts FSR3 upscaling. Copy the DSA block so both paths agree.
-    if (GLAD_GL_ARB_texture_filter_anisotropic && textureID != 0) {
-        GLfloat maxAniso = 1.0f;
-        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAniso);
-        if (maxAniso > 1.0f) {
-            glTextureParameterf(textureID, GL_TEXTURE_MAX_ANISOTROPY, maxAniso);
-        }
     }
 
     if (ownedByStbi) {

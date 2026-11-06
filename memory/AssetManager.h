@@ -23,6 +23,7 @@
 #include <functional>
 #include <chrono>
 #include <atomic>
+#include <iostream>
 
 // Forward declarations
 class Model;
@@ -37,58 +38,33 @@ class Shader;
 template<typename T>
 class AssetHandle {
 public:
-    AssetHandle() : asset(nullptr), refCount(nullptr) {}
+    AssetHandle() = default;
     
+    // Legacy constructor: takes ownership of a raw pointer via a shared_ptr
+    // with a deleting deleter. Multiple AssetHandles from the same raw pointer
+    // each create independent shared_ptrs (legacy use only).
     explicit AssetHandle(T* asset) 
-        : asset(asset)
-        , refCount(asset ? new size_t(1) : nullptr) {}
+        : asset_(asset, [](T* p) { delete p; }) {}
     
-    AssetHandle(const AssetHandle& other)
-        : asset(other.asset)
-        , refCount(other.refCount) {
-        if (refCount) {
-            ++(*refCount);
-        }
-    }
+    // Shared-ownership constructor: shares the AssetEntry's control block,
+    // so the asset survives clearAll() as long as any handle exists.
+    explicit AssetHandle(std::shared_ptr<T> sp)
+        : asset_(std::move(sp)) {}
     
-    AssetHandle& operator=(const AssetHandle& other) {
-        if (this != &other) {
-            release();
-            asset = other.asset;
-            refCount = other.refCount;
-            if (refCount) {
-                ++(*refCount);
-            }
-        }
-        return *this;
-    }
+    AssetHandle(const AssetHandle& other) = default;
+    AssetHandle& operator=(const AssetHandle& other) = default;
     
-    ~AssetHandle() {
-        release();
-    }
+    ~AssetHandle() = default;
     
-    T* get() const { return asset; }
-    T* operator->() const { return asset; }
-    T& operator*() const { return *asset; }
-    explicit operator bool() const { return asset != nullptr; }
+    T* get() const { return asset_.get(); }
+    T* operator->() const { return asset_.get(); }
+    T& operator*() const { return *asset_; }
+    explicit operator bool() const { return static_cast<bool>(asset_); }
     
-    size_t useCount() const { return refCount ? *refCount : 0; }
+    size_t useCount() const { return asset_.use_count(); }
     
 private:
-    void release() {
-        if (refCount) {
-            --(*refCount);
-            if (*refCount == 0) {
-                delete asset;
-                delete refCount;
-            }
-            refCount = nullptr;
-        }
-        asset = nullptr;
-    }
-    
-    T* asset;
-    size_t* refCount;
+    std::shared_ptr<T> asset_;
 };
 
 // ============================================================================
@@ -204,13 +180,16 @@ private:
     // Type-specific asset entry
     template<typename T>
     struct AssetEntry : AssetEntryBase {
-        T* asset;
+        std::shared_ptr<T> asset;
         std::string path;
         std::chrono::steady_clock::time_point lastAccess;
-        
-        AssetEntry(T* a, const std::string& p) : asset(a), path(p), lastAccess(std::chrono::steady_clock::now()) {}
-        ~AssetEntry() { delete asset; }
-        
+
+        AssetEntry(T* a, const std::string& p)
+            : asset(a, [](T* p) { delete p; }), path(p), lastAccess(std::chrono::steady_clock::now()) {}
+        // Destructor is default: shared_ptr drops its ref; if an AssetHandle
+        // still holds a copy, the asset survives clearAll() — no double-free.
+        ~AssetEntry() = default;
+
         size_t getSize() const override { return sizeof(T); }
         std::string getPath() const override { return path; }
         std::chrono::steady_clock::time_point getLastAccess() const override { return lastAccess; }
@@ -269,15 +248,20 @@ AssetHandle<T> AssetManager::load(const std::string& path) {
     auto it = assetCache.find(path);
     if (it != assetCache.end()) {
         ++loadHits;
-        auto entry = static_cast<AssetEntry<T>*>(it->second);
+        auto entry = dynamic_cast<AssetEntry<T>*>(it->second);
+        if (!entry) {
+            std::cerr << "[AssetManager] Type mismatch: '" << path
+                      << "' cached as a different type — update config\n";
+            return AssetHandle<T>();
+        }
         entry->lastAccess = std::chrono::steady_clock::now();
-        return AssetHandle<T>(entry->asset);
+        return AssetHandle<T>(entry->asset); // shares shared_ptr control block
     }
-    
+
     ++loadMisses;
-    
+
     // For now, return null (actual loading requires asset type definitions)
-    return AssetHandle<T>(nullptr);
+    return AssetHandle<T>();
 }
 
 template<typename T>
@@ -286,7 +270,7 @@ std::future<AssetHandle<T>> AssetManager::loadAsync(const std::string& path) {
     std::future<AssetHandle<T>> result = promise.get_future();
     
     // For now, immediately return null
-    promise.set_value(AssetHandle<T>(nullptr));
+    promise.set_value(AssetHandle<T>());
     
     return result;
 }
@@ -305,13 +289,18 @@ AssetHandle<T> AssetManager::get(const std::string& path) {
     auto it = assetCache.find(path);
     if (it != assetCache.end()) {
         ++loadHits;
-        auto entry = static_cast<AssetEntry<T>*>(it->second);
+        auto entry = dynamic_cast<AssetEntry<T>*>(it->second);
+        if (!entry) {
+            std::cerr << "[AssetManager] Type mismatch: '" << path
+                      << "' cached as a different type — update config\n";
+            return AssetHandle<T>();
+        }
         entry->lastAccess = std::chrono::steady_clock::now();
-        return AssetHandle<T>(entry->asset);
+        return AssetHandle<T>(entry->asset); // shares shared_ptr control block
     }
     
     ++loadMisses;
-    return AssetHandle<T>(nullptr);
+    return AssetHandle<T>();
 }
 
 template<typename T>

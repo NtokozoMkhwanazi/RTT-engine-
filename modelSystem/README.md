@@ -7,10 +7,7 @@
 ```
 modelSystem/
 ├── Model.h                   # Model class header
-├── model.cpp                 # Model implementation
-├── ModelHandle.h             # Opaque model handle
-├── ModelManager.h/.cpp       # Model registry + asset cache
-├── TextureCompression.h      # Texture compression helpers
+├── Model.cpp                 # Model implementation
 ├── README.md                 # This file
 └── (meshSystem/ related)
 ```
@@ -144,25 +141,21 @@ material.doubleSided = false;
 The model system compiles as part of the main engine build. From the repository root:
 
 ```bash
-make            # build bin/test_runner + bin/engine (debug)
-make test       # run the full unit-test suite (731 tests / 99 suites)
+make            # build the test runner
+make test       # run the full unit-test suite (494 tests)
 make run        # self-check tests, then boot the engine
 make run-headless  # bounded headless engine run (CI-friendly)
-make test-list  # list every test
 ```
 
-FBX loading, skeleton extraction, skinning and model/material rendering are covered
-by `make test` (the `FBXLoaderTest`, `FBXAnimationIntegrationTest`, `ECSRenderGLTest`,
-`PbrForwardGL` and `ModelTexture` suites; filter with `--gtest_filter=FBX*`).
-See the [root README](../README.md#test-suites) for the full target list and prerequisites.
+FBX loading, skeleton extraction, and motion-matching database population are covered
+by `make test` (FBX animation + play-mode suites; filter with `--gtest_filter=FBX*`).
+See the [root README](../README.md) for prerequisites and engine controls.
 
 ## 🐛 Known Issues
 
-See [Troubleshooting](../docs/TROUBLESHOOTING.md) (FBX `ASSIMP ERROR` asset warnings
-are non-fatal) and the [Architecture](../docs/ARCHITECTURE.md) notes on the
-render/data flow for the model → skeleton → skinning pipeline.
+See [MODEL_SYSTEM_IMPROVEMENTS.md](../docs/general/MODEL_SYSTEM_IMPROVEMENTS.md)
 
 ---
 
 **Status:** ✅ Production Ready
-**Last Updated:** September 2026
+**Last Updated:** August 2026

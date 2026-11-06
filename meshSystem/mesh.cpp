@@ -1,6 +1,7 @@
 #include "Mesh.h"
 #include "../editor/gl_context_lifecycle.h"
 #include <iostream>
+#include <fstream>
 #include <algorithm>
 #include <numeric>
 #include <unordered_set>
@@ -396,6 +397,16 @@ void Mesh::DrawInstanced(Shader& shader, const std::vector<InstanceData>& instan
     const size_t bytes = instances.size() * InstanceData::Size();
     if (bytes > instanceVBOCapacity) {
         glBufferData(GL_ARRAY_BUFFER, bytes, instances.data(), GL_DYNAMIC_DRAW);
+        instanceVBOCapacity = bytes;
+    } else if (bytes < instanceVBOCapacity) {
+        // Shrink (e.g. frustum culling drops instances): orphan to a fresh smaller
+        // allocation first so glBufferSubData can't sync-stall waiting on the GPU
+        // reading last frame's longer buffer. Mirrors the vertex-orphan pattern
+        // already used in rhi/RHIGL.cpp drawMeshVertices. Same bytes uploaded ->
+        // pixel-identical output. (Same-size updates stay in-place to keep the
+        // ~600-instance planted-prop pass off the 50ms/frame orphan cost.)
+        glBufferData(GL_ARRAY_BUFFER, bytes, nullptr, GL_DYNAMIC_DRAW);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, instances.data());
         instanceVBOCapacity = bytes;
     } else {
         glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, instances.data());
@@ -1388,6 +1399,12 @@ namespace MeshUtils
             }
             lastTris = newTris;
             cellSize *= 1.6f;  // grow cells for stronger reduction
+            if (!std::isfinite(cellSize)) {
+                // cellSize overflowed to INF (extreme reduction factor): further
+                // iterations cannot shrink the mesh and would feed INF into the
+                // extent/cell divisions, collapsing the model. Stop here.
+                break;
+            }
         }
 
         // Refresh derived data + GPU buffers with the decimated geometry.
@@ -1438,186 +1455,188 @@ namespace MeshUtils
                   << " vertices, " << mesh.indices.size() / 3 << " triangles\n";
     }
 
-    // ============================================================
-    // Phase 1: Cluster Builder
-    // ============================================================
-
+    // --------------------------------------------------------
+    // BuildMeshClusters
+    // --------------------------------------------------------
+    // Splits the index list into groups of `clusterTriangleCount` triangles
+    // (3 consecutive indices == 1 triangle). Each cluster is given a
+    // deduplicated local vertex pool and cluster-local indices.
     ClusterPackedPayload BuildMeshClusters(const std::vector<Vertex>& vertices,
                                            const std::vector<unsigned int>& indices,
-                                           size_t trianglesPerCluster)
+                                           uint32_t clusterTriangleCount)
     {
         ClusterPackedPayload payload;
-        if (indices.empty() || vertices.empty()) return payload;
 
-        const size_t totalTriangles = indices.size() / 3;
-        if (totalTriangles == 0) return payload;
+        if (vertices.empty() || indices.empty() || clusterTriangleCount == 0)
+            return payload;
 
-        if (trianglesPerCluster == 0) trianglesPerCluster = 128;
+        const uint32_t triCount = static_cast<uint32_t>(indices.size() / 3);
+        if (triCount == 0)
+            return payload;
 
-        size_t triIdx = 0;  // global triangle cursor
+        const uint32_t numClusters = (triCount + clusterTriangleCount - 1) / clusterTriangleCount;
+        payload.clusters.reserve(numClusters);
 
-        while (triIdx < totalTriangles) {
+        for (uint32_t c = 0; c < numClusters; ++c)
+        {
+            uint32_t triStart = c * clusterTriangleCount;
+            uint32_t triEnd   = std::min(triStart + clusterTriangleCount, triCount);
+            uint32_t idxStart = triStart * 3u;
+            uint32_t idxEnd   = triEnd   * 3u;
+
             MeshCluster cluster;
-            cluster.indices.reserve(trianglesPerCluster * 3);
+            // BoundingBox default-constructs to min=FLT_MAX / max=-FLT_MAX.
+            std::unordered_map<uint32_t, uint32_t> localIndex;
 
-            // Local vertex remapping for this cluster
-            std::unordered_map<unsigned int, unsigned int> vertexRemap;
-
-            size_t trisThisCluster = 0;
-            for (size_t t = 0; t < trianglesPerCluster && triIdx < totalTriangles; ++t) {
-                for (int i = 0; i < 3; ++i) {
-                    unsigned int origIdx = indices[triIdx * 3 + i];
-
-                    auto it = vertexRemap.find(origIdx);
-                    if (it == vertexRemap.end()) {
-                        unsigned int newIdx = static_cast<unsigned int>(cluster.vertices.size());
-                        vertexRemap[origIdx] = newIdx;
-                        cluster.vertices.push_back(vertices[origIdx]);
-                        cluster.indices.push_back(newIdx);
-                        payload.totalVertices++;
-                    } else {
-                        cluster.indices.push_back(it->second);
-                    }
-                    payload.totalIndices++;
+            for (uint32_t i = idxStart; i < idxEnd; ++i)
+            {
+                uint32_t g = indices[i];
+                if (g >= static_cast<uint32_t>(vertices.size())) {
+                    // Malformed/degenerate asset: index out of range. Skip
+                    // this index instead of OOB-reading vertices[g] (SIGSEGV).
+                    continue;
                 }
-                ++trisThisCluster;
-                ++triIdx;
+                auto it = localIndex.find(g);
+                if (it == localIndex.end())
+                {
+                    uint32_t local = static_cast<uint32_t>(cluster.vertices.size());
+                    localIndex[g] = local;
+                    cluster.vertices.push_back(vertices[g]);
+                    cluster.boundingBox.Extend(vertices[g].Position);
+                    cluster.indices.push_back(local);
+                }
+                else
+                {
+                    cluster.indices.push_back(it->second);
+                }
             }
 
-            // Compute bounding volumes
-            cluster.boundingBox = BoundingBox();
-            for (const auto& v : cluster.vertices) {
-                cluster.boundingBox.Extend(v.Position);
-            }
-            if (cluster.boundingBox.IsValid()) {
-                cluster.boundingSphere = BoundingSphere::FromBoundingBox(cluster.boundingBox);
-            }
+            cluster.boundingSphere = BoundingSphere::FromBoundingBox(cluster.boundingBox);
 
             payload.clusters.push_back(std::move(cluster));
+            payload.totalVertices += payload.clusters.back().vertices.size();
+            payload.totalIndices  += payload.clusters.back().indices.size();
         }
 
         return payload;
     }
 
-    void ExportClusterMeshFile(const std::string& binaryPath,
-                               const ClusterPackedPayload& payload)
-    {
-        std::ofstream out(binaryPath, std::ios::binary);
-        if (!out) return;
-
-        uint64_t clusterCount = payload.clusters.size();
-        out.write(reinterpret_cast<const char*>(&clusterCount), sizeof(clusterCount));
-
-        for (const auto& cluster : payload.clusters) {
-            // Bounding sphere (xyz=center, w=radius)
-            out.write(reinterpret_cast<const char*>(&cluster.boundingSphere.center),
-                      sizeof(glm::vec3));
-            out.write(reinterpret_cast<const char*>(&cluster.boundingSphere.radius),
-                      sizeof(float));
-
-            // Vertex / index counts
-            uint64_t vCount = cluster.vertices.size();
-            uint64_t iCount = cluster.indices.size();
-            out.write(reinterpret_cast<const char*>(&vCount), sizeof(vCount));
-            out.write(reinterpret_cast<const char*>(&iCount), sizeof(iCount));
-
-            // Raw vertex and index data
-            out.write(reinterpret_cast<const char*>(cluster.vertices.data()),
-                      vCount * sizeof(Vertex));
-            out.write(reinterpret_cast<const char*>(cluster.indices.data()),
-                      iCount * sizeof(unsigned int));
-        }
-    }
-
-    bool ImportClusterMeshFile(const std::string& binaryPath,
-                               ClusterPackedPayload& outPayload)
-    {
-        std::ifstream in(binaryPath, std::ios::binary);
-        if (!in) return false;
-
-        outPayload = {};
-
-        uint64_t clusterCount = 0;
-        in.read(reinterpret_cast<char*>(&clusterCount), sizeof(clusterCount));
-        if (!in) return false;
-
-        for (uint64_t c = 0; c < clusterCount; ++c) {
-            MeshCluster cluster;
-
-            // Bounding sphere
-            in.read(reinterpret_cast<char*>(&cluster.boundingSphere.center),
-                    sizeof(glm::vec3));
-            in.read(reinterpret_cast<char*>(&cluster.boundingSphere.radius),
-                    sizeof(float));
-
-            uint64_t vCount = 0, iCount = 0;
-            in.read(reinterpret_cast<char*>(&vCount), sizeof(vCount));
-            in.read(reinterpret_cast<char*>(&iCount), sizeof(iCount));
-            if (!in) return false;
-
-            cluster.vertices.resize(vCount);
-            cluster.indices.resize(iCount);
-            if (vCount) {
-                in.read(reinterpret_cast<char*>(cluster.vertices.data()),
-                        vCount * sizeof(Vertex));
-            }
-            if (iCount) {
-                in.read(reinterpret_cast<char*>(cluster.indices.data()),
-                        iCount * sizeof(unsigned int));
-            }
-            if (!in) return false;
-
-            // Recompute bounding box from loaded vertex data
-            cluster.boundingBox = BoundingBox();
-            for (const auto& v : cluster.vertices)
-                cluster.boundingBox.Extend(v.Position);
-            if (cluster.boundingBox.IsValid())
-                cluster.boundingSphere = BoundingSphere::FromBoundingBox(cluster.boundingBox);
-
-            outPayload.clusters.push_back(std::move(cluster));
-            outPayload.totalVertices += vCount;
-            outPayload.totalIndices += iCount;
-        }
-
-        return true;
-    }
-
+    // --------------------------------------------------------
+    // FlattenClustersToBuffers
+    // --------------------------------------------------------
+    // Concatenates each cluster's local vertex pool into one contiguous buffer
+    // and remaps the local indices to the global (flattened) vertex base,
+    // emitting a GPUClusterCommand per cluster.
     std::vector<GPUClusterCommand> FlattenClustersToBuffers(
         const ClusterPackedPayload& payload,
-        std::vector<Vertex>& outVertices,
-        std::vector<unsigned int>& outIndices)
+        std::vector<Vertex>&      flatVertices,
+        std::vector<unsigned int>& flatIndices)
     {
-        outVertices.clear();
-        outIndices.clear();
-        outVertices.reserve(payload.totalVertices);
-        outIndices.reserve(payload.totalIndices);
-
         std::vector<GPUClusterCommand> commands;
-        commands.resize(payload.clusters.size());
+        commands.reserve(payload.clusters.size());
 
-        size_t vertexOffset = 0;
-        size_t indexOffset = 0;
+        flatVertices.clear();
+        flatIndices.clear();
 
-        for (size_t c = 0; c < payload.clusters.size(); ++c) {
-            const auto& cluster = payload.clusters[c];
+        size_t vOffset = 0;
+        size_t iOffset = 0;
+        for (size_t c = 0; c < payload.clusters.size(); ++c)
+        {
+            const MeshCluster& cluster = payload.clusters[c];
 
-            commands[c].firstVertex = static_cast<uint32_t>(vertexOffset);
-            commands[c].firstIndex  = static_cast<uint32_t>(indexOffset);
-            commands[c].indexCount  = static_cast<uint32_t>(cluster.indices.size());
-            commands[c].instanceId  = static_cast<uint32_t>(c);
+            GPUClusterCommand cmd{};
+            cmd.firstVertex = static_cast<uint32_t>(vOffset);
+            cmd.firstIndex  = static_cast<uint32_t>(iOffset);
+            cmd.indexCount  = static_cast<uint32_t>(cluster.indices.size());
+            cmd.instanceId  = static_cast<uint32_t>(c);
+            commands.push_back(cmd);
 
-            // Append cluster vertices (already local to this cluster)
             for (const auto& v : cluster.vertices)
-                outVertices.push_back(v);
+                flatVertices.push_back(v);
+            for (uint32_t idx : cluster.indices)
+                flatIndices.push_back(idx + static_cast<uint32_t>(vOffset));
 
-            // Append indices with the global vertex offset
-            for (unsigned int idx : cluster.indices)
-                outIndices.push_back(idx + static_cast<unsigned int>(vertexOffset));
-
-            vertexOffset += cluster.vertices.size();
-            indexOffset  += cluster.indices.size();
+            vOffset += cluster.vertices.size();
+            iOffset += cluster.indices.size();
         }
 
         return commands;
+    }
+
+    // --------------------------------------------------------
+    // ExportClusterMeshFile / ImportClusterMeshFile
+    // --------------------------------------------------------
+    // Minimal binary format:
+    //   totalVertices(size_t) totalIndices(size_t) clusterCount(size_t)
+    //   per cluster:
+    //     vertexCount(size_t) indexCount(size_t)
+    //     vertices[vertexCount * sizeof(Vertex)]
+    //     indices[indexCount * sizeof(uint32_t)]
+    //     bboxMin(vec3) bboxMax(vec3) sphereCenter(vec3) sphereRadius(float)
+    void ExportClusterMeshFile(const char* path,
+                               const ClusterPackedPayload& payload)
+    {
+        std::ofstream out(path, std::ios::binary);
+        if (!out) return;
+
+        size_t clusterCount = payload.clusters.size();
+        out.write(reinterpret_cast<const char*>(&payload.totalVertices), sizeof(size_t));
+        out.write(reinterpret_cast<const char*>(&payload.totalIndices),  sizeof(size_t));
+        out.write(reinterpret_cast<const char*>(&clusterCount),          sizeof(size_t));
+
+        for (const auto& cluster : payload.clusters)
+        {
+            size_t vertexCount = cluster.vertices.size();
+            size_t indexCount  = cluster.indices.size();
+            out.write(reinterpret_cast<const char*>(&vertexCount), sizeof(size_t));
+            out.write(reinterpret_cast<const char*>(&indexCount),  sizeof(size_t));
+            if (vertexCount)
+                out.write(reinterpret_cast<const char*>(cluster.vertices.data()),
+                          vertexCount * sizeof(Vertex));
+            if (indexCount)
+                out.write(reinterpret_cast<const char*>(cluster.indices.data()),
+                          indexCount * sizeof(uint32_t));
+            out.write(reinterpret_cast<const char*>(&cluster.boundingBox.min),      sizeof(glm::vec3));
+            out.write(reinterpret_cast<const char*>(&cluster.boundingBox.max),      sizeof(glm::vec3));
+            out.write(reinterpret_cast<const char*>(&cluster.boundingSphere.center), sizeof(glm::vec3));
+            out.write(reinterpret_cast<const char*>(&cluster.boundingSphere.radius),  sizeof(float));
+        }
+    }
+
+    bool ImportClusterMeshFile(const char* path,
+                               ClusterPackedPayload& outPayload)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return false;
+
+        outPayload = ClusterPackedPayload{};
+
+        size_t clusterCount = 0;
+        in.read(reinterpret_cast<char*>(&outPayload.totalVertices), sizeof(size_t));
+        in.read(reinterpret_cast<char*>(&outPayload.totalIndices),  sizeof(size_t));
+        in.read(reinterpret_cast<char*>(&clusterCount),            sizeof(size_t));
+
+        outPayload.clusters.resize(clusterCount);
+        for (size_t c = 0; c < clusterCount; ++c)
+        {
+            auto& cluster = outPayload.clusters[c];
+            size_t vertexCount = 0, indexCount = 0;
+            in.read(reinterpret_cast<char*>(&vertexCount), sizeof(size_t));
+            in.read(reinterpret_cast<char*>(&indexCount),  sizeof(size_t));
+            cluster.vertices.resize(vertexCount);
+            cluster.indices.resize(indexCount);
+            if (vertexCount)
+                in.read(reinterpret_cast<char*>(cluster.vertices.data()),
+                        vertexCount * sizeof(Vertex));
+            if (indexCount)
+                in.read(reinterpret_cast<char*>(cluster.indices.data()),
+                        indexCount * sizeof(uint32_t));
+            in.read(reinterpret_cast<char*>(&cluster.boundingBox.min),       sizeof(glm::vec3));
+            in.read(reinterpret_cast<char*>(&cluster.boundingBox.max),       sizeof(glm::vec3));
+            in.read(reinterpret_cast<char*>(&cluster.boundingSphere.center),  sizeof(glm::vec3));
+            in.read(reinterpret_cast<char*>(&cluster.boundingSphere.radius), sizeof(float));
+        }
+
+        return true;
     }
 }

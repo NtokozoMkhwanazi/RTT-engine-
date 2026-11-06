@@ -23,7 +23,12 @@ glm::vec3 evaluate(const glm::vec3& viewDir,
                    float turbidity,
                    float sunIntensity) {
     const glm::vec3 V = glm::normalize(viewDir);
-    const glm::vec3 S = glm::normalize(sunDir);
+    // Guard against a degenerate sun dir (e.g. sun placed at the origin):
+    // normalize() of a zero vector yields NaN, which acos(dot(V,S)) then
+    // propagates as NaN across the whole sky evaluation.
+    const glm::vec3 S = (glm::dot(sunDir, sunDir) > 1e-16f)
+                            ? glm::normalize(sunDir)
+                            : UP;
     const float mu_s = glm::dot(S, UP);               // sun zenith cosine
     // Sharp(ish) cutoff at the horizon: slightly below -> no direct sun term.
     float sunContrib = (mu_s + 0.02f) / 0.04f;         // rise over [−0.02, +0.02]
@@ -45,7 +50,7 @@ glm::vec3 evaluate(const glm::vec3& viewDir,
 
     // --- Mie (haze) sunward glow: Henyey-Greenstein g~0.8, scales w/ turbidity
     const float g = 0.80f;
-    const float hh = 1.0f + g * g - 2.0f * g * cosGamma;
+    const float hh = std::max(1.0f + g * g - 2.0f * g * cosGamma, 1e-5f); // epsilon fence prevents NaN on sun alignment
     const float miePhase = (1.0f - g * g) / (hh * std::sqrt(hh));
     const glm::vec3 mie = miePhase * mieDepth * 0.05f
                         * turbidity * sunIntensity * sunContrib

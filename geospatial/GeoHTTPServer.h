@@ -299,75 +299,279 @@ private:
 };
 
 inline const char* GeoHTTPServer::DefaultPage() {
-    return R"geohtml(<!DOCTYPE html><html><head><meta charset="utf-8"><title>RTT Geo Feed</title>
+    return R"geohtml(<!DOCTYPE html><html><head><meta charset="utf-8"><title>RTT Geo Twin Telemetry</title>
 <style>
-body{background:#0d1117;color:#d0d7e2;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:18px}
-h1{font-size:16px;margin:0 0 4px}.dot{color:#3fb950}
-.grid{display:grid;grid-template-columns:300px 1fr;gap:14px;margin-top:10px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 12px;margin-bottom:12px}
-.card h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#8b949e;margin:0 0 8px}
-.k{color:#8b949e}.v{color:#79c0ff}.ok{color:#3fb950}.bad{color:#f85149}
-table{width:100%;border-collapse:collapse}td,th{padding:3px 6px;text-align:left;border-bottom:1px solid #21262d}
-th{color:#8b949e;font-weight:500}
-input,select,button{background:#0d1117;color:#d0d7e2;border:1px solid #30363d;border-radius:6px;padding:5px 8px;font:inherit}
-button{cursor:pointer}button:hover{border-color:#3fb950}
-#plot{width:100%;height:380px;border-radius:8px;border:1px solid #30363d}
-.footer{color:#8b949e;font-size:11px;margin-top:6px}
+:root {
+    --bg: #060913; --panel: #0d1222; --border: #1e293b;
+    --text: #f1f5f9; --text-dim: #94a3b8; --accent: #388bfd;
+    --green: #22c55e; --orange: #f97316; --yellow: #eab308; --red: #ef4444;
+}
+body { background: var(--bg); color: var(--text);
+     font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+     margin: 0; padding: 24px; }
+h1 { font-size: 18px; font-weight: 600; margin: 0 0 16px; display: flex; align-items: center;
+     gap: 8px; letter-spacing: -0.02em; }
+.dot { width: 8px; height: 8px; background: var(--green); border-radius: 50%;
+       box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.grid { display: grid; grid-template-columns: 340px 1fr; gap: 20px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+        padding: 16px; margin-bottom: 16px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.2); }
+.card h2 { font-size: 11px; font-weight: 700; text-transform: uppercase;
+           letter-spacing: .08em; color: var(--text-dim); margin: 0 0 12px; }
+.metric-row { display: flex; justify-content: space-between; margin-bottom: 8px;
+               font-size: 13px; border-bottom: 1px solid #1e293b; padding-bottom: 4px; }
+.k { color: var(--text-dim); } .v { color: var(--text); font-weight: 600; }
+.badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+.badge.ok { background: rgba(34,197,94,0.15); color: var(--green); }
+.badge.bad { background: rgba(239,68,68,0.15); color: var(--red); }
+table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+td { padding: 6px 4px; font-size: 12px; border-bottom: 1px solid var(--border); }
+input, select, button { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+                          border-radius: 6px; padding: 6px 10px; font-size: 12px; outline: none; }
+button { font-weight: 600; background: var(--accent); border: none; cursor: pointer;
+         transition: background 0.2s; }
+button:hover { background: #2563eb; }
+button.danger { background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid rgba(239,68,68,0.3); }
+button.danger:hover { background: var(--red); color: var(--text); }
+#plot { width: 100%; height: 420px; border-radius: 8px; background: #090d16; }
+.footer { font-size: 12px; color: var(--text-dim); margin-bottom: 16px; background: var(--panel);
+          display: inline-block; padding: 6px 16px; border-radius: 20px; border: 1px solid var(--border); }
+.toast { position: fixed; top: 22px; right: 24px; min-width: 220px; max-width: 360px;
+         background: var(--panel); border: 1px solid var(--red); border-radius: 10px;
+         padding: 12px 14px; color: var(--text); font-size: 12px;
+         box-shadow: 0 6px 18px -4px rgba(239,68,68,.35); opacity: 0;
+         transition: opacity .3s; pointer-events: none; z-index: 10; }
+.toast.show { opacity: 1; }
+.toast .x { color: var(--red); font-weight: 700; }
+.alert-row { border-bottom: 1px solid var(--border); padding: 6px 0; font-size: 12px; }
 </style></head><body>
-<h1>RTT Engine <span class="dot">●</span> Live Geospatial Feed</h1>
-<div class="footer" id="health">connecting…</div>
+<h1><div class="dot"></div> RTT Geo Twin Telemetry &middot; Live Geospatial Feed</h1>
+<div class="footer" id="health">Connecting to engine pipeline…</div>
+<div id="toast" class="toast"></div>
 <div class="grid">
  <div>
-  <div class="card"><h2>GPS Fix</h2><div id="fix">—</div></div>
-  <div class="card"><h2>Stats</h2><div id="stats">—</div></div>
-  <div class="card"><h2>Feeds</h2><div id="feeds">—</div>
-   <div style="margin-top:8px"><input id="furl" placeholder="http://host/api/position" style="width:160px">
-   <select id="ftype"><option>REST</option><option>WebSocket</option></select>
-   <button onclick="addFeed()">Add</button></div></div>
+  <div class="card"><h2>GPS Core Telemetry</h2><div id="fix">—</div></div>
+  <div class="card"><h2>Predicted Next Fix</h2><div id="prediction">—</div></div>
+  <div class="card"><h2>Database Stats</h2><div id="stats">—</div></div>
+  <div class="card"><h2>Proximity Safety Alerts</h2><div id="alerts">—</div></div>
+  <div class="card"><h2>Ingestion Pipelines</h2><div id="feeds">—</div>
+   <div style="margin-top:12px; display:flex; gap:6px;">
+     <input id="furl" placeholder="Telemetry endpoint URL" style="flex:1;">
+     <select id="ftype"><option>REST</option><option>WebSocket</option></select>
+     <button onclick="addFeed()">Deploy</button></div></div>
  </div>
- <div><div class="card"><h2>Trajectory · live fix (green) · physics crates (yellow)</h2>
-  <canvas id="plot" width="780" height="380"></canvas></div></div>
+ <div><div class="card"><h2>Real-Time Spatial Track (Cars: Blue &middot; Machinery: Yellow &middot; Personnel: Orange)</h2>
+  <canvas id="plot" width="780" height="420"></canvas></div></div>
 </div>
 <script>
-let last=null;
+// Normalize the (possibly alias-heavy) asset type string coming from a feed
+// down to the canonical category the canvas color-mapping keys off.
+function classifyType(t){
+  const s=(t||'').toLowerCase();
+  if(!s||s==='unknown'||s==='digital_twin_telemetry') return 'unknown';
+  if(s==='machinery'||s==='heavy'||s==='excavator'||s==='truck'||s==='dragline'||
+     s==='loader'||s==='drill') return 'machinery';
+  if(s==='human'||s==='personnel'||s==='miner'||s==='worker'||s==='pedestrian'||
+     s==='foot') return 'personnel';
+  if(s==='car'||s==='vehicle'||s==='light_vehicle'||s==='utility'||s==='bakkie'||
+     s==='van') return 'vehicle';
+  if(s==='sensor'||s==='static'||s==='monitor'||s==='gas'||s==='geophone'||
+     s==='fan') return 'sensor';
+  return 'unknown';
+}
+function assetColor(t){
+  const c=classifyType(t);
+  if(c==='machinery') return '#eab308';     // Yellow: heavy equipment
+  if(c==='personnel') return '#f97316';     // Orange: on-foot crew
+  return '#388bfd';                          // Blue: light vehicles / default
+}
+// Map each canonical asset category to a high-fidelity canvas glyph so the
+// 2D dots map to the same iconography used by the 3D viewport assets (Honor
+// Pass: telemetry dots -> rich visual icons matching the editor twin mesh).
+function assetGlyph(t){
+  const c=classifyType(t);
+  if(c==='machinery') return '⛟';            // Haul truck / excavator
+  if(c==='personnel') return '웃';            // Ground crew
+  if(c==='sensor')    return '📡';           // Static IoT node
+  if(c==='vehicle')   return '🚗';           // Light utility vehicle
+  return '•';                                // Unknown fallback
+}
+// Convert a '#rrggbb' hex to an 'rgba(r,g,b,a)' string for translucent fills.
+function hexRGBA(h, a){
+  const r=parseInt(h.slice(1,3),16), g=parseInt(h.slice(3,5),16),
+        b=parseInt(h.slice(5,7),16);
+  return 'rgba('+r+','+g+','+b+','+a+')';
+}
+let lastAlertCount=0;
 async function tick(){try{
-  const r=await fetch('/feed');if(!r.ok)throw 0;const d=await r.json();
-  document.getElementById('health').innerHTML='<span class="ok">● live</span> · t='+d.timestamp.toFixed(1)+' s · mode <span class="v">'+d.mode+'</span> · tracking <span class="v">'+d.tracking+'</span>';
+  const r=await fetch('/feed'); if(!r.ok) throw 0; const d=await r.json();
+  document.getElementById('health').innerHTML='Status: <span style="color:var(--green)">Online</span> &middot; Mode: <b>'+d.mode+'</b> &middot; Tracked: <b>'+d.tracking+'</b> &middot; Epoch: '+d.timestamp.toFixed(2)+'s';
   const fix=d.fix||{};
-  document.getElementById('fix').innerHTML=(fix.valid?'<span class="ok">fix acquired</span>':'<span class="bad">no fix</span>')+
-    '<br>lat <span class="v">'+fix.latitude.toFixed(7)+'</span> · lon <span class="v">'+fix.longitude.toFixed(7)+'</span>'+
-    '<br>alt <span class="v">'+fix.altitude.toFixed(1)+' m</span> · speed <span class="v">'+fix.speed_mps.toFixed(2)+' m/s</span>'+
-    '<br>heading <span class="v">'+fix.heading_deg.toFixed(1)+'°</span> · acc <span class="v">±'+fix.accuracy_m.toFixed(1)+' m</span> · sats <span class="v">'+fix.satellites+'</span>';
+  document.getElementById('fix').innerHTML=
+    '<div style="margin-bottom:10px;">'+(fix.valid?'<span class="badge ok">FIX ACQUIRED</span>':'<span class="badge bad">NO FIX</span>')+'</div>'+
+    '<div class="metric-row"><span class="k">Latitude</span><span class="v">'+fix.latitude.toFixed(7)+'°</span></div>'+
+    '<div class="metric-row"><span class="k">Longitude</span><span class="v">'+fix.longitude.toFixed(7)+'°</span></div>'+
+    '<div class="metric-row"><span class="k">Altitude</span><span class="v">'+fix.altitude.toFixed(1)+' m</span></div>'+
+    '<div class="metric-row"><span class="k">Ground Speed</span><span class="v">'+fix.speed_mps.toFixed(2)+' m/s</span></div>'+
+    '<div class="metric-row"><span class="k">True Heading</span><span class="v">'+fix.heading_deg.toFixed(1)+'°</span></div>'+
+    '<div class="metric-row"><span class="k">Satellites</span><span class="v">'+fix.satellites+'</span></div>';
+  // Predicted next fix (Todo 9/10: 3D Kalman) - a readable summary so a
+  // non-technical viewer sees WHAT is predicted (lat/lon/alt/heading/speed +
+  // confidence), not just a dot on the canvas.
+  const preds=d.predictions||[];
+  if(preds.length){
+    const nxt=preds[preds.length-1];
+    const tPlus=(nxt.timestamp-(d.fix?d.timestamp:0)).toFixed(0);
+    document.getElementById('prediction').innerHTML=
+      '<div style="margin-bottom:10px;"><span class="badge ok">PREDICTING</span></div>'+
+      '<div class="metric-row"><span class="k">Time ahead</span><span class="v">t + '+tPlus+'s</span></div>'+
+      '<div class="metric-row"><span class="k">Latitude</span><span class="v">'+nxt.latitude.toFixed(6)+'°</span></div>'+
+      '<div class="metric-row"><span class="k">Longitude</span><span class="v">'+nxt.longitude.toFixed(6)+'°</span></div>'+
+      '<div class="metric-row"><span class="k">Altitude</span><span class="v">'+nxt.altitude.toFixed(1)+' m</span></div>'+
+      '<div class="metric-row"><span class="k">Heading</span><span class="v">'+nxt.heading_deg.toFixed(1)+'°</span></div>'+
+      '<div class="metric-row"><span class="k">3D Speed</span><span class="v">'+nxt.speed_mps.toFixed(2)+' m/s</span></div>'+
+      '<div class="metric-row"><span class="k">Confidence</span><span class="v">'+(nxt.confidence*100).toFixed(0)+'%</span></div>';
+  }else{
+    document.getElementById('prediction').innerHTML='<div style="color:var(--text-dim);font-size:12px;">Feed track data to seed a path prediction.</div>';
+  }
   const st=d.stats||{};
-  document.getElementById('stats').innerHTML='<span class="k">points</span> <span class="v">'+st.pointsStored+'</span> · <span class="k">entities</span> <span class="v">'+st.trackedEntities+'</span> · <span class="k">ingestion</span> <span class="v">'+st.ingestionRate+' pts/s</span>';
-  const feeds=d.feeds||[];let fh='';
-  function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-  feeds.forEach(function(f,i){fh+='<tr><td>'+esc(f.url)+'</td><td>'+esc(f.type)+'</td><td><button onclick="delFeed('+i+')">✕</button></td></tr>';});
-  document.getElementById('feeds').innerHTML=feeds.length?('<table>'+fh+'</table>'):'<span class="k">no feeds configured</span>';
-  draw(d);last=d;
-}catch(e){document.getElementById('health').innerHTML='<span class="bad">● offline</span>';}}
-function addFeed(){fetch('/feed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:document.getElementById('furl').value,type:document.getElementById('ftype').value})}).then(tick);}
-function delFeed(i){fetch('/feed/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}).then(tick);}
+  document.getElementById('stats').innerHTML=
+    '<div class="metric-row"><span class="k">Points Stored</span><span class="v">'+st.pointsStored+'</span></div>'+
+    '<div class="metric-row"><span class="k">Tracked Entities</span><span class="v">'+st.trackedEntities+'</span></div>'+
+    '<div class="metric-row"><span class="k">Ingestion Velocity</span><span class="v">'+st.ingestionRate+' pts/s</span></div>';
+  // Proximity safety alerts (engine-side geofence, surfaced via /feed).
+  const al=(d.alerts||[]); let ah='';
+  if(al.length){
+    al.slice().reverse().forEach(function(a){
+      const lv=a.level>=2?'<span class="badge bad">CRITICAL</span>':'<span class="badge ok">WARNING</span>';
+      ah+='<div class="alert-row">'+lv+' <b>'+a.message+'</b> <span style="color:var(--text-dim)">'+a.distanceMeters.toFixed(1)+'m</span> <span style="color:var(--yellow)">↗ escape '+a.escapeBearingDeg.toFixed(0)+'°</span></div>';
+    });
+  }
+  document.getElementById('alerts').innerHTML = al.length?ah:'<div style="color:var(--text-dim);font-size:12px;">No active proximity alerts.</div>';
+  // Toast on a newly-arrived alert (only grows, never shrinks, in a session).
+  if(al.length>lastAlertCount){
+    lastAlertCount=al.length;
+    const a=al[al.length-1];
+    const t=document.getElementById('toast');
+    t.innerHTML=(a.level>=2?'<span class="x">CRITICAL</span> ':'')+'Safety alert: '+a.message;
+    t.classList.add('show'); setTimeout(function(){t.classList.remove('show');},4500);
+  }
+  const feeds=d.feeds||[]; let fh='';
+  feeds.forEach(function(f,i){
+    fh+='<tr><td><span style="color:var(--accent)">'+f.type+'</span></td><td style="word-break:break-all;">'+f.url+'</td><td style="text-align:right;"><button class="danger" onclick="delFeed('+i+')">Remove</button></td></tr>';
+  });
+  document.getElementById('feeds').innerHTML=feeds.length?('<table>'+fh+'</table>'):'<div style="color:var(--text-dim);font-size:12px;">No background feeds deployed.</div>';
+  draw(d);
+}catch(e){
+  lastAlertCount=0;
+  document.getElementById('toast').classList.remove('show');
+  document.getElementById('health').innerHTML='<span style="color:var(--red)">● Offline (Engine Disconnected)</span>'
+  ;}}
+function addFeed(){
+  fetch('/feed',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url:document.getElementById('furl').value,type:document.getElementById('ftype').value})})
+  .then(tick);
+}
+function delFeed(i){
+  fetch('/feed/remove',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({index:i})}).then(tick);
+}
 function draw(d){
-  const c=document.getElementById('plot'),x=c.getContext('2d');c.width=c.clientWidth||780;c.height=380;
+  const c=document.getElementById('plot'),x=c.getContext('2d'); c.width=c.clientWidth; c.height=420;
   x.clearRect(0,0,c.width,c.height);
-  const pts=(d.trajectory||[]).concat(d.physics||[]);
-  if(!pts.length){x.fillStyle='#8b949e';x.fillText('no points yet',12,20);return;}
+  const traj=d.trajectory||[]; const phys=d.physics||[]; const preds=d.predictions||[];
+  const pts=traj.concat(phys);
+  if(!pts.length && !preds.length){
+    x.fillStyle='#94a3b8'; x.font='12px system-ui'; x.fillText('Waiting for sensor data…',12,20); return;
+  }
   let minLat=Infinity,maxLat=-Infinity,minLon=Infinity,maxLon=-Infinity;
-  pts.forEach(function(p){minLat=Math.min(minLat,p.lat);maxLat=Math.max(maxLat,p.lat);minLon=Math.min(minLon,p.lon);maxLon=Math.max(maxLon,p.lon);});
-  if(maxLat-minLat<1e-7){minLat-=1e-6;maxLat+=1e-6;}if(maxLon-minLon<1e-7){minLon-=1e-6;maxLon+=1e-6;}
-  const pad=30,w=c.width-2*pad,h=c.height-2*pad;
+  pts.forEach(function(p){minLat=Math.min(minLat,p.lat);maxLat=Math.max(maxLat,p.lat);
+                          minLon=Math.min(minLon,p.lon);maxLon=Math.max(maxLon,p.lon);});
+  preds.forEach(function(p){minLat=Math.min(minLat,p.latitude);maxLat=Math.max(maxLat,p.latitude);
+                          minLon=Math.min(minLon,p.longitude);maxLon=Math.max(maxLon,p.longitude);});
+  if(maxLat-minLat<1e-7){minLat-=1e-5;maxLat+=1e-5;} if(maxLon-minLon<1e-7){minLon-=1e-5;maxLon+=1e-5;}
+  const pad=40,w=c.width-2*pad,h=c.height-2*pad;
   const X=function(lon){return pad+(lon-minLon)/(maxLon-minLon)*w;};
   const Y=function(lat){return c.height-pad-(lat-minLat)/(maxLat-minLat)*h;};
-  x.strokeStyle='#21262d';x.beginPath();
-  for(let g=0;g<=4;g++){const gx=pad+g*w/4;x.moveTo(gx,pad);x.lineTo(gx,pad+h);}
-  for(let g=0;g<=4;g++){const gy=pad+g*h/4;x.moveTo(pad,gy);x.lineTo(pad+w,gy);}x.stroke();
-  const traj=d.trajectory||[];
-  if(traj.length>1){x.strokeStyle='#388bfd';x.lineWidth=2;x.beginPath();traj.forEach(function(p,i){const px=X(p.lon),py=Y(p.lat);i?x.lineTo(px,py):x.moveTo(px,py);});x.stroke();}
-  (d.physics||[]).forEach(function(p){x.fillStyle='#d29922';x.beginPath();x.arc(X(p.lon),Y(p.lat),5,0,7);x.fill();});
-  if(d.fix&&d.fix.valid){x.fillStyle='#3fb950';x.beginPath();x.arc(X(d.fix.longitude),Y(d.fix.latitude),6,0,7);x.fill();}
+  const degToM=111000.0;
+  // Anti-aliased grid
+  x.strokeStyle='#1e293b'; x.lineWidth=1; x.beginPath();
+  for(let g=0;g<=4;g++){x.moveTo(pad+g*w/4,pad);x.lineTo(pad+g*w/4,pad+h);x.moveTo(pad,pad+g*h/4);x.lineTo(pad+w,pad+g*h/4);} x.stroke();
+  // Observed walker path - labelled so it's clear this is history, not a guess.
+  x.strokeStyle='#388bfd'; x.fillStyle='#388bfd'; x.lineWidth=2; x.beginPath();
+  traj.forEach(function(p,i){const px=X(p.lon),py=Y(p.lat);i?x.lineTo(px,py):x.moveTo(px,py);}); x.stroke();
+  if(traj.length){x.font='11px system-ui'; x.fillText('Observed path ('+traj.length+' pts)',X(traj[0].lon)+6,Y(traj[0].lat)-6);}
+  // Other tracked twins, colour-coded by kind.
+  phys.forEach(function(p){
+    const g=assetGlyph(p.type);
+    x.fillStyle=assetColor(p.type);
+    // Rich glyph icon centred on the twin's fix (Honor Pass) instead of a flat
+    // dot, so the web plot mirrors the editor viewport asset icons.
+    x.font="bold 14px system-ui"; x.textAlign="center"; x.textBaseline="middle";
+    x.fillText(g, X(p.lon), Y(p.lat));
+    // Per-twin prediction cone (each twin predicts its OWN future). Static/unfed
+    // twins have no observations -> no cone. Moving twins get a leading cone.
+    if(p.hasPrediction && (p.predictions||[]).length){
+      const tc=assetColor(p.type);
+      x.strokeStyle=tc; x.fillStyle=hexRGBA(tc,0.18); x.lineWidth=2;
+      const pp=p.predictions;
+      x.beginPath();
+      x.moveTo(X(pp[0].lon),Y(pp[0].lat));
+      for(let i=0;i<pp.length;i++){x.lineTo(X(pp[i].lon),Y(pp[i].lat));}
+      for(let i=pp.length-1;i>=0;i--){
+        const r=(pp[i].uncertaintyRadius||0)/degToM; const asp=Math.cos(pp[i].lat*Math.PI/180);
+        x.lineTo(X(pp[i].lon-r/asp),Y(pp[i].lat-r));
+      }
+      x.closePath(); x.fill(); x.stroke();
+      const nxt=pp[pp.length-1];
+      x.fillStyle=tc; x.font='10px system-ui';
+      x.fillText((p.type||'twin')+' predicting (conf '+(nxt.confidence*100).toFixed(0)+'%)',X(nxt.lon)+6,Y(nxt.lat)-8);
+    }
+  });
+  // 3D Kalman prediction cone (Todo 9/10): a shaded uncertainty band + predicted
+  // path + a labelled next-fix marker, so the "dot" is explained, not mystery.
+  if(preds.length){
+    x.strokeStyle='#a78bfa'; x.fillStyle='rgba(167,139,250,0.22)'; x.lineWidth=2;
+    // Uncertainty band: trace the path forward, then return along -uncertainty.
+    x.beginPath();
+    x.moveTo(X(preds[0].longitude),Y(preds[0].latitude));
+    for(let i=0;i<preds.length;i++){x.lineTo(X(preds[i].longitude),Y(preds[i].latitude));}
+    for(let i=preds.length-1;i>=0;i--){
+      const r=(preds[i].uncertaintyRadius||0)/degToM; const asp=Math.cos(preds[i].latitude*Math.PI/180);
+      x.lineTo(X(preds[i].longitude-r/asp),Y(preds[i].latitude-r));
+    }
+    x.closePath(); x.fill(); x.stroke();
+    // Sampled predicted waypoints.
+    x.fillStyle='#a78bfa';
+    for(let i=0;i<preds.length;i+=Math.max(1,Math.floor(preds.length/8))){
+      x.beginPath(); x.arc(X(preds[i].longitude),Y(preds[i].latitude),3.5,0,7); x.fill();
+    }
+    const nxt=preds[preds.length-1];
+    x.fillStyle='#a78bfa'; x.font='11px system-ui';
+    x.fillText('Predicted next fix (t+'+nxt.timestamp.toFixed(0)+'s, conf '+(nxt.confidence*100).toFixed(0)+'%)',X(nxt.longitude)+6,Y(nxt.latitude)-8);
+  }
+  // Current live position - labelled "You are here" with a speed-scaled heading.
+  if(d.fix&&d.fix.valid){
+    const fx=d.fix; const px=X(fx.longitude),py=Y(fx.latitude);
+    x.fillStyle='#22c55e'; x.strokeStyle='white'; x.lineWidth=1.5;
+    x.beginPath(); x.arc(px,py,7,0,7); x.fill(); x.stroke();
+    x.fillStyle='#22c55e'; x.font='11px system-ui'; x.fillText('You are here',px+8,py-10);
+    // Heading arrow - length encodes ground speed so faster = longer arrow.
+    const ang=(fx.heading_deg-90)*Math.PI/180, len=7+fx.speed_mps*2.5;
+    x.strokeStyle='#22c55e'; x.lineWidth=2; x.beginPath();
+    x.moveTo(px,py); x.lineTo(px+len*Math.cos(ang),py+len*Math.sin(ang)); x.stroke();
+    x.fillStyle='#22c55e'; x.font='10px system-ui'; x.fillText(fx.speed_mps.toFixed(1)+' m/s',px+8,py+18);
+  }
+  // Legend (so the colours/symbols are self-explanatory for non-technical users).
+  x.fillStyle='#94a3b8'; x.font='11px system-ui';
+  let lx=pad;
+  x.fillText('Legend:',lx,16);
+  x.fillStyle='#388bfd'; x.fillRect(lx+44,7,10,4); x.fillText('observed path',lx+58,16);
+  x.strokeStyle='#a78bfa'; x.fillStyle='#a78bfa'; x.fillRect(lx+180,7,10,4); x.fillText('prediction cone',lx+194,16);
+  x.fillStyle='#22c55e'; x.beginPath(); x.arc(lx+310,11,4,0,7); x.fill(); x.fillText('current position',lx+320,16);
 }
-setInterval(tick,1000);tick();
+setInterval(tick,1000); tick();
 </script></body></html>)geohtml";
 }
 

@@ -1,454 +1,557 @@
 /**
- * Animation System Test Application
- * 
- * Focused real-time testing for animation, skeletal animation, and motion matching.
- * Use this for debugging animation issues and memory leaks in isolation.
- * 
- * Build: make animation_test
- * Run:   ./bin/animation_test
+ * ============================================================================
+ * ANIMATION TEST - Full ECS Animation System
+ * ============================================================================
+ *
+ * This test demonstrates the fully integrated ECS animation system:
+ * - Loads bot character from assets/bot.fbx
+ * - Loads animations (Idle, Walk, Run, Jump, etc.)
+ * - Creates animated entity with AnimatorComponent + SkeletonComponent
+ * - Plays animations with blending
+ * - Shows real-time animation state
+ *
+ * Controls:
+ * - 1: Play Idle animation
+ * - 2: Play Walk animation
+ * - 3: Play Run animation
+ * - 4: Play Jump animation
+ * - 5: Blend Walk -> Run
+ * - Space: Pause/Resume
+ * - R: Reset to Idle
+ * - ESC: Exit
+ * ============================================================================
  */
-
-#include "shaderSystem/Shader.h"
-#include "modelSystem/Model.h"
-#include "cameraSystem/flyCamera.h"
-#include "animationSystem/Animator.h"
-#include "animationSystem/AssimpAnimationLoader.h"
-#include "animationSystem/AnimationStateMachine.h"
-#include "animationSystem/HybridMMFSM.h"
-#include "motionMatching/MotionMatcher.h"
-#include "boneSystem/Skeleton.h"
-#include "boneSystem/BoneDebug.h"
-#include "utils/FBXLoader.h"
-#include "shaderSystem/stb_image.h"
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
+
+#include "ecs/ECS.h"
+#include "ecs/components/Components.h"
+#include "ecs/systems/Systems.h"
+
+#include "animationSystem/Animation.h"
+#include "animationSystem/Animator.h"
+#include "animationSystem/AssimpAnimationLoader.h"
+#include "boneSystem/Skeleton.h"
+#include "boneSystem/BoneName.h"
+#include "modelSystem/Model.h"
+#include "cameraSystem/flyCamera.h"
+#include "utils/FBXLoader.h"
+
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 
-#include <glm/glm.hpp>
-#include <glm/gtc/matrix_transform.hpp>
-
 #include <iostream>
-#include <memory>
-#include <vector>
+#include <map>
+#include <string>
 
-// ================= CAMERA =================
-flyCamera camera(
-    glm::vec3(0.0f, 2.0f, 8.0f),
-    glm::vec3(0, 1.5f, 0),
-    -90.0f,
-    0.0f,
-    8.0f
-);
+// ============================================================================
+// Global State
+// ============================================================================
+static ecs::World g_world;
+static flyCamera* g_camera = nullptr;
 
-// Global window pointer for input checks
-GLFWwindow* g_window = nullptr;
+// Animation entities
+static ecs::Entity g_botEntity;
+static std::map<std::string, Animation*> g_animations;
+static int g_currentAnimIndex = 0;
+static bool g_isPaused = false;
 
-// ================= ANIMATION SYSTEM =================
-ModelManager ModelManager;
-Animator* animator = nullptr;
-AnimationStateMachine* fsm = nullptr;
-HybridMMFSM* hybrid = nullptr;
+// Engine animator (for loading animations)
+static Animator* g_engineAnimator = nullptr;
+static Skeleton* g_engineSkeleton = nullptr;
 
-// Loaded animations
-std::shared_ptr<Animation> idleAnim = nullptr;
-std::shared_ptr<Animation> walkAnim = nullptr;
-std::shared_ptr<Animation> runAnim = nullptr;
-std::shared_ptr<Animation> jumpAnim = nullptr;
-
-// ================= TEST CONFIGURATION =================
-struct AnimationTestConfig {
-    bool showSkeleton = false;
-    bool showBoneNames = false;
-    bool useHybrid = true;
-    bool enableRootMotion = true;
-    float animationSpeed = 1.0f;
-} animConfig;
-
-// ================= CALLBACKS =================
-void framebuffer_size_callback(GLFWwindow *, int w, int h) { 
-    glViewport(0, 0, w, h); 
-}
-
-void mouse_callback(GLFWwindow *window, double xpos, double ypos) {
-    static double lastX = xpos, lastY = ypos;
-    static bool firstMouse = true;
-
-    if (firstMouse) {
-        lastX = xpos;
-        lastY = ypos;
-        firstMouse = false;
-    }
-
-    float dx = (float)(xpos - lastX);
-    float dy = (float)(lastY - ypos);
-    lastX = xpos;
-    lastY = ypos;
-
-    camera.Yaw += dx * 0.1f;
-    camera.Pitch = glm::clamp(camera.Pitch + dy * 0.1f, -80.0f, 80.0f);
-}
-
-void scroll_callback(GLFWwindow *window, double xoffset, double yoffset) {
-    camera.DistanceToTarget -= (float)yoffset * 0.3f;
-    camera.DistanceToTarget = glm::clamp(camera.DistanceToTarget, 3.0f, 20.0f);
-}
-
-// ================= ANIMATION HELPERS =================
-void printAnimationInfo(const std::shared_ptr<Animation>& anim, const std::string& name) {
-    if (!anim) {
-        std::cout << "  " << name << ": NOT LOADED\n";
-        return;
-    }
-    
-    std::cout << "  " << name << ":\n";
-    std::cout << "    Duration: " << anim->duration << "s\n";
-    std::cout << "    Bones: " << anim->boneAnimations.size() << "\n";
-    std::cout << "    Ticks/sec: " << anim->ticksPerSecond << "\n";
-    std::cout << "    Frames: " << (int)(anim->duration * 30.0f) << " @30fps\n";
-}
-
-void setupAnimationSystem(Model* character) {
-    if (!character) return;
-
-    const Skeleton& skeleton = character->GetSkeleton();
-
-    // Create animator
-    animator = new Animator(&skeleton);
-
-    // Create FSM
-    fsm = new AnimationStateMachine(animator);
-    fsm->initialize();
-
-    // Create Hybrid MM+FSM
-    hybrid = new HybridMMFSM();
-    hybrid->Initialize(&skeleton, animator);
-    
-    std::cout << "\nAnimation system initialized:\n";
-    std::cout << "  Animator: OK\n";
-    std::cout << "  FSM: OK\n";
-    std::cout << "  Hybrid MM+FSM: OK\n";
-    std::cout << "  Skeleton bones: " << skeleton.bones.size() << "\n";
-}
-
-void loadAnimations(const std::string& modelPath) {
+// ============================================================================
+// Animation Loading Helper
+// ============================================================================
+Animation* LoadAnimationFromFile(const std::string& path) {
     Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(path,
+        aiProcess_Triangulate | aiProcess_FlipUVs);
+
+    if (!scene || !scene->HasAnimations()) {
+        return nullptr;
+    }
+
+    // Load animation with pose correction
+    Animation animTemp = AssimpAnimationLoader::LoadAnimationWithPoseCorrection(
+        scene, scene->mAnimations[0]);
+
+    // Copy to heap for storage
+    return new Animation(animTemp);
+}
+
+// ============================================================================
+// Animation Loading
+// ============================================================================
+bool loadCharacterAndAnimations() {
+    std::cout << "\n=== Loading Character and Animations ===" << std::endl;
+
+    // Load bot model
+    std::cout << "Loading bot.fbx..." << std::endl;
+    ModelLoadResult botResult = LoadFBXModel("assets/bot.fbx", "Bot");
+    Model* botModel = botResult.model;
     
-    auto loadAnim = [&](const std::string& animName, const std::string& animFile)
-        -> std::shared_ptr<Animation> {
+    if (!botModel) {
+        std::cerr << "Failed to load bot.fbx" << std::endl;
+        return false;
+    }
 
-        const aiScene* scene = importer.ReadFile(
-            animFile,
-            aiProcess_Triangulate | aiProcess_FlipUVs | aiProcess_CalcTangentSpace
-        );
+    // Get skeleton from model (const cast for our purposes)
+    const Skeleton* constSkel = &botModel->GetSkeleton();
+    g_engineSkeleton = const_cast<Skeleton*>(constSkel);
+    
+    if (!g_engineSkeleton || g_engineSkeleton->bones.empty()) {
+        std::cerr << "No skeleton found in bot.fbx" << std::endl;
+        return false;
+    }
+    std::cout << "  Skeleton loaded: " << g_engineSkeleton->bones.size() << " bones" << std::endl;
 
-        if (!scene || !scene->HasAnimations()) {
-            std::cerr << "Failed to load animation: " << animFile << "\n";
-            return nullptr;
-        }
+    // Create engine animator for loading animations
+    g_engineAnimator = new Animator(g_engineSkeleton);
 
-        Animation anim = AssimpAnimationLoader::LoadAnimation(
-            scene,
-            scene->mAnimations[0]
-        );
-        
-        return std::make_shared<Animation>(anim);
+    // Load animations
+    std::vector<std::pair<std::string, std::string>> animFiles = {
+        {"Idle", "assets/Idle.fbx"},
+        {"Walk", "assets/Walking.fbx"},
+        {"Run", "assets/Run.fbx"},
+        {"Jump", "assets/Jump.fbx"},
+        {"Fall", "assets/Fall.fbx"},
+        {"Crouch", "assets/Crouching.fbx"},
     };
-    
-    std::cout << "\nLoading animations from: " << modelPath << "\n";
-    
-    idleAnim = loadAnim("Idle", modelPath);
-    walkAnim = loadAnim("Walk", modelPath);
-    runAnim = loadAnim("Run", modelPath);
-    jumpAnim = loadAnim("Jump", modelPath);
-    
-    // Print info
-    std::cout << "\nLoaded animations:\n";
-    printAnimationInfo(idleAnim, "Idle");
-    printAnimationInfo(walkAnim, "Walk");
-    printAnimationInfo(runAnim, "Run");
-    printAnimationInfo(jumpAnim, "Jump");
-    
-    // Fix durations for mixamo animations
-    auto fixDuration = [](std::shared_ptr<Animation>& anim, float maxDuration) {
-        if (anim && anim->duration > maxDuration) {
-            anim->duration = maxDuration;
-            std::cout << "  Fixed " << anim->name << " duration to " << maxDuration << "s\n";
+
+    for (const auto& [name, file] : animFiles) {
+        std::cout << "Loading " << name << " from " << file << "..." << std::endl;
+        
+        Animation* anim = LoadAnimationFromFile(file);
+        if (anim) {
+            g_animations[name] = anim;
+            std::cout << "  Loaded: " << anim->GetDuration() << "s duration" << std::endl;
+        } else {
+            std::cout << "  Failed to load" << std::endl;
         }
-    };
-    
-    fixDuration(idleAnim, 3.0f);
-    fixDuration(walkAnim, 2.0f);
-    fixDuration(runAnim, 1.5f);
-    fixDuration(jumpAnim, 2.0f);
-}
-
-void setupHybridAnimations() {
-    if (!hybrid || !idleAnim || !walkAnim || !runAnim) return;
-    
-    // Load locomotion animations for motion matching
-    hybrid->LoadLocomotionAnimation("Idle", idleAnim);
-    hybrid->LoadLocomotionAnimation("Walk", walkAnim);
-    hybrid->LoadLocomotionAnimation("Run", runAnim);
-    
-    // Load jump for FSM
-    if (jumpAnim) {
-        hybrid->LoadStateAnimation(HybridState::JUMP, "Jump", jumpAnim);
     }
-    
-    // Build databases
-    hybrid->BuildDatabases();
-    
-    std::cout << "\nHybrid system configured:\n";
-    std::cout << "  Locomotion: Idle, Walk, Run\n";
-    std::cout << "  Jump: " << (jumpAnim ? "Loaded" : "Not loaded") << "\n";
+
+    std::cout << "\nLoaded " << g_animations.size() << " animations" << std::endl;
+    return !g_animations.empty();
 }
 
-// ================= RENDERING =================
-Shader* modelShader = nullptr;
-Shader* skeletonShader = nullptr;
+// ============================================================================
+// Create Animated Entity
+// ============================================================================
+ecs::Entity createAnimatedCharacter(const glm::vec3& position) {
+    std::cout << "\n=== Creating Animated Character ===" << std::endl;
 
-void setupShaders() {
-    modelShader = new Shader("shaderSystem/VS.glsl", "shaderSystem/FS.glsl");
+    auto entity = g_world.createEntity();
+
+    // Add transform
+    auto& transform = g_world.addComponent<ecs::TransformComponent>(entity);
+    transform.position = position;
+    transform.scale = glm::vec3(1.0f);
+
+    // Add skeleton component - use engine skeleton directly via AnimatorComponent
+    // The AnimationSystem will sample animations and update bone matrices
+    auto& skeleton = g_world.addComponent<ecs::SkeletonComponent>(entity);
     
-    // Use simple colored shader for skeleton debug
-    skeletonShader = new Shader("shaderSystem/skyboxVS.glsl", "shaderSystem/skyboxFS.glsl");
+    // For now, create a simple bone hierarchy (root + hips + legs)
+    // In production, this would be populated from the model's skeleton
+    if (g_engineSkeleton && !g_engineSkeleton->bones.empty()) {
+        // Copy bone count and create basic structure
+        size_t boneCount = g_engineSkeleton->bones.size();
+        skeleton.bones.resize(boneCount);
+        skeleton.rootBoneIndex = g_engineSkeleton->rootBoneIndex;
+        
+        // Initialize bones with identity transforms
+        // The AnimationSystem will populate these from animation data
+        for (size_t i = 0; i < boneCount; i++) {
+            skeleton.bones[i].name = "bone_" + std::to_string(i);
+            skeleton.bones[i].parentIndex = -1;  // Would need parent info from engine
+            skeleton.bones[i].inverseBindMatrix = glm::mat4(1.0f);
+            skeleton.bones[i].localTransform = glm::mat4(1.0f);
+            skeleton.bones[i].worldTransform = glm::mat4(1.0f);
+        }
+        
+        std::cout << "  Skeleton: " << skeleton.bones.size() << " bones" << std::endl;
+    }
+
+    // Add animator component
+    auto& animator = g_world.addComponent<ecs::AnimatorComponent>(entity);
+    
+    // Add animations to animator
+    for (const auto& [name, anim] : g_animations) {
+        animator.addAnimation(anim);
+        std::cout << "  Added animation: " << name << std::endl;
+    }
+
+    // Add name
+    g_world.addComponent<ecs::NameComponent>(entity, "Bot");
+
+    return entity;
 }
 
-void renderModel(Model* model, const glm::mat4& modelMatrix) {
-    if (!model || !modelShader || !animator) return;
-    
-    modelShader->use();
-    modelShader->setMat4("model", modelMatrix);
-    modelShader->setMat4("view", camera.GetViewMatrix());
-    modelShader->setMat4("projection", camera.GetProjectionMatrix(1280.0f / 720.0f));
-    modelShader->setVec3("lightPos", glm::vec3(5.0f, 10.0f, 5.0f));
-    modelShader->setVec3("viewPos", camera.Position);
-    
-    model->Draw(*modelShader, *animator);
+// ============================================================================
+// Initialize ECS World
+// ============================================================================
+void initializeECS() {
+    std::cout << "\n=== Initializing ECS World ===" << std::endl;
+
+    // Initialize the world
+    g_world.init();
+
+    // Add integrated ECS systems
+    g_world.addSystem<ecs::RenderSystem>();
+
+    auto& cameraSystem = g_world.addSystem<ecs::CameraSystem>();
+    cameraSystem.setPriority(-100);
+
+    auto& animationSystem = g_world.addSystem<ecs::AnimationSystem>();
+    animationSystem.setPriority(-50);
+
+    g_world.addSystem<ecs::LightSystem>();
+
+    std::cout << "  Added " << g_world.getSystemCount() << " integrated ECS systems" << std::endl;
 }
 
-void renderSkeleton(const Skeleton& skeleton, Animator* anim, const glm::mat4& modelMatrix) {
-    if (!animConfig.showSkeleton || !skeletonShader || !anim) return;
+// ============================================================================
+// Create Camera Entity
+// ============================================================================
+ecs::Entity createCamera() {
+    auto entity = g_world.createEntity();
+
+    auto& transform = g_world.addComponent<ecs::TransformComponent>(entity);
+    transform.position = glm::vec3(0.0f, 2.0f, 5.0f);
+
+    auto& camera = g_world.addComponent<ecs::CameraComponent>(entity);
+    camera.fov = 45.0f;
+    camera.nearPlane = 0.1f;
+    camera.farPlane = 1000.0f;
+    camera.isActive = true;
+
+    g_world.addComponent<ecs::NameComponent>(entity, "MainCamera");
+
+    return entity;
+}
+
+// ============================================================================
+// Create Directional Light
+// ============================================================================
+ecs::Entity createDirectionalLight() {
+    auto entity = g_world.createEntity();
+
+    auto& transform = g_world.addComponent<ecs::TransformComponent>(entity);
+    transform.setEulerAngles(glm::vec3(glm::radians(45.0f), glm::radians(45.0f), 0.0f));
+
+    auto& light = g_world.addComponent<ecs::LightComponent>(entity);
+    light.setDirectional(glm::vec3(1.0f), 1.0f);
+    light.castShadows = false;
+
+    g_world.addComponent<ecs::NameComponent>(entity, "Sun");
+
+    return entity;
+}
+
+// ============================================================================
+// Get animation index by name
+// ============================================================================
+int getAnimationIndexByName(ecs::AnimatorComponent* animator, const std::string& name) {
+    if (!animator) return -1;
     
-    // Get bone transforms
-    const std::vector<glm::mat4>& boneMatrices = anim->GetFinalBoneMatrices();
+    for (size_t i = 0; i < animator->animations.size(); i++) {
+        // Compare pointers since we stored them in g_animations
+        auto it = g_animations.find(name);
+        if (it != g_animations.end() && animator->animations[i] == it->second) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+// ============================================================================
+// Process Input
+// ============================================================================
+void processInput(GLFWwindow* window, float deltaTime) {
+    // Animation selection
+    static bool lastKeyState[10] = {false};
     
-    // Draw bones as points with labels (simplified)
-    skeletonShader->use();
-    
-    glm::mat4 mvp = camera.GetProjectionMatrix(1280.0f / 720.0f) * 
-                    camera.GetViewMatrix() * 
-                    modelMatrix;
-    
-    skeletonShader->setMat4("MVP", mvp);
-    
-    // Just draw first few bones for debugging
-    for (size_t i = 0; i < std::min(size_t(10), skeleton.bones.size()); i++) {
-        glm::vec3 pos = glm::vec3(boneMatrices[i][3]);
+    const int keyMap[] = {GLFW_KEY_1, GLFW_KEY_2, GLFW_KEY_3, GLFW_KEY_4, GLFW_KEY_5};
+    const std::string animNames[] = {"Idle", "Walk", "Run", "Jump", "Crouch"};
+
+    for (int i = 0; i < 5; i++) {
+        bool keyState = glfwGetKey(window, keyMap[i]) == GLFW_PRESS;
+        if (keyState && !lastKeyState[i]) {
+            std::cout << "\nPlaying: " << animNames[i] << std::endl;
+            
+            auto* animator = g_world.getComponent<ecs::AnimatorComponent>(g_botEntity);
+            if (animator) {
+                int targetIndex = getAnimationIndexByName(animator, animNames[i]);
+                if (targetIndex >= 0) {
+                    animator->play(targetIndex, true);
+                    g_currentAnimIndex = targetIndex;
+                }
+            }
+        }
+        lastKeyState[i] = keyState;
+    }
+
+    // Pause/Resume
+    static bool lastSpaceState = false;
+    bool spaceState = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+    if (spaceState && !lastSpaceState) {
+        g_isPaused = !g_isPaused;
+        auto* animator = g_world.getComponent<ecs::AnimatorComponent>(g_botEntity);
+        if (animator) {
+            if (g_isPaused) {
+                animator->pause();
+                std::cout << "\nAnimation Paused" << std::endl;
+            } else {
+                animator->resume();
+                std::cout << "\nAnimation Resumed" << std::endl;
+            }
+        }
+    }
+    lastSpaceState = spaceState;
+
+    // Blend Walk -> Run
+    static bool lastBState = false;
+    bool bState = glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS;
+    if (bState && !lastBState) {
+        std::cout << "\nBlending Walk -> Run" << std::endl;
         
-        float vertices[] = {
-            pos.x, pos.y, pos.z, 1.0f, 0.0f, 0.0f,
-            pos.x, pos.y + 0.5f, pos.z, 1.0f, 0.0f, 0.0f
-        };
+        auto* animator = g_world.getComponent<ecs::AnimatorComponent>(g_botEntity);
+        if (animator) {
+            int walkIndex = getAnimationIndexByName(animator, "Walk");
+            int runIndex = getAnimationIndexByName(animator, "Run");
+            
+            if (walkIndex >= 0 && runIndex >= 0) {
+                animator->previousAnimation = animator->currentAnimation;
+                animator->currentAnimation = runIndex;
+                animator->isBlending = true;
+                animator->blendTime = 0.0f;
+                animator->blendDuration = 0.3f;
+            }
+        }
+    }
+    lastBState = bState;
+
+    // Reset to Idle
+    static bool lastRState = false;
+    bool rState = glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS;
+    if (rState && !lastRState) {
+        std::cout << "\nReset to Idle" << std::endl;
         
-        GLuint VAO, VBO;
-        glGenVertexArrays(1, &VAO);
-        glGenBuffers(1, &VBO);
-        
-        glBindVertexArray(VAO);
-        glBindBuffer(GL_ARRAY_BUFFER, VBO);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-        
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
-        glEnableVertexAttribArray(1);
-        
-        glDrawArrays(GL_LINES, 0, 2);
-        
-        glDeleteVertexArrays(1, &VAO);
-        glDeleteBuffers(1, &VBO);
+        auto* animator = g_world.getComponent<ecs::AnimatorComponent>(g_botEntity);
+        if (animator) {
+            int idleIndex = getAnimationIndexByName(animator, "Idle");
+            if (idleIndex >= 0) {
+                animator->play(idleIndex, true);
+            }
+        }
+    }
+    lastRState = rState;
+
+    // Exit
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+        glfwSetWindowShouldClose(window, true);
     }
 }
 
-// ================= UPDATE =================
-void updateAnimation(float dt, Model* character) {
-    if (!animator || !character) return;
+// ============================================================================
+// Print Animation State
+// ============================================================================
+void printAnimationState() {
+    static float lastPrintTime = 0.0f;
+    float currentTime = glfwGetTime();
     
-    CharacterInput input;
-    
-    // Get input
-    if (glfwGetKey(g_window, GLFW_KEY_W) == GLFW_PRESS) {
-        input.moveDirection = glm::vec2(0.0f, 1.0f);
-        input.moveMagnitude = glfwGetKey(g_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ? 1.0f : 0.5f;
-    } else if (glfwGetKey(g_window, GLFW_KEY_S) == GLFW_PRESS) {
-        input.moveDirection = glm::vec2(0.0f, -1.0f);
-        input.moveMagnitude = 0.5f;
-    } else if (glfwGetKey(g_window, GLFW_KEY_A) == GLFW_PRESS) {
-        input.moveDirection = glm::vec2(-1.0f, 0.0f);
-        input.moveMagnitude = 0.5f;
-    } else if (glfwGetKey(g_window, GLFW_KEY_D) == GLFW_PRESS) {
-        input.moveDirection = glm::vec2(1.0f, 0.0f);
-        input.moveMagnitude = 0.5f;
+    if (currentTime - lastPrintTime >= 0.5f) {
+        auto* animator = g_world.getComponent<ecs::AnimatorComponent>(g_botEntity);
+        if (animator) {
+            std::cout << "\r" << std::flush;
+            std::cout << "Time: " << animator->currentTime << "s  |  ";
+            std::cout << "Playing: " << (animator->isPlaying ? "Yes" : "No") << "  |  ";
+            std::cout << "Blending: " << (animator->isBlending ? "Yes" : "No") << "  |  ";
+            std::cout << "Frame: " << animator->getNormalizedTime() * 100 << "%" << std::flush;
+        }
+        lastPrintTime = currentTime;
     }
-    
-    input.jump = glfwGetKey(g_window, GLFW_KEY_SPACE) == GLFW_PRESS;
-    input.crouch = glfwGetKey(g_window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS;
-    input.sprint = glfwGetKey(g_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
-    input.grounded = true;
-    
-    if (animConfig.useHybrid && hybrid) {
-        // Update hybrid system
-        HybridMMFSMState hybridState;
-        hybridState.velocity = glm::vec3(0.0f, 0.0f, input.moveMagnitude * 3.0f);
-        hybridState.grounded = input.grounded;
-        hybridState.moveDirection = input.moveDirection;
-        hybridState.moveMagnitude = input.moveMagnitude;
-        
-        hybrid->Update(dt, hybridState);
-    } else if (fsm) {
-        // Update FSM
-        fsm->update(dt, input);
-    }
-    
-    // Update animator
-    animator->Update(dt);
 }
 
-// ================= MAIN =================
+// ============================================================================
+// Main
+// ============================================================================
 int main() {
-    std::cout << "\n";
-    std::cout << "========================================\n";
-    std::cout << "  ANIMATION SYSTEM TEST\n";
-    std::cout << "========================================\n";
-    std::cout << "\nControls:\n";
-    std::cout << "  Mouse - Orbit camera\n";
-    std::cout << "  Scroll - Zoom in/out\n";
-    std::cout << "  W/S - Walk forward/backward\n";
-    std::cout << "  A/D - Strafe left/right\n";
-    std::cout << "  SPACE - Jump\n";
-    std::cout << "  LEFT SHIFT - Sprint\n";
-    std::cout << "  LEFT CTRL - Crouch\n";
-    std::cout << "  B - Toggle skeleton visualization\n";
-    std::cout << "  H - Toggle hybrid MM+FSM\n";
-    std::cout << "  R - Reset camera\n";
-    std::cout << "  ESC - Exit\n";
-    std::cout << "========================================\n\n";
+    std::cout << "========================================" << std::endl;
+    std::cout << "  ECS Animation Test" << std::endl;
+    std::cout << "========================================" << std::endl;
 
     // Initialize GLFW
     if (!glfwInit()) {
-        std::cerr << "GLFW init failed\n";
+        std::cerr << "Failed to initialize GLFW" << std::endl;
         return -1;
     }
 
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 
-    GLFWwindow* window = glfwCreateWindow(1280, 720, "Animation Test", nullptr, nullptr);
-    g_window = window;  // Set global pointer
+    GLFWwindow* window = glfwCreateWindow(1280, 720, "ECS Animation Test", nullptr, nullptr);
     if (!window) {
-        std::cerr << "GLFW window creation failed\n";
+        std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
         return -1;
     }
 
     glfwMakeContextCurrent(window);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-    glfwSetCursorPosCallback(window, mouse_callback);
-    glfwSetScrollCallback(window, scroll_callback);
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
+    // Initialize GLAD
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        std::cerr << "GLAD failed\n";
-        glfwTerminate();
+        std::cerr << "Failed to initialize GLAD" << std::endl;
         return -1;
     }
 
+    // Enable depth testing and vsync
     glEnable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
+    glfwSwapInterval(1);
 
-    // Load model
-    std::cout << "Loading model...\n";
-    ModelManager.load("Bot", "assets/bot.fbx");
-    Model* character = ModelManager.get("Bot");
-    
-    if (!character) {
-        std::cerr << "Failed to load character model!\n";
+    // Initialize camera
+    g_camera = new flyCamera(
+        glm::vec3(0.0f, 2.0f, 5.0f),
+        glm::vec3(0, 1.5f, 0),
+        -90.0f,
+        0.0f,
+        10.0f
+    );
+
+    // Initialize ECS
+    initializeECS();
+
+    // Load character and animations
+    if (!loadCharacterAndAnimations()) {
+        std::cerr << "Failed to load character and animations" << std::endl;
         glfwTerminate();
         return -1;
     }
-    
-    std::cout << "Model loaded: " << character->GetMeshCount() << " meshes\n";
-    std::cout << "Size: " << character->GetSize().x << " x " 
-              << character->GetSize().y << " x " 
-              << character->GetSize().z << "\n";
 
-    // Setup animation system
-    setupAnimationSystem(character);
-    setupShaders();
-    loadAnimations("assets/bot.fbx");
-    setupHybridAnimations();
+    // Create scene
+    std::cout << "\n=== Creating Scene ===" << std::endl;
+    createCamera();
+    createDirectionalLight();
+    g_botEntity = createAnimatedCharacter(glm::vec3(0.0f, 0.0f, 0.0f));
 
-    std::cout << "\nAnimation test ready!\n\n";
+    // Play first animation (Idle)
+    auto* initialAnimator = g_world.getComponent<ecs::AnimatorComponent>(g_botEntity);
+    if (initialAnimator) {
+        int idleIndex = getAnimationIndexByName(initialAnimator, "Idle");
+        if (idleIndex >= 0) {
+            initialAnimator->play(idleIndex, true);
+        }
+    }
+    std::cout << "\nPlaying: Idle" << std::endl;
+
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "  Controls:" << std::endl;
+    std::cout << "  1-5: Play animations" << std::endl;
+    std::cout << "  B:   Blend Walk -> Run" << std::endl;
+    std::cout << "  Space: Pause/Resume" << std::endl;
+    std::cout << "  R:   Reset to Idle" << std::endl;
+    std::cout << "  Mouse: Look around" << std::endl;
+    std::cout << "  ESC: Exit" << std::endl;
+    std::cout << "========================================\n" << std::endl;
 
     // Main loop
-    float dt = 0.016f;
+    float lastTime = 0.0f;
+    int frameCount = 0;
+    float fpsTimer = 0.0f;
+
     while (!glfwWindowShouldClose(window)) {
-        // Input
-        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-            glfwSetWindowShouldClose(window, true);
-        
-        if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
-            camera.Position = glm::vec3(0.0f, 2.0f, 8.0f);
-            camera.Yaw = -90.0f;
-            camera.Pitch = 0.0f;
-        }
-        
-        static bool lastB = false;
-        if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS && !lastB) {
-            animConfig.showSkeleton = !animConfig.showSkeleton;
-            std::cout << "Skeleton debug: " << (animConfig.showSkeleton ? "ON" : "OFF") << "\n";
-        }
-        lastB = glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS;
-        
-        static bool lastH = false;
-        if (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS && !lastH) {
-            animConfig.useHybrid = !animConfig.useHybrid;
-            std::cout << "Hybrid MM+FSM: " << (animConfig.useHybrid ? "ON" : "OFF") << "\n";
-            std::cout << "Current state: " << HybridStateToString(hybrid->GetCurrentState()) << "\n";
-        }
-        lastH = glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS;
+        // Calculate delta time
+        float currentTime = static_cast<float>(glfwGetTime());
+        float deltaTime = currentTime - lastTime;
+        lastTime = currentTime;
 
-        // Update
-        updateAnimation(dt, character);
+        // FPS counter
+        frameCount++;
+        fpsTimer += deltaTime;
+        if (fpsTimer >= 1.0f) {
+            std::cout << "\nFPS: " << frameCount << std::endl;
+            frameCount = 0;
+            fpsTimer = 0.0f;
+        }
 
-        // Render
+        // Process input
+        processInput(window, deltaTime);
+
+        // Mouse look
+        static double lastX = 0, lastY = 0;
+        double xpos, ypos;
+        glfwGetCursorPos(window, &xpos, &ypos);
+
+        if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS ||
+            glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
+            float xoffset = static_cast<float>(xpos - lastX);
+            float yoffset = static_cast<float>(lastY - ypos);
+            lastX = xpos;
+            lastY = ypos;
+
+            g_camera->ProcessMouseMovement(xoffset, yoffset);
+        } else {
+            lastX = xpos;
+            lastY = ypos;
+        }
+
+        // Clear screen
         glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        glm::mat4 modelMatrix = glm::mat4(1.0f);
-        renderModel(character, modelMatrix);
-        renderSkeleton(character->GetSkeleton(), animator, modelMatrix);
+        // Update ECS world (updates animation system)
+        if (!g_isPaused) {
+            g_world.update(deltaTime);
+        }
 
+        // Update camera system and get view/projection
+        auto* cameraSystem = g_world.getSystem<ecs::CameraSystem>();
+        if (cameraSystem) {
+            glm::mat4 view = cameraSystem->getViewMatrix();
+            glm::mat4 projection = cameraSystem->getProjectionMatrix();
+
+            auto* renderSystem = g_world.getSystem<ecs::RenderSystem>();
+            if (renderSystem) {
+                renderSystem->setViewProjection(view, projection);
+            }
+        }
+
+        // Render ECS world
+        g_world.render();
+
+        // Print animation state
+        printAnimationState();
+
+        // Swap buffers and poll events
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
     // Cleanup
-    delete animator;
-    delete fsm;
-    delete hybrid;
-    delete modelShader;
-    delete skeletonShader;
+    std::cout << "\n\n=== Cleaning up ===" << std::endl;
+
+    g_world.shutdown();
     
+    // Cleanup animations
+    for (auto& [name, anim] : g_animations) {
+        delete anim;
+    }
+    g_animations.clear();
+    
+    delete g_engineAnimator;
+    delete g_camera;
+
     glfwDestroyWindow(window);
     glfwTerminate();
-    
-    std::cout << "\nAnimation test exited cleanly.\n";
+
+    std::cout << "Cleanup complete" << std::endl;
     return 0;
 }

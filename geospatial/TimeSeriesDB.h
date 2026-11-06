@@ -18,6 +18,7 @@
 #include <mutex>
 #include <chrono>
 #include <iostream>
+#include <functional>
 #include "InfluxDBClient.h"
 
 struct TimeSeriesPoint {
@@ -29,6 +30,10 @@ struct TimeSeriesPoint {
     double heading = 0.0;
     double accuracy = 0.0;
     std::string entityId;
+    // Asset-twin classification surfaced to the line-protocol "assetKind" tag
+    // (Todo 6). The ECS producer leaves this empty until GeospatialComponent
+    // carries an asset field (Todo 7); empty -> "unknown" tag.
+    std::string assetKind;
 };
 
 class TimeSeriesDB {
@@ -58,6 +63,34 @@ public:
         return true;
     }
 
+    // ---- Async InfluxDB flush plumbing (Todo 6) --------------------------------
+    // A flush dispatcher offloads the blocking libcurl write to a JobSystem
+    // worker pool so recordBatch never blocks the caller on network I/O. The
+    // live engine wires it to ecs::JobSystem; unit tests inject a synchronous
+    // dispatcher. When unset, recordBatch falls back to a synchronous write.
+    using FlushDispatcher = std::function<void(std::function<void()>)>;
+
+    void setFlushDispatcher(FlushDispatcher d) { flushDispatcher_ = std::move(d); }
+    bool hasFlushDispatcher() const { return static_cast<bool>(flushDispatcher_); }
+
+    // Build the InfluxDB line-protocol point for a TimeSeriesPoint (includes the
+    // assetKind tag). Public so callers/tests can inspect the tag without a live
+    // InfluxDB connection.
+    static InfluxPoint makeInfluxPoint(const TimeSeriesPoint& point) {
+        InfluxPoint ip;
+        ip.measurement = "points";
+        ip.tags["entityId"] = point.entityId;
+        ip.tags["assetKind"] = point.assetKind.empty() ? "unknown" : point.assetKind;
+        ip.fields["latitude"] = point.latitude;
+        ip.fields["longitude"] = point.longitude;
+        ip.fields["altitude"] = point.altitude;
+        ip.fields["speed"] = point.speed;
+        ip.fields["heading"] = point.heading;
+        ip.fields["accuracy"] = point.accuracy;
+        ip.timestamp = static_cast<uint64_t>(point.timestamp * 1e9);
+        return ip;
+    }
+
     /**
      * Record a data point
      */
@@ -83,25 +116,49 @@ public:
     }
 
     /**
-     * Batch record multiple points
+     * Batch record multiple points (thread-safe). The in-memory buffers are
+     * updated synchronously under the data lock, but the (potentially blocking)
+     * InfluxDB line-protocol flush is handed off to the configured flush
+     * dispatcher (an ecs::JobSystem worker in the live engine) so the caller
+     * never stalls on network I/O. With no dispatcher wired, the flush falls
+     * back to a synchronous write (preserving the previous behaviour).
      */
     void recordBatch(const std::vector<TimeSeriesPoint>& points) {
-        std::lock_guard<std::mutex> lock(dataMutex);
+        std::vector<InfluxPoint> influxPoints;
+        {
+            std::lock_guard<std::mutex> lock(dataMutex);
 
-        for (const auto& point : points) {
-            memoryBuffer.push_back(point);
-            entityBuffers[point.entityId].push_back(point);
+            for (const auto& point : points) {
+                memoryBuffer.push_back(point);
+                entityBuffers[point.entityId].push_back(point);
 
-            if (memoryBuffer.size() > maxMemoryPoints) {
-                memoryBuffer.pop_front();
-            }
-            if (entityBuffers[point.entityId].size() > 1000) {
-                entityBuffers[point.entityId].pop_front();
+                if (memoryBuffer.size() > maxMemoryPoints) {
+                    memoryBuffer.pop_front();
+                }
+                if (entityBuffers[point.entityId].size() > 1000) {
+                    entityBuffers[point.entityId].pop_front();
+                }
+
+                if (influxClient.isConnected()) {
+                    influxPoints.push_back(makeInfluxPoint(point));
+                }
             }
         }
 
-        if (influxClient.isConnected() && !points.empty()) {
-            persistBatch(points);
+        if (!influxPoints.empty()) {
+            if (flushDispatcher_) {
+                // Non-blocking: the blocking libcurl write runs on a JobSystem
+                // worker. InfluxPoints are moved into the job; influxClient is
+                // only touched from workers after the data lock is released and
+                // is safe for concurrent writePoints calls (each builds its own
+                // CURL handle). The owner (GeoStorageSystem) drains its JobSystem
+                // before destroying this TimeSeriesDB.
+                flushDispatcher_([influxPoints = std::move(influxPoints), this] {
+                    influxClient.writePoints(influxPoints);
+                });
+            } else {
+                influxClient.writePoints(influxPoints);  // synchronous fallback
+            }
         }
     }
 
@@ -253,20 +310,10 @@ private:
     std::map<std::string, std::deque<TimeSeriesPoint>> entityBuffers;
     mutable std::mutex dataMutex;
     size_t maxMemoryPoints;
+    FlushDispatcher flushDispatcher_;
 
     void persistPoint(const TimeSeriesPoint& point) {
-        InfluxPoint ip;
-        ip.measurement = "points";
-        ip.tags["entityId"] = point.entityId;
-        ip.fields["latitude"] = point.latitude;
-        ip.fields["longitude"] = point.longitude;
-        ip.fields["altitude"] = point.altitude;
-        ip.fields["speed"] = point.speed;
-        ip.fields["heading"] = point.heading;
-        ip.fields["accuracy"] = point.accuracy;
-        ip.timestamp = static_cast<uint64_t>(point.timestamp * 1e9);
-
-        influxClient.writePoint(ip);
+        influxClient.writePoint(makeInfluxPoint(point));
     }
 
     void persistBatch(const std::vector<TimeSeriesPoint>& points) {
@@ -274,17 +321,7 @@ private:
         influxPoints.reserve(points.size());
 
         for (const auto& point : points) {
-            InfluxPoint ip;
-            ip.measurement = "points";
-            ip.tags["entityId"] = point.entityId;
-            ip.fields["latitude"] = point.latitude;
-            ip.fields["longitude"] = point.longitude;
-            ip.fields["altitude"] = point.altitude;
-            ip.fields["speed"] = point.speed;
-            ip.fields["heading"] = point.heading;
-            ip.fields["accuracy"] = point.accuracy;
-            ip.timestamp = static_cast<uint64_t>(point.timestamp * 1e9);
-            influxPoints.push_back(ip);
+            influxPoints.push_back(makeInfluxPoint(point));
         }
 
         influxClient.writePoints(influxPoints);

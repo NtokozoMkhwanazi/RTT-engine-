@@ -6,6 +6,7 @@
 #include <fstream>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 
 /**
  * TFLitePredictor - self-contained ML inference for trajectory prediction.
@@ -89,8 +90,22 @@ public:
         }
 
         modelLoaded = !layers_.empty();
+
+        // Pre-size the allocation-free inference scratch pads to the widest
+        // layer dimension (input OR output) so runInference() never allocates.
+        // For the canonical model (80 -> 64 -> 32 -> 100) this is 100 floats;
+        // every layer's input/output fits within [0, maxLayerWidth_].
+        maxLayerWidth_ = 0;
+        for (const auto& layer : layers_) {
+            maxLayerWidth_ = std::max(maxLayerWidth_,
+                std::max((size_t)layer.in, (size_t)layer.out));
+        }
+        buffer_A_.resize(maxLayerWidth_);
+        buffer_B_.resize(maxLayerWidth_);
+        if (!modelLoaded) maxLayerWidth_ = 0;  // keep state consistent on failure
+
         std::cout << "[TFLitePredictor] ML weights loaded from " << weightsPath
-                  << " (" << layers_.size() << " layers)\n";
+                  << " (" << layers_.size() << " layers, scratchpad=" << maxLayerWidth_ << " floats)\n";
         return modelLoaded ? TFLiteStatus::Ok : TFLiteStatus::Error;
     }
 
@@ -98,29 +113,53 @@ public:
      * Run the forward pass. `input` must be exactly the first layer's input
      * size (80); `output` receives the last layer's output (100). Returns Ok
      * on success, Error otherwise (caller falls back to Kalman).
+     *
+     * Allocation-free on the hot path: the input is memcpy'd into the
+     * pre-sized buffer_A_ scratch pad and each layer's activations ping-pong
+     * between buffer_A_/buffer_B_ (a pointer swap per layer). No per-layer
+     * std::vector is ever constructed here. The caller should pre-size
+     * `output` once (PredictiveModel sizes its reusable buffer to
+     * getOutputSize()) so even the final copy avoids allocation.
      */
     TFLiteStatus runInference(const std::vector<float>& input, std::vector<float>& output) {
         if (!modelLoaded || layers_.empty()) return TFLiteStatus::NotLoaded;
         if (input.size() != (size_t)layers_[0].in) return TFLiteStatus::Error;
 
-        std::vector<float> act = input;
+        const size_t outputSize = (size_t)layers_.back().out;
+
+        // Seed buffer_A with the incoming activations (memcpy, no allocation).
+        std::memcpy(buffer_A_.data(), input.data(),
+                    (size_t)layers_[0].in * sizeof(float));
+
+        // Ping-pong: layer l reads from the buffer holding layer (l-1)'s output
+        // and writes to the other scratch pad. Replaces the old per-layer
+        // `std::vector<float> next(...)` construction entirely.
+        float* readBuf  = buffer_A_.data();
+        float* writeBuf = buffer_B_.data();
+
         for (size_t l = 0; l < layers_.size(); ++l) {
             const Layer& layer = layers_[l];
             const bool last = (l + 1 == layers_.size());
-            std::vector<float> next((size_t)layer.out, 0.0f);
 
             const float* w = layer.weights.data();
             for (int o = 0; o < layer.out; ++o) {
                 float sum = layer.bias[o];
                 const float* row = w + (size_t)o * layer.in;
                 for (int i = 0; i < layer.in; ++i)
-                    sum += row[i] * act[(size_t)i];
-                next[(size_t)o] = last ? sum : (sum > 0.0f ? sum : 0.0f);  // ReLU
+                    sum += row[i] * readBuf[(size_t)i];
+                // Linear activation on the final layer; ReLU on hidden layers.
+                writeBuf[(size_t)o] = last ? sum : (sum > 0.0f ? sum : 0.0f);
             }
-            act = std::move(next);
+
+            // Swap read/write roles for the next layer (O(1) pointer swap).
+            // After the final iteration `readBuf` aliases the just-filled output.
+            std::swap(readBuf, writeBuf);
         }
 
-        output = std::move(act);
+        // Drain the final-layer result into the caller's vector. When the
+        // caller pre-sized `output` (capacity >= outputSize), this is a
+        // pure copy with no allocation.
+        output.assign(readBuf, readBuf + outputSize);
         return TFLiteStatus::Ok;
     }
 
@@ -129,6 +168,12 @@ public:
     }
 
     bool isModelLoaded() const { return modelLoaded; }
+
+    // Dimensions of the loaded network. Callers (e.g. PredictiveModel's
+    // predictWithML) can pre-size their reusable input/output buffers to these
+    // so the entire inference hot path is allocation-free end-to-end.
+    size_t getInputSize() const { return layers_.empty() ? 0 : (size_t)layers_[0].in; }
+    size_t getOutputSize() const { return layers_.empty() ? 0 : (size_t)layers_.back().out; }
 
 private:
     struct Layer {
@@ -140,4 +185,12 @@ private:
 
     std::vector<Layer> layers_;
     bool modelLoaded = false;
+
+    // Allocation-free inference scratch pads (see forGeo.txt §1). Resized once
+    // in loadModel() to maxLayerWidth_ (the widest layer dimension) and reused
+    // via ping-pong on every runInference() call, so no per-layer/per-frame
+    // heap allocation ever occurs on the real-time loop.
+    size_t maxLayerWidth_ = 0;
+    std::vector<float> buffer_A_;
+    std::vector<float> buffer_B_;
 };

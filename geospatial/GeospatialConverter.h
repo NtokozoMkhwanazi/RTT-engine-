@@ -164,6 +164,33 @@ public:
         return rad2deg(std::atan2(x, y));
     }
 
+    /**
+     * Destination point: given a start (lat/lon), a bearing (degrees, clockwise
+     * from North) and a distance (metres), return the lat/lon of the point
+     * `distanceMeters` along that bearing. Spherical-earth approximation
+     * (R = 6371000 m), consistent with haversineDistance()/bearing().
+     *
+     * Used by the mine-safety geofence to compute evacuation target
+     * coordinates (forGeo.txt §2): step one safety radius outward from a
+     * personnel twin along the reciprocal of the machinery->personnel bearing.
+     */
+    static void destinationPoint(double lat1, double lon1,
+                                 double bearingDeg, double distanceMeters,
+                                 double& lat2Out, double& lon2Out) {
+        constexpr double R = 6371000.0;
+        const double φ1 = deg2rad(lat1);
+        const double λ1 = deg2rad(lon1);
+        const double θ  = deg2rad(bearingDeg);
+        const double δ  = distanceMeters / R;            // angular distance
+        const double s1 = std::sin(φ1);
+        const double c1 = std::cos(φ1);
+        const double φ2 = std::asin(s1 * std::cos(δ) + c1 * std::sin(δ) * std::cos(θ));
+        const double λ2 = λ1 + std::atan2(std::sin(θ) * std::sin(δ) * c1,
+                                          std::cos(δ) - s1 * std::sin(φ2));
+        lat2Out = rad2deg(φ2);
+        lon2Out = rad2deg(λ2);
+    }
+
 private:
     // Origin state
     double originLat = 0.0;

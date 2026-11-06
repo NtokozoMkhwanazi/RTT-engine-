@@ -50,6 +50,31 @@ struct ExternalFix {
     double accuracy = 0.0;
 };
 
+// Classification of a live telemetry twin. Maps 1:1 to the asset-type tags
+// parsed out of incoming feed payloads (see ParseFeedPayload) and consumed
+// downstream by the web dashboard color-coding, the InfluxDB tag routing, the
+// proximity geofence and the dynamic mesh-attachment renderer.
+enum class AssetKind : uint8_t {
+    Unknown = 0,
+    LightVehicle,   // Cars, bakkies, utility transports
+    Personnel,      // Miners, operators, on-foot crew members
+    HeavyMachinery, // Excavators, draglines, drills, continuous miners
+    StaticSensor    // Gas monitors, seismic geophones, ventilation fans
+};
+
+// Canonical, UI-friendly names for each AssetKind. The web dashboard's canvas
+// color mapping keys off these normalized strings so alias-heavy feeds like
+// "haul_truck" / "diggers" still color-code correctly.
+inline const char* AssetKindToString(AssetKind k) {
+    switch (k) {
+        case AssetKind::LightVehicle:   return "vehicle";
+        case AssetKind::Personnel:      return "personnel";
+        case AssetKind::HeavyMachinery: return "machinery";
+        case AssetKind::StaticSensor:   return "sensor";
+        default:                        return "unknown";
+    }
+}
+
 struct EntitySnapshot {
     uint32_t id;
     double latitude;
@@ -62,6 +87,10 @@ struct EntitySnapshot {
     bool isValid;
     bool hasPrediction;
     float predictionConfidence;
+    // Per-twin 3D Kalman prediction (each tracked twin predicts its OWN future,
+    // so the dashboard can draw a cone per twin, not just the walker's cone).
+    std::vector<PredictedState> predictions;
+    AssetKind kind = AssetKind::Unknown; // <--- Asset classification flag
 };
 
 struct GPSStatus {
@@ -73,6 +102,7 @@ struct GPSStatus {
     double accuracy;
     double timestamp;
     bool isValid;
+    int satellites;        // GPS satellite count (for the web dashboard)
     GPSTracker::Mode mode;
     const char* modeName;
 };
@@ -83,6 +113,41 @@ struct GeoStats {
     float predictionInterval;
     double ingestionRate;   // points per second
     double lastUpdateTime;
+};
+
+// A single recent position of the live GPS fix - surfaced to the web dashboard
+// as the trajectory trail. Kept small (capped in GeoAPI) so the canvas shows
+// the live path instead of an indefinitely growing buffer.
+struct TrajectoryPoint {
+    double latitude  = 0.0;
+    double longitude = 0.0;
+    double altitude  = 0.0;
+    double timestamp = 0.0;
+};
+
+// A proximate-pair safety alert (from SafetyGeofenceSystem) surfaced on the
+// dashboard so operators see proximity conditions in the browser, not only the
+// editor console. Defined here with AssetKind-only fields to avoid a
+// geospatial <-> geofence include cycle.
+struct LiveAlert {
+    uint32_t entityA = 0;
+    uint32_t entityB = 0;
+    AssetKind kindA = AssetKind::Unknown;
+    AssetKind kindB = AssetKind::Unknown;
+    double distanceMeters   = 0.0;
+    double horizontalMeters = 0.0;
+    double verticalDeltaM   = 0.0;
+    double timestamp        = 0.0;
+    int level               = 1;          // 1=warning, 2=critical
+    std::string message;
+    // Evacuation interlock vector (forGeo.txt §2): reciprocal escape bearing
+    // (deg, clockwise from N) and a target WGS84 fix for the personnel twin to
+    // steer toward to exit the safety cylinder, plus the planned step distance.
+    double escapeBearingDeg   = 0.0;
+    double evacLatitude       = 0.0;
+    double evacLongitude      = 0.0;
+    double evacAltitude       = 0.0;
+    double evacuationDistance = 0.0;
 };
 
 // A data point drained from feeds registered through this facade (polled in
@@ -98,6 +163,12 @@ struct FeedDataPoint {
     double accuracy = 0.0;
     std::string sourceId;
     bool isValid = false;
+    // Digital-twin classification drained off the parsed feed payload. The
+    // enum is the type-safe handle (safety geofence / mesh selection /
+    // InfluxDB tags); assetTypeString is the canonical, web-dashboard-friendly
+    // name produced by AssetKindToString().
+    AssetKind assetKind = AssetKind::Unknown;
+    std::string assetTypeString;
 };
 
 struct GeoConfig {
@@ -150,6 +221,21 @@ public:
     // ---- Stats (cached, updated on refresh) ----
     GeoStats getStats() const;
 
+    // Build the JSON body served by GeoHTTPServer's /feed endpoint (read by
+    // the modernized dashboard at http://localhost:8123/). Reflects the live
+    // GPS fix, cached stats, registered feeds, tracked physics twins and any
+    // cached trajectory - all mutex-protected reads, safe to call from the
+    // server's accept thread.
+    std::string buildFeedJson() const;
+
+    // ---- Dashboard surfacing (Todo 7+: web enrich) ----
+    // Record a proximate-pair safety alert so it is visible on the dashboard,
+    // not only the editor console. Called from the SafetyGeofenceSystem alert
+    // sink; safe to call from any thread.
+    void recordAlert(const LiveAlert& alert);
+    // Recent safety alerts surfaced on the dashboard (capped ring, oldest-first).
+    const std::vector<LiveAlert>& getRecentAlerts() const;
+
     // ---- Configuration ----
     GeoConfig getConfig() const;
     void setGPSMode(GPSTracker::Mode mode);
@@ -178,9 +264,11 @@ public:
     void syncTo(ecs::GeoIngestionSystem& ingestion);
 
     // Feed observations into the facade's own predictive model (used by
-    // requestPrediction for on-demand queries).
+    // requestPrediction for on-demand queries). Altitude (meters, WGS84) feeds
+    // the 3D Kalman filter's Z/vertical-climb state.
     void addObservation(double lat, double lon, double timestamp,
-                        double speed = 0.0, double heading = 0.0);
+                        double speed = 0.0, double heading = 0.0,
+                        double altitude = 0.0);
 
     // ---- Coordinate conversion ----
     glm::vec3 geoToLocal(double lat, double lon, double alt) const;
@@ -194,6 +282,11 @@ public:
     // Get predictions (cached from last prediction cycle)
     const std::vector<PredictedState>& getCachedPredictions() const;
     void requestPrediction(double horizon = 60.0, int points = 50);
+
+    // Drive one live prediction tick: feed the current GPS fix (with altitude)
+    // into the 3D Kalman and refresh the cached predictions on the configured
+    // interval. Public so the engine loop + tests can advance the model.
+    void updatePredictions();
 
     // ---- Data feed management ----
     // Registers a real polling feed (REST default; "WebSocket"/"ws" selects
@@ -230,7 +323,6 @@ private:
 
     void syncEntities();
     void processQueuedData();
-    void updatePredictions();
 
     // Subsystems
     GeospatialConverter m_converter;
@@ -284,9 +376,31 @@ private:
         double latitude, longitude, altitude;
         double speed, heading, accuracy, timestamp;
         bool isValid;
+        // Asset-twin classification threaded from ParseFeedPayload's type
+        // extraction through to the drained FeedDataPoint (and onward to the
+        // /feed JSON provider + ECS). See AddFeed's sink lambda.
+        std::string assetTypeString;
+        AssetKind assetKind = AssetKind::Unknown;
     };
     std::vector<IngestedData> m_ingestionBuffer;
     mutable std::mutex m_feedMutex;
+
+    // ---- Dashboard-live buffers (Todo 7: web enrich) ----
+    // Recent positions of the live GPS fix, surfaced to the dashboard as the
+    // trajectory trail (the engine computes the path every frame but never
+    // exposed it - now surfaced via /feed). Written by syncFrom() (main
+    // thread) and read by buildFeedJson() (server thread).
+    std::vector<TrajectoryPoint> m_liveTrajectory;
+    static constexpr size_t kMaxLiveTrajectory = 500;
+
+    // Recent proximate-pair safety alerts from SafetyGeofenceSystem, surfaced
+    // on the dashboard (not only the editor console). Written by recordAlert()
+    // (main thread) and read by buildFeedJson() (server thread).
+    std::vector<LiveAlert> m_recentAlerts;
+    static constexpr size_t kMaxRecentAlerts = 32;
+
+    // Guards the dashboard-live buffers above (m_liveTrajectory / m_recentAlerts).
+    mutable std::mutex m_geoMutex;
 };
 
 } // namespace geo

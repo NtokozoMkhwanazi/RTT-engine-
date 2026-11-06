@@ -33,90 +33,122 @@ struct PredictedState {
     double uncertaintyRadius = 0.0; // meters
 };
 
-// Kalman Filter for 2D position/speed tracking
-class KalmanFilter2D {
+// Kalman Filter for 3D position/velocity tracking (X/Y/Z + Vx/Vy/Vz).
+// Tracks vertical climb (Z) so the predictor can follow altitude changes
+// (elevators, ramps, multi-level dig sites / terraced benches), not just
+// horizontal motion on the 2D plane.
+class KalmanFilter3D {
 public:
-    KalmanFilter2D() {
-        state.resize(4, 0.0);
-        covariance.resize(4, std::vector<double>(4, 0.0));
+    enum : int { X = 0, Y = 1, Z = 2, VX = 3, VY = 4, VZ = 5 };
+    static constexpr int N = 6;
 
-        for (int i = 0; i < 4; i++) {
+    KalmanFilter3D() {
+        state.assign(N, 0.0);
+        covariance.assign(N, std::vector<double>(N, 0.0));
+
+        for (int i = 0; i < N; i++) {
             covariance[i][i] = 100.0;
         }
 
-        processNoise = 0.1;
+        processNoise = 0.1;       // horizontal (m^2/s)
+        processNoiseZ = 0.2;      // vertical climb is noisier than planar motion
         measurementNoise = 5.0;
     }
 
-    void init(double x, double y, double vx = 0, double vy = 0) {
-        state[0] = x;
-        state[1] = y;
-        state[2] = vx;
-        state[3] = vy;
+    void init(double x, double y, double z, double vx = 0, double vy = 0, double vz = 0) {
+        state[X] = x;  state[Y] = y;  state[Z] = z;
+        state[VX] = vx; state[VY] = vy; state[VZ] = vz;
     }
 
+    // Constant-velocity propagate, including vertical climb (Z += Vz*dt).
     void predict(double dt) {
-        double x = state[0] + state[2] * dt;
-        double y = state[1] + state[3] * dt;
-
-        state[0] = x;
-        state[1] = y;
+        state[X]  += state[VX] * dt;
+        state[Y]  += state[VY] * dt;
+        state[Z]  += state[VZ] * dt;   // <- vertical climb
 
         double dt2 = dt * dt;
-        covariance[0][0] += 2 * dt * covariance[0][2] + dt2 * covariance[2][2] + processNoise;
-        covariance[0][2] += dt * covariance[2][2];
-        covariance[1][1] += 2 * dt * covariance[1][3] + dt2 * covariance[3][3] + processNoise;
-        covariance[1][3] += dt * covariance[3][3];
+        // Horizontal covariance propagation (original 2D filter, reindexed to 3D).
+        covariance[0][0] += 2 * dt * covariance[0][VX] + dt2 * covariance[VX][VX] + processNoise;
+        covariance[0][VX] += dt * covariance[VX][VX];
+        covariance[1][1] += 2 * dt * covariance[1][VY] + dt2 * covariance[VY][VY] + processNoise;
+        covariance[1][VY] += dt * covariance[VY][VY];
+        // Vertical (Z) covariance propagation - tracks altitude uncertainty.
+        covariance[2][2] += 2 * dt * covariance[2][VZ] + dt2 * covariance[VZ][VZ] + processNoiseZ;
+        covariance[2][VZ] += dt * covariance[VZ][VZ];
     }
 
-    void update(double measX, double measY) {
-        double innovX = measX - state[0];
-        double innovY = measY - state[1];
+    // 3D position+altitude observation update.
+    void update(double measX, double measY, double measZ) {
+        double innovX = measX - state[X];
+        double innovY = measY - state[Y];
+        double innovZ = measZ - state[Z];
 
         double sX = covariance[0][0] + measurementNoise;
         double sY = covariance[1][1] + measurementNoise;
+        double sZ = covariance[2][2] + measurementNoise;
 
         double kX = covariance[0][0] / sX;
         double kY = covariance[1][1] / sY;
+        double kZ = covariance[2][2] / sZ;
 
-        state[0] += kX * innovX;
-        state[1] += kY * innovY;
+        state[X] += kX * innovX;
+        state[Y] += kY * innovY;
+        state[Z] += kZ * innovZ;
 
         covariance[0][0] *= (1 - kX);
         covariance[1][1] *= (1 - kY);
+        covariance[2][2] *= (1 - kZ);
     }
 
-    void getState(double& x, double& y, double& vx, double& vy) const {
-        x = state[0];
-        y = state[1];
-        vx = state[2];
-        vy = state[3];
+    void getState(double& x, double& y, double& z,
+                  double& vx, double& vy, double& vz) const {
+        x = state[X]; y = state[Y]; z = state[Z];
+        vx = state[VX]; vy = state[VY]; vz = state[VZ];
+    }
+
+    // Overwrite the full 6-D state. Used by PredictiveModel to inject a
+    // velocity estimate derived from consecutive position fixes (the
+    // correction update above only nudges position, so without this the
+    // velocity state never learns the walker's heading/speed and predictions
+    // collapse to a stationary point - i.e. "just a dot").
+    void setState(double x, double y, double z,
+                  double vx, double vy, double vz) {
+        state[X] = x; state[Y] = y; state[Z] = z;
+        state[VX] = vx; state[VY] = vy; state[VZ] = vz;
     }
 
     double getPositionUncertainty() const {
-        return std::sqrt(covariance[0][0] + covariance[1][1]);
+        return std::sqrt(covariance[0][0] + covariance[1][1] + covariance[2][2]);
     }
 
 private:
     std::vector<double> state;
     std::vector<std::vector<double>> covariance;
     double processNoise;
+    double processNoiseZ;   // vertical (Z) climb noise
     double measurementNoise;
 };
 
 class PredictiveModel {
 public:
-    PredictiveModel() : originLat(0.0), originLon(0.0),
+    // Member-init order MUST match declaration order (gcc/clang -Wreorder).
+    // Declaration order of the fields below: initialized, useML, originLat,
+    // originLon, lastPredictionTime, lastVx, lastVy, ...
+    PredictiveModel() : initialized(false), useML(false),
+                        originLat(0.0), originLon(0.0), originAlt(0.0),
                         lastPredictionTime(0.0), lastVx(0.0), lastVy(0.0),
-                        initialized(false), useML(false) {}
+                        lastVz(0.0) {}
 
     /**
      * Initialize with parameters
      */
-    void initialize(double originLat, double originLon) {
+    void initialize(double originLat, double originLon, double originAlt = 0.0) {
         this->originLat = originLat;
         this->originLon = originLon;
-        kalman.init(0, 0, 0, 0);
+        this->originAlt = originAlt;
+        kalman.init(0, 0, 0, 0, 0, 0);
+        lastGeoX = lastGeoY = lastGeoZ = 0.0;
+        lastVx = lastVy = lastVz = 0.0;
         initialized = true;
     }
 
@@ -139,28 +171,46 @@ public:
 
     /**
      * Add a new observation
+     *
+     * The 3D Kalman filter is fed Z (altitude) too, so the predictor can follow
+     * vertical climb / descent (Todo 9+10): lat/lon/alt are converted from
+     * WGS84 to local metric space (East/North metres + altitude-metres Z) once,
+     * then both the position estimate and the trajectory history carry altitude.
      */
     void addObservation(double lat, double lon, double timestamp,
-                        double speed = 0, double heading = 0) {
+                        double speed = 0, double heading = 0,
+                        double altitude = 0.0) {
         if (!initialized) {
             lastPredictionTime = timestamp;
             initialized = true;
         }
 
-        double x, y;
-        geoToLocal(lat, lon, x, y);
+        double x, y, z;
+        geoToLocal3D(lat, lon, altitude, x, y, z);
 
-        if (lastPredictionTime > 0) {
-            double dt = timestamp - lastPredictionTime;
-            if (dt > 0) {
-                kalman.predict(dt);
-            }
+        const double dt = timestamp - lastPredictionTime;   // 0 on the 1st obs
+        if (dt > 0) {
+            kalman.predict(dt);
         }
 
-        kalman.update(x, y);
-        kalman.getState(x, y, lastVx, lastVy);
+        kalman.update(x, y, z);   // 3D update: feeds Z/altitude into kalman3D
+        kalman.getState(x, y, z, lastVx, lastVy, lastVz);
 
-        history.push_back({timestamp, lat, lon, 0.0, speed, heading, 0.0, ""});
+        // Learn velocity from consecutive smoothed positions. The correction
+        // update above only adjusts position, so without this Vx/Vy/Vz stay at
+        // 0 and predictWithKalman collapses to a stationary point ("just a dot").
+        // Estimating velocity here makes the dashboard prediction cone actually
+        // LEAD the walker along its heading/speed (descriptive, not a dot).
+        if (dt > 0) {
+            const double alpha = 0.5;                       // velocity learn rate
+            lastVx = lastVx + alpha * ((x - lastGeoX) / dt - lastVx);
+            lastVy = lastVy + alpha * ((y - lastGeoY) / dt - lastVy);
+            lastVz = lastVz + alpha * ((z - lastGeoZ) / dt - lastVz);
+            kalman.setState(x, y, z, lastVx, lastVy, lastVz);
+        }
+        lastGeoX = x; lastGeoY = y; lastGeoZ = z;
+
+        history.push_back({timestamp, lat, lon, altitude, speed, heading, 0.0, "", ""});
         if (history.size() > 1000) {
             history.pop_front();
         }
@@ -200,13 +250,15 @@ public:
         std::normal_distribution<double> velNoise(0, 1.0);
 
         for (int sim = 0; sim < numSimulations; sim++) {
-            double x, y, vx, vy;
-            kalman.getState(x, y, vx, vy);
+            double x, y, z, vx, vy, vz;
+            kalman.getState(x, y, z, vx, vy, vz);
 
             double simX = x + posNoise(m_rng);
             double simY = y + posNoise(m_rng);
+            double simZ = z + posNoise(m_rng);
             double simVx = vx + velNoise(m_rng);
             double simVy = vy + velNoise(m_rng);
+            double simVz = vz + velNoise(m_rng);
 
             std::vector<PredictedState> trajectory;
             double dt = horizonSeconds / pointsPerSim;
@@ -214,10 +266,11 @@ public:
             for (int i = 0; i < pointsPerSim; i++) {
                 simX += simVx * dt;
                 simY += simVy * dt;
+                simZ += simVz * dt;   // propagate vertical climb noise
 
                 PredictedState pred;
                 pred.timestamp = currentTime + (i + 1) * dt;
-                localToGeo(simX, simY, pred.latitude, pred.longitude);
+                localToGeo3D(simX, simY, simZ, pred.latitude, pred.longitude, pred.altitude);
                 pred.confidence = 1.0 / (sim + 1);
                 trajectory.push_back(pred);
             }
@@ -243,7 +296,7 @@ public:
         tflitePredictor.setPythonEnvPath(path);
     }
 
-    KalmanFilter2D kalman;
+    KalmanFilter3D kalman;
     TFLitePredictor tflitePredictor;
     bool mlModelLoaded;
     std::vector<PredictedState> lastMlPredictions; // Cache for frame skipping
@@ -251,19 +304,28 @@ public:
     bool initialized;
     bool useML;
     std::mt19937 m_rng{12345}; // Persistent RNG for Monte Carlo (deterministic)
-    double originLat, originLon;
+    double originLat, originLon, originAlt;
     double lastPredictionTime;
-    double lastVx, lastVy;
+    double lastVx, lastVy, lastVz;
+    double lastGeoX = 0.0, lastGeoY = 0.0, lastGeoZ = 0.0;   // smoothed pos (for velocity)
 
     std::deque<TimeSeriesPoint> history;
+
+    // Reusable ML inference scratch buffers. Sized once after loadMLModel()
+    // succeeds (to tflitePredictor.getInputSize() / getOutputSize()) and reused
+    // on every predictWithML() call so the allocation-free runInference()
+    // forward pass is never shadowed by a caller-side heap allocation on the
+    // 10 ms real-time loop (forGeo.txt §1).
+    std::vector<float> mlInput_;
+    std::vector<float> mlOutput_;
 
     std::vector<PredictedState> predictWithKalman(double currentTime,
                                                     double horizonSeconds,
                                                     int numPoints) {
         std::vector<PredictedState> predictions;
 
-        double x, y, vx, vy;
-        kalman.getState(x, y, vx, vy);
+        double x, y, z, vx, vy, vz;
+        kalman.getState(x, y, z, vx, vy, vz);
 
         double uncertainty = kalman.getPositionUncertainty();
         double dt = horizonSeconds / numPoints;
@@ -271,14 +333,16 @@ public:
         for (int i = 0; i < numPoints; i++) {
             double t = currentTime + (i + 1) * dt;
 
+            // Constant-velocity extrapolation including vertical climb (Z).
             double futureX = x + vx * (i + 1) * dt;
             double futureY = y + vy * (i + 1) * dt;
+            double futureZ = z + vz * (i + 1) * dt;
 
             PredictedState pred;
             pred.timestamp = t;
-            localToGeo(futureX, futureY, pred.latitude, pred.longitude);
-            pred.speed = std::sqrt(vx * vx + vy * vy);
-            pred.heading = std::atan2(vy, vx) * 180.0 / M_PI;
+            localToGeo3D(futureX, futureY, futureZ, pred.latitude, pred.longitude, pred.altitude);
+            pred.speed = std::sqrt(vx * vx + vy * vy + vz * vz); // 3D speed
+            pred.heading = std::atan2(vy, vx) * 180.0 / M_PI;    // horizontal heading
             if (pred.heading < 0) pred.heading += 360.0;
 
             pred.uncertaintyRadius = uncertainty * (1.0 + (i + 1) * 0.1);
@@ -308,7 +372,14 @@ public:
         double curX = 0.0, curY = 0.0;
         geoToLocal(last.latitude, last.longitude, curX, curY);
 
-        std::vector<float> mlInput(80, 0.0f);
+        // Reusable input/output buffers (allocation-free across frames once
+        // sized by loadMLModel). mlInput_ is zeroed each call to mirror the
+        // old `std::vector<float> mlInput(80, 0.0f)` semantics for the
+        // under-filled tail when fewer than 20 history samples are queued.
+        const size_t inSize = tflitePredictor.getInputSize();
+        if (inSize == 0) return {};
+        mlInput_.assign(inSize, 0.0f);
+
         const size_t n = std::min<size_t>(20, history.size());
         auto it = history.end();
         for (size_t i = 0; i < n; ++i) --it;  // walk back to the window start
@@ -319,23 +390,26 @@ public:
             geoToLocal(p->latitude, p->longitude, x, y);
             const double dx = x - curX;
             const double dy = y - curY;
-            mlInput[s * 4 + 0] = static_cast<float>(dx / 100.0);
-            mlInput[s * 4 + 1] = static_cast<float>(dy / 100.0);
-            mlInput[s * 4 + 2] = static_cast<float>(p->speed / 10.0);
-            mlInput[s * 4 + 3] = static_cast<float>((p->heading * M_PI / 180.0) / M_PI);
+            mlInput_[s * 4 + 0] = static_cast<float>(dx / 100.0);
+            mlInput_[s * 4 + 1] = static_cast<float>(dy / 100.0);
+            mlInput_[s * 4 + 2] = static_cast<float>(p->speed / 10.0);
+            mlInput_[s * 4 + 3] = static_cast<float>((p->heading * M_PI / 180.0) / M_PI);
         }
 
-        std::vector<float> mlOutput;
-        const TFLiteStatus status = tflitePredictor.runInference(mlInput, mlOutput);
-        if (status != TFLiteStatus::Ok || mlOutput.size() < 2) return {};
+        // Reuse the output buffer (sized to the network output, e.g. 100 floats)
+        // so runInference's final copy never allocates either.
+        const size_t outSize = tflitePredictor.getOutputSize();
+        if (mlOutput_.size() != outSize) mlOutput_.resize(outSize);
+        const TFLiteStatus status = tflitePredictor.runInference(mlInput_, mlOutput_);
+        if (status != TFLiteStatus::Ok || mlOutput_.size() < 2) return {};
 
         // Output: 50 future (dx/100, dy/100) meter offsets at 1 s steps.
         std::vector<PredictedState> predictions;
-        const size_t outputPoints = mlOutput.size() / 2;
+        const size_t outputPoints = mlOutput_.size() / 2;
         predictions.reserve(outputPoints);
         for (size_t i = 0; i < outputPoints; ++i) {
-            const double dx = mlOutput[i * 2] * 100.0;
-            const double dy = mlOutput[i * 2 + 1] * 100.0;
+            const double dx = mlOutput_[i * 2] * 100.0;
+            const double dy = mlOutput_[i * 2 + 1] * 100.0;
             PredictedState pred;
             pred.timestamp = currentTime + (double)(i + 1) * 1.0;  // 1 s grid
             localToGeo(curX + dx, curY + dy, pred.latitude, pred.longitude);
@@ -354,8 +428,23 @@ public:
         y = (lat - originLat) * 111000.0;
     }
 
+    // 3D WGS84 -> local metric: lat/lon -> East/North metres (same projection as
+    // geoToLocal), altitude -> local Z metres (relative to the seeded originAlt).
+    void geoToLocal3D(double lat, double lon, double alt,
+                      double& x, double& y, double& z) {
+        geoToLocal(lat, lon, x, y);
+        z = alt - originAlt;
+    }
+
     void localToGeo(double x, double y, double& lat, double& lon) {
         lat = originLat + y / 111000.0;
         lon = originLon + x / (111000.0 * std::cos(lat * M_PI / 180.0));
+    }
+
+    // Inverse of geoToLocal3D: local metric -> WGS84 lat/lon/alt.
+    void localToGeo3D(double x, double y, double z,
+                      double& lat, double& lon, double& alt) {
+        localToGeo(x, y, lat, lon);
+        alt = z + originAlt;
     }
 };

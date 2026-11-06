@@ -292,21 +292,18 @@ world.update(dt);  // Entities auto-snap to terrain
 From the repository root:
 
 ```bash
-make            # build bin/test_runner + bin/engine (debug)
-make editor     # build bin/editor_app (ImGui editor)
-make test       # run the full unit-test suite (731 tests / 99 suites, incl. Geo suites)
+make            # build the test runner
+make test       # run the full unit-test suite (494 tests, incl. Geo suites)
 make run        # self-check tests, then boot the engine
 make run-headless  # bounded headless engine run (CI-friendly)
-make geoterrain-test   # bin/geoterrain_test — GeoTerrain Phase 5 demo app
+make geoterrain-test   # geoterrain integration app
 ```
 
 The engine entry point (`make run`) initializes `geo::GeoAPI` at a Sydney origin with a
 simulated GPS walking track and advances it every frame, alongside the character demo.
 
-GeoHTTP server, NMEA feeds, GPS modes, Kalman/ML prediction and panel persistence are
-covered by `make test` (the `GEO*` suites: `GeoAPIFeeds`, `GeoFeedNmea`, `GeoHTTPServer`,
-`GeoPanelPersistence`, `GeoTerminalCommands`, `GeoTerminalNmea`). See the
-[root README](../README.md#test-suites) for the full target list and prerequisites.
+GeoHTTP server, NMEA feeds, GPS modes, and panel persistence are covered by `make test`
+(GEO* suites). See the [root README](../README.md) for prerequisites and engine controls.
 
 In the editor, click **GPS** to cycle modes and enable **Geo** to see the visualization
 (map viewport in the top-right corner).

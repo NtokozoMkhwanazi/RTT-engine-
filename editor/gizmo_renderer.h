@@ -2,6 +2,7 @@
 #define EDITOR_GIZMO_RENDERER_H
 
 #include <glad/glad.h>
+#include <utility>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include "ecs/ECS.h"
@@ -19,6 +20,35 @@ enum class GizmoAxis { None, X, Y, Z };
 void Draw(const glm::vec3& position, float size, const glm::quat& rotation,
           const glm::mat4& view, const glm::mat4& projection, GLuint gizmoShaderProgram,
           GizmoType type);
+
+// Draw a screen-space ADDITIVE OUTLINE halo around the gizmo handles (the
+// "selected" highlight). Renders the gizmo geometry a second time with a bright
+// additive tint, depth-test OFF + depth-mask OFF so the glow is visible behind
+// scene geometry, and half-dilates the line verts in view space (+/- uThickness,
+// two passes => a centered ribbon) so it works under the core profile (where wide
+// glLineWidth is unreliable). Self-contained: compiles its own outline program
+// on first use and fully restores the caller's GL state. Does NOT touch Draw()'s
+// state save/restore (the gizmo depth tests rely on Draw() staying unchanged);
+// only the editor caller invokes this.
+void DrawOutline(const glm::vec3& position, float size, const glm::quat& rotation,
+                 const glm::mat4& view, const glm::mat4& projection, GizmoType type);
+
+// True iff the outline shader program compiled+linked in the current GL context.
+// Forces the lazy compile on first call (same program DrawOutline uses). Exposed
+// so tests can lock the inline `#version 430 core` outline GLSL green — there is
+// no glslangValidator in this environment, so compile-time never inspects those
+// strings; only a runtime GL compile (via DrawOutline's compileGizmoOutlineProgram)
+// can fail them.
+bool GizmoOutlineCompiled();
+
+// Draw gizmo as a screen-space ImGui overlay (depth-test-free) over the viewport.
+// API-agnostic: projects the same geometry as Draw() to screen space and emits
+// ImGui lines via the background draw list. Used by the Vulkan editor path
+// (the GL path uses Draw() into the viewport FBO from renderSceneOnly).
+void DrawImGui(const glm::vec3& position, float size, const glm::quat& rotation,
+               const glm::mat4& view, const glm::mat4& projection,
+               int viewportX, int viewportY, int viewportW, int viewportH,
+               GizmoType type);
 
 // Set/get current gizmo type
 void SetGizmoType(GizmoType type);
@@ -69,15 +99,18 @@ float UpdateDragScale(float mouseX, float mouseY, const glm::mat4& view,
 // End dragging (call on mouse up)
 void EndDrag();
 
-// Query current drag state
-bool IsDragging();
-
-// Get the world-space direction of the axis being dragged
-// (used by the caller to apply rotation deltas)
-glm::vec3 GetDragAxisWorld();
-
 // Check if currently dragging
 bool IsDragging();
+
+// Unproject a screen point to a world-space ray (origin, direction) for any
+// camera. Exposed (was previously a file-local helper) so editor UI can share
+// the gizmo's NDC->world-ray convention for viewport prop picking instead of
+// duplicating the inverse-projection math. screenX/Y are viewport coords;
+// viewportW/H are the viewport dimensions.
+std::pair<glm::vec3, glm::vec3> ScreenToWorldRay(float screenX, float screenY,
+                                                 const glm::mat4& view,
+                                                 const glm::mat4& projection,
+                                                 int viewportW, int viewportH);
 
 // Get the currently dragged axis
 GizmoAxis GetDragAxis();

@@ -1,7 +1,9 @@
 #pragma once
 #include <functional>
+#include <future>    // staged stage-reload: worker-side heightmap decode
 #include <memory>
 #include <string>
+#include <vector>
 #include "config.h"
 #include "render_pipeline.h"
 #include "input_manager.h"
@@ -9,9 +11,18 @@
 #include "resource_manager.h"
 #include "PlayModeController.h"
 #include "cameraSystem/ThirdPersonCamera.h"
+#include "ecs/ECS.h"                  // ecs::EntityID / ecs::INVALID_ENTITY_ID for the bot twin
+#include "ecs/JobSystem.h"            // stage 2 (forhotswap.txt): async character hot-swap worker
 
 struct GLFWwindow;
 class Model;
+class SimpleWorldRenderer;            // world-object renderer (see getWorldRenderer)
+
+// ThirdPersonCamera selection-focus tracking (ecs::EntityID) is compiled in
+// this translation unit, which already includes ECS headers via EditorApplication
+// (ecs/ECS.h). Define the guard so the camera class resolves FocusEntityID /
+// INVALID_ENTITY_ID to the real ECS types whenever it is included here.
+#define THIRD_PERSON_CAMERA_HAS_ECS
 
 namespace Editor {
     
@@ -44,6 +55,16 @@ namespace Editor {
         // for the final swap, which lets overlays (e.g. ImGui HUD) draw on top.
         void renderSceneOnly(float dt);
 
+        // Queue a staged "Reload Complete Stage" (landscape + props) instead of
+        // running it inline in the UI button handler - that blocked the frame
+        // for seconds (worker-less Assimp parse + texture upload) and froze the
+        // editor. update() pumps the stages; progress is published to
+        // uiState.stageReload for the resolve bar. `terrainOnly` is the
+        // "Load Ground" variant (skips the props stage).
+        void requestStageReload(bool terrainOnly = false);
+        // True while a staged reload is queued/running (UI gating).
+        bool isStageReloading() const;
+
         // Optional per-frame UI hook called at the END of render() - after
         // renderSceneOnly() has drawn the scene into the viewport FBO and
         // before the buffer swap. The GL editor path uses it to drive the
@@ -73,6 +94,15 @@ namespace Editor {
         Render::RenderPipeline& getRenderPipeline() { return m_renderPipeline; }
         Input::InputManager& getInputManager() { return m_inputManager; }
         World::WorldManager& getWorldManager() { return m_worldManager; }
+
+        // forPlayer.txt Theme 2 (grounded correction): the world-object renderer
+        // (trees/rocks/props/water) is ALREADY drawn by WorldManager::render
+        // (world_manager.cpp:280) via its WorldObjectManager. This exposes that
+        // SAME instance so editor UI can raycast / enumerate props WITHOUT a
+        // duplicate SimpleWorldRenderer (which would double-draw). No new member,
+        // no extra render() call - renderSceneOnly already renders it at 520.
+        SimpleWorldRenderer& getWorldRenderer();
+        const SimpleWorldRenderer& getWorldRenderer() const;
         Resources::ResourceManager& getResourceManager() { return m_resourceManager; }
         
         // Scene management
@@ -114,6 +144,31 @@ namespace Editor {
         void processInput(float dt);
         void update(float dt);
         void render(float dt);
+
+        // Advance the staged "Reload Complete Stage" job by one step. Called
+        // from update() every frame while uiState.stageReload.active is set.
+        void pumpStageReload();
+
+        // Result of the worker-side heightmap decode that feeds the landscape
+        // stage (the 4K EXR/PNG decode used to run on the main thread and was
+        // the last multi-second freeze in a stage reload).
+        struct StageHeightmapDecode {
+            bool               ok   = false;
+            std::vector<float> data;
+            int                size = 0;
+            std::string        path;
+        };
+        std::future<StageHeightmapDecode> m_stageHeightmapFuture;
+        bool m_stageHeightmapPending = false;
+        // Decoded grid handed to Terrain::initialize() (kept alive only for the
+        // duration of the landscape stage).
+        std::vector<float> m_stageHeightmap;
+        int                m_stageHeightmapSize = 0;
+
+        // forUI.txt Governor: frame-rate-controlled brush density throttle.
+        void UpdateAdaptiveBrushThrottle(float dt);
+        // forUI.txt Pillar 4: End-key drop-to-floor + surface snapping for selected actors/props.
+        void ProcessPlacementConstraints(float dt);
         
         // Event handlers
         void onWindowResize(int width, int height);
@@ -126,9 +181,26 @@ namespace Editor {
         void renderPlayCharacter(const glm::mat4& view, const glm::mat4& projection,
                                  const glm::vec3& cameraPos);
 
-        // Render NPC target markers as colored spheres (debug visualization)
-        void renderNPCs(const glm::mat4& view, const glm::mat4& projection,
-                        const glm::vec3& cameraPos);
+        // Sync the Character inspector's path/clips buffers into the live
+        // play-mode bot and hot-reload it (Animator + viewport mesh) when the
+        // artist edits the model path. Editor-time only — never mid play-tick.
+        void syncPlayCharacterPath();
+
+        // Bridge the play-mode bot (AnimatedCharacter, which is NOT itself an
+        // ECS entity) and a lightweight ECS "twin" (TransformComponent) so the
+        // viewport gizmo / Details panel can edit it. Edit mode pushes the
+        // twin -> bot; play mode mirrors the bot -> twin. Called every frame
+        // from update(). See forUI.txt (Steps A/B/C).
+        void syncPlayCharacterTwin();
+
+        // forGeo.txt "Direct Mesh-Attachment Sync Pipeline" - Part 2.
+        // Procedurally binds incoming GeoAPI telemetry snapshots to ECS digital
+        // twin actors in the viewport: lazily spawns an ECS entity (Transform +
+        // Model + Name + Geospatial + Layer), hot-swaps its mesh when the asset
+        // kind drifts, drives the transform from the ENU fix (snapped to the
+        // terrain heightfield), and garbage-collects twins whose telemetry has
+        // timed out. Runs every frame from update() in lockstep with telemetry.
+        void SynchronizeDigitalTwinTelemetryActors(float dt);
         
         // Map an animation state to the follow camera's state enum
         CameraState CameraStateForAnimationState(AnimationState s) const;
@@ -152,22 +224,46 @@ namespace Editor {
         // Play-mode character
         PlayModeController m_playController;
         std::unique_ptr<Model> m_playRenderModel;   // GPU mesh used to draw the character
-        std::string m_playModelPath = "assets/bot.fbx";
-        std::string m_playClipsDir = "assets";
-        
+        // forhotswap.txt stage 2 + the "engine stays empty till an artist loads
+        // a model" redesign: DEFAULT-EMPTY. The viewport starts empty (no idle
+        // bot) and the bot is created at runtime, exactly like its clips, via
+        // the Character panel (syncPlayCharacterPath / launchAsyncSwap). Keep
+        // m_lastRequestedMeshPath semantics identical for Todo-7.
+        // Default stand-in bot: the viewport boots WITH a loaded character so
+        // the artist sees the scene (follow cam, grid, props) immediately. The
+        // Character panel hot-reloads a new model+clips via syncPlayCharacterPath()
+        // (async swap, stage 2); clearing the field + committing empties the bot.
+        std::string m_playModelPath;        // config-driven (engine_config.json "character")
+        std::string m_playClipsDir;         // config-driven (engine_config.json "character")
+        // Last mesh path actually requested for the play model (Todo 7). Used to
+        // avoid reloading on every frame when the kind is unchanged; a failed
+        // load is cached so we don't re-attempt a missing asset each frame.
+        std::string m_lastRequestedMeshPath;
+
+        // ECS twin entity that carries a TransformComponent the gizmo can read
+        // and write. The play-mode bot (AnimatedCharacter) owns its own pose and
+        // is not an ECS entity, so without this twin the gizmo has no transform
+        // to bind to. Kept in lockstep with the bot via syncPlayCharacterTwin().
+        ecs::EntityID m_playCharacterEntity = ecs::INVALID_ENTITY_ID;
+
         // Third-person follow camera used while in play mode
         ThirdPersonCamera m_playCamera;
-
-        // Debug sphere VAO for rendering NPC targets
-        unsigned int m_npcSphereVAO = 0;
-        unsigned int m_npcSphereVBO = 0;
-        unsigned int m_npcSphereIndexCount = 0;
-        bool m_npcSphereInitialized = false;
-        // Off by default: the NPC debug spheres are viewport-only diagnostics
-        // that read as stray white boulders in-engine and still render even
-        // while showCharacter hides the play character (they are world NPCs,
-        // not the play model). Toggle only when actively debugging combat.
-        bool m_showNPCSpheres = false;
+        bool m_playCameraRestingSynced = false;   // one-shot resting cam sync on play-enter
+        // forCam.txt §3C: frame-coherence of the last selection so FocusOnEntity
+        // glides only on an actual selection CHANGE (viewport click / outliner
+        // row), not on every frame.
+        ecs::EntityID m_lastSelectedEntity = ecs::INVALID_ENTITY_ID;
+        std::size_t   m_lastPropIdx        = 0;
+        // Last focus target identity used to skip redundant FocusOnEntity calls
+        // when the same selection stays held across frames (avoids re-arming the
+        // glide timer so the camera can settle instead of oscillating).
+        glm::vec3     m_lastFocusPosition  = glm::vec3(0.0f);
+        bool          m_lastFocusAnimated  = false;
+        // Accumulated scroll-zoom offset from the World Settings Distance
+        // slider. The slider sets the resting distance; scroll zoom offsets
+        // from it so the two never fight. Applied in renderSceneOnly() as
+        // distance = uiState.playCameraDistance + m_cameraZoomOffset.
+        float m_cameraZoomOffset = 0.0f;
         
         // Optional per-frame UI hook (see setUiFrameHook).
         std::function<void(float)> m_uiFrameHook;
@@ -181,6 +277,52 @@ namespace Editor {
         float m_lastTime = 0.0f;
         float m_fpsTimer = 0.0f;
         int m_frameCount = 0;
+
+        // -------------------------------------------------------------------
+        // Stage 2 (forhotswap.txt): asynchronous character hot-swap.
+        // A worker thread builds a SEPARATE staging AnimatedCharacter (load +
+        // loadLocomotion, which compiles the motion KD-tree OFF the main
+        // thread) and extracts its RuntimeSystems; the main thread then
+        // atomically adopts them via swapInRuntimeSystems() before render. The
+        // live character keeps animating its OLD pack until the worker
+        // finishes, so there is never a "half-rebuilt" observable state. If the
+        // worker fails or times out, we fall back to the sync reload() path
+        // (stage 1), so the live character can NEVER break mid-play.
+        // -------------------------------------------------------------------
+        struct CharacterSwapAsyncState {
+            // Captured by the worker lambda; only read on the main thread AFTER
+            // handle.isComplete() fulfills the promise (happens-before).
+            struct Capsule {
+                AnimatedCharacter::RuntimeSystems systems;  // staging result
+                std::atomic<bool> swapReady{false};          // worker built systems OK
+                std::atomic<bool> failed{false};             // worker hit a load error
+            };
+            std::shared_ptr<Capsule> capsule;
+            ecs::JobSystem::JobHandle handle;                      // pollable completion
+            bool  isLoading = false;
+            int   timeoutFrames = 600;                        // ~10s @ 60fps, then sync fallback
+            geo::AssetKind prevKind = geo::AssetKind::Unknown;
+        };
+        CharacterSwapAsyncState m_charSwap;
+
+        // Worker pool for async hot-swap + (future) async content-browser scan.
+        ecs::JobSystem m_jobSystem;
+
+    private:
+        // Launch a worker to build the staging pack (called from
+        // syncPlayCharacterPath when a new character path is requested in play
+        // mode). No-op while a swap is already in flight.
+        void launchAsyncSwap(const std::string& modelPath,
+                             const std::string& clipsDir,
+                             geo::AssetKind prevKind);
+        // Poll the in-flight swap; apply on completion, fall back to sync on
+        // timeout/failure. Called from update() each frame (pre-render).
+        void tickCharacterSwap();
+        // Adopt a worker-built pack onto the live character + refresh the GPU
+        // render mesh + re-clamp to terrain. Single-threaded (main), pre-render.
+        void applyPendingSwap();
+        // (Re)build m_playRenderModel from path + reseed mesh/gizmo guards.
+        void reloadRenderModel(geo::AssetKind prevKind, const std::string& modelPath);
     };
     
     // Helper function

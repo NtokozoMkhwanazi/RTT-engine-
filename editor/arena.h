@@ -14,6 +14,7 @@
  */
 #include <glm/glm.hpp>
 #include <vector>
+#include <memory>
 #include <glad/glad.h>
 
 class Shader;
@@ -25,6 +26,20 @@ struct CubeInstance {
     glm::vec3 position{0.0f};   ///< world-space center of the cube base
     glm::vec3 scale{1.0f};      ///< per-axis scale (meters)
     glm::vec3 color{0.7f};      ///< albedo tint
+    float rotationY{0.0f};      ///< tangential facing around Y (radians)
+    float rotationX{0.0f};      ///< prop inclination around X (radians)
+};
+
+/// Per-instance GPU payload for the single instanced draw call. The model and
+/// its inverse-transpose normal matrix are computed ON THE CPU once per
+/// instance (see forArena.txt Phase 1 + Phase 4) so the vertex shader avoids a
+/// per-vertex mat3(transpose(inverse(...))); color.a doubles as the "is floor"
+/// flag so the fragment shader can draw the world-space measurement grid only
+/// on the ground plane.
+struct InstanceData {
+    glm::mat4 modelMatrix{};
+    glm::mat4 normalMatrix{};   // mat3(aInstanceNormal) in shader; row .w unused
+    glm::vec4 color{};          // rgb = albedo; a = 1.0 floor (grid), 0.0 otherwise
 };
 
 /// A simple procedural test arena: circular ring of cube walls with
@@ -32,7 +47,10 @@ struct CubeInstance {
 class ArenaScene {
 public:
     ArenaScene();
-    ~ArenaScene() { shutdown(); }
+    // ~ArenaScene() is defined out-of-line (in arena.cpp) because m_shader is a
+    // unique_ptr<Shader> and Shader is incomplete here; it must be complete at
+    // the point the unique_ptr deleter runs.
+    ~ArenaScene();
 
     // Non-copyable (owns GL objects)
     ArenaScene(const ArenaScene&) = delete;
@@ -63,6 +81,10 @@ public:
     void setPartialHeightColor(const glm::vec3& c) { m_partialHeightColor = c; }
     void setFloorColor(const glm::vec3& c)       { m_floorColor = c; }
 
+    // Procedural obstacle count (forArena.txt Part 2). 0 disables generation.
+    void setObstacleCount(int n) { m_obstacleCount = (n < 0) ? 0 : n; }
+    int obstacleCount() const { return m_obstacleCount; }
+
     float radius() const { return m_radius; }
     float wallHeight() const { return m_fullHeight; }
     float wallThickness() const { return m_thickness; }
@@ -74,12 +96,22 @@ public:
 private:
     void buildWalls();
 
+    // Bake m_instanceData from m_walls/m_floor (computing the per-instance
+    // model + CPU inverse-transpose normal matrix) and stream it into
+    // m_instanceVBO. Called by buildWalls after the instance lists are rebuilt.
+    void uploadInstances();
+
     // GL resources
-    GLuint m_cubeVAO   = 0;
-    GLuint m_cubeVBO   = 0;
-    GLuint m_cubeEBO   = 0;
+    GLuint m_cubeVAO        = 0;
+    GLuint m_cubeVBO        = 0;
+    GLuint m_cubeEBO        = 0;
+    GLuint m_instanceVBO    = 0;  // per-instance model/normal/color (instancing)
     GLsizei m_cubeIndexCount = 0;
-    Shader* m_shader    = nullptr;   // owned, created from embedded source
+    std::unique_ptr<Shader> m_shader;  // owned, created from embedded source
+
+    // Cached per-instance draw data (baked from m_walls/m_floor, uploaded to
+    // m_instanceVBO). Rendered in a single glDrawElementsInstanced call.
+    std::vector<InstanceData> m_instanceData;
 
     // Instance lists
     std::vector<CubeInstance> m_walls;     ///< peripheral walls
@@ -94,6 +126,8 @@ private:
     glm::vec3 m_fullHeightColor   {0.45f, 0.45f, 0.48f};  ///< steel grey
     glm::vec3 m_partialHeightColor{0.55f, 0.35f, 0.30f};  ///< terracotta
     glm::vec3 m_floorColor        {0.20f, 0.22f, 0.25f};  ///< dark floor
+
+    int m_obstacleCount = 20;       ///< random obstacle block count (0 = off; forArena.txt Part 2)
 
     bool m_visible = true;
     bool m_initialized = false;

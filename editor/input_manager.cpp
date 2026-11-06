@@ -102,6 +102,16 @@ void InputManager::shutdown() {
 }
 
 void InputManager::update() {
+    // Per-frame delta time from GLFW's monotonic clock. Replaces the hardcoded
+    // 0.016f "approximate" dt that clamped held-action timing and mis-stepped
+    // on paused / variable-timestep frames. Implausible deltas (pause / hang)
+    // fall back to a 60Hz step so a held binding never injects a huge spike.
+    static double lastTime = glfwGetTime();
+    const double now = glfwGetTime();
+    float dt = static_cast<float>(now - lastTime);
+    if (dt <= 0.0f || dt > 0.25f) dt = 0.016667f;
+    lastTime = now;
+
     // Store previous state
     m_inputState.previousKeys = m_inputState.currentKeys;
     m_inputState.previousMouseButtons = m_inputState.currentMouseButtons;
@@ -122,7 +132,7 @@ void InputManager::update() {
             binding.onReleased();
         }
         if (m_inputState.isKeyDown(key) && binding.onHeld) {
-            binding.onHeld(0.016f); // Approximate delta time
+            binding.onHeld(dt); // real per-frame delta time (was hardcoded 0.016f)
         }
     }
 }

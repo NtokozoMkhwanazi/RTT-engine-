@@ -1,5 +1,6 @@
 #include "gizmo_renderer.h"
 #include "editor_state.h"
+#include "imgui.h"   // DrawImGui(): screen-space overlay (Vulkan editor path)
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -7,6 +8,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -47,7 +49,10 @@ static glm::vec2 WorldToScreen(const glm::vec3& worldPos, const glm::mat4& view,
 // Unprojects BOTH near and far planes: a single NDC point at z=-1 is a
 // near-plane point, and normalize(worldPoint) is only the correct direction
 // when the camera sits at the world origin. This version works for any camera.
-static std::pair<glm::vec3, glm::vec3> ScreenToWorldRay(float screenX, float screenY,
+// forPlayer.txt Theme 3: made non-static (declared in gizmo_renderer.h) so
+// editor UI can share the gizmo's NDC->world-ray convention for viewport prop
+// picking, instead of duplicating the inverse-projection math here.
+std::pair<glm::vec3, glm::vec3> ScreenToWorldRay(float screenX, float screenY,
     const glm::mat4& view, const glm::mat4& projection, int vpW, int vpH) {
     // Convert screen coords to NDC (y-down screen -> y-up NDC)
     const float ndcX = (screenX / vpW) * 2.0f - 1.0f;
@@ -86,11 +91,271 @@ static float PointToLineDistance(const glm::vec3& point, const glm::vec3& lineSt
     return glm::distance(point, closest);
 }
 
+// ---------------------------------------------------------------------------
+// Gizmo outline halo (the "this handle is selected" glow).
+// A screen-space additive outline: the gizmo handle geometry is rendered a
+// second time, half-dilated in view space along +/- uThickness (two passes =>
+// a centered ribbon) so it works under the core profile (glLineWidth>1 is not
+// reliable there), blended ADDITIVELY with a warm tint, depth-TEST OFF +
+// depth-MASK OFF so the glow wraps the handles even behind scene geometry.
+// Self-contained: compiles its own outline program on first use (matches the
+// #version 430 core of editor/shader_manager.cpp gizmo shader) and fully
+// restores the caller's GL state.
+//
+// IMPORTANT: Draw() (and the depth save/restore guard the gizmo tests rely on)
+// is left UNTOUCHED in behavior; only its vertex-generation is factored into
+// buildAxisVerts() so the halo stays geometrically in sync. DrawOutline itself
+// is invoked only by the editor caller — no test calls it, so its shader compile
+// is never exercised on the test GL path.
+// ---------------------------------------------------------------------------
+
+struct GizmoGeometry {
+    std::array<std::vector<float>, 3> pos; // 3 floats/vert, per axis (mirrors Draw's axisVerts)
+    std::array<std::vector<float>, 3> dir; // 3 floats/vert: owning axis world dir per vertex
+};
+
+// Builds gizmo handle line vertices. Mirrors editor/gizmo_renderer.cpp Draw()
+// geometry generation exactly — keep in sync if handle shapes change.
+static GizmoGeometry buildAxisVerts(const glm::vec3& position, float size,
+                                    const glm::quat& rotation, GizmoType type,
+                                    const glm::mat4& rotMat, float len, float sizeS) {
+    GizmoGeometry verts;
+    struct AxisDef {
+        glm::vec3 dir;
+        glm::vec3 color;
+        glm::vec3 highlight;
+    };
+    // NOTE: must match Draw()'s axis color table exactly so halo + handles align.
+    const AxisDef axes[3] = {
+        { glm::vec3(1, 0, 0), glm::vec3(0.85f, 0.25f, 0.22f), glm::vec3(1.0f, 0.80f, 0.30f) },
+        { glm::vec3(0, 1, 0), glm::vec3(0.22f, 0.80f, 0.25f), glm::vec3(0.85f, 1.00f, 0.35f) },
+        { glm::vec3(0, 0, 1), glm::vec3(0.25f, 0.40f, 0.90f), glm::vec3(0.60f, 0.85f, 1.00f) },
+    };
+
+    auto world = [&](const glm::vec3& local) -> glm::vec3 {
+        return position + glm::vec3(rotMat * glm::vec4(local, 1.0f));
+    };
+    auto line = [&](const glm::vec3& a, const glm::vec3& b, int axisIdx) {
+        const glm::vec3 wa = world(a);
+        const glm::vec3 wb = world(b);
+        const glm::vec3 wd = glm::normalize(glm::vec3(rotMat * glm::vec4(axes[axisIdx].dir, 0.0f)));
+        std::vector<float>& p = verts.pos[axisIdx];
+        std::vector<float>& d = verts.dir[axisIdx];
+        p.insert(p.end(), { wa.x, wa.y, wa.z, wb.x, wb.y, wb.z });
+        d.insert(d.end(), { wd.x, wd.y, wd.z, wd.x, wd.y, wd.z });
+    };
+
+    const int kRingSegments = 48;
+    for (int a = 0; a < 3; ++a) {
+        const glm::vec3 d = axes[a].dir;
+        glm::vec3 p1 = (std::abs(d.y) < 0.9f)
+                           ? glm::normalize(glm::cross(d, glm::vec3(0, 1, 0)))
+                           : glm::normalize(glm::cross(d, glm::vec3(1, 0, 0)));
+        const glm::vec3 p2 = glm::cross(d, p1);
+
+        if (type == GizmoType::Rotate) {
+            glm::vec3 prev = (p1 * glm::cos(0.0f) + p2 * glm::sin(0.0f)) * len;
+            for (int i = 1; i <= kRingSegments; ++i) {
+                const float th = 2.0f * (float)M_PI * i / kRingSegments;
+                const glm::vec3 cur = (p1 * std::cos(th) + p2 * std::sin(th)) * len;
+                line(prev, cur, a);
+                prev = cur;
+            }
+        } else {
+            line(glm::vec3(0.0f), d * len, a);
+            if (type == GizmoType::Scale) {
+                const float s = sizeS * 0.12f;
+                glm::vec3 c[8];
+                for (int i = 0; i < 8; ++i) {
+                    const float sx = (i & 1) ? s : -s;
+                    const float sy = (i & 2) ? s : -s;
+                    const float sz = (i & 4) ? s : -s;
+                    c[i] = d * (len + sz) + p1 * sx + p2 * sy;
+                }
+                const int edges[12][2] = {
+                    {0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}
+                };
+                for (const auto& e : edges) line(c[e[0]], c[e[1]], a);
+            } else {
+                const float headLen = sizeS * 0.25f;
+                const float headW = sizeS * 0.09f;
+                const glm::vec3 tip = d * len;
+                const glm::vec3 base = d * (len - headLen);
+                line(tip, base + p1 * headW, a);
+                line(tip, base - p1 * headW, a);
+                line(tip, base + p2 * headW, a);
+                line(tip, base - p2 * headW, a);
+            }
+        }
+    }
+    return verts;
+}
+
+static GLuint compileGizmoOutlineProgram() {
+    static GLuint prog = 0;
+    static bool tried = false;
+    if (tried) return prog;
+    tried = true;
+
+    const char* vs = R"(#version 430 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aAxis;       // world-space segment dir (unit)
+uniform mat4 uView;
+uniform mat4 uProjection;
+uniform mat4 uModel;
+uniform vec4 uColor;
+uniform float uThickness = 0.05;           // view-space half-width
+uniform float uSign = 1.0;                 // +1/-1 => two-sided ribbon
+out vec4 vColor;
+void main() {
+    vec4 worldPos = uModel * vec4(aPos, 1.0);
+    vec4 viewPos  = uView * worldPos;
+    // screen-space perpendicular to the view-space segment (glow direction)
+    vec3 vAxis = mat3(uView) * aAxis;
+    vec3 perp  = cross(normalize(vAxis), vec3(0.0, 0.0, 1.0));
+    if (length(perp) < 1e-4) perp = vec3(1.0, 0.0, 0.0);
+    viewPos.xyz += normalize(perp) * (uSign * uThickness);
+    vColor = uColor;
+    gl_Position = uProjection * viewPos;
+}
+)";
+    const char* fs = R"(#version 430 core
+in vec4 vColor;
+out vec4 FragColor;
+void main() { FragColor = vColor; }
+)";
+
+    GLint ok = 0;
+    char log[512];
+
+    GLuint gvs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(gvs, 1, &vs, nullptr);
+    glCompileShader(gvs);
+    glGetShaderiv(gvs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        glGetShaderInfoLog(gvs, 512, nullptr, log);
+        std::fprintf(stderr, "[GizmoRenderer] outline VS compile failed: %s\n", log);
+        glDeleteShader(gvs);
+        return prog; // 0
+    }
+
+    GLuint gfs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(gfs, 1, &fs, nullptr);
+    glCompileShader(gfs);
+    glGetShaderiv(gfs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        glGetShaderInfoLog(gfs, 512, nullptr, log);
+        std::fprintf(stderr, "[GizmoRenderer] outline FS compile failed: %s\n", log);
+        glDeleteShader(gvs);
+        glDeleteShader(gfs);
+        return prog; // 0
+    }
+
+    prog = glCreateProgram();
+    glAttachShader(prog, gvs);
+    glAttachShader(prog, gfs);
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        glGetProgramInfoLog(prog, 512, nullptr, log);
+        std::fprintf(stderr, "[GizmoRenderer] outline program link failed: %s\n", log);
+        glDeleteProgram(prog);
+        prog = 0;
+    }
+    glDeleteShader(gvs);
+    glDeleteShader(gfs);
+    return prog;
+}
+
+void DrawOutline(const glm::vec3& position, float size, const glm::quat& rotation,
+                 const glm::mat4& view, const glm::mat4& projection, GizmoType type) {
+    if (type == GizmoType::None) return;
+
+    const GLuint prog = compileGizmoOutlineProgram();
+    if (!prog) return; // no GL context or compile failed -> silent no-op
+
+    // Track the per-axis scale Draw() uses so the halo matches at any distance.
+    const glm::mat4 rotMat = glm::toMat4(rotation);
+    const glm::vec3 camPos = glm::vec3(glm::inverse(view)[3]);
+    const float dist = glm::max(glm::distance(camPos, position), 1.0f);
+    const float distScale = glm::clamp(dist * 0.05f, 0.5f, 4.0f);
+    const float sizeS = size * distScale;
+    const float len = sizeS * 0.8f;
+    const GizmoGeometry verts = buildAxisVerts(position, size, rotation, type, rotMat, len, sizeS);
+
+    // Save caller GL state, then switch to the additive outline state.
+    const bool blendEnabled = glIsEnabled(GL_BLEND) == GL_TRUE;
+    const bool depthTestEnabled = glIsEnabled(GL_DEPTH_TEST) == GL_TRUE;
+    GLint prevDepthFunc = 0;           glGetIntegerv(GL_DEPTH_FUNC, &prevDepthFunc);
+    GLboolean prevDepthMask = GL_FALSE; glGetBooleanv(GL_DEPTH_WRITEMASK, &prevDepthMask);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);  // additive glow
+    glDisable(GL_DEPTH_TEST);           // halo visible behind scene geometry
+    glDepthMask(GL_FALSE);
+
+    glUseProgram(prog);
+    glUniformMatrix4fv(glGetUniformLocation(prog, "uView"),      1, GL_FALSE, &view[0][0]);
+    glUniformMatrix4fv(glGetUniformLocation(prog, "uProjection"), 1, GL_FALSE, &projection[0][0]);
+    glUniformMatrix4fv(glGetUniformLocation(prog, "uModel"),     1, GL_FALSE, glm::value_ptr(glm::mat4(1.0f)));
+    glUniform1f(glGetUniformLocation(prog, "uThickness"), 0.04f);
+    const glm::vec4 tint(1.0f, 1.0f, 0.9f, 0.55f); // warm additive outline
+    glUniform4fv(glGetUniformLocation(prog, "uColor"), 1, &tint[0]);
+
+    GLuint vao = 0, vboPos = 0, vboDir = 0;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vboPos);
+    glGenBuffers(1, &vboDir);
+    glBindVertexArray(vao);
+
+    glBindBuffer(GL_ARRAY_BUFFER, vboPos);
+    glBufferData(GL_ARRAY_BUFFER, 2048 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
+    glEnableVertexAttribArray(0);
+
+    glBindBuffer(GL_ARRAY_BUFFER, vboDir);
+    glBufferData(GL_ARRAY_BUFFER, 2048 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
+    glEnableVertexAttribArray(1);
+
+    for (int sign = -1; sign <= 1; ++sign) {   // two-sided => centered ribbon
+        if (sign == 0) continue;
+        glUniform1f(glGetUniformLocation(prog, "uSign"), static_cast<float>(sign));
+        for (int a = 0; a < 3; ++a) {
+            if (verts.pos[a].empty()) continue;
+            glBindBuffer(GL_ARRAY_BUFFER, vboPos);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, verts.pos[a].size() * sizeof(float), verts.pos[a].data());
+            glBindBuffer(GL_ARRAY_BUFFER, vboDir);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, verts.dir[a].size() * sizeof(float), verts.dir[a].data());
+            glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(verts.pos[a].size() / 3));
+        }
+    }
+
+    glBindVertexArray(0);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vboPos);
+    glDeleteBuffers(1, &vboDir);
+    glUseProgram(0);
+
+    // Restore caller GL state. Blend *func* is owned by the caller (the editor
+    // viewport re-sets it after we return), so we only restore enable + depth state.
+    if (blendEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    glDepthMask(prevDepthMask);
+    if (depthTestEnabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glDepthFunc(prevDepthFunc);
+}
+
 void Draw(const glm::vec3& position, float size, const glm::quat& rotation,
           const glm::mat4& view, const glm::mat4& projection, GLuint gizmoShaderProgram,
           GizmoType type) {
     if (!g_editor.showGizmo() || type == GizmoType::None) return;
 
+    // Save the caller's depth-test enable state. The gizmo is drawn with depth
+    // testing OFF so its manipulation handles stay pickable behind scene geometry;
+    // the prior code unconditionally re-enabled GL_DEPTH_TEST at exit, leaking a
+    // stale enable into the downstream ImGui / forward passes. Mirror
+    // grid_renderer.cpp's save/restore guard so the caller's state is restored.
+    const bool depthTestWasEnabled = glIsEnabled(GL_DEPTH_TEST) == GL_TRUE;
     glDisable(GL_DEPTH_TEST);
     glUseProgram(gizmoShaderProgram);
 
@@ -121,70 +386,27 @@ void Draw(const glm::vec3& position, float size, const glm::quat& rotation,
     };
 
     const GizmoAxis activeAxis = g_dragging ? g_dragAxis : g_editor.hoveredAxis();
-    const float len = size * 0.8f;
 
-    // World-space line vertices per axis (3 floats per vertex, pairs = lines).
-    std::array<std::vector<float>, 3> axisVerts;
+    // Perspective-aware scaling (forUI.txt gizmo point): grow the gizmo with
+    // camera distance so it stays a usable on-screen size at any range — the
+    // previous `size * 0.8f` shrank it to a pixel when zoomed out. Clamped so
+    // it can't explode near the far plane.
+    const glm::vec3 camPos = glm::vec3(glm::inverse(view)[3]);
+    const float dist = glm::max(glm::distance(camPos, position), 1.0f);
+    const float distScale = glm::clamp(dist * 0.05f, 0.5f, 4.0f);
+    const float sizeS = size * distScale;
+    const float len = sizeS * 0.8f;
 
-    auto world = [&](const glm::vec3& local) -> glm::vec3 {
-        return position + glm::vec3(rotMat * glm::vec4(local, 1.0f));
-    };
-    auto line = [&](const glm::vec3& a, const glm::vec3& b, int axisIdx) {
-        const glm::vec3 wa = world(a);
-        const glm::vec3 wb = world(b);
-        std::vector<float>& v = axisVerts[axisIdx];
-        v.insert(v.end(), { wa.x, wa.y, wa.z, wb.x, wb.y, wb.z });
-    };
+    // Direction camera->gizmo, used to fade axes that point straight at/away
+    // from the viewer ("looking down the pipe") so edge-on axes can't be
+    // accidentally grabbed.
+    const glm::vec3 viewDir = (dist > 0.001f) ? glm::normalize(position - camPos)
+                                              : glm::vec3(0, 0, -1);
 
-    const int kRingSegments = 48;
-    for (int a = 0; a < 3; ++a) {
-        const glm::vec3 d = axes[a].dir;
-        // Two vectors perpendicular to the axis, defining the rotation plane.
-        glm::vec3 p1 = (std::abs(d.y) < 0.9f)
-                           ? glm::normalize(glm::cross(d, glm::vec3(0, 1, 0)))
-                           : glm::normalize(glm::cross(d, glm::vec3(1, 0, 0)));
-        const glm::vec3 p2 = glm::cross(d, p1);
-
-        if (type == GizmoType::Rotate) {
-            // Circle in the plane perpendicular to the axis.
-            glm::vec3 prev = (p1 * glm::cos(0.0f) + p2 * glm::sin(0.0f)) * len;
-            for (int i = 1; i <= kRingSegments; ++i) {
-                const float th = 2.0f * (float)M_PI * i / kRingSegments;
-                const glm::vec3 cur = (p1 * glm::cos(th) + p2 * glm::sin(th)) * len;
-                line(prev, cur, a);
-                prev = cur;
-            }
-        } else {
-            // Shaft from origin to the handle.
-            line(glm::vec3(0.0f), d * len, a);
-
-            if (type == GizmoType::Scale) {
-                // Small cube at the end (12 edges).
-                const float s = size * 0.12f;
-                glm::vec3 c[8];
-                for (int i = 0; i < 8; ++i) {
-                    const float sx = (i & 1) ? s : -s;
-                    const float sy = (i & 2) ? s : -s;
-                    const float sz = (i & 4) ? s : -s;
-                    c[i] = d * (len + sz) + p1 * sx + p2 * sy;
-                }
-                const int edges[12][2] = {
-                    {0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}
-                };
-                for (const auto& e : edges) line(c[e[0]], c[e[1]], a);
-            } else {
-                // Arrow head (translate).
-                const float headLen = size * 0.25f;
-                const float headW = size * 0.09f;
-                const glm::vec3 tip = d * len;
-                const glm::vec3 base = d * (len - headLen);
-                line(tip, base + p1 * headW, a);
-                line(tip, base - p1 * headW, a);
-                line(tip, base + p2 * headW, a);
-                line(tip, base - p2 * headW, a);
-            }
-        }
-    }
+    // Geometry is generated once (shared with DrawOutline) so the colored
+    // handles and the screen-space outline halo stay geometrically in sync.
+    GizmoGeometry verts = buildAxisVerts(position, size, rotation, type, rotMat, len, sizeS);
+    std::array<std::vector<float>, 3>& axisVerts = verts.pos;
 
     // Create VAO for gizmo
     GLuint gizmoVAO, gizmoVBO;
@@ -203,7 +425,12 @@ void Draw(const glm::vec3& position, float size, const glm::quat& rotation,
 
         const glm::vec3 col = (activeAxis == static_cast<GizmoAxis>(a + 1))
                                   ? axes[a].highlight : axes[a].color;
-        glUniform3f(colorLoc, col.r, col.g, col.b);
+        // Fade axes that are edge-on to the camera (aligned with viewDir) so
+        // they can't be grabbed when the view lines up with an axis.
+        const glm::vec3 worldAxis = glm::normalize(glm::vec3(rotMat * glm::vec4(axes[a].dir, 0.0f)));
+        const float align = glm::abs(glm::dot(worldAxis, viewDir));
+        const float dim = (align > 0.92f) ? 0.35f : 1.0f;
+        glUniform3f(colorLoc, col.r * dim, col.g * dim, col.b * dim);
         glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(axisVerts[a].size() / 3));
     }
 
@@ -211,7 +438,101 @@ void Draw(const glm::vec3& position, float size, const glm::quat& rotation,
     glDeleteVertexArrays(1, &gizmoVAO);
     glDeleteBuffers(1, &gizmoVBO);
     glUseProgram(0);
-    glEnable(GL_DEPTH_TEST);
+    // Restore the caller's depth-test enable bit instead of forcing GL_DEPTH_TEST
+    // on unconditionally (matches grid_renderer.cpp's parity guard).
+    if (depthTestWasEnabled) glEnable(GL_DEPTH_TEST);
+    else glDisable(GL_DEPTH_TEST);
+}
+
+// Vulkan editor gizmo: a depth-test-free screen-space ImGui overlay across the
+// swapchain scene. Mirrors Draw()'s geometry (perspective-aware scale, arrow
+// heads / rotate ring / scale cube, edge-on axis dimming, active-axis
+// highlight) but emits ImGui lines instead of GL VAO/VBO draws, so no GL/Vulkan
+// shader or vertex path is needed. Draw() (GL) is left untouched.
+void DrawImGui(const glm::vec3& position, float size, const glm::quat& rotation,
+               const glm::mat4& view, const glm::mat4& projection,
+               int vpX, int vpY, int vpW, int vpH, GizmoType type) {
+    if (!g_editor.showGizmo() || type == GizmoType::None) return;
+
+    const glm::mat4 rotMat = glm::toMat4(rotation);
+    const GizmoAxis activeAxis = g_dragging ? g_dragAxis : g_editor.hoveredAxis();
+    const glm::vec3 camPos = glm::vec3(glm::inverse(view)[3]);
+    const float dist = glm::max(glm::distance(camPos, position), 1.0f);
+    const float distScale = glm::clamp(dist * 0.05f, 0.5f, 4.0f);
+    const float sizeS = size * distScale;
+    const float len = sizeS * 0.8f;
+    const glm::vec3 viewDir = (dist > 0.001f) ? glm::normalize(position - camPos)
+                                              : glm::vec3(0, 0, -1);
+
+    struct AxisDef { glm::vec3 dir, color, highlight; };
+    const AxisDef axes[3] = {
+        { glm::vec3(1, 0, 0), glm::vec3(0.85f, 0.25f, 0.22f), glm::vec3(1.0f, 0.80f, 0.30f) },
+        { glm::vec3(0, 1, 0), glm::vec3(0.22f, 0.80f, 0.25f), glm::vec3(0.85f, 1.00f, 0.35f) },
+        { glm::vec3(0, 0, 1), glm::vec3(0.25f, 0.40f, 0.90f), glm::vec3(0.60f, 0.85f, 1.00f) },
+    };
+
+    auto world = [&](const glm::vec3& local) -> glm::vec3 {
+        return position + glm::vec3(rotMat * glm::vec4(local, 1.0f));
+    };
+    auto emit = [&](const glm::vec3& a, const glm::vec3& b,
+                    const glm::vec3& col, float dim) {
+        const glm::vec2 sa = WorldToScreen(a, view, projection, vpX, vpY, vpW, vpH);
+        const glm::vec2 sb = WorldToScreen(b, view, projection, vpX, vpY, vpW, vpH);
+        const float f = std::clamp(dim, 0.0f, 1.0f) * 255.0f;
+        ImU32 c = IM_COL32((int)(col.r * f), (int)(col.g * f), (int)(col.b * f), 255);
+        ImGui::GetBackgroundDrawList()->AddLine(ImVec2(sa.x, sa.y),
+                                              ImVec2(sb.x, sb.y), c, 2.0f);
+    };
+
+    const int kRingSegments = 48;
+    for (int a = 0; a < 3; ++a) {
+        const glm::vec3 d = axes[a].dir;
+        glm::vec3 p1 = (std::abs(d.y) < 0.9f)
+                           ? glm::normalize(glm::cross(d, glm::vec3(0, 1, 0)))
+                           : glm::normalize(glm::cross(d, glm::vec3(1, 0, 0)));
+        const glm::vec3 p2 = glm::cross(d, p1);
+        const glm::vec3 col = (activeAxis == static_cast<GizmoAxis>(a + 1))
+                                  ? axes[a].highlight : axes[a].color;
+        const glm::vec3 worldAxis =
+            glm::normalize(glm::vec3(rotMat * glm::vec4(axes[a].dir, 0.0f)));
+        const float align = glm::abs(glm::dot(worldAxis, viewDir));
+        const float dim = (align > 0.92f) ? 0.35f : 1.0f;
+
+        if (type == GizmoType::Rotate) {
+            glm::vec3 prev = (p1 * std::cos(0.0f) + p2 * std::sin(0.0f)) * len;
+            for (int i = 1; i <= kRingSegments; ++i) {
+                const float th = 2.0f * (float)M_PI * i / kRingSegments;
+                glm::vec3 cur = (p1 * std::cos(th) + p2 * std::sin(th)) * len;
+                emit(world(prev), world(cur), col, dim);
+                prev = cur;
+            }
+        } else {
+            emit(world(glm::vec3(0.0f)), world(d * len), col, dim);
+            if (type == GizmoType::Scale) {
+                const float s = sizeS * 0.12f;
+                glm::vec3 c[8];
+                for (int i = 0; i < 8; ++i) {
+                    const float sx = (i & 1) ? s : -s;
+                    const float sy = (i & 2) ? s : -s;
+                    const float sz = (i & 4) ? s : -s;
+                    c[i] = d * (len + sz) + p1 * sx + p2 * sy;
+                }
+                const int edges[12][2] = {
+                    {0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}
+                };
+                for (const auto& e : edges) emit(world(c[e[0]]), world(c[e[1]]), col, dim);
+            } else {
+                const float headLen = sizeS * 0.25f;
+                const float headW  = sizeS * 0.09f;
+                const glm::vec3 tip  = d * len;
+                const glm::vec3 base = d * (len - headLen);
+                emit(world(tip), world(base + p1 * headW), col, dim);
+                emit(world(tip), world(base - p1 * headW), col, dim);
+                emit(world(tip), world(base + p2 * headW), col, dim);
+                emit(world(tip), world(base - p2 * headW), col, dim);
+            }
+        }
+    }
 }
 
 void SetGizmoType(GizmoType type) { g_gizmoType = type; }
@@ -232,7 +553,17 @@ GizmoAxis HitTest(const glm::vec3& gizmoPos, float gizmoSize, const glm::quat& g
     if (g_gizmoType == GizmoType::None) return GizmoAxis::None;
 
     const glm::mat4 rotMat = glm::toMat4(gizmoRot);
-    const float axisLen = gizmoSize * 0.8f;
+
+    // Perspective-aware click bounds (Todo 8). Draw() scales the gizmo on screen
+    // by `distScale` so it stays a usable size at any camera range; the pick
+    // volume MUST track that same scale or the gizmo becomes un-clickable when
+    // zoomed out (the drawn gizmo grows but the unscaled pick volume stays tiny)
+    // and overly grabby when zoomed in. Mirrors Draw()'s distScale formula.
+    const glm::vec3 camPos = glm::vec3(glm::inverse(view)[3]);
+    const float dist = glm::max(glm::distance(camPos, gizmoPos), 1.0f);
+    const float distScale = glm::clamp(dist * 0.05f, 0.5f, 4.0f);
+
+    const float axisLen = gizmoSize * 0.8f * distScale;   // matches Draw()'s `len`
 
     struct AxisLine {
         GizmoAxis axis;
@@ -241,8 +572,9 @@ GizmoAxis HitTest(const glm::vec3& gizmoPos, float gizmoSize, const glm::quat& g
     };
 
     // Rotate gizmo: hit-test the circle (pick the axis whose ring passes near
-    // the cursor). The ring radius is gizmoSize * 0.8, matching Draw().
-    const float ringR = gizmoSize * 0.8f;
+    // the cursor). The ring radius is gizmoSize * 0.8, matching Draw()'s scaled
+    // ring radius (gizmoSize * 0.8 * distScale).
+    const float ringR = gizmoSize * 0.8f * distScale;
     AxisLine axes[3] = {
         { GizmoAxis::X, gizmoPos, gizmoPos + glm::vec3(rotMat * glm::vec4(axisLen, 0, 0, 0)) },
         { GizmoAxis::Y, gizmoPos, gizmoPos + glm::vec3(rotMat * glm::vec4(0, axisLen, 0, 0)) },
@@ -250,7 +582,11 @@ GizmoAxis HitTest(const glm::vec3& gizmoPos, float gizmoSize, const glm::quat& g
     };
 
     // Find closest axis
-    float minDist = 15.0f; // Pixel threshold
+    // Pixel click threshold. Grows with camera distance so a zoomed-out (large
+    // on-screen) gizmo and a zoomed-in (small) gizmo demand similar relative
+    // precision, then clamped to a sane [5, 60] px band.
+    float minDist = 15.0f * distScale;
+    minDist = glm::clamp(minDist, 5.0f, 60.0f);
     GizmoAxis closest = GizmoAxis::None;
 
     for (const auto& ax : axes) {
@@ -412,5 +748,10 @@ void EndDrag() {
 bool IsDragging() { return g_dragging; }
 GizmoAxis GetDragAxis() { return g_dragAxis; }
 glm::vec3 GetDragAxisWorld() { return g_dragAxisWorld; }
+
+// Forces compileGizmoOutlineProgram()'s lazy compile and reports linker success.
+// Same program DrawOutline() uses internally; cached after the first compile, so
+// this is a cheap read thereafter. Lets tests assert the outline GLSL linked.
+bool GizmoOutlineCompiled() { return compileGizmoOutlineProgram() != 0; }
 
 } // namespace GizmoRenderer

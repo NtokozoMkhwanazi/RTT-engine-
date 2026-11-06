@@ -41,12 +41,7 @@
 #include "../animationSystem/AssimpAnimationLoader.h"
 #include "../motionMatching/MotionDatabase.h"
 #include "../motionMatching/MotionMatcher.h"
-#include "../motionMatching/MotionKDTree.h"
-#include "../motionMatching/MotionTransitionGraph.h"
-#include "../memory/MemoryManager.h"
-#include "../boneSystem/BoneName.h"
-#include "profiler.h"
-#include "world_manager.h"
+#include "../geospatial/GeoAPI.h"   // geo::AssetKind twin classification (Todo 7)
 
 class AnimatedCharacter {
 public:
@@ -70,7 +65,7 @@ public:
     // crouch auto-switches with the crouch input; combat/capoeira/dance are
     // explicit requests (editor keys 3/4/5, or CharacterInput.motionContext).
     enum class MotionContext {
-        LOCOMOTION = 0,  // Idle/Walk/Run/Jump/turns/run-look-back
+        LOCOMOTION = 0,  // Idle/Walk/Jog/Run/Jump/Fall/turns/catwalk
         CROUCH,          // Crouching + CrouchWalk (auto with crouch input)
         COMBAT,          // Boxing strikes/blocks/defeated
         CAPOEIRA,        // the ~39-clip capoeira set (built lazily on demand)
@@ -78,11 +73,17 @@ public:
         COUNT
     };
 
-    // REMOVED: StandstillPostureLock / StableIdleSnapshot.
-    // Previously froze the skeleton on the first frame of rest to prevent
-    // IK-loop knee jitter. Now replaced by continuous motion matching through
-    // the structural transition graph — all clips flow seamlessly, no pose
-    // is ever frozen. Foot IK runs with sub-frame damping (see ApplyFootIK).
+    // Parse a motion-context name (as authored in JSON / CharacterInput)
+    // into the enum. Mirrors the worker if-chain: "Crouch"/"CROUCH" -> CROUCH,
+    // "Combat"/"COMBAT" -> COMBAT, "Capoeira"/"CAPOEIRA" -> CAPOEIRA,
+    // "Dance"/"DANCE" -> DANCE, anything else -> LOCOMOTION. Pure refactor.
+    static MotionContext parseMotionContext(const std::string& name) {
+        if (name == "Crouch" || name == "CROUCH")       return MotionContext::CROUCH;
+        if (name == "Combat" || name == "COMBAT")       return MotionContext::COMBAT;
+        if (name == "Capoeira" || name == "CAPOEIRA")   return MotionContext::CAPOEIRA;
+        if (name == "Dance" || name == "DANCE")         return MotionContext::DANCE;
+        return MotionContext::LOCOMOTION;
+    }
 
     // -----------------------------------------------------------------------
     // Tuning (public so tests can read/write)
@@ -101,6 +102,10 @@ public:
     glm::vec3 velocity{0.0f};
     float heading = 0.0f;              // Yaw (radians); local -Z is forward
     bool grounded = true;
+    // Geospatial twin classification - drives mesh selection in the editor
+    // (Todo 7). Defaults to Personnel (the bot/human stand-in used while the
+    // dedicated excavator/utility_car/miner/sensor_node assets are authored).
+    geo::AssetKind m_assetKind = geo::AssetKind::Personnel;
     glm::vec3 terrainNormal{0.0f, 1.0f, 0.0f};
 
     // -----------------------------------------------------------------------
@@ -108,6 +113,45 @@ public:
     // -----------------------------------------------------------------------
     bool load(const std::string& path);
     int loadLocomotion(const std::string& dir);
+    // Dynamic Hot-Swap (forhotswap.txt, stage 1 - synchronous): flush all
+    // motion systems in strict dependency order and reload from a new model +
+    // clip folder IN PLACE (the AnimatedCharacter object is preserved so
+    // external render-model refs stay valid). Returns false (leaving the
+    // character non-ready) on failure. Tear-down order per the doc:
+    // Animator -> MotionMatcher -> Contextual Databases -> Clip Assets.
+    bool HotSwapCharacterPack(const std::string& fbxModelPath,
+                              const std::string& clipsDirectory);
+
+    // Stage 2 (forhotswap.txt, async): the live motion systems can be extracted
+    // (moved out) and later re-applied (moved back in). This is the
+    // double-buffer primitive behind the async hot-swap: a worker thread builds
+    // a staging AnimatedCharacter and calls ExtractRuntimeSystems(); the main
+    // thread then move-applies the result onto THIS live character. Extract
+    // moves OUT the Animator/Skeleton/MotionMatcher/Databases/Clips + the
+    // load-derived scalars (rawSizeY, targetHeight, idleClipDuration,
+    // clipCount, clipsDir, mmReady, loaded) but preserves the SOURCE pose.
+    // ApplyRuntimeSystems() is the inverse: it flushes the existing systems,
+    // adopts the staging set, recomputes render `scale` from rawSizeY, and
+    // preserves the LIVE pose so the bot never teleports on a pack swap.
+    struct RuntimeSystems {
+        std::unique_ptr<Animator> animator;
+        std::unique_ptr<Skeleton> skeleton;
+        std::unique_ptr<MotionMatcher> matcher;
+        std::array<std::unique_ptr<MotionDatabase>,
+                   (size_t)MotionContext::COUNT> databases;
+        std::vector<std::unique_ptr<Animation>> clips;
+        std::vector<float> clipSpeeds;
+        float  rawSizeY         = 0.0f;
+        float  targetHeight     = 1.8f;
+        float  idleClipDuration  = 0.0f;
+        int    clipCount        = 0;
+        std::string clipsDir;
+        bool   mmReady          = false;
+        bool   loaded           = false;
+    };
+    RuntimeSystems ExtractRuntimeSystems();
+    void ApplyRuntimeSystems(RuntimeSystems&& rs);
+
     static Animation* LoadClipFromFile(const std::string& path);
 
     // -----------------------------------------------------------------------
@@ -116,6 +160,8 @@ public:
     size_t boneCount() const { return skeleton_ ? skeleton_->bones.size() : 0; }
     float rawSizeY() const { return rawSizeY_; }
     bool ready() const { return loaded_; }
+    // Public handle to the authored model path (NPC details panel hot-reload).
+    const std::string& modelPath() const { return activeModelPath_; }
     int clipCount() const { return clipCount_; }
     AnimationState state() const { return state_; }
     float idleClipDuration() const { return idleClipDuration_; }
@@ -131,6 +177,18 @@ public:
     Animator* animator() { return animator_.get(); }
     const Animator* animator() const { return animator_.get(); }
     const Skeleton* skeleton() const { return skeleton_.get(); }
+
+    // Public handle to the motion matcher. The forAnime.txt §3 trajectory debug
+    // overlay reaches in from ui.cpp to read MotionMatchingDebug without coupling
+    // the UI to AnimatedCharacter's private member layout. Null when no matcher
+    // is attached (e.g. the character is not yet motion-matching ready).
+    MotionMatcher* getMatcher() const { return matcher_.get(); }
+
+    // Geospatial twin classification accessor (Todo 7: mesh swap). Lets the
+    // geo terminal / panel reclassify the play character so renderPlayCharacter
+    // swaps the visible mesh accordingly.
+    geo::AssetKind geospatialAssetKind() const { return m_assetKind; }
+    void setGeospatialAssetKind(geo::AssetKind k) { m_assetKind = k; }
 
     // -----------------------------------------------------------------------
     // World model matrix (rendering + foot IK)
@@ -159,6 +217,20 @@ public:
     bool motionMatchingReady() const { return mmReady_; }
     bool isMotionMatchingActive() const { return motionMatchingEnabled && mmReady_; }
 
+    // --- Performance metrics for the PlayMode HUD visual tiles ---
+    struct MMDiagnosticTile {
+        int posesSearched = 0;          // Poses searched this frame
+        float searchTimeMs = 0.0f;      // KD-tree search duration (ms)
+        int kdTreeNodes = 0;            // KD-tree node count
+        int kdTreeDepth = 0;            // KD-tree max depth
+        int kdTreeLeaves = 0;           // KD-tree leaf count
+        int databaseClips = 0;          // Total clips in active database
+        int databasePoses = 0;          // Total poses in active database
+        float matchScore = 0.0f;        // Current best match score
+        const char* simdStatus = "AVX2";// SIMD width label (compile-time)
+    };
+    MMDiagnosticTile mmDiagnosticTile() const;
+
     // -----------------------------------------------------------------------
     // Motion contexts (contextual database switching)
     // -----------------------------------------------------------------------
@@ -166,28 +238,14 @@ public:
     // and new databases (blendDuration = 0 switches instantly); requests to
     // the already-active context are no-ops (safe to send every frame). The
     // capoeira database is built lazily on first request.
-    void setMotionContext(MotionContext ctx, float blendDuration = 0.15f);
-
-    // Build transition clips between all currently-built motion contexts.
-    // Called after databases are loaded so the transition graph has both
-    // endpoints available.
-    void buildTransitionGraph();
-
-    // Check if a transition clip is currently playing.
-    bool isTransitionClipPlaying() const { return transitionClipPlaying_; }
-
-    // Check if clip-lock mode is active (idle cycle lock — matcher is
-    // advancing the current clip's play time without KD-tree search).
-    bool isClipLocked() const;
-
-    // Access the context-switch cooldown timer (for testing).
-    float contextSwitchCooldown() const { return contextSwitchCooldown_; }
-
+    void setMotionContext(MotionContext ctx, float blendDuration = 0.25f);
     MotionContext motionContext() const { return motionContext_; }
     std::string motionContextName() const;
     // Pose/clip counts of a context's database (0 = not built / empty).
     size_t contextPoseCount(MotionContext ctx) const;
     int contextClipCount(MotionContext ctx) const;
+    // Name of the clip at index within a context's database (for UI listing).
+    std::string contextClipName(MotionContext ctx, size_t index) const;
 
     // -----------------------------------------------------------------------
     // Preview (plays a clip by slot until it finishes or movement cancels it)
@@ -198,6 +256,12 @@ public:
         previewClipIndex_ = index;
         previewTimer_ = duration;
         previewActive_ = true;
+    }
+
+    // Rewind — reset the current animation clip time to the beginning.
+    // Used by the toolbar "Rewind" button to replay the clip from start.
+    void rewind() {
+        if (animator_) animator_->Rewind();
     }
 
     // -----------------------------------------------------------------------
@@ -259,83 +323,33 @@ private:
     void buildContextDatabases(const std::string& dir);
     void ensureContextBuilt(MotionContext ctx);
     void buildCapoeiraContext(const std::string& dir);
-
-    // Combat combo helpers (Black Myth-style: movement during attacks,
-    // directional selection, 3-step combo chain with input buffering).
-    void startCombatAction(const glm::vec2& moveDir, float moveMag);
-    void selectCombatClip(int& outIdx, int step, const glm::vec2& dir);
-    void endCombatAction();
-
-    // AAA Root Motion Extraction: extracts the root bone's world-space delta
-    // from the active combat clip and applies it to the character's position.
-    // This replaces procedural WASD movement during attacks — the animation's
-    // authored root motion drives the capsule, eliminating skating/sliding.
-    glm::vec3 ComputeRawAssetRootDisplacement(float dt);
-    bool combatClipNeedsRootMotion() const;
-
-    // Target Warping / Soft Magnetism: adjusts the extracted root motion delta
-    // to steer the character toward a combat target during attack playback.
-    // The target is set via setCombatTarget() — typically the nearest enemy or
-    // the direction the player is attacking toward.
-    void setCombatTarget(const glm::vec3& target) { combatTarget_ = target; }
-    bool hasCombatTarget() const { return combatHasTarget_; }
-    void clearCombatTarget() { combatHasTarget_ = false; }
-    void ApplyTargetWarpingToRootMotion(glm::vec3& outWorldDelta, float dt,
-                                         const glm::vec3& enemyTargetPos);
-
-    // Tagless Procedural Foot Planting: monitors foot bone velocity and height
-    // relative to the capsule root. When a foot is stationary and close to the
-    // ground, the system dynamically engages a lock — no artist-authored
-    // metatags required. Uses the existing FootIKState.isLocked/lockWeight fields.
-    void UpdateProceduralFootPlanting(float dt);
-
-    // Query helper for target magnetism (stub: returns closest enemy or false)
-    bool EngineQueryClosestLivingEnemy(const glm::vec3& from, const glm::vec2& dir,
-                                        float maxDist, glm::vec3& outTargetPos);
-
-    // Register a Profiler provider that pushes MotionMatcher + memory stats
-    // into the Profiler every frame (called once after the matcher is built).
-    void registerProfilingProvider();
     void addClipToContext(MotionContext ctx, const std::string& name,
                           const std::string& file, const std::string& dir);
+
+    // Flush all motion systems in dependency order (see HotSwapCharacterPack).
+    void FlushMotionSystems();
 
     // Destruction order matters: animator_/skeleton_ die first, then matcher_
     // (whose database holds non-owning aliases into clips_), then clips_ last.
     std::vector<std::unique_ptr<Animation>> clips_;
     std::vector<float> clipSpeeds_;
 
-    // Contextual databases + pre-built KD-trees, one per MotionContext. The
-    // matcher holds RAW pointers into these (non-owning SetDatabaseExplicit),
-    // so they must be declared BEFORE matcher_ (destroyed AFTER it) and AFTER
-    // clips_ (the context DBs alias slot clips, so clips_ must outlive them).
-    //
-    // FIX (todo §2): Each context's KD-tree is built ONCE at load time and
-    // warm-swapped via SetDatabaseExplicit (zero allocation) instead of
-    // being rebuilt inside SetDatabase on every context switch — the
-    // rebuild was the source of the crouch↔run FPS dips.
+    // Contextual databases, one per MotionContext. The matcher holds RAW
+    // pointers into these (non-owning SetDatabase), so they must be declared
+    // BEFORE matcher_ (destroyed AFTER it) and AFTER clips_ (the context DBs
+    // alias slot clips, so clips_ must outlive them).
     std::array<std::unique_ptr<MotionDatabase>, (size_t)MotionContext::COUNT> contextDatabases_;
-    std::array<std::unique_ptr<MotionKDTree>, (size_t)MotionContext::COUNT> contextSearchTrees_;
     std::string clipsDir_;                        // for lazy capoeira building
     MotionContext motionContext_ = MotionContext::LOCOMOTION;
     bool wasCrouching_ = false;                   // crouch-context edge detect
 
-    // ---- Structural Motion Graph: Pre-computed transition clips ----
-    // Between motion context databases (LOCOMOTION↔CROUCH, LOCOMOTION↔COMBAT,
-    // etc.), instead of instant SetDatabaseExplicit swaps. Each clip is a
-    // smooth all-joint slerp blend pre-baked at load time via TransitionClipGenerator.
-    MotionTransitionGraph transitionGraph_;
-    bool transitionClipPlaying_{false};           // Is a transition clip active?
-    MotionContext transitionTargetCtx_{MotionContext::LOCOMOTION};  // Where we're blending to
-
-    // Cooldown timer for motion context switches (prevents rapid crouch
-    // toggle jitter — e.g. double-tapping C causes conflicting transition clips
-    // and leg flexing). While > 0, new context switch requests are ignored.
-    float contextSwitchCooldown_{0.0f};
-    static constexpr float kContextSwitchCooldown = 0.35f;  // ~1 cycle at 120fps
-
-    // Speed threshold (m/s, world units) below which the character is
-    // considered "at rest" and clip-lock mode engages for smooth idle cycling.
-    static constexpr float kAtRestThreshold = 0.05f;
+    // Hot-swap tracking (forhotswap.txt): active asset paths + dirty flag.
+    // isSystemDirty_ is reset to false once a sync reload completes; in the
+    // async stage it stays true across frames until the background KD-tree
+    // finishes.
+    std::string activeModelPath_;
+    std::string activeClipsDir_;
+    bool isSystemDirty_ = false;
 
     std::unique_ptr<MotionMatcher> matcher_;
     std::unique_ptr<Skeleton> skeleton_;
@@ -360,58 +374,9 @@ private:
     float previewTimer_ = 0.0f;
     glm::vec2 lastMoveDir_{0.0f, 0.0f};
 
-    // ---- Combat / dance action playback ----
-    bool combatActionActive_ = false;   // True while a 1-shot combat clip plays
-    float combatTimer_ = 0.0f;           // Counts down the active clip's duration
-    std::shared_ptr<Animation> combatClip_;  // The clip being played directly
-    bool prevAttack_ = false;            // Edge-detect the attack button
-    glm::vec2 combatMoveDir_{0.0f, 0.0f};  // WASD captured at combat start (directional attacks)
-
-    // Combat target for soft magnetism / target warping
-    glm::vec3 combatTarget_{0.0f};            // World-space target during combat
-    bool combatHasTarget_ = false;            // True when a target is set
-
-    // ---- Combo chain system (Black Myth Wukong style) ----
-    // A combo advances through 3 steps (Punch → Swipe → JumpAttack). Each
-    // attack press within kComboWindow seconds advances the chain. Movement
-    // (WASD) is still processed during combat so the bot "slides" while
-    // attacking — root motion from the clip adds to velocity. After the final
-    // step's clip finishes with no further input, the character auto-returns
-    // to Locomotion (or Combat Idle if standing still).
-    int comboStep_ = 0;                 // 0 = no combo, 1/2/3 = combo step
-    float comboTimer_ = 0.0f;           // Time window for next attack press
-    bool pendingAttack_ = false;        // Attack input buffered during clip
-    int combatClipIndex_ = 0;           // Index of current clip in the ordered combat list
-
-    // Combat clip preference order per step (directional variants)
-    static constexpr float kComboWindow = 0.3f;      // seconds for next input
-    static constexpr float kAttackBuffer = 0.15f;    // pre-finish input acceptance
-    static constexpr float kCombatMoveScale = 0.3f; // WASD speed modifier during attack
-
     // Movement tuning
     float jumpSpeed_ = 5.5f;
     float gravity_ = 9.8f;
-
-    // ---- Jump cycle tuning (todo §1) ----
-    // Jump input is edge-detected (rising edge only) to prevent double/triple
-    // jumps when the button is held.  Coyote time gives a brief grace window
-    // after leaving ground so a slightly-late press still fires.  Jump buffer
-    // holds a press made mid-air so it auto-fires on the next landing.
-    static constexpr float kCoyoteTime = 0.10f;     // 6 frames @ 60fps
-    static constexpr float kJumpBufferTime = 0.10f;  // 6 frames
-    static constexpr float kLandingRecovery = 0.15f; // hold Fall→Idle gap
-    // Hysteresis around the apex: only flip JUMP→FALL when *descending*,
-    // and keep JUMP through the flat apex zone (|vy| < this band).  0.3 m/s is
-    // small enough to be visually meaningless but large enough to absorb
-    // float noise — at 60fps gravity moves vy by 0.16 m/s/frame, so without a
-    // band the state could flip-flop on 1-2 frames near zero.
-    static constexpr float kJumpApexHysteresis = 0.3f;
-    bool prevJumpInput_ = false;
-    float coyoteTimeLeft_ = 0.0f;
-    float jumpBufferLeft_ = 0.0f;
-    float landingRecoveryLeft_ = 0.0f;
-    // Sticky airborne state for JUMP↔FALL hysteresis (avoids apex jitter).
-    AnimationState lastAirborneState_ = AnimationState::JUMP;
 };
 
 // ============================================================================
@@ -420,7 +385,7 @@ private:
 
 inline bool AnimatedCharacter::load(const std::string& path) {
     loaded_ = false;
-    float progress = 0.0f;
+    std::atomic<float> progress{0.0f};
     std::unique_ptr<AsyncModelData> data;
     try {
         data = Model::LoadModelData(path, &progress);
@@ -481,7 +446,7 @@ inline bool AnimatedCharacter::load(const std::string& path) {
 inline Animation* AnimatedCharacter::LoadClipFromFile(const std::string& path) {
     Assimp::Importer importer;
     const aiScene* scene = importer.ReadFile(
-        path, aiProcess_Triangulate | aiProcess_GenUVCoords | aiProcess_FlipUVs);
+        path, aiProcess_Triangulate | aiProcess_GenUVCoords);
     if (!scene || !scene->HasAnimations() || scene->mNumAnimations == 0) return nullptr;
 
     Animation raw("", 0.0f, 0.0f);
@@ -509,19 +474,25 @@ inline int AnimatedCharacter::loadLocomotion(const std::string& dir) {
     idleClipDuration_ = 0.0f;
     // Destroy the matcher (whose motion database holds aliasing shared_ptrs
     // into clips_) BEFORE freeing the clip objects.
+    // Also reset the context databases FIRST — they hold non-owning
+    // shared_ptr aliases into the same clip memory.  Clearing clips_ before
+    // resetting the DBs would leave those aliases dangling (use-after-free)
+    // if any code path touches them during the reload window.
     matcher_.reset();
+    for (auto& db : contextDatabases_) {
+        db.reset(); // Clear all non-owning database aliases first!
+    }
     clips_.clear();
     clips_.resize(CLIP_SLOTS);
     clipSpeeds_.assign(CLIP_SLOTS, 0.0f);
 
     struct SlotFile { ClipSlot slot; const char* name; const char* file; };
     static const SlotFile kSlots[] = {
-        {CLIP_IDLE, "Idle", "Creature Pack/mutant idle.fbx"},
-        {CLIP_WALK, "Walk", "Creature Pack/mutant walking.fbx"},
-        {CLIP_RUN, "Run", "Creature Pack/mutant run.fbx"},
-        {CLIP_JUMP, "Jump", "Creature Pack/mutant jumping.fbx"},
-        // Fall clip: creature pack doesn't provide a dedicated fall; the Jump
-        // clip covers the entire airborne arc via pose-follow / loop.
+        {CLIP_IDLE, "Idle", "Idle.fbx"},
+        {CLIP_WALK, "Walk", "Walking.fbx"},
+        {CLIP_RUN, "Run", "Run.fbx"},
+        {CLIP_JUMP, "Jump", "Jump.fbx"},
+        {CLIP_FALL, "Fall", "Fall.fbx"},
         {CLIP_CROUCH, "Crouch", "Crouching.fbx"},
         {CLIP_CROUCH_WALK, "CrouchWalk", "chrouchWalk.fbx"},
     };
@@ -579,100 +550,15 @@ inline int AnimatedCharacter::loadLocomotion(const std::string& dir) {
         mmReady_ = matcher_->IsInitialized() && matcher_->GetDatabase() &&
                    matcher_->GetDatabase()->GetPoseCount() > 0;
 
-        // Register a profiling provider so the Profiler pulls MotionMatcher
-        // stats (KD-tree geometry, search timing, SIMD status, memory) once
-        // per endFrame() and forwards them to the console flush + UI panel.
-        registerProfilingProvider();
-
-        // FIX (todo §2): Activate the ENRICHED locomotion context (all 10 clips,
-        // including Run/Jump/turns/run-look-back) as the default search domain
-        // so MM handles the extra locomotion clips out of the box. Use the zero-
-        // allocation SetDatabaseExplicit + pre-built KD-tree + pre-warmed SIMD
-        // cache instead of SetDatabase(…, 0.0f) which rebuilt the tree on every
-        // activation (the crouch↔run FPS dip source).
+        // Activate the ENRICHED locomotion context (all 10 clips, including
+        // Jog/turns/catwalk/run-look-back) as the default search domain so
+        // MM handles the extra locomotion clips out of the box.
         if (contextDatabases_[(int)MotionContext::LOCOMOTION] &&
-            contextDatabases_[(int)MotionContext::LOCOMOTION]->GetPoseCount() > 0 &&
-            contextSearchTrees_[(int)MotionContext::LOCOMOTION]) {
-            matcher_->SetDatabaseExplicit(
-                *contextDatabases_[(int)MotionContext::LOCOMOTION],
-                *contextSearchTrees_[(int)MotionContext::LOCOMOTION]);
+            contextDatabases_[(int)MotionContext::LOCOMOTION]->GetPoseCount() > 0) {
+            matcher_->SetDatabase(*contextDatabases_[(int)MotionContext::LOCOMOTION], 0.0f);
         }
     }
-
-    // ---- Structural Motion Graph: Build pre-computed transition clips ----
-    // Pre-compute smooth transition clips between all built context databases.
-    // This replaces the instant SetDatabaseExplicit swap at runtime with
-    // smooth all-joint slerp blends (eq. 6, 7) + 2D alignment (eq. 1).
-    buildTransitionGraph();
-
     return clipCount_;
-}
-
-inline void AnimatedCharacter::buildTransitionGraph() {
-    if (!skeleton_) return;
-
-    // Build a map of int -> MotionDatabase* for all contexts that have
-    // databases built.
-    std::map<int, MotionDatabase*> dbMap;
-    for (int i = 0; i < static_cast<int>(MotionContext::COUNT); ++i) {
-        if (contextDatabases_[i] && contextDatabases_[i]->GetPoseCount() > 0) {
-            dbMap[i] = contextDatabases_[i].get();
-        }
-    }
-
-    if (dbMap.size() >= 2) {
-        std::cout << "[AnimatedCharacter] Building transition graph for "
-                  << dbMap.size() << " contexts...\n";
-        transitionGraph_.BuildTransitions(dbMap, skeleton_.get());
-        transitionGraph_.PruneGraph();
-        transitionGraph_.PrintGraph();
-    } else {
-        std::cout << "[AnimatedCharacter] Only " << dbMap.size()
-                  << " contexts built - skipping transition graph\n";
-    }
-}
-
-inline void AnimatedCharacter::registerProfilingProvider() {
-    // Push a single MotionMatcher stats snapshot + MemoryTracker stats into
-    // the Profiler.  The callback fires every endFrame() so the console
-    // flush and UI panel can display live values.
-    Profiler::Instance().registerProvider([this](Profiler& p) {
-        if (!matcher_) return;
-
-        MotionMatcher::Stats ms = matcher_->GetStats();
-
-        // --- KD-TREE stats ---
-        p.setStat("KDTree.TotalNodes",   static_cast<double>(ms.kdTreeNodes),  "nodes");
-        p.setStat("KDTree.LeafNodes",    static_cast<double>(ms.kdTreeLeaves), "leaves");
-        p.setStat("KDTree.MaxDepth",     static_cast<double>(ms.kdTreeMaxDepth), "max");
-        p.setStat("KDTree.AvgLeafSize",  static_cast<double>(ms.kdTreeAvgLeafSize), "poses/leaf");
-        p.setStat("KDTree.InternalNodes",static_cast<double>(ms.kdTreeInternal), "internal");
-
-        // --- Database scale ---
-        p.setStat("MotionDB.Poses",      static_cast<double>(ms.poseCount),     "poses");
-        p.setStat("MotionDB.Animations", static_cast<double>(ms.animationCount), "clips");
-
-        // --- Search metrics ---
-        p.setStat("MotionMatch.SearchTimeMs", static_cast<double>(ms.searchTimeMs), "ms");
-        p.setStat("MotionMatch.PosesSearched", static_cast<double>(ms.posesSearched), "poses");
-
-        // --- SIMD status ---
-        p.setStat("SIMD.AVX2_Available", ms.simdAvailable ? 1.0 : 0.0,
-                  ms.simdAvailable ? "AVX2" : "no-AVX2");
-        p.setStat("SIMD.AVX2_Active",    ms.simdActive ? 1.0 : 0.0,
-                  ms.simdActive ? "on" : "off");
-
-        // --- Current pose ---
-        p.setStat("MotionMatch.QuerySpeed", ms.querySpeed, "m/s");
-        // Use string stat for the clip name (not a number)
-        p.setStringStat("MotionMatch.CurrentClip", ms.currentClip);
-
-        // --- MemoryTracker stats ---
-        MemoryTracker& mt = MemoryTracker::getInstance();
-        p.setStat("Memory.AllocatedBytes",    static_cast<double>(mt.getCurrentAllocatedBytes()), "bytes");
-        p.setStat("Memory.AllocationCount",   static_cast<double>(mt.getAllocationCount()), "allocs");
-        p.setStat("Memory.DeallocationCount", static_cast<double>(mt.getDeallocationCount()), "deallocs");
-    });
 }
 
 inline void AnimatedCharacter::update(float dt, const CharacterInput& input,
@@ -696,25 +582,11 @@ inline void AnimatedCharacter::update(float dt, const CharacterInput& input,
     // input, per the suggestions). Both are edge-triggered - a held key or
     // sustained crouch only switches once, and switching away from combat/etc.
     // requires an explicit key.
-    //
-    // Cooldown: while a transition clip is playing OR the context-switch
-    // cooldown is active, ignore new switch requests to prevent rapid toggling
-    // (e.g. double-tap C → conflicting transition clips → leg flexing).
-    if (contextSwitchCooldown_ > 0.0f) {
-        contextSwitchCooldown_ -= dt;
-        if (contextSwitchCooldown_ < 0.0f) contextSwitchCooldown_ = 0.0f;
-    }
-    const bool canSwitchContext = (contextSwitchCooldown_ <= 0.0f) &&
-                                  !transitionClipPlaying_;
-
-    if (canSwitchContext && input.motionContext >= 0 &&
-        input.motionContext < (int)MotionContext::COUNT) {
+    if (input.motionContext >= 0 && input.motionContext < (int)MotionContext::COUNT) {
         setMotionContext(static_cast<MotionContext>(input.motionContext));
-    } else if (canSwitchContext && motionContext_ == MotionContext::LOCOMOTION &&
-        crouching_ && !wasCrouching_) {
+    } else if (motionContext_ == MotionContext::LOCOMOTION && crouching_ && !wasCrouching_) {
         setMotionContext(MotionContext::CROUCH);
-    } else if (canSwitchContext && motionContext_ == MotionContext::CROUCH &&
-        !crouching_ && wasCrouching_) {
+    } else if (motionContext_ == MotionContext::CROUCH && !crouching_ && wasCrouching_) {
         setMotionContext(MotionContext::LOCOMOTION);
     }
     wasCrouching_ = crouching_;
@@ -728,108 +600,30 @@ inline void AnimatedCharacter::update(float dt, const CharacterInput& input,
         heading += diff * std::min(1.0f, 10.0f * dt);
     }
 
-    // ---- Horizontal speed (walk / jog / run / crouch bands) ----
-    // Speed caps aligned to industry-standard mocap gait speeds:
-    //   Walk:   1.5 m/s  (was 2.0 — too high, caused matcher to select jog/run
-    //                    clips since walk clips are typically 1.2–1.5 m/s)
-    //   Sprint: 6.0 m/s  (run/sprint range 5.5–6.5)
-    //   Crouch: 1.45 m/s (crouch-walk, slightly slower than standing walk)
-    float speedCap = 1.5f;
+    // ---- Horizontal speed (walk / run / crouch bands) ----
+    float speedCap = 2.0f;
     if (sprinting_) speedCap = 6.0f;
     else if (crouching_) speedCap = 1.45f;
-
     const float targetSpeed = speedCap * moveMag;
 
-    // During combat attacks, WASD does NOT procedurally drive the capsule.
-    // AAA Root Motion rule: the root bone delta extracted from the FBX clip
-    // drives all movement.  WASD only selects the attack direction (directional
-    // attacks) and the facing.  Zeroing horizontal velocity here prevents the
-    // "skating" artifact the old kCombatMoveScale caused.
-    const bool inCombatAction = combatActionActive_ && combatClip_;
     const float horizSpeed = glm::length(glm::vec2(velocity.x, velocity.z));
-    const float accel = crouching_ ? 15.0f : 25.0f;  // m/s² (was 10/16 exponential)
-    const float maxDelta = accel * dt;
-    float velDelta = targetSpeed - horizSpeed;
-    velDelta = std::clamp(velDelta, -maxDelta, maxDelta);
-    const float newHoriz = horizSpeed + velDelta;
+    const float accel = crouching_ ? 10.0f : 16.0f;
+    const float newHoriz = horizSpeed + (targetSpeed - horizSpeed) * std::min(1.0f, accel * dt);
     velocity.x = moveDir.x * newHoriz;
     velocity.z = moveDir.y * newHoriz;
-    if (inCombatAction) {
-        // Combat action: nullify procedural WASD velocity.  If the clip has
-        // root bone translation, extractCombatRootMotion() applies the
-        // authored delta.  If the clip is in-place (no root motion), the
-        // character stays planted — NO sliding regardless of WASD input.
-        velocity.x = 0.0f;
-        velocity.z = 0.0f;
-    }
 
     // ---- Jump / gravity ----
-    // FIX (todo §1 jump cycle): Three interlocked problems solved here:
-    //   1. DOUBLE JUMP — input.jump is a held button (key-down), so checking
-    //      it every grounded frame fires repeatedly.  Edge-detect: only take
-    //      off on the RISING edge (input.jump && !prevJumpInput_).
-    //   2. Coyote time — a press up to kCoyoteTime after walking off a ledge
-    //      still jumps, forgiving sub-frame-perfect timing.
-    //   3. Jump buffer — a press made mid-air is queued for kJumpBufferTime;
-    //      it fires the instant the character touches down, so jumping just
-    //      before landing still lifts off instead of being swallowed.
     const bool mmCanDriveAir = isMotionMatchingActive() && matcher_ && matcher_->HasAirbornePoses();
-
-    // Track coyote time: refreshed while grounded, counts down airborne.
-    if (grounded) {
-        coyoteTimeLeft_ = kCoyoteTime;
-    } else {
-        coyoteTimeLeft_ = std::max(0.0f, coyoteTimeLeft_ - dt);
-    }
-    // Track jump buffer: refreshed while jump is held, counts down airborne.
-    // This lets a press made just before landing (or just as the character
-    // leaves the ground) fire at the next valid opportunity.
-    if (input.jump) {
-        jumpBufferLeft_ = kJumpBufferTime;
-    } else if (jumpBufferLeft_ > 0.0f) {
-        jumpBufferLeft_ = std::max(0.0f, jumpBufferLeft_ - dt);
-    }
-    const bool jumpPressed = input.jump && !prevJumpInput_;
-    prevJumpInput_ = input.jump;
-
     if (grounded) {
         velocity.y = 0.0f;
-        // Jump fires on the rising edge of the button.  When grounded this
-        // is always allowed (coyoteTimeLeft_ >= 0 fresh from the block above).
-        // When airborne but within coyote time (just left ground), the same
-        // check fires from the else-branch below.
-        if (jumpPressed) {
+        if (input.jump) {
             velocity.y = jumpSpeed_;
             grounded = false;
-            lastAirborneState_ = AnimationState::JUMP;  // fresh takeoff = JUMP
             // Legacy one-shot jump timer: only used when the pose search can't
-            // represent the arc (no Jump/Fall poses in the database).  Duration
-            // matches the actual physics air time (~1.1s at 5.5 m/s / 9.8 m/s²)
-            // so mmJumping() stays consistent through the full arc — the old
-            // 0.4s value expired mid-flight, leaving the legacy path with a
-            // stale "not jumping" flag that let Idle leak in.
-            legacyJumpTimer_ = (!mmCanDriveAir)
-                ? (2.0f * jumpSpeed_ / gravity_ + 0.1f) : 0.0f;
-            // Landing recovery: hold the airborne state label briefly before
-            // the FSM is allowed to pick IDLE/WALK, preventing an instant
-            // Fall→Idle snap that looks like the character "skips landing".
-            landingRecoveryLeft_ = kLandingRecovery;
-            coyoteTimeLeft_ = 0.0f;  // consumed
-            jumpBufferLeft_ = 0.0f;  // consumed
+            // represent the arc (no Jump/Fall poses in the database).
+            if (!mmCanDriveAir) legacyJumpTimer_ = 0.4f;
         }
     } else {
-        // Airborne: coyote-time catch — a rising-edge press within the grace
-        // window (just left ground) still takes off, forgiving sub-frame-perfect
-        // timing on platform edges.
-        if (jumpPressed && coyoteTimeLeft_ > 0.0f) {
-            velocity.y = jumpSpeed_;
-            lastAirborneState_ = AnimationState::JUMP;
-            legacyJumpTimer_ = (!mmCanDriveAir)
-                ? (2.0f * jumpSpeed_ / gravity_ + 0.1f) : 0.0f;
-            landingRecoveryLeft_ = kLandingRecovery;
-            coyoteTimeLeft_ = 0.0f;
-            jumpBufferLeft_ = 0.0f;
-        }
         velocity.y -= gravity_ * dt;
         if (legacyJumpTimer_ > 0.0f) legacyJumpTimer_ -= dt;
     }
@@ -837,91 +631,20 @@ inline void AnimatedCharacter::update(float dt, const CharacterInput& input,
     // ---- Integrate ----
     position += velocity * dt;
 
-    // ---- Root Motion Extraction (combat attacks) ----
-    // AAA rule: during combat, the capsule position is driven by the root bone's
-    // baked delta from the FBX, NOT by procedural WASD velocity.  This eliminates
-    // the skating/sliding artifact where the character slides forward regardless
-    // of whether the animation actually moves the feet.
-    // Phase 2+3 pipeline (per todo design doc):
-    //   2. Trajectory Extraction — extract raw root bone displacement
-    //   3. Warping Transform — apply target magnetism if an enemy is nearby
-    if (combatActionActive_ && combatClip_ && animator_) {
-        // 1. Extract raw displacement from the FBX root bone
-        glm::vec3 worldDelta = ComputeRawAssetRootDisplacement(dt);
-
-        // 2. Apply target warping / soft magnetism
-        //    If no explicit target was set, query the nearest enemy via
-        //    the Intent Matrix + LOS filtered spatial query.
-        if (!combatHasTarget_) {
-            combatHasTarget_ = EngineQueryClosestLivingEnemy(
-                position, combatMoveDir_, 5.5f, combatTarget_);
-        }
-        if (combatHasTarget_) {
-            ApplyTargetWarpingToRootMotion(worldDelta, dt, combatTarget_);
-        }
-
-        // 3. Apply definitive root motion to character position
-        position.x += worldDelta.x;
-        position.z += worldDelta.z;
-    }
-
     // ---- Terrain snap ----
     const float floorY = terrain ? terrain(position.x, position.z) : position.y;
     if (grounded) {
         position.y = floorY;
     } else if (position.y <= floorY) {
         position.y = floorY;
+        grounded = true;
         velocity.y = 0.0f;
-        // Jump buffer: if a press was queued mid-air, fire it immediately on
-        // landing so the character doesn't "stick" to the ground when the
-        // player was clearly trying to jump.
-        if (jumpBufferLeft_ > 0.0f) {
-            grounded = false;
-            velocity.y = jumpSpeed_;
-            lastAirborneState_ = AnimationState::JUMP;
-            legacyJumpTimer_ = (!mmCanDriveAir)
-                ? (2.0f * jumpSpeed_ / gravity_ + 0.1f) : 0.0f;
-            landingRecoveryLeft_ = kLandingRecovery;
-            jumpBufferLeft_ = 0.0f;
-            coyoteTimeLeft_ = 0.0f;
-        } else {
-            grounded = true;
-        }
     }
 
     // ---- Locomotion FSM ----
     const float speed2d = glm::length(glm::vec2(velocity.x, velocity.z));
-    // FIX (todo §1): Hysteresis on the JUMP→FALL transition.  The old single
-    // `velocity.y > 0.5f` threshold flipped state as soon as upward velocity
-    // dropped below 0.5 m/s — but gravity crosses 0.5 m/s/symmetrically, so a
-    // character rising *through* 0.5 m/s (ascent) and falling *toward* 0.5 m/s
-    // (descent) both trigger the flip near the apex, causing JUMP↔FALL flicker
-    // on 1-2 frames of float noise.  Hysteresis: only switch to FALL once
-    // descending past -kJumpApexHysteresis, and only switch back to JUMP once
-    // ascending past +kJumpApexHysteresis — the state is sticky through the
-    // flat apex zone.
     if (!grounded) {
-        if (velocity.y > kJumpApexHysteresis) {
-            lastAirborneState_ = AnimationState::JUMP;
-        } else if (velocity.y < -kJumpApexHysteresis && clips_[CLIP_FALL]) {
-            // Only flip to FALL when the clip is actually available.  The Fall
-            // clip is currently removed (see kSlots in loadLocomotion) to
-            // eliminate mid-air JUMP↔FALL clip mismatch — the Jump clip covers
-            // the entire arc.  When Fall is re-added, the hysteresis gate
-            // re-activates automatically.
-            lastAirborneState_ = AnimationState::FALL;
-        }
-        // Between -kJumpApexHysteresis and +kJumpApexHysteresis (near apex):
-        // keep lastAirborneState_ — sticky, no flip.
-        state_ = lastAirborneState_;
-    } else if (landingRecoveryLeft_ > 0.0f && isMotionMatchingActive()) {
-        // Landing recovery: hold the last airborne state (FALL) briefly so the
-        // motion matcher can finish its landing crossfade.  Cutting straight to
-        // IDLE/WALK here is what caused the "jump → instant idle (no fall/land)"
-        // jank the animator saw.  During recovery the rest-override (which keys
-        // on IDLE/CROUCH + grounded) doesn't fire, so the Fall pose holds.
-        landingRecoveryLeft_ -= dt;
-        state_ = lastAirborneState_;
+        state_ = (velocity.y > 0.5f) ? AnimationState::JUMP : AnimationState::FALL;
     } else if (crouching_) {
         state_ = (speed2d > 0.2f) ? AnimationState::CROUCH_WALK : AnimationState::CROUCH;
     } else if (sprinting_) {
@@ -932,67 +655,11 @@ inline void AnimatedCharacter::update(float dt, const CharacterInput& input,
         state_ = AnimationState::IDLE;
     }
 
-    // ---- Combat / dance action playback ----
-    // COMBAT context uses an explicit combo chain (not pose search): each
-    // attack press advances the chain, movement (WASD) still slides the
-    // character, and directional input selects the attack type (forward =
-    // JumpAttack, side = Punch, neutral = Swipe). After the final clip or
-    // timeout, the character auto-returns to Locomotion.
-    const bool attackPressed = input.attack && !prevAttack_;
-    prevAttack_ = input.attack;
-
-    if (combatActionActive_) {
-        // A 1-shot combat clip is playing.  Count it down.
-        combatTimer_ -= dt;
-        comboTimer_ -= dt;  // also shrink the input-acceptance window
-
-        // Attack input during the second half of the clip advances the combo.
-        // Input in the last kAttackBuffer seconds is queued for the next clip.
-        if (attackPressed) {
-            if (combatTimer_ <= kAttackBuffer || comboTimer_ > 0.0f) {
-                pendingAttack_ = true;
-                comboTimer_ = kComboWindow;
-                comboStep_ = std::min(comboStep_ + 1, 3);
-            } else {
-                // Too early — extend the window so the player isn't punished
-                // for a slightly-fast tap.
-                comboTimer_ = kComboWindow;
-                comboStep_ = std::min(comboStep_ + 1, 3);
-            }
-        }
-
-        if (combatTimer_ <= 0.0f) {
-            // Clip finished — either continue the combo or end it.
-            if (pendingAttack_ || comboTimer_ > 0.0f) {
-                pendingAttack_ = false;
-                // Select the next combo clip based on step + direction
-                selectCombatClip(combatClipIndex_, comboStep_, combatMoveDir_);
-                combatTimer_ = combatClip_->duration;
-                comboTimer_ = kComboWindow;
-            } else {
-                // Combo ended — auto-return to Locomotion.
-                endCombatAction();
-            }
-        }
-    } else if (motionContext_ == MotionContext::COMBAT && attackPressed) {
-        // Start a new combo (step 1). Capture the movement direction for
-        // directional attack selection (forward = JumpAttack, side = Punch).
-        combatMoveDir_ = moveDir;
-        startCombatAction(moveDir, moveMag);
-    }
+    // ---- Preview bookkeeping ----
     if (previewActive_) {
         previewTimer_ -= dt;
         if (moveMag > 0.05f || previewTimer_ <= 0.0f) previewActive_ = false;
     }
-
-    // ---- Continuous animation (no pose freezing) ----
-    // REMOVED: Standstill Posture Lock (idle snapshot).
-    // Previously froze the skeleton on the first frame of rest to prevent
-    // IK-loop knee jitter. Now the structural motion graph handles all state
-    // transitions via pre-computed transition clips (slerp + 2D alignment),
-    // and idle poses are selected from the motion database each frame.
-    // Foot IK runs continuously with sub-frame damping (ApplyFootIK) to
-    // eliminate jitter without freezing — all clips flow seamlessly.
 
     // ---- Drive the animation ----
     if (previewActive_ && previewClipIndex_ >= 0 &&
@@ -1000,11 +667,6 @@ inline void AnimatedCharacter::update(float dt, const CharacterInput& input,
         activeClipIndex_ = previewClipIndex_;
         if (animator_->GetCurrentAnimation() != clips_[previewClipIndex_].get()) {
             animator_->Play(clips_[previewClipIndex_].get());
-        }
-    } else if (combatActionActive_ && combatClip_) {
-        // Play the combat/dance one-shot clip directly.
-        if (animator_->GetCurrentAnimation() != combatClip_.get()) {
-            animator_->Play(combatClip_.get());
         }
     } else if (motionMatchingEnabled && mmReady_) {
         // Hand the terrain heightmap to the matcher -> animator foot IK so feet
@@ -1019,6 +681,10 @@ inline void AnimatedCharacter::update(float dt, const CharacterInput& input,
     }
 
     // ---- Evaluate the skeleton (advances layer times, computes matrices) ----
+    // Set the model matrix BEFORE Update() so the clean reference pass in
+    // Update() can transform bone positions to world space for the pelvis
+    // reach comparison inside CalculatePelvisAdjustment.
+    animator_->SetModelMatrix(modelMatrix());
     animator_->Update(dt);
 
     // ---- Foot IK (AFTER skeleton evaluation) -------------------------------
@@ -1029,13 +695,6 @@ inline void AnimatedCharacter::update(float dt, const CharacterInput& input,
     // applied on the NEXT frame's EvaluateNode (standard 1-frame IK latency,
     // masked by the smoothed ankle / pelvis interpolation).
     if ((motionMatchingEnabled && mmReady_) && matcher_) {
-        // CRITICAL ENGINE ALIGNMENT: Synchronize the model matrix translation
-        // directly to the live character velocity profile. Pass horizontal
-        // velocity to the animator to enable velocity-robust over-stride
-        // releases — the IK solver scales its release threshold with body speed
-        // to prevent false releases on high-speed turns.
-        animator_->SetCharacterVelocity(velocity);
-
         // modelMatrix() matches what the renderer uses (180° flip included).
         matcher_->SetCharacterModelMatrix(modelMatrix());
         matcher_->ApplyFootIK(dt);
@@ -1043,16 +702,17 @@ inline void AnimatedCharacter::update(float dt, const CharacterInput& input,
         // matches the IK solve (eliminates 1-frame lag → knee jitter during
         // motion-matching pose switches).
         animator_->RevalidateIK();
+    } else {
+        // FIX (forAnime.txt Fix 4): For the FSM / preview paths, run the
+        // standard Animator foot IK solver + immediate skeleton revalidation.
+        // Without RevalidateIK() here, the fresh IK offsets sit in the ik arrays
+        // for one full frame before reaching the hardware bone matrices,
+        // producing a visible 1-frame lag (Temporal Desync Loop) that causes
+        // foot jitter during slow walks and idles.
+        const bool characterIsMoving = (horizSpeed > 0.05f) || !grounded;
+        animator_->UpdateFootIK(dt, modelMatrix(), /*isMoving=*/characterIsMoving);
+        animator_->RevalidateIK();
     }
-
-    // ---- Procedural Foot Planting (tagless) -------------------------------
-    // Phase 5: Evaluate foot bone velocity and height relative to capsule.
-    // Engage locks dynamically when feet are stationary and near the ground.
-    UpdateProceduralFootPlanting(dt);
-
-    // REMOVED: Idle snapshot capture/release (was todo §1).
-    // The structural transition graph + continuous foot IK damping handle
-    // smooth idle stability without freezing poses.
 }
 
 inline void AnimatedCharacter::driveFsm(float dt) {
@@ -1073,33 +733,11 @@ inline void AnimatedCharacter::driveFsm(float dt) {
     // crossfade is in flight (>=2 layers), since the outgoing layer still owns
     // the highest weight mid-blend and re-blending would restart it.
     const bool fsmStateChanged = state_ != lastFsmState_;
-    // Determine the animator's dominant animation by *layer weight* — NOT via
-    // GetCurrentAnimation(), which falls back to the stale `current` pointer
-    // (nullptr after Play(nullptr) clears the idle snapshot) when every layer's
-    // weight is zero.  That fallback caused a false-positive hijacked=true on
-    // every frame of a finishing crossfade, re-blending the clip at t=0.0
-    // (T-pose pose) indefinitely — the walk snap.
-    Animation* domAnim = nullptr;
-    {
-        float maxW = -1.0f;
-        int nLayers = animator_->GetActiveAnimationLayerCount();
-        for (int li = 0; li < nLayers; ++li) {
-            const auto* l = animator_->GetActiveLayer(li);
-            if (l && l->animation && l->weight > maxW) {
-                maxW = l->weight;
-                domAnim = l->animation;
-            }
-        }
-    }
     const bool hijacked = animator_->GetActiveAnimationLayerCount() <= 1 &&
-                          domAnim != clip;
+                          animator_->GetCurrentAnimation() != clip;
     if (fsmStateChanged || hijacked) {
         lastFsmState_ = state_;
-        // Preserve the current playback time instead of hard-resetting to 0.0f.
-        // The old 0.0f start yanked the clip back to its entry pose on every
-        // false-positive hijack, producing a visible snap to T-pose.  Using
-        // the live clip time keeps the new layer phase-aligned.
-        animator_->BlendToAt(clip, animator_->GetCurrentTime(), kFsmBlendDuration);
+        animator_->BlendToAt(clip, 0.0f, kFsmBlendDuration);
     }
 }
 
@@ -1115,7 +753,6 @@ inline void AnimatedCharacter::driveMotionMatching(float dt, float floorY) {
     CharacterState cs;
     cs.position = position * inv;
     cs.velocity = velocity * inv;
-    cs.worldVelocity = velocity;  // Raw world-space m/s for speed-dependent filters
     cs.rotation = heading;
     cs.moveDirection = lastMoveDir_;
     cs.grounded = grounded;
@@ -1129,55 +766,7 @@ inline void AnimatedCharacter::driveMotionMatching(float dt, float floorY) {
 
     matcher_->SetFloorHeight(floorY);
     matcher_->SetCharacterModelMatrix(modelMat);
-
-    // ---- Clip Lock Mode for Smooth Idle ----
-    // When the character is truly at rest (grounded, zero velocity, no
-    // transition playing), engage clip-lock mode so the idle clip plays
-    // through its full cycle without pose-search interruptions ("cut mid
-    // clip" effect). Resume normal search when the character starts moving.
-    //
-    // IMPORTANT: only engage clip-lock when the matcher already has a valid
-    // current animation. After a transition clip completes, CompleteTransitionNow()
-    // sets currentAnimationPtr = nullptr (forcing re-selection). If clip-lock
-    // engages before that re-selection happens, the matcher skips the search
-    // entirely and the animator is left stuck on the finished transition clip.
-    // By requiring IsClipLockReady() (currentAnimationPtr != nullptr), we
-    // guarantee the matcher has a valid clip to play before suspending the
-    // search — the next frame will engage clip-lock with a real clip loaded.
-    const float speed2dWorld = glm::length(glm::vec2(velocity.x, velocity.z));
-    const bool atRest = grounded && speed2dWorld < kAtRestThreshold &&
-                        !transitionClipPlaying_ && !matcher_->IsPlayingTransitionClip();
-    if (atRest && matcher_->IsClipLockReady()) {
-        matcher_->SetClipLock(true);
-    } else if (matcher_->IsClipLocked()) {
-        matcher_->SetClipLock(false);
-    }
-
     matcher_->Update(dt, cs);
-
-    // ---- Structural Motion Graph: Check transition clip completion ----
-    if (transitionClipPlaying_ && matcher_ && !matcher_->IsPlayingTransitionClip()) {
-        // Transition clip has finished — commit the context switch
-        transitionClipPlaying_ = false;
-        motionContext_ = transitionTargetCtx_;
-        contextSwitchCooldown_ = kContextSwitchCooldown;
-        std::cout << "[AnimatedCharacter] Transition clip complete -> "
-                  << motionContextName() << " context active\n";
-
-        // --- HIGH-LEVEL ATOMIC PRIMING PASS ---
-        // Extract the exact target entry frame from the destination database
-        // and push it into the animator layer immediately to prevent a
-        // 0-weight fallback (the single-frame T-pose snap). This mirrors
-        // the atomic hand-off in HybridMMFSM::Update — both ensure the
-        // target animation is at full weight the same frame the transition
-        // completes, so there's no frame where totalWeight < 0.0001f.
-        auto destinationAnim = matcher_->GetCurrentAnimation();
-        if (destinationAnim && animator_) {
-            animator_->Play(destinationAnim.get());
-            animator_->SetCurrentTime(matcher_->GetCurrentAnimationTime());
-        }
-        // --------------------------------------
-    }
 
     // Deterministic safety-net overrides on top of the pose search. These are
     // edge-triggered: they blend ONCE, only when the animator/matcher is not
@@ -1190,40 +779,11 @@ inline void AnimatedCharacter::driveMotionMatching(float dt, float floorY) {
     // the contextual databases the matcher already picks the right gait (the
     // crouch DB contains only Crouch/CrouchWalk), so this is a safety net,
     // not a per-frame driver.
-    // Deterministic safety-net overrides on top of the pose search. These are
-    // edge-triggered: they blend ONCE, only when the animator/matcher is not
-    // already playing the target clip. The old version force-blended every
-    // frame, which (a) re-ramped the crossfade each frame (blendProgress
-    // reset -> the blend never settled), (b) yanked the clip time to
-    // GetCurrentTime() mid-blend (gait-phase mismatch / footskate), and (c)
-    // spammed the console via the Animator's [BlendTo] prints - a visible
-    // FPS drop + pose mismatch whenever the bot crouched or stood still. With
-    // the contextual databases the matcher already picks the right gait (the
-    // crouch DB contains only Crouch/CrouchWalk), so this is a safety net,
-    // not a per-frame driver.
-    //
-    // DEFERRED: when clip-lock mode is active (idle) or a transition clip is
-    // playing, the safety net must NOT run — it would override the clip-lock's
-    // time advancement with BlendToAt calls, cutting the idle mid-cycle, and
-    // it would interfere with transition clip playback.
-    const bool matcherPlayingTransition =
-        matcher_ && matcher_->IsPlayingTransitionClip();
-    const bool clipLocked = matcher_ && matcher_->IsClipLocked();
-    // CRITICAL HIGH-LEVEL PROTECTION GATE:
-    // Completely disable safety-net overrides if a transition clip is active
-    // OR the matcher is structurally blending joints via its internal
-    // transition clip layer. The (motionContext_ == transitionTargetCtx_)
-    // check ensures the context has fully settled — during a transition the
-    // contexts mismatch and the safety net would override the blend mid-stride.
-    const bool safetyNetActive = !clipLocked &&
-                                 !transitionClipPlaying_ &&
-                                 !matcherPlayingTransition &&
-                                 (motionContext_ == transitionTargetCtx_);
     const bool locomotionLike =
         motionContext_ == MotionContext::LOCOMOTION ||
         motionContext_ == MotionContext::CROUCH;
     const float speed2d = glm::length(glm::vec2(velocity.x, velocity.z));
-    if (safetyNetActive && grounded && locomotionLike) {
+    if (grounded && locomotionLike) {
         const int slot =
             crouching_
                 ? ((speed2d > 0.2f) ? CLIP_CROUCH_WALK : CLIP_CROUCH)
@@ -1239,7 +799,14 @@ inline void AnimatedCharacter::driveMotionMatching(float dt, float floorY) {
             const bool animatorOnIt =
                 animator_->GetCurrentAnimation() == want;
             if (!matcherOnIt && !animatorOnIt) {
-                animator_->BlendToAt(want, animator_->GetCurrentTime(), 0.2f);
+                // FIX (forAnime.txt Fix 3): Only force-blend when there is
+                // active movement. At true idle the motion matcher context
+                // should own the pose; forcing a BlendToAt here repeatedly
+                // appends layers, resets root motion, and disrupts the IK
+                // targets every frame, causing feet to jitter in place.
+                if (speed2d > 0.05f) {
+                    animator_->BlendToAt(want, animator_->GetCurrentTime(), 0.2f);
+                }
             }
         }
     }
@@ -1430,12 +997,9 @@ inline void AnimatedCharacter::addClipToContext(MotionContext ctx, const std::st
     // with a no-op deleter) so the FBX is never parsed twice. Safe: the
     // context databases are destroyed before clips_.
     static const std::pair<const char*, ClipSlot> kSlotFiles[] = {
-        {"Creature Pack/mutant idle.fbx", CLIP_IDLE},
-        {"Creature Pack/mutant walking.fbx", CLIP_WALK},
-        {"Creature Pack/mutant run.fbx", CLIP_RUN},
-        {"Creature Pack/mutant jumping.fbx", CLIP_JUMP},
-        {"Crouching.fbx", CLIP_CROUCH},
-        {"chrouchWalk.fbx", CLIP_CROUCH_WALK},
+        {"Idle.fbx", CLIP_IDLE}, {"Walking.fbx", CLIP_WALK},
+        {"Run.fbx", CLIP_RUN}, {"Jump.fbx", CLIP_JUMP}, {"Fall.fbx", CLIP_FALL},
+        {"Crouching.fbx", CLIP_CROUCH}, {"chrouchWalk.fbx", CLIP_CROUCH_WALK},
     };
     for (const auto& sf : kSlotFiles) {
         if (file != sf.first || !clips_[sf.second]) continue;
@@ -1464,14 +1028,10 @@ inline void AnimatedCharacter::addClipToContext(MotionContext ctx, const std::st
 
 inline void AnimatedCharacter::buildContextDatabases(const std::string& dir) {
     for (auto& db : contextDatabases_) db.reset();  // fresh load
-    for (auto& tree : contextSearchTrees_) tree.reset();  // discard stale trees
     // Only the DEFAULT search domain is built eagerly - the other contexts
     // (crouch/combat/capoeira/dance) load lazily on first request, per the
     // suggestions' "only load what the active context needs".
     ensureContextBuilt(MotionContext::LOCOMOTION);
-    // Also eagerly build Crouch since walk↔crouch is the most common
-    // transition and the transition graph needs both endpoints at load time.
-    ensureContextBuilt(MotionContext::CROUCH);
 }
 
 inline void AnimatedCharacter::ensureContextBuilt(MotionContext ctx) {
@@ -1481,27 +1041,20 @@ inline void AnimatedCharacter::ensureContextBuilt(MotionContext ctx) {
 
     struct ContextClip { const char* name; const char* file; };
     static const ContextClip kLocomotion[] = {
-        {"Idle", "Creature Pack/mutant idle.fbx"},
-        {"Walk", "Creature Pack/mutant walking.fbx"},
-        {"Run", "Creature Pack/mutant run.fbx"},
-        {"Jump", "Creature Pack/mutant jumping.fbx"},
-        {"LeftTurn", "Creature Pack/mutant left turn 45.fbx"},
-        {"RightTurn", "Creature Pack/mutant right turn 45.fbx"},
-        {"RightTurn90", "Creature Pack/mutant right turn 90.fbx"},
+        {"Idle", "Idle.fbx"}, {"Walk", "Walking.fbx"}, {"Jog", "Jogging.fbx"},
+        {"Run", "Run.fbx"}, {"Jump", "Jump.fbx"}, {"Fall", "Fall.fbx"},
+        {"Catwalk", "Catwalk Idle To Walk Forward.fbx"},
+        {"LeftTurn", "Left Turn.fbx"}, {"RightTurn", "Right Turn.fbx"},
+        {"RunLookBack", "Run Look Back.fbx"},
     };
     static const ContextClip kCrouch[] = {
         {"Crouch", "Crouching.fbx"}, {"CrouchWalk", "chrouchWalk.fbx"},
     };
     static const ContextClip kCombat[] = {
-        {"Punch", "Creature Pack/mutant punch.fbx"},
-        {"Swipe", "Creature Pack/mutant swiping.fbx"},
-        {"JumpAttack", "Creature Pack/jump attack.fbx"},
-        {"Defeated", "Defeated.fbx"},
+        {"Boxing", "Boxing.fbx"}, {"BodyBlock", "Body Block.fbx"},
+        {"BoxTurn", "Box Turn.fbx"}, {"Defeated", "Defeated.fbx"},
     };
     static const ContextClip kDance[] = {
-        {"Roar", "Creature Pack/mutant roaring.fbx"},
-        {"Flex", "Creature Pack/mutant flexing muscles.fbx"},
-        {"Breathing", "Creature Pack/mutant breathing idle.fbx"},
         {"Rumba", "Rumba Dancing.fbx"}, {"HipHop", "Hip Hop Dancing.fbx"},
         {"Capoeira", "Capoeira.fbx"}, {"Taunt", "Taunt.fbx"},
         {"Taunt2", "Taunt(1).fbx"}, {"SittingLaugh", "Sitting Laughing.fbx"},
@@ -1525,18 +1078,6 @@ inline void AnimatedCharacter::ensureContextBuilt(MotionContext ctx) {
             break;
         default:
             break;
-    }
-
-    // FIX (todo §2): Pre-build the KD-tree and pre-warm the SIMD SoA cache
-    // for this context's database at LOAD TIME.  At runtime setMotionContext()
-    // swaps in both via SetDatabaseExplicit (zero allocation), so neither
-    // BuildSearchIndex() nor RebuildSIMDCacheIfNeeded() ever allocates mid-frame
-    // during a crouch↔run transition.
-    if (contextDatabases_[idx] && contextDatabases_[idx]->GetPoseCount() > 0 &&
-        !contextSearchTrees_[idx]) {
-        contextSearchTrees_[idx] = std::make_unique<MotionKDTree>();
-        contextSearchTrees_[idx]->BuildWithSAH(contextDatabases_[idx]->GetPoses(), 10);
-        contextDatabases_[idx]->RebuildSIMDCacheIfNeeded();  // pre-bake SoA snapshot
     }
 }
 
@@ -1584,59 +1125,17 @@ inline void AnimatedCharacter::setMotionContext(MotionContext ctx, float blendDu
     if (!matcher_ || !mmReady_) return;
     const int idx = static_cast<int>(ctx);
     if (idx < 0 || idx >= static_cast<int>(MotionContext::COUNT)) return;
-    (void)blendDuration;  // retained for API compatibility; transition clips have fixed duration
 
-    // Build the context's database + KD-tree + SIMD cache on first request
-    // (all contexts build lazily on first request except LOCOMOTION which is
-    // built at load time).
+    // Build the context's database on first request (crouch/combat/capoeira/
+    // dance are lazy - only the default locomotion context is eager).
     ensureContextBuilt(ctx);
     if (!contextDatabases_[idx] || contextDatabases_[idx]->GetPoseCount() == 0) return;
-    if (!contextSearchTrees_[idx]) return;  // tree must be pre-built (shouldn't happen)
-    if (motionContext_ == ctx) return;  // already active - don't re-swap
+    if (motionContext_ == ctx) return;  // already active - don't restart the blend
 
-    // ---- Structural Motion Graph: Play pre-computed transition clip ----
-    // Instead of instantly swapping databases (SetDatabaseExplicit), look up
-    // a pre-baked transition clip from the motion transition graph. The clip
-    // smoothly blends ALL joints via slerp + linear root interpolation with
-    // 2D coordinate alignment over ~0.33s. When the clip finishes, the
-    // MotionMatcher swaps to the target database seamlessly.
-    auto clip = transitionGraph_.GetTransition(
-        static_cast<int>(motionContext_), static_cast<int>(ctx));
-
-    if (clip && matcher_) {
-        // Play the transition clip through the MotionMatcher
-        const MotionDatabase* targetDB = contextDatabases_[idx].get();
-        const MotionKDTree* targetTree = contextSearchTrees_[idx].get();
-        matcher_->PlayTransitionClip(
-            clip,
-            targetDB ? *targetDB : *matcher_->GetDatabase(),
-            targetTree ? *targetTree : matcher_->GetSearchTree(),
-            0);
-
-        transitionClipPlaying_ = true;
-        transitionTargetCtx_ = ctx;
-        contextSwitchCooldown_ = kContextSwitchCooldown;  // prevent rapid re-toggle
-        std::cout << "[AnimatedCharacter] Playing transition clip: "
-                  << motionContextName() << " -> "
-                  << ([&]{ switch(ctx) {
-                      case MotionContext::LOCOMOTION: return "Locomotion";
-                      case MotionContext::CROUCH: return "Crouch";
-                      case MotionContext::COMBAT: return "Combat";
-                      case MotionContext::CAPOEIRA: return "Capoeira";
-                      case MotionContext::DANCE: return "Dance";
-                      default: return "Unknown";
-                  }}())
-                  << " (" << clip->duration << "s)\n";
-    } else {
-        // Fallback: instant swap (e.g. for contexts without a pre-built
-        // transition clip, like CAPOEIRA/DANCE which may not be built yet)
-        matcher_->SetDatabaseExplicit(*contextDatabases_[idx], *contextSearchTrees_[idx]);
-        motionContext_ = ctx;
-        std::cout << "[AnimatedCharacter] Instant motion context switch (no transition clip) -> "
-                  << motionContextName() << " ("
-                  << contextDatabases_[idx]->GetAnimationCount() << " clips, "
-                  << contextDatabases_[idx]->GetPoseCount() << " poses, SIMD pre-warmed)\n";
-    }
+    matcher_->SetDatabase(*contextDatabases_[idx], blendDuration);
+    motionContext_ = ctx;
+    std::cout << "[AnimatedCharacter] Motion context -> " << motionContextName()
+              << " (" << contextDatabases_[idx]->GetAnimationCount() << " clips)\n";
 }
 
 inline std::string AnimatedCharacter::motionContextName() const {
@@ -1663,294 +1162,41 @@ inline int AnimatedCharacter::contextClipCount(MotionContext ctx) const {
                ? static_cast<int>(contextDatabases_[idx]->GetAnimationCount()) : 0;
 }
 
-inline bool AnimatedCharacter::isClipLocked() const {
-    return matcher_ ? matcher_->IsClipLocked() : false;
+inline std::string AnimatedCharacter::contextClipName(MotionContext ctx, size_t index) const {
+    const int idx = static_cast<int>(ctx);
+    if (idx < 0 || idx >= static_cast<int>(MotionContext::COUNT)) return std::string();
+    if (!contextDatabases_[idx]) return std::string();
+    return contextDatabases_[idx]->GetAnimationName(index);
 }
 
-// -------------------------------------------------------------------
-// Combat combo helpers
-// -------------------------------------------------------------------
-// Combat clip preference by combo step + movement direction (forward,
-// side, or neutral).  The Creature Pack provides three combat clips:
-//   - Punch      (quick jab, forward/side)
-//   - Swipe      (wide arc, neutral)
-//   - JumpAttack (leap forward, forward-only)
-// Step 1 = starter, Step 2 = chamber, Step 3 = finisher.
+inline AnimatedCharacter::MMDiagnosticTile AnimatedCharacter::mmDiagnosticTile() const {
+    MMDiagnosticTile tile;
+    if (!matcher_ || !mmReady_) return tile;
 
-inline void AnimatedCharacter::startCombatAction(const glm::vec2& moveDir, float moveMag) {
-    const int ctxIdx = static_cast<int>(MotionContext::COMBAT);
-    auto* db = contextDatabases_[ctxIdx].get();
-    if (!db || db->GetAnimationCount() == 0) return;
+    const MotionMatchingDebug& dbg = matcher_->GetDebugInfo();
+    tile.posesSearched = dbg.posesSearched;
+    tile.searchTimeMs = dbg.searchTimeMs;
+    tile.matchScore = dbg.currentResult.score;
 
-    comboStep_ = 1;
-    comboTimer_ = kComboWindow;
-    combatMoveDir_ = moveDir;
-    selectCombatClip(combatClipIndex_, comboStep_, moveDir);
-
-    if (!combatClip_) return;
-    combatActionActive_ = true;
-    combatTimer_ = combatClip_->duration;
-}
-
-inline void AnimatedCharacter::selectCombatClip(int& outIdx, int step, const glm::vec2& dir) {
-    const int ctxIdx = static_cast<int>(MotionContext::COMBAT);
-    auto* db = contextDatabases_[ctxIdx].get();
-    if (!db) {
-        combatClip_.reset();
-        return;
+    // KD-Tree stats from the matcher's search tree
+    if (matcher_->GetDatabase()) {
+        tile.databaseClips = (int)matcher_->GetDatabase()->GetAnimationCount();
+        tile.databasePoses = (int)matcher_->GetDatabase()->GetPoseCount();
     }
+    MotionKDTree::TreeStats treeStats = matcher_->GetKDTreeStats();
+    tile.kdTreeNodes = (int)treeStats.totalNodes;
+    tile.kdTreeDepth = treeStats.maxDepth;
+    tile.kdTreeLeaves = (int)treeStats.leafNodes;
 
-    // Directional selection:
-    //   forward (|dir.y| > |dir.x|, -Y is forward) → JumpAttack
-    //   side (|dir.x| > |dir.y|)                      → Punch
-    //   neutral (moveMag < 0.1)                      → Swipe
-    const bool forward = std::abs(dir.y) > std::abs(dir.x) && dir.y < -0.1f;
-    const bool sideways = std::abs(dir.x) > 0.1f && !forward;
-    const bool neutral = std::abs(dir.x) < 0.1f && std::abs(dir.y) < 0.1f;
-
-    std::string preferred;
-    if (step == 1) {
-        if (forward)      preferred = "JumpAttack";
-        else              preferred = "Punch";
-    } else if (step == 2) {
-        if (sideways)     preferred = "Punch";
-        else if (forward) preferred = "JumpAttack";
-        else              preferred = "Swipe";
-    } else {  // step 3 = finisher
-        preferred = "JumpAttack";
-    }
-
-    std::shared_ptr<Animation> clip = db->GetAnimation(preferred);
-    if (!clip) {
-        // Fallback: cycle through all combat clips
-        size_t idx = (comboStep_ - 1) % db->GetAnimationCount();
-        clip = db->GetAnimation(idx);
-    }
-
-    if (clip) {
-        combatClip_ = clip;
-        outIdx = combatClipIndex_ = (combatClipIndex_ + 1) % 3;
-    }
-}
-
-inline void AnimatedCharacter::endCombatAction() {
-    combatActionActive_ = false;
-    combatTimer_ = 0.0f;
-    comboStep_ = 0;
-    comboTimer_ = 0.0f;
-    pendingAttack_ = false;
-    combatClip_.reset();
-
-    // Auto-return to Locomotion if we were in Combat.
-    if (motionContext_ == MotionContext::COMBAT) {
-        setMotionContext(MotionContext::LOCOMOTION);
-    }
-    state_ = AnimationState::IDLE;
-    lastFsmState_ = state_;
-}
-
-// -------------------------------------------------------------------
-// AAA Root Motion Extraction
-// -------------------------------------------------------------------
-// Extracts the root bone's displacement between the previous and current
-// animation time, transforms it to world space, and applies it to the
-// character's position.  This is the "Golden Rule" of AAA combat animation:
-// the capsule follows the authored root motion, not procedural velocity.
-
-inline bool AnimatedCharacter::combatClipNeedsRootMotion() const {
-    // All Creature Pack combat clips have root bone position animation.
-    // Return false only if the clip lacks position keys (then procedural
-    // velocity handles movement).
-    if (!combatClip_) return false;
-    static const std::vector<std::string> rootNames = {
-        "hips", "Hips", "mixamorig:hips", "mixamorig:Hips",
-        "Root", "root", "pelvis", "Pelvis"
-    };
-    for (const auto& name : rootNames) {
-        auto it = combatClip_->boneAnimations.find(NormalizeBoneName(name));
-        if (it != combatClip_->boneAnimations.end()) {
-            return !it->second.positionTimes.empty();
-        }
-    }
-    return !combatClip_->boneAnimations.empty() &&
-           !combatClip_->boneAnimations.begin()->second.positionTimes.empty();
-}
-
-inline glm::vec3 AnimatedCharacter::ComputeRawAssetRootDisplacement(float dt) {
-    if (!combatClip_ || !animator_) return glm::vec3(0.0f);
-
-    // 1. Find the root bone animation in the combat clip
-    const BoneAnimation* rootBone = nullptr;
-    static const std::vector<std::string> rootNames = {
-        "hips", "Hips", "mixamorig:hips", "mixamorig:Hips",
-        "Root", "root", "pelvis", "Pelvis"
-    };
-    for (const auto& name : rootNames) {
-        auto it = combatClip_->boneAnimations.find(NormalizeBoneName(name));
-        if (it != combatClip_->boneAnimations.end()) {
-            rootBone = &it->second;
-            break;
-        }
-    }
-    if (!rootBone || rootBone->positionTimes.empty()) return glm::vec3(0.0f);
-
-    // 2. Sample root bone position at current and previous time
-    float currTime = animator_->GetCurrentTime();
-    float prevTime = std::max(0.0f, currTime - dt);
-
-    // Linear interpolation helper for raw bone track
-    auto sampleRootPos = [](const BoneAnimation* bone, float t) -> glm::vec3 {
-        if (bone->positionTimes.empty()) return glm::vec3(0.0f);
-        if (t <= bone->positionTimes.front()) return bone->positionValues.front();
-        if (t >= bone->positionTimes.back()) return bone->positionValues.back();
-        for (size_t i = 0; i + 1 < bone->positionTimes.size(); ++i) {
-            if (t >= bone->positionTimes[i] && t <= bone->positionTimes[i + 1]) {
-                float span = bone->positionTimes[i + 1] - bone->positionTimes[i];
-                if (span <= 0.0f) return bone->positionValues[i];
-                float f = (t - bone->positionTimes[i]) / span;
-                return glm::mix(bone->positionValues[i], bone->positionValues[i + 1], f);
-            }
-        }
-        return bone->positionValues.front();
-    };
-
-    glm::vec3 posPrev = sampleRootPos(rootBone, prevTime);
-    glm::vec3 posCurr = sampleRootPos(rootBone, currTime);
-    glm::vec3 localDelta = posCurr - posPrev;
-
-    // 3. Transform local delta → world space using character heading.
-    // Local -Z is forward; the FBX root bone moves in the character's local
-    // space, so we rotate by the inverse heading to get world-aligned motion.
-    glm::mat4 rot = glm::rotate(glm::mat4(1.0f), heading + kPi,
-                                glm::vec3(0.0f, 1.0f, 0.0f));
-    glm::vec3 worldDelta = glm::vec3(rot * glm::vec4(localDelta, 1.0f))
-                            * scale * visualScale;
-
-    // XZ only — Y is handled by gravity/physics
-    return glm::vec3(worldDelta.x, 0.0f, worldDelta.z);
-}
-
-inline void AnimatedCharacter::ApplyTargetWarpingToRootMotion(
-        glm::vec3& outWorldDelta, float dt, const glm::vec3& enemyTargetPos) {
-    if (!combatActionActive_ || !combatClip_) return;
-
-    // 1. Current spatial error between capsule and target
-    float currentDistance = glm::distance(position, enemyTargetPos);
-    const float kIdealStrikeDistance = 1.4f; // metres — preferred attack range
-
-    // Out of range: no warping needed
-    if (currentDistance < 0.1f || currentDistance > 5.5f) return;
-
-    // 2. Separate horizontal displacement from raw root motion
-    glm::vec2 horizontalDelta(outWorldDelta.x, outWorldDelta.z);
-    float rawStepLength = glm::length(horizontalDelta);
-    if (rawStepLength < 0.001f) return; // don't warp stationary attacks
-
-    // 3. Compute direction to target
-    glm::vec3 targetDir = glm::normalize(enemyTargetPos - position);
-    glm::vec2 warpDirection(targetDir.x, targetDir.z);
-
-    // 4. Compute adaptive warp scale
-    float remainingTime = combatTimer_;
-    if (remainingTime <= dt) return;
-
-    float requiredClosingSpeed = (currentDistance - kIdealStrikeDistance) / remainingTime;
-    float baselineSpeed = rawStepLength / dt;
-
-    float warpScalingFactor = 1.0f;
-    if (baselineSpeed > 0.001f) {
-        warpScalingFactor = requiredClosingSpeed / baselineSpeed;
-        warpScalingFactor = glm::clamp(warpScalingFactor, 0.6f, 1.8f);
-    }
-
-    // 5. Soft magnetism: blend 45% toward warped direction
-    glm::vec2 warpedHorizontal = glm::mix(horizontalDelta,
-        warpDirection * rawStepLength * warpScalingFactor, 0.45f);
-
-    outWorldDelta.x = warpedHorizontal.x;
-    outWorldDelta.z = warpedHorizontal.y;
-}
-
-inline bool AnimatedCharacter::EngineQueryClosestLivingEnemy(
-        const glm::vec3& from, const glm::vec2& dir,
-        float maxDist, glm::vec3& outTargetPos) {
-    // Delegate to WorldManager's NPC tracking system with Intent Matrix
-    // Scoring + Line-of-Sight filtering.
-    World::WorldManager& wm = World::WorldManager::getInstance();
-    float score = 0.0f;
-    // Lift dir from 2D (x, y) → 3D forward (x, 0, y) for world-space cone
-    glm::vec3 forward3d(dir.x, 0.0f, dir.y);
-    if (forward3d.length() < 0.001f) forward3d = glm::vec3(0, 0, -1.0f);  // default forward
-    forward3d = glm::normalize(forward3d);
-    return wm.getNearestEnemy(from, forward3d, maxDist, outTargetPos, score);
-}
-
-inline void AnimatedCharacter::UpdateProceduralFootPlanting(float dt) {
-    if (!animator_ || !skeleton_ || dt <= 0.0001f) return;
-
-    // Resolve foot bone indices (cached)
-    static const int leftFootIdx =
-        skeleton_->GetBoneIndex("LeftFoot") >= 0
-            ? skeleton_->GetBoneIndex("LeftFoot")
-            : skeleton_->GetBoneIndex("leftfoot");
-    static const int rightFootIdx =
-        skeleton_->GetBoneIndex("RightFoot") >= 0
-            ? skeleton_->GetBoneIndex("RightFoot")
-            : skeleton_->GetBoneIndex("rightfoot");
-
-    if (leftFootIdx < 0 || rightFootIdx < 0) return;
-
-    // Track last local foot positions across frames
-    static glm::vec3 lastLocalPosLeft{0.0f};
-    static glm::vec3 lastLocalPosRight{0.0f};
-
-    const glm::mat4 ident(1.0f);
-
-    // 1. Local foot positions relative to character capsule
-    glm::vec3 currentLocalPosLeft  = animator_->GetBoneWorldPosition(leftFootIdx, ident) - position;
-    glm::vec3 currentLocalPosRight = animator_->GetBoneWorldPosition(rightFootIdx, ident) - position;
-
-    // 2. Derive foot velocity relative to capsule
-    glm::vec3 velLeft  = (currentLocalPosLeft  - lastLocalPosLeft)  / dt;
-    glm::vec3 velRight = (currentLocalPosRight - lastLocalPosRight) / dt;
-
-    lastLocalPosLeft  = currentLocalPosLeft;
-    lastLocalPosRight = currentLocalPosRight;
-
-    // 3. Threshold gates for locking
-    const float kVelocityThreshold = 0.18f;  // m/s — foot must be nearly stationary
-    const float kHeightThreshold   = 0.08f;  // metres — foot must be near ground
-
-    auto EvaluateStanceLock = [&](glm::vec3& vel, glm::vec3& localPos,
-                                   auto& footIKData) {
-        float horizontalSpeed = glm::length(glm::vec2(vel.x, vel.z));
-        float absoluteHeight  = localPos.y;
-
-        if (grounded && horizontalSpeed < kVelocityThreshold &&
-            absoluteHeight < kHeightThreshold) {
-            // Engage lock
-            if (!footIKData.isLocked) {
-                footIKData.isLocked = true;
-                footIKData.lockedPosition =
-                    animator_->GetBoneWorldPosition(
-                        &footIKData == &animator_->leftFootIK ? leftFootIdx : rightFootIdx,
-                        modelMatrix());
-            }
-            // Smooth weight ramp-up
-            footIKData.lockWeight = std::min(1.0f,
-                footIKData.lockWeight + (5.0f * dt));
-        } else {
-            // Release lock smoothly
-            footIKData.lockWeight = std::max(0.0f,
-                footIKData.lockWeight - (8.0f * dt));
-            if (footIKData.lockWeight <= 0.0f) {
-                footIKData.isLocked = false;
-            }
-        }
-    };
-
-    EvaluateStanceLock(velLeft,  currentLocalPosLeft,  animator_->leftFootIK);
-    EvaluateStanceLock(velRight, currentLocalPosRight, animator_->rightFootIK);
+    // SIMD status (compile-time)
+#ifdef __AVX2__
+    tile.simdStatus = "AVX2";
+#elif defined(__SSE4_1__)
+    tile.simdStatus = "SSE4.1";
+#else
+    tile.simdStatus = "Scalar";
+#endif
+    return tile;
 }
 
 inline void AnimatedCharacter::TrimClipTo(Animation& clip, float maxSeconds) {
@@ -1971,4 +1217,156 @@ inline void AnimatedCharacter::TrimClipTo(Animation& clip, float maxSeconds) {
         trim(ba.rotationTimes, ba.rotationValues);
         trim(ba.scaleTimes, ba.scaleValues);
     }
+}
+
+// ============================================================================
+// Hot-Swap: Synchronous Character Pack Reloading (forhotswap.txt, stage 1).
+// Rebuilds the Animator/MotionMatcher/Databases/Clips in place so an external
+// observer (e.g. PlayModeController -> EditorApplication render model) keeps
+// valid refs across a pack change. Runs on the main thread, before render.
+// ============================================================================
+inline void AnimatedCharacter::FlushMotionSystems() {
+    // Tear down in strict dependency order so no dependent system holds a
+    // dangling alias into memory we've already released:
+    //   Animator -> MotionMatcher -> Contextual Databases -> Clip Assets.
+    if (animator_) {
+        animator_.reset();
+    }
+    if (matcher_) {
+        matcher_->SetTerrainFn(nullptr);  // detach live fn before reset
+        matcher_.reset();
+    }
+    for (auto& db : contextDatabases_) {
+        db.reset();
+    }
+    clips_.clear();
+    clipSpeeds_.clear();
+    mmReady_ = false;
+    clipCount_ = 0;
+    idleClipDuration_ = 0.0f;
+    // A fully-flushed character has no systems/clips -> not loaded/ready.
+    loaded_ = false;
+}
+
+inline bool AnimatedCharacter::HotSwapCharacterPack(const std::string& fbxModelPath,
+                                                    const std::string& clipsDirectory) {
+    if (fbxModelPath.empty() || clipsDirectory.empty()) {
+        isSystemDirty_ = true;
+        return false;
+    }
+    activeModelPath_ = fbxModelPath;
+    activeClipsDir_  = clipsDirectory;
+    isSystemDirty_   = true;
+
+    // 1) Flush live motion systems (Animator / Matcher / DBs / Clips).
+    FlushMotionSystems();
+
+    // 2) Reload structure + clips + motion DBs. This reuses the verified
+    //    load()/loadLocomotion() path, so the rebuilt character is
+    //    byte-identical to a freshly-loaded one (skeleton/animator/matcher +
+    //    the LOCOMOTION KD-tree all rebuilt and ready).
+    if (!load(fbxModelPath)) {
+        isSystemDirty_ = true;
+        return false;
+    }
+    if (loadLocomotion(clipsDirectory) < 1) {
+        isSystemDirty_ = true;
+        return false;
+    }
+
+    // 3) Land cleanly: reset the FSM so driveFsm acquires the freshly-built
+    //    clip slots on the next update (no stale state_ referencing freed clips).
+    state_ = AnimationState::IDLE;
+    lastFsmState_ = AnimationState::NONE;
+    activeClipIndex_ = CLIP_IDLE;
+    isSystemDirty_ = false;
+    return true;
+}
+
+// ============================================================================
+// Hot-Swap: Asynchronous Double-Buffered System Swap (forhotswap.txt, stage 2).
+// The worker thread builds a staging AnimatedCharacter (load+loadLocomotion)
+// and calls ExtractRuntimeSystems(); the main thread then move-applies the
+// result onto the LIVE character. Extract preserves the source pose; Apply
+// preserves the LIVE pose so a pack change never teleports the bot.
+// ============================================================================
+inline AnimatedCharacter::RuntimeSystems AnimatedCharacter::ExtractRuntimeSystems() {
+    RuntimeSystems rs;
+    rs.animator   = std::move(animator_);
+    rs.skeleton   = std::move(skeleton_);
+    rs.matcher    = std::move(matcher_);
+    for (size_t i = 0; i < (size_t)MotionContext::COUNT; ++i) {
+        rs.databases[i] = std::move(contextDatabases_[i]);
+    }
+    rs.clips      = std::move(clips_);
+    rs.clipSpeeds = std::move(clipSpeeds_);
+
+    // Copy the load-derived scalars BEFORE Flush zeroes the source.
+    rs.rawSizeY         = rawSizeY_;
+    rs.targetHeight     = targetHeight_;
+    rs.idleClipDuration = idleClipDuration_;
+    rs.clipCount        = clipCount_;
+    rs.clipsDir         = std::move(clipsDir_);
+    rs.mmReady          = mmReady_;
+    rs.loaded           = loaded_;
+
+    // Leave the source flushed/empty (mirrors FlushMotionSystems scalars) so
+    // the staging character is non-ready while its systems live in transit.
+    FlushMotionSystems();
+    return rs;
+}
+
+inline void AnimatedCharacter::ApplyRuntimeSystems(RuntimeSystems&& rs) {
+    // Preserve the LIVE world pose across the swap - the staging pack may be a
+    // completely different model, but the bot must not teleport mid-play.
+    const glm::vec3 posePos  = position;
+    const float      poseHdg = heading;
+    const glm::vec3  poseVel = velocity;
+    const glm::vec3  poseNrm = terrainNormal;
+
+    // Release the live motion systems (Animator -> Matcher -> DBs -> Clips).
+    FlushMotionSystems();
+
+    // Adopt the staging systems + load-derived scalars (mirrors load()+
+    // loadLocomotion() on a freshly-built pack).
+    animator_   = std::move(rs.animator);
+    skeleton_   = std::move(rs.skeleton);
+    matcher_    = std::move(rs.matcher);
+    for (size_t i = 0; i < (size_t)MotionContext::COUNT; ++i) {
+        contextDatabases_[i] = std::move(rs.databases[i]);
+    }
+    clips_      = std::move(rs.clips);
+    clipSpeeds_ = std::move(rs.clipSpeeds);
+
+    rawSizeY_         = rs.rawSizeY;
+    targetHeight_     = rs.targetHeight;
+    idleClipDuration_ = rs.idleClipDuration;
+    clipCount_        = rs.clipCount;
+    clipsDir_         = std::move(rs.clipsDir);
+    mmReady_          = rs.mmReady;
+    loaded_           = rs.loaded;
+
+    // Re-derive render scale exactly like load() does.
+    scale = (rawSizeY_ > 0.001f) ? (targetHeight_ / rawSizeY_) : 1.0f;
+
+    // Restore the pose we saved (Flush never touches these, but be defensive).
+    position      = posePos;
+    heading       = poseHdg;
+    velocity      = poseVel;
+    terrainNormal = poseNrm;
+
+    // Re-arm the FSM so driveFsm acquires the freshly-applied clip slots and
+    // no stale clip pointers (from the old pack) linger in the FSM state.
+    state_           = AnimationState::IDLE;
+    lastFsmState_    = AnimationState::NONE;
+    activeClipIndex_ = CLIP_IDLE;
+    crouching_       = false;
+    sprinting_       = false;
+    wasCrouching_    = false;
+    lastMoveDir_     = glm::vec2(0.0f);
+    legacyJumpTimer_ = 0.0f;
+    previewActive_   = false;
+    previewClipIndex_ = -1;
+    previewTimer_     = 0.0f;
+    isSystemDirty_    = false;
 }

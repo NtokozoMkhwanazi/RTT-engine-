@@ -1,4 +1,5 @@
 #include "editor_state.h"
+#include "AnimatedCharacter.h"  // A: complete type for NPCSpawnAsyncState::Capsule::~Capsule (unique_ptr<AnimatedCharacter> member)
 #include "mesh_builder.h"
 #include "shader_manager.h"
 #include "grid_renderer.h"
@@ -13,13 +14,28 @@ namespace Editor {
 
 Editor::Editor() = default;
 
+// NPCSpawnAsyncState::Capsule holds std::unique_ptr<AnimatedCharacter>
+// (forward-declared in editor_state.h); define its destructor here where
+// AnimatedCharacter is complete so the staged character is destroyed on the
+// main thread when an async NPC spawn is committed or abandoned.
+Editor::UIState::NPCSpawnAsyncState::Capsule::~Capsule() = default;
+
+
 Editor::~Editor() {
     // RAII: ensure cleanup runs even if shutdown() was not called.
     shutdown();
 }
 
 void Editor::setSelectedEntity(ecs::EntityID id) noexcept {
+    // Trigger the viewport selection pulse only on a *real* change of selection
+    // to a valid entity (clearing or re-selecting the same ID is silent).
+    if (id != selectedEntity_ && id != ecs::INVALID_ENTITY_ID) {
+        triggerSelectionPulse(kPulseDuration);
+    }
     selectedEntity_ = id;
+    // Symmetric with setSelectedPropInstance: picking an ECS entity releases
+    // any prop gizmo so the two selection modes never overlap.
+    clearSelectedPropInstance();
 }
 
 bool Editor::initialize() {
@@ -32,7 +48,7 @@ bool Editor::initialize() {
     // Initialize resources
     ShaderManager::InitShaders();
     MeshBuilder::InitAll();
-    GridRenderer::Init(20, 1.0f);
+    GridRenderer::Init(100, 1.0f);  // was: Init(20, 1.0f) — 20-unit grid was a
     viewportFB_.initialize(1280, 720);
 
     // Register meshes
@@ -95,9 +111,6 @@ bool Editor::initialize() {
     geoTerrainSystem_.setGeospatialSystem(&geospatialSystem_);
     geoTerrainSystem_.generateTerrain();
 
-    // Initialize GeoTerrain Renderer
-    geoTerrainRenderer_.initialize();
-
     world_.addStaticSystem(&geospatialSystem_);
     world_.addStaticSystem(&geoTerrainSystem_);
 #endif
@@ -122,7 +135,6 @@ void Editor::shutdown() {
 
     renderer_.Shutdown();
 #ifndef DISABLE_GEOSPATIAL
-    geoTerrainRenderer_.shutdown();
     geospatialSystem_.shutdown();
 #endif
 

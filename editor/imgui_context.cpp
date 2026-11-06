@@ -46,6 +46,11 @@ bool ImGuiContext::initialize(GLFWwindow* window, const char* glslVersion) {
         return false;
     }
 
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr; // Disable ini file saving/loading for performance
+    // io.ConfigFlags |= ImGuiConfigFlags_DockingEnable; // Not using docking
+    io.ConfigWindowsResizeFromEdges = true;
+
     if (!ImGui_ImplGlfw_InitForOpenGL(window, true)) {
         ImGui::DestroyContext(context_);
         context_ = nullptr;

@@ -25,17 +25,47 @@ static void CleanupMesh(MeshData& mesh) {
     mesh.indexCount = 0;
 }
 
-MeshData CreateCube() {
+// Upload a Verts blob to a fresh GL VAO/VBO/EBO. Shared by every Create*() so
+// the vertex math lives in exactly one place (the Create*Verts() helpers) and
+// the GL handle path cannot drift from the CPU-verts path the RHI bridge reads.
+MeshData UploadVerts(const Verts& v) {
     MeshData mesh;
-    
-    float verts[] = {
+    mesh.indexCount = (GLsizei)v.indices.size();
+    glGenVertexArrays(1, &mesh.vao);
+    glGenBuffers(1, &mesh.vbo);
+    glGenBuffers(1, &mesh.ebo);
+    glBindVertexArray(mesh.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 v.vertices.size() * sizeof(float), v.vertices.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                 v.indices.size() * sizeof(uint32_t), v.indices.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glBindVertexArray(0);
+    return mesh;
+}
+
+// ---------------------------------------------------------------------------
+// CPU-only vertex generators (source-of-truth). Create*() call these; the RHI
+// bridge (RenderPipeline::toOffscreenScene) calls them directly. Both paths are
+// therefore built from the identical vertex math → GL/Vulkan pixel parity.
+// ---------------------------------------------------------------------------
+Verts CreateCubeVerts() {
+    Verts cube;
+    float v[] = {
         // positions          // normals           // texcoords
         -0.5f,-0.5f,-0.5f,  0,0,-1,  0,0,   0.5f,-0.5f,-0.5f,  0,0,-1,  1,0,   0.5f,0.5f,-0.5f,  0,0,-1,  1,1,
          0.5f,0.5f,-0.5f,  0,0,-1,  1,1,  -0.5f,0.5f,-0.5f,  0,0,-1,  0,1,  -0.5f,-0.5f,-0.5f,  0,0,-1,  0,0,
         -0.5f,-0.5f, 0.5f,  0,0, 1,  0,0,   0.5f,-0.5f, 0.5f,  0,0, 1,  1,0,   0.5f, 0.5f, 0.5f,  0,0, 1,  1,1,
          0.5f, 0.5f, 0.5f,  0,0, 1,  1,1,  -0.5f, 0.5f, 0.5f,  0,0, 1,  0,1,  -0.5f,-0.5f, 0.5f,  0,0, 1,  0,0,
         -0.5f, 0.5f, 0.5f, -1,0, 0,  0,0,  -0.5f, 0.5f,-0.5f, -1,0, 0,  1,0,  -0.5f,-0.5f,-0.5f, -1,0, 0,  1,1,
-        -0.5f,-0.5f,-0.5f, -1,0, 0,  1,1,  -0.5f,-0.5f, 0.5f, -1,0, 0,  0,1,  -0.5f, 0.5f, 0.5f, -1,0, 0,  0,0,
+        -0.5f,-0.5f,-0.5f, -1,0, 0,  0,1,  -0.5f,-0.5f, 0.5f, -1,0, 0,  0,1,  -0.5f, 0.5f, 0.5f, -1,0, 0,  0,0,
          0.5f, 0.5f, 0.5f,  1,0, 0,  0,0,   0.5f, 0.5f,-0.5f,  1,0, 0,  1,0,   0.5f,-0.5f,-0.5f,  1,0, 0,  1,1,
          0.5f,-0.5f,-0.5f,  1,0, 0,  1,1,   0.5f,-0.5f, 0.5f,  1,0, 0,  0,1,   0.5f, 0.5f, 0.5f,  1,0, 0,  0,0,
         -0.5f,-0.5f,-0.5f,  0,-1, 0,  0,0,   0.5f,-0.5f,-0.5f,  0,-1, 0,  1,0,   0.5f,-0.5f, 0.5f,  0,-1, 0,  1,1,
@@ -43,331 +73,232 @@ MeshData CreateCube() {
         -0.5f, 0.5f,-0.5f,  0, 1, 0,  0,0,   0.5f, 0.5f,-0.5f,  0, 1, 0,  1,0,   0.5f, 0.5f, 0.5f,  0, 1, 0,  1,1,
          0.5f, 0.5f, 0.5f,  0, 1, 0,  1,1,  -0.5f, 0.5f, 0.5f,  0, 1, 0,  0,1,  -0.5f, 0.5f,-0.5f,  0, 1, 0,  0,0
     };
-    unsigned int idx[] = {
-        0,1,2,2,3,4,5, 6,7,7,8,9, 10,11,12,12,13,14,
-        15,16,17,17,18,19, 20,21,22,22,23,24, 25,26,27,27,28,29,
-        30,31,32,32,33,34, 35,36,37,37,38,39
+    uint32_t idx[] = {
+        0,  1,  2,  3,  4,  5,      // -Z face
+        6,  7,  8,  9, 10, 11,      // +Z face
+        12, 13, 14, 15, 16, 17,     // -X face
+        18, 19, 20, 21, 22, 23,     // +X face
+        24, 25, 26, 27, 28, 29,     // -Y face
+        30, 31, 32, 33, 34, 35      // +Y face
     };
-
-    glGenVertexArrays(1, &mesh.vao);
-    glGenBuffers(1, &mesh.vbo);
-    glGenBuffers(1, &mesh.ebo);
-
-    glBindVertexArray(mesh.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx), idx, GL_STATIC_DRAW);
-
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(3*sizeof(float)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(6*sizeof(float)));
-    glEnableVertexAttribArray(2);
-
-    glBindVertexArray(0);
-    mesh.indexCount = 36;
-    
-    return mesh;
+    cube.vertices.assign(v, v + sizeof(v) / sizeof(float));
+    cube.indices.assign(idx, idx + sizeof(idx) / sizeof(uint32_t));
+    return cube;
 }
 
-MeshData CreateSphere(int rings, int segments, float radius) {
-    MeshData mesh;
-    std::vector<float> verts;
-    std::vector<unsigned int> indices;
-
+Verts CreateSphereVerts(int rings, int segments, float radius) {
+    Verts s;
     for (int r = 0; r <= rings; r++) {
         float phi = M_PI * r / rings;
         float sinPhi = std::sin(phi);
         float cosPhi = std::cos(phi);
-
-        for (int s = 0; s <= segments; s++) {
-            float theta = 2.0f * M_PI * s / segments;
+        for (int i = 0; i <= segments; i++) {
+            float theta = 2.0f * M_PI * i / segments;
             float sinTheta = std::sin(theta);
             float cosTheta = std::cos(theta);
-
             float x = radius * sinPhi * cosTheta;
             float y = radius * cosPhi;
             float z = radius * sinPhi * sinTheta;
-
             float nx = sinPhi * cosTheta;
             float ny = cosPhi;
             float nz = sinPhi * sinTheta;
-
-            float u = (float)s / segments;
+            float u = (float)i / segments;
             float v = (float)r / rings;
-
-            verts.insert(verts.end(), {x, y, z, nx, ny, nz, u, v});
+            s.vertices.insert(s.vertices.end(), {x, y, z, nx, ny, nz, u, v});
         }
     }
-
     for (int r = 0; r < rings; r++) {
-        for (int s = 0; s < segments; s++) {
-            unsigned int current = r * (segments + 1) + s;
-            unsigned int next = current + segments + 1;
-            indices.insert(indices.end(), {
+        for (int i = 0; i < segments; i++) {
+            uint32_t current = r * (segments + 1) + i;
+            uint32_t next = current + segments + 1;
+            s.indices.insert(s.indices.end(), {
                 current, next, current + 1,
                 current + 1, next, next + 1
             });
         }
     }
-
-    mesh.indexCount = indices.size();
-    glGenVertexArrays(1, &mesh.vao);
-    glGenBuffers(1, &mesh.vbo);
-    glGenBuffers(1, &mesh.ebo);
-    glBindVertexArray(mesh.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
-    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glBindVertexArray(0);
-
-    std::cout << "[Mesh] Sphere: " << verts.size()/8 << " verts, " << mesh.indexCount << " indices\n";
-    return mesh;
+    return s;
 }
 
-MeshData CreatePlane() {
-    MeshData mesh;
-    float verts[] = {
+Verts CreatePlaneVerts() {
+    Verts p;
+    float v[] = {
         // positions          // normals           // texcoords
         -0.5f, 0.0f, -0.5f,  0, 1, 0,  0, 0,
          0.5f, 0.0f, -0.5f,  0, 1, 0,  1, 0,
          0.5f, 0.0f,  0.5f,  0, 1, 0,  1, 1,
         -0.5f, 0.0f,  0.5f,  0, 1, 0,  0, 1,
     };
-    unsigned int indices[] = { 0, 1, 2, 2, 3, 0 };
-    mesh.indexCount = 6;
-
-    glGenVertexArrays(1, &mesh.vao);
-    glGenBuffers(1, &mesh.vbo);
-    glGenBuffers(1, &mesh.ebo);
-    glBindVertexArray(mesh.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glBindVertexArray(0);
-
-    return mesh;
+    uint32_t idx[] = { 0, 1, 2, 2, 3, 0 };
+    p.vertices.assign(v, v + sizeof(v) / sizeof(float));
+    p.indices.assign(idx, idx + sizeof(idx) / sizeof(uint32_t));
+    return p;
 }
 
-MeshData CreateCylinder(int radialSegments, float radius, float height) {
-    MeshData mesh;
-    std::vector<float> verts;
-    std::vector<unsigned int> indices;
+Verts CreateCylinderVerts(int radialSegments, float radius, float height) {
+    Verts c;
     float halfH = height * 0.5f;
-
-    // Side vertices
     for (int i = 0; i <= radialSegments; i++) {
         float theta = 2.0f * M_PI * i / radialSegments;
         float cosT = std::cos(theta);
         float sinT = std::sin(theta);
-
         float x = radius * cosT;
         float z = radius * sinT;
-
-        verts.insert(verts.end(), {x, -halfH, z, cosT, 0, sinT, (float)i/radialSegments, 0});
-        verts.insert(verts.end(), {x,  halfH, z, cosT, 0, sinT, (float)i/radialSegments, 1});
+        c.vertices.insert(c.vertices.end(), {x, -halfH, z, cosT, 0, sinT, (float)i/radialSegments, 0});
+        c.vertices.insert(c.vertices.end(), {x,  halfH, z, cosT, 0, sinT, (float)i/radialSegments, 1});
     }
-
-    // Side indices
     for (int i = 0; i < radialSegments; i++) {
-        unsigned int bottom0 = i * 2;
-        unsigned int bottom1 = (i + 1) * 2;
-        unsigned int top0 = bottom0 + 1;
-        unsigned int top1 = bottom1 + 1;
-        indices.insert(indices.end(), {bottom0, top0, bottom1, bottom1, top0, top1});
+        uint32_t bottom0 = i * 2;
+        uint32_t bottom1 = (i + 1) * 2;
+        uint32_t top0 = bottom0 + 1;
+        uint32_t top1 = bottom1 + 1;
+        c.indices.insert(c.indices.end(), {bottom0, top0, bottom1, bottom1, top0, top1});
     }
-
     // Top cap
-    unsigned int topCenter = verts.size() / 8;
-    verts.insert(verts.end(), {0, halfH, 0, 0, 1, 0, 0.5f, 0.5f});
-    unsigned int topRingStart = verts.size() / 8;
+    uint32_t topCenter = c.vertices.size() / 8;
+    c.vertices.insert(c.vertices.end(), {0, halfH, 0, 0, 1, 0, 0.5f, 0.5f});
+    uint32_t topRingStart = c.vertices.size() / 8;
     for (int i = 0; i <= radialSegments; i++) {
         float theta = 2.0f * M_PI * i / radialSegments;
         float cosT = std::cos(theta);
         float sinT = std::sin(theta);
-        verts.insert(verts.end(), {radius * cosT, halfH, radius * sinT, 0, 1, 0, cosT*0.5f+0.5f, sinT*0.5f+0.5f});
+        c.vertices.insert(c.vertices.end(), {radius * cosT, halfH, radius * sinT, 0, 1, 0, cosT*0.5f+0.5f, sinT*0.5f+0.5f});
     }
     for (int i = 0; i < radialSegments; i++) {
-        indices.insert(indices.end(), {topCenter, topRingStart + i, topRingStart + i + 1});
+        c.indices.insert(c.indices.end(), {topCenter, topRingStart + i + 1, topRingStart + i});
     }
-
     // Bottom cap
-    unsigned int bottomCenter = verts.size() / 8;
-    verts.insert(verts.end(), {0, -halfH, 0, 0, -1, 0, 0.5f, 0.5f});
-    unsigned int bottomRingStart = verts.size() / 8;
+    uint32_t bottomCenter = c.vertices.size() / 8;
+    c.vertices.insert(c.vertices.end(), {0, -halfH, 0, 0, -1, 0, 0.5f, 0.5f});
+    uint32_t bottomRingStart = c.vertices.size() / 8;
     for (int i = 0; i <= radialSegments; i++) {
         float theta = 2.0f * M_PI * i / radialSegments;
         float cosT = std::cos(theta);
         float sinT = std::sin(theta);
-        verts.insert(verts.end(), {radius * cosT, -halfH, radius * sinT, 0, -1, 0, cosT*0.5f+0.5f, sinT*0.5f+0.5f});
+        c.vertices.insert(c.vertices.end(), {radius * cosT, -halfH, radius * sinT, 0, -1, 0, cosT*0.5f+0.5f, sinT*0.5f+0.5f});
     }
     for (int i = 0; i < radialSegments; i++) {
-        indices.insert(indices.end(), {bottomCenter, bottomRingStart + i + 1, bottomRingStart + i});
+        c.indices.insert(c.indices.end(), {bottomCenter, bottomRingStart + i + 1, bottomRingStart + i});
     }
-
-    mesh.indexCount = indices.size();
-    glGenVertexArrays(1, &mesh.vao);
-    glGenBuffers(1, &mesh.vbo);
-    glGenBuffers(1, &mesh.ebo);
-    glBindVertexArray(mesh.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
-    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glBindVertexArray(0);
-
-    std::cout << "[Mesh] Cylinder: " << verts.size()/8 << " verts, " << mesh.indexCount << " indices\n";
-    return mesh;
+    return c;
 }
 
-MeshData CreateCone(int radialSegments, float radius, float height) {
-    MeshData mesh;
-    std::vector<float> verts;
-    std::vector<unsigned int> indices;
-
+Verts CreateConeVerts(int radialSegments, float radius, float height) {
+    Verts c;
+    float halfH = height * 0.5f;
     // Apex
-    verts.insert(verts.end(), {0, height*0.5f, 0, 0, 1, 0, 0.5f, 0.5f});
-
+    c.vertices.insert(c.vertices.end(), {0, halfH, 0, 0, 1, 0, 0.5f, 0.5f});
     // Base ring
-    unsigned int baseRingStart = 1;
+    uint32_t baseRingStart = 1;
     for (int i = 0; i <= radialSegments; i++) {
         float theta = 2.0f * M_PI * i / radialSegments;
         float cosT = std::cos(theta);
         float sinT = std::sin(theta);
-
         float x = radius * cosT;
         float z = radius * sinT;
-
         float ny = radius / height;
         float nLen = std::sqrt(cosT*cosT + ny*ny + sinT*sinT);
         float nx = cosT / nLen;
         float nny = ny / nLen;
         float nz = sinT / nLen;
-
-        verts.insert(verts.end(), {x, -height*0.5f, z, nx, nny, nz, (float)i/radialSegments, 0});
+        c.vertices.insert(c.vertices.end(), {x, -halfH, z, nx, nny, nz, (float)i/radialSegments, 0});
     }
-
-    // Side triangles
     for (int i = 0; i < radialSegments; i++) {
-        indices.insert(indices.end(), {0, baseRingStart + i, baseRingStart + i + 1});
+        c.indices.insert(c.indices.end(), {0, baseRingStart + i, baseRingStart + i + 1});
     }
-
     // Base cap
-    unsigned int baseCenter = verts.size() / 8;
-    verts.insert(verts.end(), {0, -height*0.5f, 0, 0, -1, 0, 0.5f, 0.5f});
-    unsigned int baseCapRingStart = verts.size() / 8;
+    uint32_t baseCenter = c.vertices.size() / 8;
+    c.vertices.insert(c.vertices.end(), {0, -halfH, 0, 0, -1, 0, 0.5f, 0.5f});
+    uint32_t baseCapRingStart = c.vertices.size() / 8;
     for (int i = 0; i <= radialSegments; i++) {
         float theta = 2.0f * M_PI * i / radialSegments;
         float cosT = std::cos(theta);
         float sinT = std::sin(theta);
-        verts.insert(verts.end(), {radius * cosT, -height*0.5f, radius * sinT, 0, -1, 0, cosT*0.5f+0.5f, sinT*0.5f+0.5f});
+        c.vertices.insert(c.vertices.end(), {radius * cosT, -halfH, radius * sinT, 0, -1, 0, cosT*0.5f+0.5f, sinT*0.5f+0.5f});
     }
     for (int i = 0; i < radialSegments; i++) {
-        indices.insert(indices.end(), {baseCenter, baseCapRingStart + i + 1, baseCapRingStart + i});
+        c.indices.insert(c.indices.end(), {baseCenter, baseCapRingStart + i + 1, baseCapRingStart + i});
     }
-
-    mesh.indexCount = indices.size();
-    glGenVertexArrays(1, &mesh.vao);
-    glGenBuffers(1, &mesh.vbo);
-    glGenBuffers(1, &mesh.ebo);
-    glBindVertexArray(mesh.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
-    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glBindVertexArray(0);
-
-    std::cout << "[Mesh] Cone: " << verts.size()/8 << " verts, " << mesh.indexCount << " indices\n";
-    return mesh;
+    return c;
 }
 
-MeshData CreateTorus(int majorSegments, int minorSegments, float majorRadius, float minorRadius) {
-    MeshData mesh;
-    std::vector<float> verts;
-    std::vector<unsigned int> indices;
-
+Verts CreateTorusVerts(int majorSegments, int minorSegments, float majorRadius, float minorRadius) {
+    Verts t;
     for (int i = 0; i <= majorSegments; i++) {
         float theta = 2.0f * M_PI * i / majorSegments;
         float cosTheta = std::cos(theta);
         float sinTheta = std::sin(theta);
-
         for (int j = 0; j <= minorSegments; j++) {
             float phi = 2.0f * M_PI * j / minorSegments;
             float cosPhi = std::cos(phi);
             float sinPhi = std::sin(phi);
-
             float x = (majorRadius + minorRadius * cosPhi) * cosTheta;
             float y = minorRadius * sinPhi;
             float z = (majorRadius + minorRadius * cosPhi) * sinTheta;
-
             float nx = cosPhi * cosTheta;
             float ny = sinPhi;
             float nz = cosPhi * sinTheta;
-
             float u = (float)i / majorSegments;
             float v = (float)j / minorSegments;
-
-            verts.insert(verts.end(), {x, y, z, nx, ny, nz, u, v});
+            t.vertices.insert(t.vertices.end(), {x, y, z, nx, ny, nz, u, v});
         }
     }
-
     for (int i = 0; i < majorSegments; i++) {
         for (int j = 0; j < minorSegments; j++) {
-            unsigned int current = i * (minorSegments + 1) + j;
-            unsigned int next = current + minorSegments + 1;
-            indices.insert(indices.end(), {
+            uint32_t current = i * (minorSegments + 1) + j;
+            uint32_t next = current + minorSegments + 1;
+            t.indices.insert(t.indices.end(), {
                 current, next, current + 1,
                 current + 1, next, next + 1
             });
         }
     }
+    return t;
+}
 
-    mesh.indexCount = indices.size();
-    glGenVertexArrays(1, &mesh.vao);
-    glGenBuffers(1, &mesh.vbo);
-    glGenBuffers(1, &mesh.ebo);
-    glBindVertexArray(mesh.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
-    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glBindVertexArray(0);
+// ---------------------------------------------------------------------------
+// GL-handle wrappers (upload the CPU verts to a VAO). Behavior is identical to
+// the original implementation; the vertex math now lives in Create*Verts().
+// ---------------------------------------------------------------------------
+MeshData CreateCube() {
+    Verts v = CreateCubeVerts();
+    MeshData mesh = UploadVerts(v);
+    std::cout << "[Mesh] Cube: " << v.vertices.size()/8 << " verts, " << mesh.indexCount << " indices\n";
+    return mesh;
+}
 
-    std::cout << "[Mesh] Torus: " << verts.size()/8 << " verts, " << mesh.indexCount << " indices\n";
+MeshData CreateSphere(int rings, int segments, float radius) {
+    Verts v = CreateSphereVerts(rings, segments, radius);
+    MeshData mesh = UploadVerts(v);
+    std::cout << "[Mesh] Sphere: " << v.vertices.size()/8 << " verts, " << mesh.indexCount << " indices\n";
+    return mesh;
+}
+
+MeshData CreatePlane() {
+    Verts v = CreatePlaneVerts();
+    MeshData mesh = UploadVerts(v);
+    std::cout << "[Mesh] Plane: " << v.vertices.size()/8 << " verts, " << mesh.indexCount << " indices\n";
+    return mesh;
+}
+
+MeshData CreateCylinder(int radialSegments, float radius, float height) {
+    Verts v = CreateCylinderVerts(radialSegments, radius, height);
+    MeshData mesh = UploadVerts(v);
+    std::cout << "[Mesh] Cylinder: " << v.vertices.size()/8 << " verts, " << mesh.indexCount << " indices\n";
+    return mesh;
+}
+
+MeshData CreateCone(int radialSegments, float radius, float height) {
+    Verts v = CreateConeVerts(radialSegments, radius, height);
+    MeshData mesh = UploadVerts(v);
+    std::cout << "[Mesh] Cone: " << v.vertices.size()/8 << " verts, " << mesh.indexCount << " indices\n";
+    return mesh;
+}
+
+MeshData CreateTorus(int majorSegments, int minorSegments, float majorRadius, float minorRadius) {
+    Verts v = CreateTorusVerts(majorSegments, minorSegments, majorRadius, minorRadius);
+    MeshData mesh = UploadVerts(v);
+    std::cout << "[Mesh] Torus: " << v.vertices.size()/8 << " verts, " << mesh.indexCount << " indices\n";
     return mesh;
 }
 

@@ -102,6 +102,46 @@ void SetThemeMode(ThemeMode mode) {
     ApplyTheme();
 }
 
+// ============================================================================
+// UI scale / zoom
+// ============================================================================
+namespace {
+float s_uiScale = 1.0f;
+}
+
+float GetUIScale() {
+    return s_uiScale;
+}
+
+void SetUIScale(float scale) {
+    if (scale < 0.5f) scale = 0.5f;
+    if (scale > 2.0f) scale = 2.0f;
+    if (s_uiScale == scale) return;
+    s_uiScale = scale;
+
+    // Scale the font rendering so text stays crisp at any zoom level.
+    ImGuiIO& io = ImGui::GetIO();
+    io.FontGlobalScale = scale;
+
+    // Scale base style metrics so widgets, padding, and spacing all grow/
+    // shrink with the text. This is the "browser zoom" equivalent — every
+    // element scales proportionally while layout structure stays identical.
+    ImGuiStyle& style = ImGui::GetStyle();
+    auto imv2 = [](float x, float y) { return ImVec2(x, y); };
+    style.WindowPadding    = imv2(8 * scale, 8 * scale);
+    style.FramePadding     = imv2(6 * scale, 4 * scale);
+    style.CellPadding      = imv2(6 * scale, 4 * scale);
+    style.ItemSpacing      = imv2(8 * scale, 4 * scale);
+    style.ItemInnerSpacing = imv2(4 * scale, 4 * scale);
+    style.TouchExtraPadding = ImVec2(0, 0);
+    style.WindowRounding   = 4.0f * scale;
+    style.FrameRounding    = 4.0f * scale;
+    style.GrabRounding     = 3.0f * scale;
+    style.WindowBorderSize = 1.0f * scale;
+    style.ChildBorderSize  = 1.0f * scale;
+    style.PopupBorderSize  = 1.0f * scale;
+}
+
 const Palette& Get() {
     return s_mode == ThemeMode::Dark ? kDarkPalette : kLightPalette;
 }
@@ -224,17 +264,22 @@ void ApplyTheme() {
     style.GrabRounding      = 4.0f;
     style.TabRounding       = 4.0f;
 
-    style.WindowBorderSize    = 1.0f;
-    style.ChildBorderSize     = 1.0f;
+    // Minimalist polish (forUI.txt §1): drop panel/child borders entirely —
+    // the palette's panelBg vs bg contrast delineates docked windows, so the
+    // workspace reads as a single seamless canvas. Popups keep a 1px border
+    // for affordance.
+    style.WindowBorderSize    = 0.0f;
+    style.ChildBorderSize     = 0.0f;
     style.PopupBorderSize     = 1.0f;
     style.FrameBorderSize     = 0.0f;
     style.TabBorderSize       = 0.0f;
 
-    style.WindowPadding    = ImVec2(10, 10);
-    style.FramePadding     = ImVec2(8, 5);
-    style.ItemSpacing      = ImVec2(8, 5);
+    // Tighter padding for a denser, modern UE5/Blender-style surface.
+    style.WindowPadding    = ImVec2(8, 8);
+    style.FramePadding     = ImVec2(7, 4);
+    style.ItemSpacing      = ImVec2(7, 5);
     style.ItemInnerSpacing = ImVec2(5, 5);
-    style.CellPadding      = ImVec2(8, 4);
+    style.CellPadding      = ImVec2(6, 4);
     style.ScrollbarSize    = 12.0f;
     style.GrabMinSize      = 10.0f;
     style.IndentSpacing    = 18.0f;

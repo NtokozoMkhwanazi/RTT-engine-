@@ -7,7 +7,7 @@
  * Why this exists:
  * - In test.cpp, main() calls glfwDestroyWindow + glfwTerminate BEFORE returning.
  * - After main() returns, C++ static destructors run.
- * - Several globally-owned objects (g_editor.renderer, g_editor.geoTerrainRenderer,
+ * - Several globally-owned objects (g_editor.renderer,
  *   RenderPipeline singleton) have destructors that perform GL cleanup.
  * - Calling any GL function after the context is destroyed is undefined behavior
  *   and on Linux/GLX manifests as a SIGSEGV at exit.

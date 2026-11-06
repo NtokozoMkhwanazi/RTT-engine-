@@ -75,6 +75,21 @@ struct Palette {
 // The palette for the active theme mode (see editor_theme.cpp).
 const Palette& Get();
 
+// ============================================================================
+// UI scale / zoom (proportional layout scaling)
+// ============================================================================
+// A single float (0.5–2.0, default 1.0) that scales fonts, panel dimensions,
+// widget padding, and tab/button heights together — like zooming in a browser.
+// The *structure* of the layout (which panels exist and where they dock) is
+// never affected; only the visual size grows or shrinks.
+//
+// SetScale() updates io.FontGlobalScale and scales the base ImGui style
+// metrics (WindowPadding, FramePadding, ItemSpacing, etc.) so widgets remain
+// legible at every zoom level. Call it whenever the user changes the slider.
+void SetUIScale(float scale);
+float GetUIScale();
+const Palette& Get();
+
 // Convenience conversions.
 inline ImU32 ToU32(const ImVec4& c) { return ImGui::ColorConvertFloat4ToU32(c); }
 inline ImVec4 WithAlpha(const ImVec4& c, float a) { return ImVec4(c.x, c.y, c.z, a); }

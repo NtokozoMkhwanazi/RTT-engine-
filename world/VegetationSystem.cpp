@@ -148,6 +148,14 @@ void VegetationSystem::cleanupInstanceBuffers() {
 
 void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,
                                          const std::vector<float>& heights, int heightmapSize) {
+    // verify.txt Step 3: Enforce strict production asset validation. If this is
+    // an outer chunk and no elevation data array is provided, halt generation!
+    // This prevents the engine from scattering placeholder props at y=0.0f
+    // across empty chunks that have no heightmap backing.
+    if (heights.empty() && (chunkX != 0 || chunkY != 0)) {
+        return;
+    }
+
     float worldStartX = chunkX * chunkSize;
     float worldStartZ = chunkY * chunkSize;
     
@@ -161,15 +169,6 @@ void VegetationSystem::generateForChunk(int chunkX, int chunkY, float chunkSize,
     // Generate trees
     int numTrees = (int)(chunkSize * chunkSize * m_config.treeDensity);
     numTrees = std::min(numTrees, m_config.maxTreesPerChunk);
-
-    // Global hard cap for performance: never place more than 5 trees scene-wide
-    // total (overridable via VegetationConfig::treeDensity/maxTreesPerChunk for
-    // production). The function-local static accumulates across chunks so the
-    // cap is global, not per-chunk.
-    static int s_totalTreesPlaced = 0;
-    constexpr int kMaxTotalTrees = 5;
-    numTrees = std::max(0, std::min(numTrees, kMaxTotalTrees - s_totalTreesPlaced));
-    s_totalTreesPlaced += numTrees;
     
     for (int i = 0; i < numTrees; i++) {
         glm::vec3 pos;

@@ -53,24 +53,13 @@ const char* kTerrainGrassNormalPath  = "assets/grass/textures/grass_medium_01_no
 const char* kTerrainGrassRoughPath   = "assets/grass/textures/grass_medium_01_rough_4k.exr";
 const char* kTerrainGrassAoPath      = "assets/grass/textures/grass_medium_01_ao_4k.jpg";
 
-// Authored displacement heightmap (grayscale height in [0,1]). When wired via
-// Terrain::setHeightmapSource(), this feeds the GL_R32F master heightmap that
-// drives the terrain_splat vertex displacement (see Terrain::loadHeightmapFromFile).
-// 8-bit PNG is the shipped asset; a 16/32-bit EXR height would give higher
-// displacement precision for "true terrain" — but for now the PNG is resampled
-// (bilinear) down to the heightmap resolution and pre-scaled to [0, heightScale].
-const char* kTerrainHeightmapPath    = "assets/boulder/textures/rocky_terrain_disp_4k.png";
-
-//   Layer 1 = rocky ground (mid slopes) — the rocks_ground PBR set (the
-//   "rocky terrain we used before" looked flat; this higher-quality set is
-//   the base rocky material for the AAA look). Albedo is sRGB; normal is EXR;
-//   roughness ships as an 8-bit JPG (no EXR), so it loads through the LDR
+//   Layer 1 = rocky ground (mid slopes) — the rocks_ground_05_4k PBR set.
+//   Higher-quality than the old rocks_ground_02 set. Albedo is sRGB; normal
+//   is EXR; roughness ships as EXR; ARM is 8-bit JPG, loaded through the LDR
 //   single-channel path in Terrain.cpp.
-const char* kTerrainRocksGroundAlbedoPath = "assets/rocks_ground/textures/rocks_ground_02_col_4k.jpg";
-const char* kTerrainRocksGroundNormalPath = "assets/rocks_ground/textures/rocks_ground_02_nor_gl_4k.exr";
-const char* kTerrainRocksGroundRoughPath  = "assets/rocks_ground/textures/rocks_ground_02_rough_4k.jpg";
-// (rocks_ground_02_height_4k.png exists for a future detail-displacement pass;
-//  the vertex shader currently displaces from the master heightmap only.)
+const char* kTerrainRocksGroundAlbedoPath = "assets/rocks_ground_05_4k/textures/rocks_ground_05_diff_4k.jpg";
+const char* kTerrainRocksGroundNormalPath = "assets/rocks_ground_05_4k/textures/rocks_ground_05_nor_gl_4k.exr";
+const char* kTerrainRocksGroundRoughPath  = "assets/rocks_ground_05_4k/textures/rocks_ground_05_rough_4k.exr";
 
 const char* kTerrainAerialAlbedoPath = "assets/boulder/textures/aerial_rocks_02_diff_4k.jpg";
 const char* kTerrainAerialNormalPath = "assets/boulder/textures/aerial_rocks_02_nor_gl_4k.exr";
@@ -271,6 +260,16 @@ static GLuint CompileTerrainProgram(const char* fsSource) {
         char log[1024];
         glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
         std::cerr << "[TerrainShader] Link error: " << log << "\n";
+        // glCreateProgram() always returns a non-zero handle even on link
+        // failure; returning that handle here makes initTerrainShader() (and
+        // thus Terrain::render's legacy path) treat a NON-LINKED program as
+        // valid -> glUseProgram(non-linked) emits GL_INVALID_OPERATION and
+        // draws zero pixels every frame ("loaded but invisible"). Delete it and
+        // return 0 so the `if (g_terrainShader == 0) return;` guard below fires
+        // and the caller falls back / surfaces the failure instead of silently
+        // rendering nothing.
+        glDeleteProgram(prog);
+        prog = 0;
     }
 
     glDeleteShader(vert);
@@ -808,15 +807,10 @@ void TerrainChunk::generateIndices(int lod) {
     }
 }
 
-void TerrainChunk::draw(bool asPatches) const {
+void TerrainChunk::draw() const {
     if (!m_loaded || m_VAO == 0 || m_lod >= 3) return;
 
     glBindVertexArray(m_VAO);
-    if (asPatches) {
-        // Tessellation path: each triangle in the index list becomes a patch.
-        glDrawElements(GL_PATCHES, (GLsizei)m_indices.size(), GL_UNSIGNED_INT, 0);
-    } else {
-        glDrawElements(GL_TRIANGLES, (GLsizei)m_indices.size(), GL_UNSIGNED_INT, 0);
-    }
+    glDrawElements(GL_TRIANGLES, (GLsizei)m_indices.size(), GL_UNSIGNED_INT, 0);
     glBindVertexArray(0);
 }

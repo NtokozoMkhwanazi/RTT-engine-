@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <glm/glm.hpp>
+#include "WorldObjectManager.h"  // WorldObjectType for ClassifyImportedNode (forUI.txt Item 1)
 
 // World import system for loading levels from various formats
 class WorldImporter {
@@ -24,6 +25,11 @@ public:
         glm::vec3 scale;
         std::string type;  // "tree", "rock", "building", etc.
         std::string name;
+
+        // forUI.txt Item 2.A: PBR texture mapping tracking indicators
+        std::string albedoTexturePath = "";
+        std::string normalTexturePath = "";
+        bool hasPBRMaterials = false;
     };
 
     // Imported world data
@@ -63,3 +69,6 @@ private:
     std::string getExtension(const std::string& path);
     bool fileExists(const std::string& path);
 };
+
+// forUI.txt Item 1: heuristic category assignment for imported node names.
+WorldObjectType ClassifyImportedNode(const std::string& nodeName);

@@ -1,0 +1,249 @@
+{
+  "atmosphere_pipeline" : 
+  {
+    "cubemap" : 
+    {
+      "autoCycleTime" : false,
+      "blendFactor" : 0.0,
+      "debugSolidMagenta" : false,
+      "timeCycleSpeed" : 0.019999999552965164
+    },
+    "procedural" : 
+    {
+      "sunIntensity" : 1.0,
+      "turbidity" : 2.0,
+      "useProceduralOverCubemap" : false
+    }
+  },
+  "character" : 
+  {
+    "clips" : 
+    {
+      "Idle" : "Idle",
+      "Jump" : "Jump",
+      "LeftStrafe" : "LeftStrafe",
+      "LeftStrafeWalk" : "LeftStrafeWalk",
+      "LeftTurn90" : "LeftTurn90",
+      "RightStrafe" : "RightStrafe",
+      "RightStrafeWalk" : "RightStrafeWalk",
+      "RightTurn90" : "RightTurn90",
+      "Run" : "Run",
+      "Walk" : "Walk"
+    },
+    "clipsDir" : "assets",
+    "modelPath" : ""
+  },
+  "npcs" : 
+  [
+    {
+      "animSet" : 
+      {
+        "idle" : "Idle",
+        "jump" : "Jump",
+        "leftStrafe" : "LeftStrafe",
+        "leftStrafeWalk" : "LeftStrafeWalk",
+        "leftTurn90" : "LeftTurn90",
+        "rightStrafe" : "RightStrafe",
+        "rightStrafeWalk" : "RightStrafeWalk",
+        "rightTurn90" : "RightTurn90",
+        "run" : "Run",
+        "walk" : "Walk"
+      },
+      "clipsDir" : "assets",
+      "modelPath" : "assets/guan.fbx",
+      "motionContext" : "Locomotion",
+      "name" : "Guard"
+    },
+    {
+      "animSet" : 
+      {
+        "idle" : "Idle",
+        "jump" : "Jump",
+        "leftStrafe" : "LeftStrafe",
+        "leftStrafeWalk" : "LeftStrafeWalk",
+        "leftTurn90" : "LeftTurn90",
+        "rightStrafe" : "RightStrafe",
+        "rightStrafeWalk" : "RightStrafeWalk",
+        "rightTurn90" : "RightTurn90",
+        "run" : "Run",
+        "walk" : "Walk"
+      },
+      "clipsDir" : "assets",
+      "modelPath" : "assets/him.fbx",
+      "motionContext" : "Locomotion",
+      "name" : "Scientist"
+    },
+    {
+      "animSet" : 
+      {
+        "idle" : "Idle",
+        "jump" : "Jump",
+        "leftStrafe" : "LeftStrafe",
+        "leftStrafeWalk" : "LeftStrafeWalk",
+        "leftTurn90" : "LeftTurn90",
+        "rightStrafe" : "RightStrafe",
+        "rightStrafeWalk" : "RightStrafeWalk",
+        "rightTurn90" : "RightTurn90",
+        "run" : "Run",
+        "walk" : "Walk"
+      },
+      "clipsDir" : "assets",
+      "modelPath" : "assets/Girl.fbx",
+      "motionContext" : "Locomotion",
+      "name" : "Girl"
+    }
+  ],
+  "paths" : 
+  {
+    "assetRoot" : "./assets",
+    "configPath" : "./config",
+    "defaultScene" : "scene.json",
+    "fontPath" : "./fonts",
+    "modelPath" : "./models",
+    "savePath" : "./saves",
+    "shaderPath" : "./shaderSystem",
+    "skyboxPath" : "./models/skybox",
+    "texturePath" : "./assets/textures"
+  },
+  "physics" : 
+  {
+    "enableCCD" : true,
+    "gravity" : 
+    [
+      0.0,
+      -9.8100004196166992,
+      0.0
+    ]
+  },
+  "render" : 
+  {
+    "farPlane" : 4330.0,
+    "fov" : 65.0,
+    "nearPlane" : 6.8540000915527344,
+    "vsync" : true,
+    "windowHeight" : 1080,
+    "windowWidth" : 1920,
+    "wireframe" : true
+  },
+  "terrain" : 
+  {
+    "chunkResolution" : 46,
+    "chunkSize" : 500.0,
+    "heightScale" : 156.0,
+    "heightmapPath" : "assets/quiver_tree/textures/quiver_tree_02_rough_4k.exr",
+    "maxActiveChunks" : 8,
+    "viewDistance" : 6
+  },
+  "terrain_material" : 
+  {
+    "desertAlbedo" : "assets/rocky_trail/textures_1k/rocky_trail_02_diff_4k.jpg",
+    "desertNormal" : "assets/rocky_trail/textures_1k/rocky_trail_02_nor_gl_4k.jpg",
+    "desertRough" : "assets/rocky_trail/textures_1k/rocky_trail_02_arm_4k.jpg",
+    "layers" : 
+    [
+      {
+        "albedo" : "assets/grass/textures/grass_medium_01_diff_4k.jpg",
+        "ao" : "assets/grass/textures/grass_medium_01_ao_4k.jpg",
+        "normal" : "assets/grass/textures/grass_medium_01_nor_gl_4k.exr",
+        "rough" : "assets/grass/textures/grass_medium_01_rough_4k.exr"
+      },
+      {
+        "albedo" : "assets/rocks_ground/textures/rocks_ground_02_col_4k.jpg",
+        "ao" : "assets/rocks_ground/textures/rocks_ground_02_arm_4k.jpg",
+        "normal" : "assets/rocks_ground/textures/rocks_ground_02_nor_gl_4k.exr",
+        "rough" : "assets/rocks_ground/textures/rocks_ground_02_rough_4k.exr"
+      },
+      {
+        "albedo" : "assets/coast_land_rocks/textures/coast_land_rocks_04_diff_4k.jpg",
+        "ao" : "",
+        "normal" : "assets/coast_land_rocks/textures/coast_land_rocks_04_nor_gl_4k.jpg",
+        "rough" : "assets/coast_land_rocks/textures/coast_land_rocks_04_arm_4k.jpg"
+      },
+      {
+        "albedo" : "",
+        "ao" : "",
+        "normal" : "",
+        "rough" : ""
+      }
+    ]
+  },
+  "terrain_splat_pbr" : 
+  {
+    "blendWidths" : 
+    [
+      6.0,
+      9.0,
+      9.0,
+      8.0
+    ],
+    "enableSplatShader" : true,
+    "globalTextureScale" : 8.0,
+    "layerHeights" : 
+    [
+      2.0,
+      16.0,
+      38.0,
+      62.0
+    ],
+    "normalStrength" : 9.0,
+    "parallaxScale" : 0.039999999105930328,
+    "slopeBands" : 
+    [
+      0.0,
+      0.15000000596046448,
+      0.60000002384185791,
+      0.85000002384185791
+    ],
+    "tessFactorInner" : 10.0,
+    "tessFactorOuter" : 10.0,
+    "tints" : 
+    {
+      "grass" : 
+      [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "rock" : 
+      [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "snow" : 
+      [
+        0.87999999523162842,
+        0.92000001668930054,
+        1.0
+      ],
+      "stone" : 
+      [
+        1.0,
+        1.0,
+        1.0
+      ]
+    }
+  },
+  "vegetation" : 
+  {
+    "grassDensity" : 0.039999999105930328,
+    "pebbleDensity" : 0.0099999997764825821,
+    "rockDensity" : 0.0060000000521540642,
+    "treeDensity" : 0.0099999997764825821
+  },
+  "world_objects" : 
+  [
+    {
+      "maxScale" : 1.2000000476837158,
+      "minScale" : 0.80000001192092896,
+      "modelPath" : "assets/",
+      "type" : "TREE_PINE"
+    },
+    {
+      "maxScale" : 1.2000000476837158,
+      "minScale" : 0.80000001192092896,
+      "modelPath" : "assets/",
+      "type" : "TREE_PINE"
+    }
+  ]
+}

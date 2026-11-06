@@ -65,6 +65,8 @@ namespace TerrainOptimizations {
             }
         }
         
+        const Plane& plane(int i) const { return m_planes[i]; }
+
         bool isBoxInFrustum(const glm::vec3& center, const glm::vec3& halfExtents) const {
             for (int i = 0; i < 6; i++) {
                 // Compute the projection of the half-extents onto the plane normal

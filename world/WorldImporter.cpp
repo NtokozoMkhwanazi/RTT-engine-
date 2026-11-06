@@ -10,6 +10,11 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtx/quaternion.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
+#include <algorithm>          // std::transform (ClassifyImportedNode)
+#include <cctype>             // std::tolower (ClassifyImportedNode)
+#include <glad/glad.h>        // glGenTextures/etc (CompileBilinearPBRTexture)
+#include "shaderSystem/stb_image.h"  // stbi_load (CompileBilinearPBRTexture)
+#include "renderer/TextureProfiler.h"  // forUI.txt: VRAM footprint profiling
 
 namespace fs = std::filesystem;
 
@@ -145,7 +150,6 @@ WorldImporter::ImportedWorld WorldImporter::importFromFBX(const std::string& pat
             if (meshIdx < scene->mNumMeshes) {
                 glm::vec3 skew;
                 glm::vec4 persp;
-                glm::vec3 unusedScale;
                 glm::quat rotQuat;
                 glm::decompose(worldXform, meshTransforms[meshIdx].scale,
                                rotQuat, meshTransforms[meshIdx].position, skew, persp);
@@ -179,6 +183,21 @@ WorldImporter::ImportedWorld WorldImporter::importFromFBX(const std::string& pat
         obj.rotation = meshTransforms[i].rotation;
         obj.scale = meshTransforms[i].scale;
         obj.meshPath = path;
+
+        // forUI.txt Item 2.B: resolve PBR texture paths from the mesh material
+        if (mesh->mMaterialIndex < scene->mNumMaterials) {
+            aiMaterial* mat = scene->mMaterials[mesh->mMaterialIndex];
+            aiString texPath;
+            if (mat->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
+                std::string filename = std::filesystem::path(texPath.C_Str()).filename().string();
+                obj.albedoTexturePath = "assets/textures/" + filename;
+                obj.hasPBRMaterials = true;
+            }
+            if (mat->GetTexture(aiTextureType_NORMALS, 0, &texPath) == AI_SUCCESS) {
+                std::string filename = std::filesystem::path(texPath.C_Str()).filename().string();
+                obj.normalTexturePath = "assets/textures/" + filename;
+            }
+        }
         
         world.objects.push_back(obj);
     }
@@ -279,4 +298,89 @@ void WorldImporter::convertToEngineFormat(const ImportedWorld& imported,
     }
     
     std::cout << "Conversion complete!\n";
+}
+
+// forUI.txt Item 1.A: procedural category assignment rule filter.
+WorldObjectType ClassifyImportedNode(const std::string& nodeName) {
+    std::string nameLower = nodeName;
+    std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    // 1. Evaluate Tree Classifications
+    if (nameLower.find("pine") != std::string::npos || nameLower.find("fir") != std::string::npos) {
+        return WorldObjectType::TREE_PINE;
+    }
+    if (nameLower.find("oak") != std::string::npos) {
+        return WorldObjectType::TREE_OAK;
+    }
+    if (nameLower.find("birch") != std::string::npos) {
+        return WorldObjectType::TREE_BIRCH;
+    }
+    if (nameLower.find("tree") != std::string::npos || nameLower.find("foliage") != std::string::npos) {
+        return WorldObjectType::TREE_PINE; // Default fallback tree category
+    }
+
+    // 2. Evaluate Rock & Geological Structure Classifications
+    if (nameLower.find("boulder") != std::string::npos) {
+        return WorldObjectType::ROCK_BOULDER;
+    }
+    if (nameLower.find("cliff") != std::string::npos || nameLower.find("mountain") != std::string::npos) {
+        return WorldObjectType::ROCK_CLIFF;
+    }
+    if (nameLower.find("stone") != std::string::npos || nameLower.find("rock") != std::string::npos) {
+        return WorldObjectType::ROCK_STONE;
+    }
+    if (nameLower.find("pebble") != std::string::npos) {
+        return WorldObjectType::ROCK_STONE; // Maps down to stone slot at micro scale
+    }
+
+    // 3. Evaluate Props, Ground Covers, & Logistics
+    if (nameLower.find("log") != std::string::npos) {
+        return WorldObjectType::LOG;
+    }
+    if (nameLower.find("stump") != std::string::npos) {
+        return WorldObjectType::STUMP;
+    }
+    if (nameLower.find("grass") != std::string::npos) {
+        return WorldObjectType::GRASS_CLUSTER;
+    }
+    if (nameLower.find("flower") != std::string::npos || nameLower.find("plant") != std::string::npos) {
+        return WorldObjectType::FLOWER_PATCH;
+    }
+    if (nameLower.find("bush") != std::string::npos || nameLower.find("shrub") != std::string::npos) {
+        return WorldObjectType::BUSH;
+    }
+
+    // Default structural fallback category if strings match no operational keyword patterns
+    return WorldObjectType::ROCK_BOULDER;
+}
+
+// forUI.txt Item 2.C: asynchronous bilinear GPU upload completion gate
+// (main-thread; called from the polling loop after the JobSystem task resolves).
+unsigned int CompileBilinearPBRTexture(const std::string& texturePath) {
+    if (texturePath.empty() || !std::filesystem::exists(texturePath)) return 0;
+
+    int width = 0, height = 0, channels = 0;
+    unsigned char* pixelData = stbi_load(texturePath.c_str(), &width, &height, &channels, 4);
+    if (!pixelData) return 0;
+
+    unsigned int glTextureID = 0;
+    glGenTextures(1, &glTextureID);
+    glBindTexture(GL_TEXTURE_2D, glTextureID);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixelData);
+    glGenerateMipmap(GL_TEXTURE_2D);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    stbi_image_free(pixelData);
+
+    // forUI.txt: register the staged texture footprint with the VRAM profiler.
+    TextureProfiler::Instance().RegisterTexture(glTextureID, texturePath, width, height, GL_RGBA8);
+
+    return glTextureID;
 }

@@ -7,7 +7,7 @@
 # ============================================================
 
 CXX       := g++
-CXXFLAGS  := -std=c++17 -Wall -Wextra -Wno-unused-parameter -MMD -MP
+CXXFLAGS  := -std=c++17 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -MMD -MP
 
 # The header-dependency files are -include'd below, and their rules (one per
 # object) would otherwise become make's default goal before 'all' is seen.
@@ -50,8 +50,12 @@ INCLUDES := -I. \
             -Irhi \
             -Iexternal/imgui \
             -Iexternal/imgui/backends \
+            -Iexternal/imgui/misc/cpp \
             -Iexternal \
             -IIconFontCppHeaders-main \
+            -IFidelityFX-SDK-FSR3/framework/cauldron/framework/libs/memoryallocator \
+            -IFidelityFX-SDK-FSR3/framework/cauldron/framework/inc \
+            -IFidelityFX-SDK-FSR3/sdk/include \
             -I/usr/include/jsoncpp \
             -I/usr/include/eigen3 \
             -I/usr/include/OpenEXR \
@@ -109,6 +113,7 @@ IMGUI_SRC := \
 	external/imgui/imgui_draw.cpp \
 	external/imgui/imgui_tables.cpp \
 	external/imgui/imgui_widgets.cpp \
+	external/imgui/misc/cpp/imgui_stdlib.cpp \
 	external/imgui/backends/imgui_impl_glfw.cpp \
 	external/imgui/backends/imgui_impl_opengl3.cpp \
 	external/imgui/backends/imgui_impl_vulkan.cpp
@@ -131,11 +136,11 @@ RHI_SPV += $(RHI_SHADERS:rhi/shaders/%.comp=$(BUILD_DIR)/rhi/%.comp.spv)
 # the SDK include root; the vertex/fragment shaders are standalone glslc.
 $(BUILD_DIR)/rhi/%.vert.spv: rhi/shaders/%.vert
 	@mkdir -p $(BUILD_DIR)/rhi
-	glslc $< -o $@
+	glslc --target-env=vulkan1.3 $< -o $@
 
 $(BUILD_DIR)/rhi/%.frag.spv: rhi/shaders/%.frag
 	@mkdir -p $(BUILD_DIR)/rhi
-	glslc $< -o $@
+	glslc --target-env=vulkan1.3 $< -o $@
 
 $(BUILD_DIR)/rhi/%.comp.spv: rhi/shaders/%.comp
 	@mkdir -p $(BUILD_DIR)/rhi
@@ -149,6 +154,7 @@ STANDALONE_TESTS := $(TEST_DIR)/bot_viewport_minimal.cpp $(TEST_DIR)/test_geoter
                      $(TEST_DIR)/repro_static_destruction.cpp $(TEST_DIR)/bench_soa_cache.cpp
 
 # Excluded files that need deeper implementation work (none currently):
+# (test_cluster_builder.cpp is now included — MeshUtils cluster API implemented.)
 EXCLUDED_TESTS :=
 
 TEST_SRC := $(filter-out $(STANDALONE_TESTS) $(EXCLUDED_TESTS),$(ALL_TESTS))
@@ -227,27 +233,27 @@ $(BUILD_DIR)/%.o: %.c
 # ============================================================
 #  Standalone Test Apps
 # ============================================================
-$(BIN_DIR)/$(BOT_VIEWPORT_TEST): dirs $(OBJS) build/tests/bot_viewport_minimal.o
-	$(CXX) $(CXXFLAGS) $(OBJS) build/tests/bot_viewport_minimal.o -o $@ $(LIBS) $(LDFLAGS)
+$(BIN_DIR)/$(BOT_VIEWPORT_TEST): dirs $(OBJS) $(BUILD_DIR)/tests/bot_viewport_minimal.o
+	$(CXX) $(CXXFLAGS) $(OBJS) $(BUILD_DIR)/tests/bot_viewport_minimal.o -o $@ $(LIBS) $(LDFLAGS)
 
-$(BIN_DIR)/$(GEOTERRAIN_TEST): dirs $(OBJS) build/tests/test_geoterrain.o
-	$(CXX) $(CXXFLAGS) $(OBJS) build/tests/test_geoterrain.o -o $@ $(LIBS) $(LDFLAGS)
+$(BIN_DIR)/$(GEOTERRAIN_TEST): dirs $(OBJS) $(BUILD_DIR)/tests/test_geoterrain.o
+	$(CXX) $(CXXFLAGS) $(OBJS) $(BUILD_DIR)/tests/test_geoterrain.o -o $@ $(LIBS) $(LDFLAGS)
 
 # --- Static-destruction crash regression guard (crash.log: ResourceManager
 #     singleton destroyed after GL context teardown calls glDelete* on a dead
 #     context -> SIGSEGV). Exit 0 = guards hold; SIGSEGV = regression. ---
 STATIC_DESTRUCTION_TEST := repro_static_destruction
 
-$(BIN_DIR)/$(STATIC_DESTRUCTION_TEST): dirs $(OBJS) build/tests/repro_static_destruction.o
-	$(CXX) $(CXXFLAGS) $(OBJS) build/tests/repro_static_destruction.o -o $@ $(LIBS) $(LDFLAGS)
+$(BIN_DIR)/$(STATIC_DESTRUCTION_TEST): dirs $(OBJS) $(BUILD_DIR)/tests/repro_static_destruction.o
+	$(CXX) $(CXXFLAGS) $(OBJS) $(BUILD_DIR)/tests/repro_static_destruction.o -o $@ $(LIBS) $(LDFLAGS)
 
 # --- Editor application (own main, not part of the test runner) ---
-$(BIN_DIR)/$(EDITOR_APP): dirs $(OBJS) build/src/editor_main.o
-	$(CXX) $(CXXFLAGS) $(OBJS) build/src/editor_main.o -o $@ $(LIBS) $(LDFLAGS)
+$(BIN_DIR)/$(EDITOR_APP): dirs $(OBJS) $(BUILD_DIR)/src/editor_main.o
+	$(CXX) $(CXXFLAGS) $(OBJS) $(BUILD_DIR)/src/editor_main.o -o $@ $(LIBS) $(LDFLAGS)
 
-# --- #4 perf harness (headless micro-bench; NOT part of the 246 gate) ---
-$(BIN_DIR)/bench_soa_cache: dirs build/tests/bench_soa_cache.o
-	$(CXX) $(CXXFLAGS) build/tests/bench_soa_cache.o -o $@
+# --- #4 perf harness (headless micro-bench; NOT part of the 712 gate) ---
+$(BIN_DIR)/bench_soa_cache: dirs $(BUILD_DIR)/tests/bench_soa_cache.o
+	$(CXX) $(CXXFLAGS) $(BUILD_DIR)/tests/bench_soa_cache.o -o $@
 
 # --- Full engine entry point (test.cpp): runs the whole test suite as a
 #     self-check, then boots the entire engine. ---
@@ -287,7 +293,7 @@ run-headless: $(BIN_DIR)/$(ENGINE_APP)
 	@echo "========================================"
 	@echo "  Running the full engine headless..."
 	@echo "========================================"
-	./$(BIN_DIR)/$(ENGINE_APP) --headless --frames $(or $(FRAMES),900)
+	./$(BIN_DIR)/$(ENGINE_APP) --skip-tests --headless --frames $(or $(FRAMES),900)
 
 bot-viewport-test: $(BIN_DIR)/$(BOT_VIEWPORT_TEST)
 	@echo ""
@@ -439,8 +445,19 @@ rebuild: clean all
 # ============================================================
 #  Release build
 # ============================================================
+# Objects/binaries stay in their own trees so `make release` and a plain
+# `make` (debug) never link each other's stale objects, and the debug build
+# is left untouched: build/release/ + bin/release/editor_app.
+RELEASE_BUILD_DIR := build/release
+RELEASE_BIN_DIR   := bin/release
+
 release:
-	$(MAKE) MODE=release
+	$(MAKE) MODE=release BUILD_DIR=$(RELEASE_BUILD_DIR) BIN_DIR=$(RELEASE_BIN_DIR) \
+	        $(RELEASE_BIN_DIR)/$(EDITOR_APP)
+	@echo ""
+	@echo "========================================"
+	@echo "  Release editor built: $(RELEASE_BIN_DIR)/$(EDITOR_APP)"
+	@echo "========================================"
 
 # ============================================================
 #  Phony targets

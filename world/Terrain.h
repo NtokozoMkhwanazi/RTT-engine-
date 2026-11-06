@@ -5,8 +5,8 @@
 #include <glm/glm.hpp>
 #include <vector>
 #include <array>
-#include <memory>
 #include <string>
+#include <memory>
 #include <map>
 #include <set>
 #include <thread>
@@ -45,13 +45,50 @@ public:
         float lodDistance = 120.0f;
         int heightmapSize = 2040;
         float heightScale = 100.0f;
+        // Optional authored heightmap (.exr/.jpg/.png L8). When non-empty the
+        // terrain loads real elevation instead of the procedural Perlin arena.
+        std::string heightmapPath;
+
+        // verify.txt: artist-authored terrain material texture sets.
+        // When non-empty, these override the hardcoded splat layer paths so
+        // artists can load any terrain material (marble_cliff, desert_scrub,
+        // etc.) by pointing at the asset's texture folder.
+        struct TerrainMaterialLayer {
+            std::string albedo;
+            std::string normal;
+            std::string rough;
+            std::string ao;
+        };
+        TerrainMaterialLayer materialLayers[4];
+        std::string desertAlbedoPath;
+        std::string desertNormalPath;
+        std::string desertRoughPath;
     };
 
     Terrain();
     Terrain(const TerrainConfig& config);
     ~Terrain();
 
-    void initialize();
+    // `preloadedHeightmap` / `preloadedSize`: an optional, already-decoded
+    // square height grid (see DecodeHeightmapFile). When supplied, initialize()
+    // skips reading + decoding the source file — the editor decodes it on a
+    // worker thread and hands it in, so a landscape rebuild no longer blocks the
+    // main thread for the length of a 4K EXR/PNG decode.
+    void initialize(const std::vector<float>* preloadedHeightmap = nullptr,
+                    int preloadedSize = 0);
+
+    // GL-free heightmap decode (EXR / JPG / PNG / TGA -> square float grid
+    // remapped to [0, heightScale]). Safe to call from a worker thread.
+    static bool DecodeHeightmapFile(const std::string& path, float heightScale,
+                                    std::vector<float>& out, int& outSize);
+
+    // Release the shared material-texture cache that initialize() fills (4K
+    // splat/desert albedo, normal, ARM...). The cache owns those GL textures so
+    // a landscape rebuild reuses them instead of re-decoding + re-uploading
+    // every asset (measured at 17-22 s per rebuild). Call once, while the GL
+    // context is still alive, during editor/engine teardown.
+    static void ClearTextureCache();
+
     void update(const glm::vec3& cameraPos, float dt);
     void render(const glm::mat4& view, const glm::mat4& projection,
                 const glm::vec3& cameraPos, float fovDegrees = 45.0f,
@@ -76,19 +113,27 @@ public:
     const TerrainConfig& getConfig() const { return m_config; }
     size_t getActiveChunkCount() const { return m_chunks.size(); }
 
-    // Opt-in authored heightmap (e.g. a grayscale displacement PNG/EXR) that
-    // feeds the GL_R32F master heightmap driving the terrain_splat VERTEX
-    // displacement. Empty by default -> the procedural Perlin heightmap
-    // (generateHeightmap) is used, so Terrain tests / existing behaviour are
-    // unchanged. Set before initialize() to override the procedural surface.
-    void setHeightmapSource(const std::string& path) { m_heightmapAssetPath = path; }
-    const std::string& heightmapSource() const { return m_heightmapAssetPath; }
+    // Accessor for shadow-map / depth-only rendering passes that need to
+    // iterate the chunk map directly. Returns const ref to avoid exposing
+    // chunk ownership.
+    const std::map<ChunkCoord, std::unique_ptr<TerrainChunk>>& getChunks() const {
+        return m_chunks;
+    }
 
     // Opt-in: render terrain through the modern height-based splat-map shader
     // (shaderSystem/terrain_splat.*) instead of the legacy embedded RVT shader.
     // Off by default → the existing rendering path is untouched.
     void setUseSplatShader(bool enable) { m_useSplatShader = enable; }
     bool useSplatShader() const { return m_useSplatShader; }
+
+    // forUI.txt: load an authored heightmap (.exr or .jpg/.png L8) into the CPU
+    // m_heightmap, replacing the procedural Perlin arena. Returns false (and
+    // leaves the existing heightmap intact) on a missing/unreadable file. The
+    // GPU texture is (re)uploaded by Terrain::initialize or uploadHeightTexture
+    // — chunks sample m_heightTexture in-shader, so a re-upload updates the
+    // displaced surface without regenerating chunk VBOs for a flat rebuild.
+    bool loadHeightmap(const std::string& path);
+    void uploadHeightTexture();
 
     // Frustum culling toggle — when disabled, ALL terrain chunks are sent to
     // the GPU (no view-frustum rejection). Useful for debugging LOD and for
@@ -116,13 +161,20 @@ public:
     // Returns the page index, or -1 if baking is unavailable.
     int bakeChunkMaterial(const TerrainChunk& chunk);
 
+    // forUI.txt Pillar 3: CPU heightmap sculpt + localized RVT re-bake.
+    void ModifyHeightmapRegion(float worldX, float worldZ, float radius,
+                               float strength, int falloffType, float softWidth);
+    // forUI.txt Pillar 3: sculpt brush loop access to a chunk instance by coord.
+    TerrainChunk* GetChunkInstance(int chunkX, int chunkY);
+    const TerrainChunk* GetChunkInstance(int chunkX, int chunkY) const;
+    // forUI.txt Pillar 3: worldXZ -> chunk grid coords (3x3 re-bake lookup).
+    void getChunkCoords(float worldX, float worldZ, int& chunkX, int& chunkY) const;
+
     // FBO the material atlas is rendered into (page readback / tests).
     GLuint getBakeFramebuffer() const { return m_bakeFBO; }
 
 private:
     void generateHeightmap();
-    void loadHeightmapFromFile(const std::string& path);
-    void getChunkCoords(float worldX, float worldZ, int& chunkX, int& chunkY) const;
 
     // Opt-in height-based splat render path (see shaderSystem/terrain_splat.*).
     void renderSplat(const glm::mat4& view, const glm::mat4& projection,
@@ -135,9 +187,6 @@ private:
 
     TerrainConfig m_config;
     std::vector<float> m_heightmap;
-    // Empty -> procedural Perlin heightmap (default). Set via setHeightmapSource()
-    // to drive the GL_R32F vertex-displacement terrain from an authored asset.
-    std::string m_heightmapAssetPath;
     std::map<ChunkCoord, std::unique_ptr<TerrainChunk>> m_chunks;
 
     GLuint m_heightTexture = 0;   // GL_R32F master heightmap (GPU displacement)

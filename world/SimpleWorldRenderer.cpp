@@ -1,8 +1,14 @@
 #include "SimpleWorldRenderer.h"
+#include "ecs/System.h"        // complete ecs::System (must precede JobSystem.h —
+                               // JobSystem.h's SystemExecutor inline bodies need it)
+#include "ecs/JobSystem.h"     // bounded worker pool + SystemExecutor
 #include "shaderSystem/Shader.h"
 #include "lighting/LightingEnvironment.h"   // authoritative sun / lighting standard
 #include "TerrainOptimizations.h"
 #include <glad/glad.h>
+#include <limits>
+#include <algorithm>
+#include <cmath>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/matrix_inverse.hpp>  // for glm::inverse (viewPos derivation)
 #include <chrono>
@@ -10,12 +16,33 @@
 #include <unordered_map>
 
 SimpleWorldRenderer::SimpleWorldRenderer() {
+    // Lazy-construct the bounded prop-parse pool on first render-system init.
+    // Worker threads spawn here; they are joined on destruction (see dtor).
+    m_jobSystem = std::make_unique<ecs::JobSystem>();
+    m_jobSystem->init();
 }
 
 SimpleWorldRenderer::~SimpleWorldRenderer() {
+    // Join parse workers before teardown so no background thread touches the GL
+    // context or slot state after destruction begins.
+    if (m_jobSystem) {
+        m_jobSystem->shutdown();
+    }
 }
 
 int SimpleWorldRenderer::loadModel(const std::string& path, size_t maxTrianglesPerMesh) {
+    // Guard against directory paths before Assimp ever sees them: an empty or
+    // "assets/"-style world-object entry (a cleared Model field in the World
+    // Settings panel saves as just the asset dir) is a DIRECTORY, and Assimp
+    // answers it with the misleading
+    //   ASSIMP ERROR: No suitable reader found for the file format of file "assets/".
+    // A directory can never be a model, so reject it with one accurate line.
+    if (path.empty() || path.back() == '/' || path.back() == '\\') {
+        std::cerr << "[SimpleWorldRenderer] Ignoring model path \"" << path
+                  << "\" (empty or a directory, not a model file)\n";
+        return -1;
+    }
+
     // Dedupe by path: several object types reference the same asset (e.g. all
     // three tree variants use quiver_tree/q.gltf). Loading it once instead of
     // 3x avoids re-decoding/re-compressing the same 4K textures - a ~45s
@@ -49,6 +76,241 @@ int SimpleWorldRenderer::loadModel(const std::string& path, size_t maxTrianglesP
     m_modelWindStrength.push_back(0.0f);
     m_modelByPath[path] = id;
     return id;
+}
+
+int SimpleWorldRenderer::registerParsedModel(const std::string& path, Model* model,
+                                             size_t maxTrianglesPerMesh, float windSway) {
+    if (!model || model->GetMeshCount() == 0) {
+        delete model;
+        std::cerr << "[SimpleWorldRenderer] registerParsedModel: empty model " << path << "\n";
+        return -1;
+    }
+
+    // Dedup by path: several prop types share one asset (e.g. the three tree
+    // variants all use quiver_tree/q.gltf). Reuse the already-registered model
+    // and drop the duplicate instead of re-decimating + re-uploading. The caller
+    // (WOM commit) keeps the wind/base-scale bookkeeping keyed on the returned id.
+    auto existing = m_modelByPath.find(path);
+    if (existing != m_modelByPath.end()) {
+        delete model;
+        return existing->second;
+    }
+
+    // Decimate each mesh to the budget. DecimateStaticMesh calls
+    // UpdateVertexBuffer/UpdateIndexBuffer (GL buffer re-submission), so this
+    // MUST run on the main thread that owns the GL context — i.e. inside the
+    // commit pump, not on the parse worker.
+    for (size_t i = 0; i < model->GetMeshCount(); ++i) {
+        MeshUtils::DecimateStaticMesh(model->GetMesh(i), maxTrianglesPerMesh);
+    }
+
+    const int id = (int)m_models.size();
+    m_models.push_back(std::shared_ptr<Model>(model));
+    m_modelWindStrength.push_back(windSway);
+    m_modelByPath[path] = id;
+    return id;
+}
+
+void SimpleWorldRenderer::beginAsyncModelLoad(const std::string& typeKey,
+                                              const std::string& path,
+                                              size_t maxTrianglesPerMesh,
+                                              float windSway,
+                                              int maxTextureSize) {
+    // Path-level dedup: parse each unique asset once; every typeKey sharing
+    // that path reuses the SAME handle so the GL upload + bookkeeping happen
+    // once and the single model id is handed back to each key on commit.
+    for (auto& slot : m_worldAsync.slots) {
+        if (slot.path == path) {
+            // Reuse: append this key to the path's slot (idempotent on re-add).
+            slot.typeKeys.push_back(typeKey);
+            return;
+        }
+    }
+
+    m_worldAsync.isLoading.store(true, std::memory_order_relaxed);
+    m_worldAsync.loadFinished.store(false, std::memory_order_relaxed);
+
+    // Dispatch the heavy Assimp parse + texture decode onto the bounded JobSystem
+    // pool (NOT std::async per-model). The worker writes progress into a shared
+    // atom and delivers the parsed AsyncModelData through a std::promise whose
+    // future lives in the slot; on the main thread we only poll JobHandle::
+    // isComplete() (non-blocking) and then consume dataFuture.get() (already
+    // ready, so also non-blocking). This caps parse concurrency to ~3 workers
+    // instead of one OS thread per asset, which is what pinned the editor to
+    // ~2-3 FPS when a whole prop set parsed at once.
+    auto dataPromise = std::make_shared<std::promise<std::unique_ptr<AsyncModelData>>>();
+    auto progressAtom = std::make_shared<std::atomic<float>>(0.0f);
+
+    AsyncLoadSlot slot;
+    slot.path = path;
+    slot.maxTrianglesPerMesh = maxTrianglesPerMesh;
+    slot.windSway = windSway;
+    slot.maxTextureSize = maxTextureSize;
+    slot.typeKeys.push_back(typeKey);
+    slot.dataFuture = dataPromise->get_future();
+    slot.progress = progressAtom;
+
+    const std::string assetPath = path;           // copy for the worker
+    const int texCap = maxTextureSize;            // copy for the worker
+    // Dispatch to the bounded pool; the returned JobHandle is intentionally
+    // discarded — completion is observed via `slot.dataFuture` (the promise is
+    // fulfilled inside the job, before the pool's own completion future).
+    m_jobSystem->addJob([assetPath, dataPromise, progressAtom, texCap]() {
+        try {
+            dataPromise->set_value(Model::LoadModelData(assetPath, progressAtom.get(), texCap));
+        } catch (const std::exception& e) {
+            auto result = std::make_unique<AsyncModelData>();
+            result->success = false;
+            result->error = std::string("Exception: ") + e.what();
+            dataPromise->set_value(std::move(result));
+        } catch (...) {
+            auto result = std::make_unique<AsyncModelData>();
+            result->success = false;
+            result->error = "Unknown exception during async loading";
+            dataPromise->set_value(std::move(result));
+        }
+    }, /*priority=*/0);
+    m_worldAsync.slots.push_back(std::move(slot));
+    m_worldAsync.totalModels.store((int)m_worldAsync.slots.size(),
+                                   std::memory_order_relaxed);
+}
+
+float SimpleWorldRenderer::commitAsyncModels() {
+    if (!m_worldAsync.isLoading.load(std::memory_order_relaxed)) return 1.0f;
+    if (m_worldAsync.loadFinished.load(std::memory_order_relaxed)) return 1.0f;
+
+    // TIME-SLICE the main-thread GL work (Model::CreateFromAsync uploads the
+    // textures/buffers for a model + DecimateStaticMesh re-submits GL buffers).
+    // Without this, every worker parse that finishes together commits in ONE
+    // frame -> for the real prop assets (quiver_tree 82k tris, othonna 118k,
+    // boulder 98k, ...) that is a multi-hundred-ms frame and the editor drops
+    // to ~2 FPS while the "Resolving..." bar is up. Each call only does as
+    // much GL work as fits in a small CPU budget (~4 ms), committing at least
+    // one ready model per frame so it always makes forward progress; the rest
+    // rides over to the next frame and the bar advances smoothly at 60 FPS.
+    static constexpr double kBudgetMs = 4.0;
+    int committedThisFrame = 0;
+    auto frameStart = std::chrono::steady_clock::now();
+    const auto budgetElapsed = [&]() {
+        using namespace std::chrono;
+        return duration<double, std::milli>(steady_clock::now() - frameStart).count();
+    };
+
+    for (auto& slot : m_worldAsync.slots) {
+        if (slot.committed || slot.failed) continue;
+        // Still parsing on the worker pool: poll the promise (non-blocking; the
+        // JobSystem completion future is strictly later than our promise).
+        if (slot.dataFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready) continue;
+
+        // Budget gate: once we've committed at least one model this frame, stop
+        // as soon as the CPU budget is exhausted (keeps the render thread free).
+        if (committedThisFrame > 0 && budgetElapsed() > kBudgetMs) continue;
+
+        // ---- HEAVY MAIN-THREAD GL work: upload buffers/textures + decimate ----
+        // dataFuture is guaranteed ready (the JobSystem promise is fulfilled
+        // before the JobHandle's own completion future, which we just tested).
+        auto parsedData = slot.dataFuture.get();
+        if (!parsedData || !parsedData->success) {
+            slot.failed = true;
+            slot.error = (!parsedData || parsedData->error.empty())
+                ? "CPU parse reported failure" : parsedData->error;
+            m_worldAsync.failedMessage = slot.path + ": " + slot.error;
+            continue;
+        }
+
+        std::string err;
+        Model* glModel = Model::CreateFromAsync(std::move(parsedData), &err);
+        if (!glModel) {
+            slot.failed = true;
+            slot.error = err.empty() ? "GPU upload reported failure" : err;
+            m_worldAsync.failedMessage = slot.path + ": " + slot.error;
+            continue;
+        }
+
+        const int id = registerParsedModel(slot.path, glModel,
+                                           slot.maxTrianglesPerMesh, slot.windSway);
+        if (id < 0) {
+            slot.failed = true;
+            slot.error = "registration rejected";
+            m_worldAsync.failedMessage = slot.path + ": " + slot.error;
+            continue;
+        }
+
+        slot.modelId = id;
+        slot.committed = true;
+        ++committedThisFrame;
+        // Hand the single model id to EVERY typeKey backed by this asset.
+        for (const auto& tk : slot.typeKeys) {
+            m_worldAsync.pendingResults.push_back(
+                WorldModelResult{tk, slot.path, id, slot.windSway});
+        }
+        std::cout << "[SimpleWorldRenderer] async model committed: " << slot.path
+                  << " (id=" << id << ")\n";
+    }
+
+    // Recompute aggregates from flags so the per-frame budget doesn't skew the
+    // committed/failed totals (some parse-complete models may still be queued).
+    int committed = 0, failed = 0, parseReady = 0;
+    float progressSum = 0.0f;   // live worker progress for in-flight parses
+    for (const auto& slot : m_worldAsync.slots) {
+        if (slot.committed) { ++committed; }
+        else if (slot.failed) { ++failed; }
+        else if (slot.dataFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) { ++parseReady; }   // parsed, GL upload queued
+        else {
+            // In-flight: contribute its live worker parse progress (0..1).
+            float p = slot.progress
+                ? slot.progress->load(std::memory_order_relaxed) : 0.0f;
+            progressSum += p;
+        }
+    }
+
+    const int total = (int)m_worldAsync.slots.size();
+    m_worldAsync.committedModels.store(committed, std::memory_order_relaxed);
+    m_worldAsync.failedModels.store(failed, std::memory_order_relaxed);
+
+    // Aggregate progress: committed/failed = 1.0 each; parse-complete-but-
+    // awaiting GL upload = 0.9 (almost done — worker finished, upload queued);
+    // in-flight = its live worker progress (0..1).
+    float frac = 0.0f;
+    if (total > 0) {
+        frac = (float)(committed + failed) / (float)total;
+        frac += 0.9f * (float)parseReady / (float)total;
+        if (total > (committed + failed + parseReady)) {
+            frac += progressSum / (float)total;
+        }
+        if (frac > 1.0f) frac = 1.0f;
+    }
+    m_worldAsync.progress.store(frac, std::memory_order_relaxed);
+
+    if (committed + failed >= total) {
+        m_worldAsync.loadFinished.store(true, std::memory_order_relaxed);
+        m_worldAsync.isLoading.store(false, std::memory_order_relaxed);
+        if (failed > 0) {
+            m_worldAsync.failed.store(true, std::memory_order_relaxed);
+        }
+        std::cout << "[SimpleWorldRenderer] async model load complete: "
+                  << committed << " ok, " << failed << " failed\n";
+    }
+    return frac;
+}
+
+std::vector<SimpleWorldRenderer::WorldModelResult> SimpleWorldRenderer::drainCommittedModelIds() {
+    auto out = std::move(m_worldAsync.pendingResults);
+    m_worldAsync.pendingResults.clear();
+    return out;
+}
+
+void SimpleWorldRenderer::cancelAsyncModelLoads() {
+    m_worldAsync.slots.clear();
+    m_worldAsync.totalModels.store(0, std::memory_order_relaxed);
+    m_worldAsync.committedModels.store(0, std::memory_order_relaxed);
+    m_worldAsync.failedModels.store(0, std::memory_order_relaxed);
+    m_worldAsync.isLoading.store(false, std::memory_order_relaxed);
+    m_worldAsync.loadFinished.store(false, std::memory_order_relaxed);
+    m_worldAsync.failed.store(false, std::memory_order_relaxed);
+    m_worldAsync.pendingResults.clear();
+    m_worldAsync.progress.store(0.0f, std::memory_order_relaxed);
+    m_worldAsync.failedMessage.clear();
 }
 
 void SimpleWorldRenderer::setWindStrength(int modelId, float strength) {
@@ -215,9 +477,10 @@ void SimpleWorldRenderer::render(const glm::mat4& view, const glm::mat4& project
     }
 
     // Water plane (transparent, depth-tested no-write) rendered on top of the
-    // opaque scene. Gated on m_renderWater (default false) so the placeholder
-    // flat water no longer hides the terrain once the camera is properly framed.
-    if (m_water && m_renderWater) {
+    // opaque scene. Sun direction/color + fog are pulled from the same
+    // LightingEnvironment the terrain and deferred meshes use, so the water
+    // catches the one canonical sun instead of a separate, mismatched light.
+    if (m_water) {
         m_water->render(view, projection,
                         glm::vec3(glm::inverse(view)[3]), windTime, lighting);
     }
@@ -240,4 +503,73 @@ BoundingBox SimpleWorldRenderer::getModelBounds(int modelId) const {
         return BoundingBox{};
     }
     return m_models[modelId]->GetBoundingBox();
+}
+
+// forPlayer.txt Theme 3, Method 1: instanced-prop raycast. Slab AABB-ray test
+// per instance - mirrors PhysicsWorld::raycast (physicsSystem/physics.cpp:94),
+// but tests each Model's bounding box (Model::GetBoundingBox) scaled by the
+// instance's uniform scale and translated by its world position, recovered
+// from the instance modelMatrix (col3 = position, column lengths = per-axis
+// scale, matching addInstance's translate*rotateY*scale composition). The prop
+// hit set is intentionally separate from PhysicsWorld's rigid-body raycast:
+// foliage / plants have no collider but must still be pickable.
+bool SimpleWorldRenderer::raycastProps(
+    const glm::vec3& origin, const glm::vec3& direction, float maxDist,
+    float& outDist, std::size_t& outIndex,
+    glm::vec3& outHitPoint, glm::vec3& outHitNormal,
+    uint32_t pickableLayerMask) const {
+    outIndex = 0;
+    outDist = maxDist;
+    bool hitAnything = false;
+
+    for (std::size_t i = 0; i < m_instances.size(); ++i) {
+        const SimpleModelInstance& inst = m_instances[i];
+        if (!inst.model) continue;
+
+        // verify.txt Module 3: skip instances whose layer is not in the
+        // pickable-layer mask (locked / isolated layers are raycast-locked).
+        if (!((pickableLayerMask >> inst.layer) & 1u)) continue;
+
+        const BoundingBox& bb = inst.model->GetBoundingBox();
+        if (!bb.IsValid()) continue;  // degenerate model - cannot be picked
+
+        // Instance world placement (see addInstance: translate * rotateY * scale).
+        const float sx = glm::length(inst.modelMatrix[0]);
+        const float sy = glm::length(inst.modelMatrix[1]);
+        const float sz = glm::length(inst.modelMatrix[2]);
+        const glm::vec3 instPos(inst.modelMatrix[3]);
+        const glm::vec3 halfExtents =
+            glm::vec3(bb.max - bb.min) * 0.5f * glm::vec3(sx, sy, sz);
+        const glm::vec3 bmin = instPos - halfExtents;
+        const glm::vec3 bmax = instPos + halfExtents;
+
+        // Slab AABB-ray test (PhysicsWorld::raycast style, physics/physics.cpp:94).
+        float tmin = -std::numeric_limits<float>::max();
+        float tmax =  std::numeric_limits<float>::max();
+        bool outside = false;
+        for (int a = 0; a < 3; ++a) {
+            if (std::abs(direction[a]) < 1e-8f) {
+                if (origin[a] < bmin[a] || origin[a] > bmax[a]) { outside = true; break; }
+            } else {
+                float t1 = (bmin[a] - origin[a]) / direction[a];
+                float t2 = (bmax[a] - origin[a]) / direction[a];
+                if (t1 > t2) std::swap(t1, t2);
+                if (t1 > tmin) tmin = t1;
+                if (t2 < tmax) tmax = t2;
+                if (tmin > tmax || tmax < 0.0f) { outside = true; break; }
+            }
+        }
+        if (outside) continue;
+        if (tmin < 0.0f) continue;       // box is behind the ray origin
+        if (tmin >= outDist) continue;   // not the closest hit so far
+
+        outDist = tmin;
+        outIndex = (std::size_t)i;
+        outHitPoint = origin + direction * tmin;
+        outHitNormal = (instPos != outHitPoint)
+            ? glm::normalize(outHitPoint - instPos)   // radial, matches PhysicsWorld::raycast
+            : glm::vec3(0.0f, 1.0f, 0.0f);
+        hitAnything = true;
+    }
+    return hitAnything;
 }

@@ -141,12 +141,8 @@ public:
     // Update LOD based on distance to camera
     void updateLOD(const glm::vec3& cameraPos, float lodDistance);
 
-    // Render the chunk (no shader setup - call Terrain::renderBatch first).
-    // When asPatches is true the index list is emitted as GL_PATCHES (triangle
-    // patches, requires the tessellation pipeline + glPatchParameteri(GL_PATCH_VERTICES,3));
-    // false keeps the legacy GL_TRIANGLES path. Defaults to false so all existing
-    // callers are unaffected.
-    void draw(bool asPatches = false) const;
+    // Render the chunk (no shader setup - call Terrain::renderBatch first)
+    void draw() const;
 
     // Get chunk world position
     glm::vec3 getWorldPosition() const;
@@ -177,6 +173,11 @@ public:
 
     // LOD level
     int getLOD() const { return m_lod; }
+
+    // VAO + index count for direct draw (rendersplat needs these to choose
+    // GL_PATCHES vs. GL_TRIANGLES for the tessellation pipeline).
+    GLuint getVAO() const { return m_VAO; }
+    GLsizei getIndexCount() const { return (GLsizei)m_indices.size(); }
 
 private:
     void createMesh();

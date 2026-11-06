@@ -117,12 +117,76 @@ public:
      */
     void PrintGraph() const;
 
+    // =========================================================================
+    // TOPOLOGY DIAGNOSTICS (PlayMode HUD)
+    // =========================================================================
+
+    /**
+     * One graph connection, flattened for UI/debug listing.
+     */
+    struct ConnectionInfo {
+        int from;
+        int to;
+        float cost;     // transition distance (lower = better blend)
+        bool valid;     // false once pruned
+    };
+
+    /** Summary of the last BuildTransitions / PruneGraph pass. */
+    struct TopologyResult {
+        size_t nodes = 0;             // states in the graph
+        size_t edges = 0;             // total edges
+        size_t keptEdges = 0;         // edges surviving pruning
+        size_t prunedEdges = 0;
+        size_t components = 0;        // weakly-connected components ("contexts")
+        size_t largestScc = 0;        // largest SCC kept (nodes)
+        size_t sinkNodes = 0;         // nodes with no valid outgoing edge
+    };
+
+    /**
+     * Pure topology pass: within EACH weakly-connected component, keep only the
+     * edges whose endpoints both lie in that component's largest strongly-
+     * connected component.
+     *
+     * Running one global Tarjan SCC over the whole macro-graph is what wipes out
+     * entire gameplay contexts: an isolated loop (a Capoeira or Dance database
+     * that never links back into Locomotion) is a perfectly healthy N-star of
+     * its own, but it is not part of the global largest SCC, so every edge in it
+     * was being deleted. Partitioning by connectivity and keeping the largest
+     * SCC per partition preserves those islands while still removing genuine
+     * dead-ends.
+     *
+     * @param nodes      All graph nodes.
+     * @param edgePairs  Edge endpoints, in the same order as the caller's edges.
+     * @param keep       Output, resized to edgePairs.size(): true = survive.
+     */
+    static TopologyResult PruneTopology(const std::set<int>& nodes,
+                                        const std::vector<std::pair<int, int>>& edgePairs,
+                                        std::vector<bool>& keep);
+
+    /** Statistics from the last PruneGraph() pass. */
+    const TopologyResult& GetTopologyStats() const { return topology_; }
+
+    /** Every connection (valid and pruned), for the PlayMode connection list. */
+    std::vector<ConnectionInfo> GetConnections() const;
+
+    size_t GetNodeCount() const { return nodeSet.size(); }
+    size_t GetValidEdgeCount() const;
+
+    /**
+     * The bridge state used when a direct transition cannot be built
+     * (HybridState::LOCOMOTION — the highest-connectivity hub).
+     */
+    static int HubState();
+
 private:
     // Edges keyed by (from, to) state pair
     std::map<std::pair<int, int>, GraphEdge> edges;
 
     // Nodes in the graph
     std::set<int> nodeSet;
+
+    // Stats from the last PruneGraph() pass (HUD/diagnostics).
+    TopologyResult topology_;
 
     // Tarjan's SCC algorithm implementation
     struct TarjanState {

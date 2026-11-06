@@ -49,6 +49,7 @@ struct CacheFriendlyMotionData {
     
     // Secondary features (accessed less frequently)
     std::vector<float> facingAngles;              // Root facing angle
+    std::vector<float> angularVelocities;         // Root yaw rate (rad/s) - ghost-node scoring
     std::vector<bool> isGrounded;                 // Grounded state
     std::vector<bool> isCrouching;                // Crouch state
     
@@ -95,6 +96,7 @@ struct CacheFriendlyMotionData {
         rootVelocities.clear();
         moveAngles.clear();
         facingAngles.clear();
+        angularVelocities.clear();
         isGrounded.clear();
         isCrouching.clear();
         leftFootPlanted.clear();
@@ -118,6 +120,7 @@ struct CacheFriendlyMotionData {
         rootVelocities.reserve(numPoses);
         moveAngles.reserve(numPoses);
         facingAngles.reserve(numPoses);
+        angularVelocities.reserve(numPoses);
         isGrounded.reserve(numPoses);
         isCrouching.reserve(numPoses);
         leftFootPlanted.reserve(numPoses);
@@ -141,6 +144,7 @@ struct CacheFriendlyMotionData {
         rootVelocities.push_back(pose.features.rootVelocity);
         moveAngles.push_back(pose.features.moveAngle);
         facingAngles.push_back(pose.features.facingAngle);
+        angularVelocities.push_back(pose.features.angularVelocity);
         isGrounded.push_back(pose.features.isGrounded);
         isCrouching.push_back(pose.features.isCrouching);
         leftFootPlanted.push_back(pose.leftFootPlanted);
@@ -162,6 +166,7 @@ struct CacheFriendlyMotionData {
     float GetSpeed(size_t index) const { return speeds[index]; }
     const glm::vec3& GetVelocity(size_t index) const { return rootVelocities[index]; }
     float GetMoveAngle(size_t index) const { return moveAngles[index]; }
+    float GetAngularVelocity(size_t index) const { return angularVelocities[index]; }
     bool IsLeftFootPlanted(size_t index) const { return leftFootPlanted[index]; }
     bool IsRightFootPlanted(size_t index) const { return rightFootPlanted[index]; }
 };
@@ -260,11 +265,14 @@ public:
                                      const MotionMatchingConfig& config) const;
 
     /**
-     * Cache-friendly search using SoA layout
-     * 
-     * This is OPTIMIZED for SIMD and cache efficiency.
-     * Accesses contiguous memory for each feature comparison.
-     * 
+     * Cache-friendly search using the flat SoA pose layout.
+     *
+     * Dispatches to the 8-wide AVX2 kernel (SearchSIMD) when the CPU supports
+     * AVX2 + FMA, and to the allocation-free scalar SoA loop otherwise. Both
+     * paths compute the identical weighted metric, so results do not depend on
+     * which one ran. Use SetForceScalarSearch(true) to pin the scalar reference
+     * (the equivalence tests do this).
+     *
      * @param query Query features
      * @param trajectory Trajectory to match
      * @param maxCandidates How many candidates to return
@@ -280,14 +288,55 @@ public:
         int airborneFilter = -1) const;
 
     // ---- AVX2 SIMD-accelerated search ---------------------------------------
-    // Builds an aligned SoA snapshot of the database and runs an 8-wide
-    // AVX2 distance evaluator.  Falls back gracefully if the CPU lacks AVX2.
-    // The SoA cache is rebuilt only when the database changes (dirty flag).
+    // Builds an aligned SoA snapshot of the database and runs the 8-wide AVX2
+    // distance evaluator that mirrors CalculatePoseScoreCacheOptimized. The SoA
+    // cache is rebuilt only when the database changes.
+    //
+    // `airborneFilter` has the same meaning as in SearchCacheOptimized. When
+    // AVX2/FMA is unavailable this still returns the correct candidates via the
+    // kernel's scalar tail; callers that want the allocation-free scalar loop
+    // should call SearchCacheOptimized instead.
     std::vector<std::pair<int, float>> SearchSIMD(
         const MotionFeatures& query,
         const Trajectory& trajectory,
         int maxCandidates = 10,
         int airborneFilter = -1) const;
+
+    /**
+     * Pin / query the scalar reference search (e.g. to A/B a CPU without AVX2,
+     * or in tests that assert AVX2 results match the scalar ones bit-for-bit in
+     * ordering). Process-wide, defaults to false.
+     */
+    static void SetForceScalarSearch(bool force);
+    static bool IsForceScalarSearch();
+
+    /**
+     * Enable/disable the root-relative future-path ("trajectory") term in the
+     * flat SoA search. Process-wide, defaults to ON.
+     *
+     * Why it exists: the KD tree scores the Unreal-style future path (its dims
+     * 7..7+2*kTrajectorySteps-1), but the flat search historically did not -
+     * its trajectory hook went through Trajectory::getDifference, which reads
+     * `trajectory.positions/velocities` and is inert for database poses (those
+     * are never populated; only `trajectory.localPositions` is). Two search
+     * paths scoring different features silently pick different clips when the
+     * matcher alternates between them. The term is now applied by BOTH the
+     * scalar and AVX2 flat implementations, from the same falloff weights as
+     * the tree (kDefaultTrajectoryFalloff). Set to false to restore the old
+     * (trajectory-blind) flat metric.
+     */
+    static void SetFlatSearchUsesTrajectory(bool on);
+    static bool FlatSearchUsesTrajectory();
+
+    /**
+     * Measure how much faster the AVX2 flat search is than the scalar
+     * reference on THIS database, by timing both over the current query load.
+     * Returns 0 when AVX2/FMA is unavailable. Intended for the PlayMode
+     * diagnostics HUD (it is a real measurement, not a compile-time label).
+     *
+     * @param iterations Number of full passes over the query set per path.
+     */
+    double MeasureFlatSearchSpeedup(int iterations = 20) const;
 
     /**
      * Check if the SIMD database cache needs rebuilding
@@ -326,22 +375,6 @@ public:
     std::string GetAnimationName(size_t index) const {
         if (index >= animations.size()) return std::string();
         return animations[index].name;
-    }
-
-    /**
-     * Get the pose range [startPoseIndex, endPoseIndex] for the animation
-     * at the given index. Used by MotionMatcher to derive a time-aligned
-     * pose index inside an animation clip (instead of re-running the KD-tree
-     * on every frame during rest).
-     */
-    void GetPoseRange(size_t index, size_t& outStart, size_t& outEnd) const {
-        if (index >= animations.size()) {
-            outStart = 0;
-            outEnd = 0;
-            return;
-        }
-        outStart = animations[index].startPoseIndex;
-        outEnd = animations[index].endPoseIndex;
     }
 
     /**
@@ -445,15 +478,16 @@ private:
     void ExtractPoseFeatures(size_t poseIndex, std::shared_ptr<Animation> anim, float time,
                             const class Skeleton* skeleton);
 
-    // FIX (v11 Section 3): AVX2-accelerated trajectory feature extraction.
-    // Vectorizes the future-path look-ahead (4 sample points in a single
-    // _mm256_sub_ps) instead of looping scalar. Caller must guard with
-    // cpuSupportsAVX2() — falls back to ExtractPoseFeatures otherwise.
-#if defined(__GNUC__) || defined(__clang__)
-    __attribute__((target("avx2,fma")))
-#endif
-    void ExtractPoseFeaturesSIMD(size_t poseIndex, std::shared_ptr<Animation> anim,
-                                 float time, float rootPos_x, float rootPos_z);
+    /**
+     * Scalar reference for SearchCacheOptimized (the exact loop the AVX2 kernel
+     * mirrors). Kept as a separate entry point so equivalence tests can compare
+     * the two implementations directly.
+     */
+    std::vector<std::pair<int, float>> SearchCacheOptimizedScalar(
+        const MotionFeatures& query,
+        const Trajectory& trajectory,
+        int maxCandidates,
+        int airborneFilter) const;
 
     /**
      * Calculate pose score (lower = better match)
@@ -475,8 +509,31 @@ private:
                                            const MotionMatchingConfig& config) const;
 
     /**
+     * Root-relative future-path term shared by the flat scalar reference and
+     * the AVX2 kernel (which mirrors this expression exactly):
+     *
+     *   trajectoryWeight · Σ_{k<cmp} w_k·‖pose.localPositions[k] − query.futureLocal[k]‖
+     *                      / Σ_{k<cmp} w_k
+     *
+     * with cmp = min(kTrajectorySteps, query.futureCount), w = trajectoryFalloff_.
+     * Returns 0 when the feature is disabled on either side, so a missing
+     * future path contributes nothing instead of biasing the score.
+     */
+    float CalculateTrajectoryTerm(const PoseSample& pose,
+                                  const MotionFeatures& query) const;
+
+    // Near->far falloff for the future-path term; mirrors
+    // MotionKDTree::kDefaultTrajectoryWeights (both sourced from
+    // kDefaultTrajectoryFalloff).
+    float trajectoryFalloff_[kTrajectorySteps] = {
+        kDefaultTrajectoryFalloff[0], kDefaultTrajectoryFalloff[1],
+        kDefaultTrajectoryFalloff[2], kDefaultTrajectoryFalloff[3]
+    };
+
+    /**
      * Feature weights (tune matching behavior)
      */
+public:
     struct FeatureWeights {
         float velocityWeight = 3.0f;        // How important is velocity match
         float speedWeight = 2.0f;           // How important is speed match
@@ -487,4 +544,15 @@ private:
     };
 
     FeatureWeights weights;
+
+    /**
+     * Get the feature weights used by the pose-search scoring, so external
+     * callers (e.g. TransitionClipGenerator::CalculateAdvancedTrajectoryPenalty)
+     * can scale the trajectory forward-look-ahead term consistently with the
+     * flat / KD-tree search weights.
+     */
+    const FeatureWeights& GetWeights() const { return weights; }
+    // forUI.txt Block 1: live-editable handle to the feature weights so the
+    // Details-panel sliders write straight into the matcher's scoring profile.
+    FeatureWeights& GetWeightsRef() { return weights; }
 };

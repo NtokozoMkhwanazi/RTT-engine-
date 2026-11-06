@@ -128,15 +128,17 @@ void FootPlantingSystem::FootState::Update(
 {
     position = newPos;
 
-    // STATE-SPACE REST ZEROING PASS:
-    // If the animation player registers micro-velocity below 0.02 m/s, force-
-    // clamp to zero. The old 0.09 threshold masked real micro-velocity during
-    // walk contact transitions (0.02-0.09 m/s) that the Schmitt trigger needs
-    // to see to decide plant/release — lowering it to match the at-rest
-    // threshold (0.02) so only true noise is zeroed.
+    // STATE-SPACE REST ZEROING PASS (Fix 1 from updated todo):
+    // If the animation player registers micro-velocity below 0.09 m/s, force-
+    // clamp the velocity vector to pure zero. This stops the feedback shockwave
+    // from the over-reach solver (d > maxReach) from generating false velocity
+    // spikes that bypass the Schmitt-Trigger gates and re-break the lock.
     float currentSpeed = glm::length(newVel);
     glm::vec3 currentAnkleVel = newVel;
-    if (currentSpeed < 0.02f) {
+    // FIX (forAnime.txt Fix 2): Raise the deadband from 0.09 to 0.25 so
+    // sub-pixel compression/idle noise is flattened before it can trip the
+    // variance Schmitt-Trigger and cause foot lock jitter.
+    if (currentSpeed < 0.25f) {
         currentAnkleVel = glm::vec3(0.0f);
         currentSpeed = 0.0f;
     }
@@ -146,10 +148,7 @@ void FootPlantingSystem::FootState::Update(
 
     // --- STATISTICAL VARIANCE SCHMITT-TRIGGER ---
     // Online Exponential Moving Statistical aggregation (Welford variant).
-    // Gain lowered from 0.15 to 0.08 for more stable variance at low speeds
-    // (the 0.15 gain made speedVariance flutter around the 0.002 threshold
-    // frame-to-frame, causing rapid plant/release oscillation).
-    const float kVarianceGain = 0.08f;
+    const float kVarianceGain = 0.15f;
     float previousMean = speedMean;
 
     speedMean = glm::mix(speedMean, currentSpeed, kVarianceGain);
@@ -159,26 +158,27 @@ void FootPlantingSystem::FootState::Update(
 
     bool isCloseToGround = distanceToFloor <= config.footPlantedHeightThreshold;
 
-    // Schmitt trigger with hysteresis. The old dead zone was 0.02-0.35 m/s —
-    // far too wide for walk speeds, where foot contact-transition velocities
-    // sit at 0.05-0.15 m/s (squarely in the dead zone, so the foot state
-    // never updated → jitter). The at-rest band is tightened (0.01 for speed,
-    // 0.001 for variance) and the active band is lowered to 0.08 m/s (just
-    // above the velocity-zeroing floor) so a lifting foot releases cleanly
-    // instead of sitting in limbo. The variance thresholds scale with the
-    // speed thresholds to keep the ratio consistent.
-    bool signalIsAtRest  = (speedVariance < 0.001f) && (currentSpeed < 0.01f);
-    bool signalIsActive  = (currentSpeed > 0.08f) || (speedVariance > 0.005f);
+    // Separate boundary thresholds strictly to ignore floating point log flutter
+    bool signalIsAtRest  = (speedVariance < 0.002f) && (currentSpeed < 0.02f);
+    bool signalIsActive  = (currentSpeed > 0.35f) || (speedVariance > 0.01f);
 
     if (isLocked) {
         if (signalIsActive || !isCloseToGround) {
             isLocked = false;
-            lockWeight = 0.0f;
-            releaseTimer = 0.10f; // 100ms blending window
+            releaseTimer = 0.10f; // Let the cooldown timer handle decay smoothly
         } else {
             lockWeight = 1.0f;
             releaseTimer = 0.0f;
-            plantTimer += dt;  // NOW incremented — was dead code before
+
+            // FIX (forAnime.txt Fix 3): Standing Anchor Lock — when the
+            // character is completely stationary (zero velocity, negligible
+            // variance), zero out the ankle velocity entirely. This cuts off
+            // sub-pixel FBX keyframe interpolation chatter before it can
+            // propagate into the sensitive cosA analytical leg solver curve,
+            // where a 0.0001 change causes multi-degree knee angle swings.
+            if (currentSpeed == 0.0f && speedVariance < 0.0001f) {
+                velocity = glm::vec3(0.0f);
+            }
         }
     } else {
         if (isCloseToGround && signalIsAtRest) {
@@ -187,7 +187,6 @@ void FootPlantingSystem::FootState::Update(
             plantedWorldPos = position;
             plantedWorldPos.y = groundHeight; // Snap strictly to floor
             releaseTimer = 0.0f;
-            plantTimer = 0.0f;  // Reset on plant
         } else {
             if (releaseTimer > 0.0f) {
                 releaseTimer -= dt;

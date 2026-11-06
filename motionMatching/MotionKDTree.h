@@ -72,10 +72,18 @@ public:
     static constexpr int NUM_FEATURES = 7 + 2 * kTrajectorySteps;
 
     // Default near->far trajectory falloff (motion matching weights nearer
-    // future points more). Shared by the runtime member initializer and by
-    // MotionMatcher::SetSearchWeights so the tuned scale is defined once.
+    // future points more). Sourced from kDefaultTrajectoryFalloff so the KD
+    // tree, MotionMatcher::SetSearchWeights and the flat SoA search all share
+    // one tuned scale.
     static constexpr float kDefaultTrajectoryWeights[kTrajectorySteps] =
-        { 4.0f, 2.5f, 1.5f, 1.0f };
+        { kDefaultTrajectoryFalloff[0], kDefaultTrajectoryFalloff[1],
+          kDefaultTrajectoryFalloff[2], kDefaultTrajectoryFalloff[3] };
+
+    // Safety cap on BuildWithSAHRecursive depth. A balanced tree over N
+    // poses reaches ~log2(N/maxLeaf) depth (e.g. ~6 for 400 poses, maxLeaf=10);
+    // 40 is well past that, so this only truncates degenerate SAH spines on
+    // duplicate/degenerate feature vectors. Search is exact over leafIndices.
+    static constexpr int kMaxBuildDepth = 40;
 
     MotionKDTree();
     ~MotionKDTree();
@@ -172,6 +180,26 @@ public:
     std::vector<float> GetFeatureVector(const MotionFeatures& features) const;
     float CalculateDistance(const std::vector<float>& a,
                             const std::vector<float>& b) const;
+
+    // =========================================================================
+    // LEAF EVALUATION (vectorised)
+    // =========================================================================
+    // The hot path of a kNN query is the leaf sweep: every pose in a leaf is
+    // scored against the query. Leaves hold up to maxLeafSize poses, which suits
+    // 8-wide chunking. `GetLeafDistances` returns the exact same weighted
+    // distance as CalculateDistance for each requested pose index, computed via
+    // an AVX2 gather kernel over the internal feature SoA when the CPU supports
+    // it (scalar otherwise). Exposed so the SIMD and scalar evaluations can be
+    // compared directly in tests.
+    std::vector<float> GetLeafDistances(const MotionFeatures& query,
+                                        const std::vector<int>& poseIndices) const;
+
+    /**
+     * Pin / query the scalar leaf evaluator (tests A/B the two kernels;
+     * defaults to false = use AVX2 when available).
+     */
+    static void SetForceScalarLeafEval(bool force);
+    static bool IsForceScalarLeafEval();
     
     // =========================================================================
     // DEBUG
@@ -225,6 +253,32 @@ private:
     std::unique_ptr<KDTreeNode> root;
     std::vector<PoseSample> poseData;  // Internal copy of poses (owns the data)
     size_t poseCount{0};
+
+    // Transposed feature cache: featureSoA_[dim * poseCount + pose], built once
+    // per Build so the leaf kernel can gather one dimension of 8 poses with a
+    // single instruction instead of allocating a std::vector<float> per pose
+    // per query (which the old leaf loops did).
+    std::vector<float> featureSoA_;
+
+    // Per-dimension metric weights for the SoA kernel, in feature index order
+    // (0 speed, 1 X vel, 2 Z vel, 3 direction, 4-5 foot plants, 6 vertical vel,
+    // 7..7+2*kTrajectorySteps-1 future path). Kept in sync with what
+    // CalculateDistance derives from `weights`/`trajectoryWeights`.
+    void BuildFeatureSoA();
+    void FillDimensionWeights(float out[NUM_FEATURES]) const;
+
+    // Allocation-free core of GetLeafDistances: fills `out` (resized) with the
+    // per-index distances for an ALREADY-EXTRACTED query feature vector (the
+    // recursive search helpers carry the vector, not the MotionFeatures). The
+    // search loops call this with a member scratch buffer, so a leaf sweep
+    // allocates nothing.
+    void GetLeafDistancesVec(const std::vector<float>& queryVec,
+                             const std::vector<int>& poseIndices,
+                             std::vector<float>& out) const;
+
+    // Scratch buffers for the leaf sweep (mutable: reused across const queries).
+    mutable std::vector<float> leafDistScratch_;
+    mutable std::vector<int>   leafIdxScratch_;
 
     // SAH Configuration
     static constexpr int SAH_NUM_BINS = 12;      // Number of bins for SAH evaluation

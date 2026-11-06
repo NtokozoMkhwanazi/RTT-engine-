@@ -20,6 +20,13 @@
 constexpr int kTrajectorySteps = 4;         // Future points per pose/query
 constexpr float kTrajectoryStepTime = 0.1f; // Seconds between points (0.1..0.4s)
 
+// Near->far falloff applied to the root-relative future-path feature, shared
+// by EVERY search path so they cannot drift apart:
+//   - MotionKDTree's distance metric (dims 7..7+2*kTrajectorySteps-1),
+//   - MotionDatabase's flat SoA search (scalar + AVX2).
+// Nearer future points are more predictive of the intended motion than far ones.
+constexpr float kDefaultTrajectoryFalloff[kTrajectorySteps] = { 4.0f, 2.5f, 1.5f, 1.0f };
+
 // ============================================================================
 // MOTION MATCHING - CORE TYPES
 // ============================================================================
@@ -47,6 +54,7 @@ struct MotionFeatures {
     // Body orientation
     float facingAngle{0.0f};            // Angle root is facing (radians)
     float moveAngle{0.0f};              // Angle between facing and movement
+    float angularVelocity{0.0f};       // Root yaw rate (rad/s) - ghost-node turn scoring
     
     // State flags
     bool isGrounded{true};              // Is character on ground
@@ -99,6 +107,13 @@ struct Trajectory {
     // current root position rotated into the root's local space (XZ only, y=0).
     glm::vec3 localPositions[MAX_POINTS]{glm::vec3(0.0f)};
     int localNumPoints{0};              // How many local points are valid
+
+    // Ghost-node turn-in-place signal (forAnime.txt Upgrade 2). Set ONLY by
+    // PredictWithGhostNodes so the angular-velocity score hook fires
+    // exclusively for turn-in-place trajectories and stays a no-op (and
+    // SIMD-parity safe) for ordinary motion whose velocities[] lanes may hold
+    // unrelated/vertical data.
+    bool hasGhostNodes{false};
     
     /**
      * Get trajectory point at time offset
@@ -266,6 +281,29 @@ struct MotionMatchingConfig {
 // DEBUG VISUALIZATION
 // ============================================================================
 
+/**
+ * Which implementation served the pose search this frame.
+ *
+ * Distinguishing these is the whole point of the PlayMode diagnostics: "the
+ * search took 4 ms" is not actionable, "the 8-wide AVX2 SoA scan took 4 ms
+ * because the KD tree was not built" is.
+ */
+enum class MMPoseSearchPath {
+    None = 0,       // no search ran this frame
+    StaticRoot,     // static-root short circuit (no search at all)
+    KDTree,         // hierarchical kNN (leaf sweep is AVX2 when available)
+    FlatSoA,        // flat database scan (AVX2 kernel, or its scalar tail)
+};
+
+inline const char* MMPoseSearchPathName(MMPoseSearchPath p) {
+    switch (p) {
+        case MMPoseSearchPath::StaticRoot: return "Static root";
+        case MMPoseSearchPath::KDTree:     return "KD-Tree";
+        case MMPoseSearchPath::FlatSoA:    return "Flat SoA";
+        default:                           return "none";
+    }
+}
+
 struct MotionMatchingDebug {
     bool enabled{false};
     
@@ -288,4 +326,34 @@ struct MotionMatchingDebug {
     int currentAnimationIndex{-1};
     float currentAnimationTime{0.0f};
     std::string currentAnimationName;
+
+    // =========================================================================
+    // SEARCH / SIMD TELEMETRY (PlayMode HUD)
+    // =========================================================================
+
+    MMPoseSearchPath searchPath{MMPoseSearchPath::None};
+    float searchUs{0.0f};            // search duration in microseconds
+    bool  avx2Available{false};      // CPU supports AVX2+FMA
+    bool  avx2LeafEval{false};       // KD-tree leaf sweep using the AVX2 kernel
+    bool  avx2FlatScan{false};       // flat SoA scan using the AVX2 kernel
+    int   simdLanes{0};              // 8 when a vector kernel is active
+    int   paddedPoses{0};            // database size rounded up to the SIMD width
+    bool  trajectoryUsed{false};     // future-path term active in the flat search
+
+    // =========================================================================
+    // CONNECTION / DECISION TELEMETRY (PlayMode HUD)
+    // =========================================================================
+    // A "connection" is the link the matcher acts on: the currently playing
+    // clip and the clip/pose it decided to move to this frame.
+
+    int   candidatesReturned{0};     // candidates the search handed back
+    float bestDistance{0.0f};        // winner's feature-space distance
+    float secondBestDistance{0.0f};  // runner-up distance (0 if none)
+    bool  persistenceOverride{false};// persistence demoted the raw nearest pose
+    bool  switchedClipThisFrame{false};
+    int   clipSwitchCount{0};        // total clip switches since load
+    float secondsSinceClipSwitch{0.0f};
+    std::string lastSwitchFrom;      // previous clip of the most recent switch
+    std::string lastSwitchTo;        // new clip of the most recent switch
+    float trajectoryError{0.0f};     // chosen pose's path vs the predicted path
 };

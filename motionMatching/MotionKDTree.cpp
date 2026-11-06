@@ -1,16 +1,62 @@
 #include "MotionKDTree.h"
+// Brings in the AVX2 availability macro + cpuSupportsAVX2(), and the shared
+// kTrajectorySteps constants - the tree deliberately reuses the project's one
+// AVX2 detection rather than rolling its own.
+#include "MotionKDTreeSIMD.h"
 #include <iostream>
 #include <queue>
 #include <iomanip>
 #include <limits>
-#include <future>
+#include <cmath>
 
-// Only parallelize KD-Tree construction for large pose sets; small trees (and
-// the small test fixtures) stay serial so the build stays deterministic and
-// thread-overhead-free. The two subtrees are built from DISJOINT index vectors
-// and only READ poseData (written once before recursion), so the fork is
-// race-free by construction; max in-flight threads is O(log(n/threshold)).
-static constexpr int kParallelBuildThreshold = 128;
+namespace {
+// Process-wide switch that pins leaf evaluation to the scalar reference (see
+// MotionKDTree::SetForceScalarLeafEval). Used by tests to A/B the kernels.
+bool gForceScalarLeafEval = false;
+
+#if RTT_MOTION_AVX2
+// 8-wide weighted-Euclidean distance for one chunk of pose indices, over the
+// transposed feature SoA (soa[d * stride + pose]). Arithmetic order matches the
+// scalar CalculateDistance loop - accumulate ((diff*diff) * w) dimension by
+// dimension - so results agree to within 1 ulp (the only deliberate deviation
+// is dim 3's angular wrap; see WrapAngle8 below).
+__attribute__((target("avx2,fma")))
+inline void LeafDistancesAVX2(const float* soa, size_t stride, int dims,
+                              const float* q, const float* w,
+                              const int* idx8, float* out8) {
+    const __m256i vidx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(idx8));
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int d = 0; d < dims; ++d) {
+        const __m256 g = _mm256_i32gather_ps(
+            soa + static_cast<size_t>(d) * stride, vidx, 4);
+        __m256 diff = _mm256_sub_ps(g, _mm256_set1_ps(q[d]));
+        if (d == 3) {
+            // Angular dimension. The scalar path wraps with fmod(); for the
+            // canonicalised feature range (both angles in [0, 2pi), so
+            // |diff| < 2pi) the fold below is the same operation:
+            //   |d| <= pi -> d, otherwise d -+ 2pi.
+            const __m256 absMask =
+                _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+            const __m256 pi = _mm256_set1_ps(3.14159265f);
+            const __m256 twoPi = _mm256_set1_ps(6.28318530f);
+            const __m256 overPi = _mm256_cmp_ps(diff, pi, _CMP_GT_OQ);
+            const __m256 belowNegPi = _mm256_cmp_ps(diff, _mm256_sub_ps(_mm256_setzero_ps(), pi),
+                                                    _CMP_LT_OQ);
+            diff = _mm256_sub_ps(diff, _mm256_and_ps(overPi, twoPi));
+            diff = _mm256_add_ps(diff, _mm256_and_ps(belowNegPi, twoPi));
+            (void)absMask;
+        }
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_mul_ps(diff, diff),
+                                               _mm256_set1_ps(w[d])));
+    }
+    _mm256_storeu_ps(out8, _mm256_sqrt_ps(acc));
+}
+#endif  // RTT_MOTION_AVX2
+}  // namespace
+
+void MotionKDTree::SetForceScalarLeafEval(bool force) { gForceScalarLeafEval = force; }
+bool MotionKDTree::IsForceScalarLeafEval() { return gForceScalarLeafEval; }
 
 MotionKDTree::MotionKDTree() {}
 
@@ -22,6 +68,83 @@ void MotionKDTree::Clear() {
     root.reset();
     poseData.clear();
     poseCount = 0;
+    featureSoA_.clear();
+    leafDistScratch_.clear();
+    leafIdxScratch_.clear();
+}
+
+void MotionKDTree::FillDimensionWeights(float out[NUM_FEATURES]) const {
+    out[0] = weights.speed;
+    out[1] = weights.velocityX;
+    out[2] = weights.velocityZ;
+    out[3] = weights.direction;
+    out[4] = weights.footPlant;
+    out[5] = weights.footPlant;
+    out[6] = weights.verticalVelocity;
+    for (int k = 0; k < kTrajectorySteps; ++k) {
+        out[7 + 2 * k] = trajectoryWeights[k];
+        out[7 + 2 * k + 1] = trajectoryWeights[k];
+    }
+}
+
+void MotionKDTree::BuildFeatureSoA() {
+    featureSoA_.assign(static_cast<size_t>(NUM_FEATURES) * poseCount, 0.0f);
+    for (size_t i = 0; i < poseCount; ++i) {
+        const std::vector<float> v = GetFeatureVector(poseData[i]);
+        for (int d = 0; d < NUM_FEATURES && d < static_cast<int>(v.size()); ++d) {
+            featureSoA_[static_cast<size_t>(d) * poseCount + i] = v[d];
+        }
+    }
+}
+
+std::vector<float> MotionKDTree::GetLeafDistances(
+    const MotionFeatures& query, const std::vector<int>& poseIndices) const {
+    std::vector<float> out;
+    GetLeafDistancesVec(GetFeatureVector(query), poseIndices, out);
+    return out;
+}
+
+void MotionKDTree::GetLeafDistancesVec(
+    const std::vector<float>& qv, const std::vector<int>& poseIndices,
+    std::vector<float>& out) const {
+    out.assign(poseIndices.size(), 0.0f);
+    if (poseIndices.empty()) return;
+
+    const int dims = std::min<int>(NUM_FEATURES, static_cast<int>(qv.size()));
+
+    bool simd = false;
+#if RTT_MOTION_AVX2
+    simd = !gForceScalarLeafEval && !featureSoA_.empty() &&
+           cpuSupportsAVX2() && dims == NUM_FEATURES;
+#endif
+
+    if (!simd) {
+        for (size_t i = 0; i < poseIndices.size(); ++i) {
+            const int pi = poseIndices[i];
+            if (pi < 0 || pi >= static_cast<int>(poseData.size())) continue;
+            out[i] = CalculateDistance(qv, GetFeatureVector(poseData[pi]));
+        }
+        return;
+    }
+
+#if RTT_MOTION_AVX2
+    float wdims[NUM_FEATURES];
+    FillDimensionWeights(wdims);
+
+    alignas(32) int idx8[8];
+    alignas(32) float out8[8];
+    for (size_t i = 0; i < poseIndices.size(); i += 8) {
+        const size_t count = std::min<size_t>(8, poseIndices.size() - i);
+        for (size_t l = 0; l < 8; ++l) idx8[l] = 0;
+        for (size_t l = 0; l < count; ++l) {
+            const int pi = poseIndices[i + l];
+            idx8[l] = (pi >= 0 && pi < static_cast<int>(poseCount)) ? pi : 0;
+        }
+        LeafDistancesAVX2(featureSoA_.data(), poseCount, dims, qv.data(), wdims,
+                          idx8, out8);
+        for (size_t l = 0; l < count; ++l) out[i + l] = out8[l];
+    }
+#endif
 }
 
 // ============================================================================
@@ -189,6 +312,9 @@ MotionKDTree::SAHSplit MotionKDTree::FindBestSplit(const std::vector<int>& indic
         // fractional positions like 0.333f, creating degenerate sub-trees
         // with zero variance that collapse to O(n). Split exactly at 0.5f.
         if (axis == 4 || axis == 5) {
+            if (bounds.maxBounds[axis] - bounds.minBounds[axis] < 1e-4f) {
+                continue; // Guard against zero-variance binary nodes
+            }
             float cost = SAH_TRAVERSAL_COST +
                          (indices.size() * 0.5f * SAH_INTERSECTION_COST);
             if (cost < bestSplit.bestCost) {
@@ -286,6 +412,17 @@ std::unique_ptr<KDTreeNode> MotionKDTree::BuildWithSAHRecursive(
         return node;
     }
     
+    // Safety cap on SAH recursion depth (bail to leaf). See kMaxBuildDepth.
+    // Search is exact over leafIndices regardless of depth, so this only
+    // bounds build time on degenerate subtrees.
+    if (depth >= kMaxBuildDepth) {
+        node->leafIndices = indices;
+        if (!indices.empty()) {
+            node->poseIndex = indices[0];
+        }
+        return node;
+    }
+
     // Find best split using SAH with binning
     SAHSplit split = FindBestSplit(indices, maxLeafSize);
     
@@ -355,28 +492,12 @@ std::unique_ptr<KDTreeNode> MotionKDTree::BuildWithSAHRecursive(
     leftBounds.maxBounds[split.bestAxis] = node->splitValue;
     rightBounds.minBounds[split.bestAxis] = node->splitValue;
     
-    // Build subtrees - parallelize the independent right-subtree construction
-    // across a worker thread so index builds overlap with IO on large pose
-    // databases. The two halves operate on DISJOINT index vectors
-    // (leftIndices vs rightIndices) and only READ poseData (populated once by
-    // BuildWithSAH before any recursion), so the fork is race-free by
-    // construction. Gated by kParallelBuildThreshold so small trees (and the
-    // small test fixtures) stay serial and deterministic.
-    if (!leftIndices.empty() && !rightIndices.empty() &&
-        (int)indices.size() > kParallelBuildThreshold) {
-        auto rightFuture = std::async(std::launch::async,
-            [this, depth, maxLeafSize, numBins,
-             rightBounds, rightIndices = std::move(rightIndices)]() mutable {
-                return BuildWithSAHRecursive(rightIndices, depth + 1,
-                                             maxLeafSize, rightBounds, numBins);
-            });
-        node->left  = BuildWithSAHRecursive(leftIndices, depth + 1, maxLeafSize, leftBounds, numBins);
-        node->right = rightFuture.get();
-    } else {
-        if (!leftIndices.empty())
-            node->left  = BuildWithSAHRecursive(leftIndices, depth + 1, maxLeafSize, leftBounds, numBins);
-        if (!rightIndices.empty())
-            node->right = BuildWithSAHRecursive(rightIndices, depth + 1, maxLeafSize, rightBounds, numBins);
+    // Build subtrees
+    if (!leftIndices.empty()) {
+        node->left = BuildWithSAHRecursive(leftIndices, depth + 1, maxLeafSize, leftBounds, numBins);
+    }
+    if (!rightIndices.empty()) {
+        node->right = BuildWithSAHRecursive(rightIndices, depth + 1, maxLeafSize, rightBounds, numBins);
     }
     
     return node;
@@ -395,6 +516,10 @@ void MotionKDTree::BuildWithSAH(const std::vector<PoseSample>& inPoses, int maxL
         return;
     }
     
+    // Transposed feature cache for the AVX2 leaf sweep (also removes the
+    // per-pose std::vector allocation the leaf loops used to make).
+    BuildFeatureSoA();
+
     // Create index array
     std::vector<int> indices(poseCount);
     for (size_t i = 0; i < poseCount; i++) {
@@ -504,13 +629,18 @@ void MotionKDTree::SearchRecursive(
 
     // If leaf, check EVERY pose it contains (exact nearest-neighbor search).
     if (node->isLeaf()) {
+        // Vectorised leaf sweep: score every pose in the leaf 8-wide (scalar /
+        // non-AVX2 falls back inside GetLeafDistancesInto, same values).
+        leafIdxScratch_.clear();
         for (int pi : node->leafIndices) {
-            if (pi < 0 || pi >= static_cast<int>(poseData.size())) continue;
-            auto poseVec = GetFeatureVector(poseData[pi]);
-            float dist = CalculateDistance(query, poseVec);
+            if (pi >= 0 && pi < static_cast<int>(poseData.size())) leafIdxScratch_.push_back(pi);
+        }
+        GetLeafDistancesVec(query, leafIdxScratch_, leafDistScratch_);
+        for (size_t i = 0; i < leafIdxScratch_.size(); ++i) {
+            const float dist = leafDistScratch_[i];
             if (dist < bestDist) {
                 bestDist = dist;
-                bestIndex = pi;
+                bestIndex = leafIdxScratch_[i];
             }
         }
         return;
@@ -574,11 +704,17 @@ void MotionKDTree::SearchKNearestRecursive(
     // looked at a single representative pose per leaf, which made the result
     // set arbitrary and clip-biased).
     if (node->isLeaf()) {
+        // Vectorised leaf sweep (see GetLeafDistancesInto). The bounded top-k
+        // insertion stays scalar - only the distance math is 8-wide.
+        leafIdxScratch_.clear();
         for (int pi : node->leafIndices) {
-            if (pi < 0 || pi >= static_cast<int>(poseData.size())) continue;
-            auto poseVec = GetFeatureVector(poseData[pi]);
-            float dist = CalculateDistance(query, poseVec);
-            
+            if (pi >= 0 && pi < static_cast<int>(poseData.size())) leafIdxScratch_.push_back(pi);
+        }
+        GetLeafDistancesVec(query, leafIdxScratch_, leafDistScratch_);
+        for (size_t i = 0; i < leafIdxScratch_.size(); ++i) {
+            const int pi = leafIdxScratch_[i];
+            const float dist = leafDistScratch_[i];
+
             KDTSearchResult result;
             result.poseIndex = pi;
             result.distance = dist;
@@ -655,10 +791,14 @@ void MotionKDTree::SearchRadiusRecursive(
     // Evaluate every pose in a leaf (the old code checked only the leaf's
     // single representative pose, missing poses that were nearer).
     if (node->isLeaf()) {
+        leafIdxScratch_.clear();
         for (int pi : node->leafIndices) {
-            if (pi < 0 || pi >= static_cast<int>(poseData.size())) continue;
-            auto poseVec = GetFeatureVector(poseData[pi]);
-            float dist = CalculateDistance(query, poseVec);
+            if (pi >= 0 && pi < static_cast<int>(poseData.size())) leafIdxScratch_.push_back(pi);
+        }
+        GetLeafDistancesVec(query, leafIdxScratch_, leafDistScratch_);
+        for (size_t i = 0; i < leafIdxScratch_.size(); ++i) {
+            const int pi = leafIdxScratch_[i];
+            const float dist = leafDistScratch_[i];
             if (dist <= radius) {
                 KDTSearchResult result;
                 result.poseIndex = pi;
@@ -722,8 +862,9 @@ float MotionKDTree::CalculateDistance(
         // full circle - so a straight-backward character ranks backward poses
         // as far. Wrap the difference into [-pi, pi] before weighting.
         if (i == 3) {
-            while (diff > 3.14159265f) diff -= 6.28318530f;
-            while (diff < -3.14159265f) diff += 6.28318530f;
+            diff = std::fmod(diff + 3.14159265f, 6.28318530f);
+            if (diff < 0.0f) diff += 6.28318530f;
+            diff -= 3.14159265f;
         }
         float weight = 1.0f;
         

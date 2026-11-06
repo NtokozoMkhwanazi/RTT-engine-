@@ -72,6 +72,20 @@ public:
     );
 
     /**
+     * Advanced trajectory forward-look-ahead penalty (forAnime.txt 888-961):
+     * velocity-scaled horizon + exponential temporal discounting + angular
+     * curvature alignment. Lets FindBestTransitionPoint reject transitions
+     * that match pose-wise but diverge in long-term momentum ("Transition
+     * Blindness" — e.g. a straight sprint vs a banking stop beyond the horizon).
+     */
+    static float CalculateAdvancedTrajectoryPenalty(
+        const PoseSample& srcPose,
+        const PoseSample& tgtPose,
+        const MotionDatabase& sourceDB,
+        const MotionDatabase& targetDB,
+        float dt);
+
+    /**
      * Generate a transition clip that smoothly blends from the source pose
      * to the target pose over transitionFrames.
      *
@@ -98,6 +112,63 @@ public:
         float fps = 120.0f
     );
 
+    // =========================================================================
+    // PURE MATH HELPERS (public so the Kovar & Gleicher equations can be unit-
+    // tested directly against the paper - see tests/test_kovar_gleicher.cpp).
+    // They are stateless pure functions; nothing here touches database state.
+    // =========================================================================
+
+    /**
+     * C¹-continuous cubic smoothstep blend weight (equation 7):
+     *   α(p) = 2((p+1)/k)³ − 3((p+1)/k)² + 1,  for −1 < p < k
+     *   α(p) = 1 for p ≤ −1
+     *   α(p) = 0 for p ≥ k
+     */
+    static float SmoothstepC1(float p, float k);
+
+    /**
+     * Apply 2D rigid transform to a 3D point (rotation about Y axis +
+     * XZ translation), as used in equation (1).
+     *
+     *   T(p) = R(θ)·p + t
+     *   R(θ)·(x,z) = ( c·x + s·z,  −s·x + c·z )    (c = cosθ, s = sinθ)
+     *
+     * NOTE: the rotation matrix here is R(θ); ComputeOptimal2DAlignment must
+     * return the θ and t that are consistent with THIS convention (verified by
+     * the unit tests).
+     */
+    static glm::vec3 Apply2DTransform(
+        const glm::vec3& point,
+        float rotationRad,
+        const glm::vec2& translation
+    );
+
+    /**
+     * Compute optimal 2D rigid alignment: the rotation θ and translation
+     * (x₀, z₀) that minimize the weighted point-cloud distance
+     *
+     *     D = Σᵢ wᵢ ‖aᵢ − (R(θ)·bᵢ + t)‖²
+     *
+     * i.e. the rigid transform T that best maps the TARGET cloud b onto the
+     * SOURCE cloud a (matching how WindowPointCloudDistance applies it:
+     * `alignedTarget = Apply2DTransform(targetPort, θ, t)` compared to source).
+     *
+     * Closed-form weighted solution (Kovar & Gleicher equations 2-4), written
+     * in terms of the weighted centroids x̄, z̄ (source) and x̄₀, z̄₀ (target):
+     *
+     *   θ = atan2( Σ wᵢ(aᵢ⁻·bᵢ⁻ in cross form) , Σ wᵢ(aᵢ⁻·bᵢ⁻ in dot form) )
+     *   t = centroid(a) − R(θ)·centroid(b)
+     *
+     * where aᵢ⁻, bᵢ⁻ are the centroid-subtracted (centered) points.
+     */
+    static void ComputeOptimal2DAlignment(
+        const std::vector<glm::vec3>& sourcePoints,
+        const std::vector<glm::vec3>& targetPoints,
+        const std::vector<float>& weights,
+        float& outRotation,
+        glm::vec2& outTranslation
+    );
+
 private:
     /**
      * Window-based point-cloud distance with 2D rigid alignment (eq. 1).
@@ -114,24 +185,6 @@ private:
         int targetPoseIdx,
         int windowSize,
         const Skeleton* skeleton,
-        float& outRotation,
-        glm::vec2& outTranslation
-    );
-
-    /**
-     * Compute optimal 2D rigid alignment: the rotation θ and translation
-     * (x₀, z₀) that minimize the weighted point-cloud distance.
-     *
-     * Closed-form solution (equations 2-4):
-     *   θ = arctan(Σ wᵢ (xᵢ z₀ᵢ − x₀ᵢ zᵢ) − Σ wᵢ (x z₀ − x₀ z)) /
-     *          (Σ wᵢ (xᵢ x₀ᵢ + zᵢ z₀ᵢ) − Σ wᵢ (x x₀ + z z₀))
-     *   x₀ = (Σ wᵢ (xᵢ − x cosθ − zᵢ sinθ)) / Σ wᵢ
-     *   z₀ = (Σ wᵢ (zᵢ + xᵢ sinθ − zᵢ cosθ)) / Σ wᵢ
-     */
-    static void ComputeOptimal2DAlignment(
-        const std::vector<glm::vec3>& sourcePoints,
-        const std::vector<glm::vec3>& targetPoints,
-        const std::vector<float>& weights,
         float& outRotation,
         glm::vec2& outTranslation
     );
@@ -158,23 +211,5 @@ private:
         std::vector<glm::vec3>& outPositions,
         std::vector<glm::quat>& outRotations,
         std::vector<glm::vec3>& outScales
-    );
-
-    /**
-     * C¹-continuous cubic smoothstep blend weight (equation 7):
-     *   α(p) = 2((p+1)/k)³ − 3((p+1)/k)² + 1,  for −1 < p < k
-     *   α(p) = 1 for p ≤ −1
-     *   α(p) = 0 for p ≥ k
-     */
-    static float SmoothstepC1(float p, float k);
-
-    /**
-     * Apply 2D rigid transform to a 3D point (rotation about Y axis +
-     * XZ translation), as used in equation (1).
-     */
-    static glm::vec3 Apply2DTransform(
-        const glm::vec3& point,
-        float rotationRad,
-        const glm::vec2& translation
     );
 };

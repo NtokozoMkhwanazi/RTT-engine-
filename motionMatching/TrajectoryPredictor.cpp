@@ -39,20 +39,6 @@ Trajectory TrajectoryPredictor::Predict(
     
     // Predict future positions assuming constant velocity + input
     glm::vec3 predictedVel = currentVelocity;
-    // FIX (refreshed todo Fix 2): When the stick is released AND the character
-    // is below the foot-lift velocity threshold, zero the initial prediction
-    // velocity immediately instead of letting residual momentum project a ghost
-    // trajectory 0.5 s into the future. The loop's 0.25-per-step decay only
-    // shrinks velocity exponentially, so at low but non-zero speeds (e.g. 0.3
-    // m/s coasting to a stop) the future path still stretches forward and lures
-    // the KD-tree toward slow walk clips instead of static Idle — producing
-    // root jitter and ankle drift on return to rest. Collapsing the velocity
-    // up-front makes the trajectory converge to a point so the matcher cleanly
-    // selects idle poses.
-    if (glm::length(moveDirection) < 1e-5f &&
-        glm::length(currentVelocity) < config.footLiftVelocityThreshold) {
-        predictedVel = glm::vec3(0.0f);
-    }
     glm::vec3 predictedPos = currentPosition;
     
     for (int i = 0; i < config.trajectoryPoints; i++) {
@@ -68,21 +54,14 @@ Trajectory TrajectoryPredictor::Predict(
             const float curSpeed = glm::length(predictedVel);
             predictedVel = glm::mix(predictedVel, worldInputDir * curSpeed, 0.15f);
         } else {
-            // Replace the frame-rate-dependent glm::mix (0.25f/step) with a
-            // physical, dt-normalized exponential decay. The fixed 0.25
-            // coefficient assumed a hardcoded frame cadence; at 120 Hz it
-            // collapsed the future path far too fast, decoupling the predicted
-            // trajectory from the capsule's real momentum and triggering the
-            // inertialization tug-of-war (hips yanked backward, feet locked)
-            // that hyper-extended the legs. exp(-rate*dt) is frame-rate
-            // invariant — the decay over a fixed time window is constant
-            // regardless of refresh rate. The explicit floor at 0.01 m/s snaps
-            // to true zero, killing sub-threshold micro-drift residual.
-            const float decelerationRate = 12.0f;
-            predictedVel *= std::exp(-decelerationRate * dt);
-            if (glm::length(predictedVel) < 0.01f) {
-                predictedVel = glm::vec3(0.0f);
-            }
+            // CRITICAL CORRECTION: When stick is released, damp velocity quickly
+            // toward zero so the future path collapses and matches static Idle
+            // poses cleanly. Without this, predictedVel stays locked at the last
+            // frame's moving velocity during the predictor loop, so the trajectory
+            // keeps projecting a forward path into the future even as the character
+            // stops — the system refuses to match clean idle poses, causing foot
+            // plants that slide or snap aggressively on return to rest.
+            predictedVel = glm::mix(predictedVel, glm::vec3(0.0f), 0.25f);
         }
         
         // Integrate position
@@ -92,8 +71,58 @@ Trajectory TrajectoryPredictor::Predict(
         trajectory.positions[i] = predictedPos;
         trajectory.velocities[i] = predictedVel;
         trajectory.directions[i] = atan2(predictedVel.x, predictedVel.z);
+        if (trajectory.directions[i] < 0.0f) trajectory.directions[i] += 6.28318530f;
     }
     
+    return trajectory;
+}
+
+Trajectory TrajectoryPredictor::PredictWithGhostNodes(
+    const glm::vec3& currentPosition,
+    const glm::vec3& currentVelocity,
+    float currentRotation,
+    const glm::vec2& moveDirection,
+    const MotionMatchingConfig& config) const {
+
+    Trajectory trajectory = Predict(currentPosition, currentVelocity, currentRotation, moveDirection, config);
+    trajectory.hasGhostNodes = true; // signal the ghost-node angular-velocity score hook
+
+    float linearSpeed = glm::length(glm::vec3(currentVelocity.x, 0.0f, currentVelocity.z));
+    float inputMagnitude = glm::length(moveDirection);
+
+    // ---- GHOST NODE DETECTION PASS ----
+    // Stationary capsule but active stick input -> player is turning in place.
+    // Inject a simulated angular-velocity turn so the DB search prefers
+    // turn-in-place clips over static idles (forAnime.txt L1076-1126).
+    if (linearSpeed < 0.1f && inputMagnitude > 0.1f) {
+        glm::vec3 inputWorldSpace(moveDirection.x, 0.0f, moveDirection.y);
+        float targetAngle = atan2(inputWorldSpace.x, inputWorldSpace.z);
+        if (targetAngle < 0.0f) targetAngle += 6.28318530f;
+
+        float angularError = targetAngle - currentRotation;
+        while (angularError > 3.14159265f) angularError -= 6.28318530f;
+        while (angularError < -3.14159265f) angularError += 6.28318530f;
+
+        // Sharp turn (> 45deg) -> construct the ghost nodes
+        if (std::abs(angularError) > 0.7853981f) {
+            float simulatedAngularVel = angularError * 5.0f; // Turn-around tracking speed scalar
+
+            for (int i = 0; i < config.trajectoryPoints; i++) {
+                float pointTime = (i + 1) * (config.trajectoryDuration / config.trajectoryPoints);
+
+                // Inject fake angular displacement into the predicted direction array
+                float projectedRotation = currentRotation + simulatedAngularVel * pointTime;
+                trajectory.directions[i] = fmod(projectedRotation, 6.28318530f);
+                if (trajectory.directions[i] < 0.0f) trajectory.directions[i] += 6.28318530f;
+
+                // Pack angular speed in the Y lane of the velocity vector so
+                // CalculatePoseScoreCacheOptimized can read it as the turn
+                // target (forAnime.txt L1131).
+                trajectory.velocities[i] = glm::vec3(0.0f, simulatedAngularVel, 0.0f);
+            }
+        }
+    }
+
     return trajectory;
 }
 
@@ -130,6 +159,7 @@ Trajectory TrajectoryPredictor::PredictWithAcceleration(
         trajectory.positions[i] = predictedPos;
         trajectory.velocities[i] = predictedVel;
         trajectory.directions[i] = atan2(predictedVel.x, predictedVel.z);
+        if (trajectory.directions[i] < 0.0f) trajectory.directions[i] += 6.28318530f;
     }
     
     return trajectory;
@@ -171,6 +201,7 @@ Trajectory TrajectoryPredictor::PredictCurve(
         trajectory.positions[i] = pos;
         trajectory.velocities[i] = vel;
         trajectory.directions[i] = atan2(vel.x, vel.z);
+        if (trajectory.directions[i] < 0.0f) trajectory.directions[i] += 6.28318530f;
     }
     
     return trajectory;
@@ -254,5 +285,6 @@ void TrajectoryPredictor::PredictInternal(
         outTrajectory.positions[i] = pos;
         outTrajectory.velocities[i] = vel;
         outTrajectory.directions[i] = atan2(vel.x, vel.z);
+        if (outTrajectory.directions[i] < 0.0f) outTrajectory.directions[i] += 6.28318530f;
     }
 }

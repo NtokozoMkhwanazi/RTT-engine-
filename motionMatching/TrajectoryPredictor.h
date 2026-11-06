@@ -40,6 +40,18 @@ public:
                       float currentRotation,
                       const glm::vec2& moveDirection,
                       const MotionMatchingConfig& config) const;
+
+    /**
+     * Predict trajectory with ghost-node velocity matching. forAnime.txt
+     * Upgrade 2 (L1076-1138): when the character is stationary but the player
+     * is pushing the stick, inject a simulated angular-velocity turn so the
+     * DB search prefers turn-in-place clips over static idles.
+     */
+    Trajectory PredictWithGhostNodes(const glm::vec3& currentPosition,
+                                     const glm::vec3& currentVelocity,
+                                     float currentRotation,
+                                     const glm::vec2& moveDirection,
+                                     const MotionMatchingConfig& config) const;
     
     /**
      * Predict trajectory with acceleration

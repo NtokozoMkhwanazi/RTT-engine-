@@ -31,6 +31,8 @@ GPU profiler and GPS simulation) and runs its main loop.
   
 **Hardware Constraint Note**: All benchmarking and tests are conducted on a low-specification machine **AMD Ryzen 3700U with Radeon Vega 10 Integrated Graphics**. This engine has been highly optimized specifically for this hardware architecture. Because this integrated card shares system memory and features exceptionally rigid memory-layout constraints, minor programmatic inaccuracies or oversized data transfers easily trigger full VRAM saturation and GPU driver context losses (crashes). Therefore, data systems—such as our virtualized geometry pipeline—are completely GPU-driven and written using strict, high-performance C++ memory layouts. On discrete, higher-tier desktop graphics cards, the performance will scale substantially higher, but our primary development philosophy remains strictly bound to extracting maximum performance from constrained, low-spec hardware
 
+**NOTE** GIFs take time to load due to being heavy uncompressed files >2mb...
+
   (openGL test) UV displacement stretching artifact on steep slopes  & Parallax ocllusion mapping test 
 
   <img width="400" height="225" alt="test(1)" src="https://github.com/user-attachments/assets/5c524fdf-cb1b-45a9-83f5-67ebcc70f257" />

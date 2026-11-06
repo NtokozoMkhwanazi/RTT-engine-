@@ -1,4 +1,5 @@
 
+
 # RTT Engine — 3D Engine
 
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
@@ -50,6 +51,9 @@ GPU profiler and GPS simulation) and runs its main loop.
   (Engine core) Splat tests and POM
 
   <img width="400" height="225" alt="2026-11-05 17-59-47" src="https://github.com/user-attachments/assets/7b51f224-556b-4a71-9171-64b202b3a42e" />
+
+(Engine core) Legacy tests
+<img width="400" height="225" alt="test4(1)" src="https://github.com/user-attachments/assets/593200b7-430f-4294-b564-c2b10f05888d" />
 
 ---
 ## ✨ Features

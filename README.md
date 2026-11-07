@@ -58,6 +58,11 @@ GPU profiler and GPS simulation) and runs its main loop.
 
   <img width="400" height="225" alt="test4(1)" src="https://github.com/user-attachments/assets/593200b7-430f-4294-b564-c2b10f05888d" />
 
+(Engine core) NPC tests. this test uses wasd spceifically single direction key W for driving motion
+
+ <img width="400" height="225" alt="2026-11-07 07-55-38" src="https://github.com/user-attachments/assets/01eccd9c-40a8-4fb9-9f7e-91b0dbef2a7b" />
+
+
 ---
 ## ✨ Features
 

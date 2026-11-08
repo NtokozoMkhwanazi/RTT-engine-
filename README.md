@@ -66,6 +66,14 @@ GPU profiler and GPS simulation) and runs its main loop.
 
   <img width="400" height="225" alt="2026-11-07 08-09-49(1)(1)" src="https://github.com/user-attachments/assets/33651606-72c9-46c1-868e-08715d0584ae" />
 
+(Engine core) Cam tests & Animation Tests (Motion matching...the question: is the kd-tree i.e avx2 available, selecting correct poses?)
+
+  <img width="400" height="225" alt="2026-11-08 17-17-35" src="https://github.com/user-attachments/assets/561496e6-fabd-419a-bbe3-bf4e3064e2c6" />
+  
+  <img width="400" height="225" alt="2026-11-08 18-40-24" src="https://github.com/user-attachments/assets/bd1759fa-2215-469a-85e7-522d28c713c0" />
+
+
+
 ---
 ## ✨ Features
 

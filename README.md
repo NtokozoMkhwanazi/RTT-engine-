@@ -33,36 +33,29 @@ GPU profiler and GPS simulation) and runs its main loop.
 
 **NOTE** GIFs take time to load due to being heavy uncompressed files >2mb...and these Tests dont include Physics system yet still figuring out how to actually expose physics in Editor for ease of use.   
 
-  (openGL test) UV displacement stretching artifact on steep slopes  & Parallax ocllusion mapping test 
+  (openGL test) UV displacement stretching artifact on steep slopes  & Parallax ocllusion mapping test  (engine core test) Animation Test. pose A to pose B snappy state switches.
+  Requires more clips between transitions for a better motion graph 
 
   <img width="400" height="225" alt="test(1)" src="https://github.com/user-attachments/assets/5c524fdf-cb1b-45a9-83f5-67ebcc70f257" />
-
-  (engine core test) Animation Test. pose A to pose B snappy state switches.
-  Requires more clips between transitions for a better motion graph 
   
   <img width="400" height="225" alt="TEST2(1)(1)" src="https://github.com/user-attachments/assets/28ad909f-5cc3-4ea2-9459-52c3eacd22f7" />
 
-  (openGL test) Model Texture binding. disabled root motion
+  (openGL test) Model Texture binding. disabled root motion  (Engine core) Tessellation tests using wireframe
 
   <img width="400" height="225" alt="view(1)(1)" src="https://github.com/user-attachments/assets/2480229c-f7ab-48be-b4d7-9b092782d18d" /> 
   
-  (engine core) Tessellation tests using wireframe
-  
 <img width="400" height="225" alt="2026-11-05 18-01-19" src="https://github.com/user-attachments/assets/cce5bf46-af1a-4999-b3e1-098227f6b364" />
   
-  (Engine core) Splat tests and POM
+(Engine core) Splat tests and POM ... and  Legacy tests
 
   <img width="400" height="225" alt="2026-11-05 17-59-47" src="https://github.com/user-attachments/assets/7b51f224-556b-4a71-9171-64b202b3a42e" />
 
-(Engine core) Legacy tests
-
   <img width="400" height="225" alt="test4(1)" src="https://github.com/user-attachments/assets/593200b7-430f-4294-b564-c2b10f05888d" />
 
-(Engine core) NPC tests. this test uses wasd spceifically single direction key W for driving motion
+(Engine core) NPC tests. this test uses wasd spceifically single direction key W for driving motion. Near grazing smear of the terrain ... looks better from far looks worse closer to the terrain but solves the artifact stretching issue by re-projecting uv on cliffs or high points instead of strecthing the texture causing the artifact where cliffs look smeared or stretched. 
 
- <img width="400" height="225" alt="2026-11-07 07-55-38" src="https://github.com/user-attachments/assets/01eccd9c-40a8-4fb9-9f7e-91b0dbef2a7b" />
 
-(Engine core) Near grazing smear of the terrain ... looks better from far looks worse closer to the terrain but solves the artifact stretching issue by re-projecting uv on cliffs or high points instead of strecthing the texture causing the artifact where cliffs look smeared or stretched. 
+  <img width="400" height="225" alt="2026-11-07 07-55-38" src="https://github.com/user-attachments/assets/01eccd9c-40a8-4fb9-9f7e-91b0dbef2a7b" />
 
   <img width="400" height="225" alt="2026-11-07 08-09-49(1)(1)" src="https://github.com/user-attachments/assets/33651606-72c9-46c1-868e-08715d0584ae" />
 

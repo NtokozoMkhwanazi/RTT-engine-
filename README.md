@@ -33,12 +33,6 @@ GPU profiler and GPS simulation) and runs its main loop.
 
 **NOTE** GIFs take time to load due to being heavy uncompressed files >2mb...and these Tests dont include Physics system yet still figuring out how to actually expose physics in Editor for ease of use.   
 
-  
-(Engine core) Splat tests and POM ... and  Legacy tests
-
-  <img width="400" height="225" alt="2026-11-05 17-59-47" src="https://github.com/user-attachments/assets/7b51f224-556b-4a71-9171-64b202b3a42e" />
-
-  <img width="400" height="225" alt="test4(1)" src="https://github.com/user-attachments/assets/593200b7-430f-4294-b564-c2b10f05888d" />
 
 (Engine core) NPC tests. this test uses wasd spceifically single direction key W for driving motion. Near grazing smear of the terrain ... looks better from far looks worse closer to the terrain but solves the artifact stretching issue by re-projecting uv on cliffs or high points instead of strecthing the texture causing the artifact where cliffs look smeared or stretched. 
 

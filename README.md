@@ -33,18 +33,6 @@ GPU profiler and GPS simulation) and runs its main loop.
 
 **NOTE** GIFs take time to load due to being heavy uncompressed files >2mb...and these Tests dont include Physics system yet still figuring out how to actually expose physics in Editor for ease of use.   
 
-  (openGL test) UV displacement stretching artifact on steep slopes  & Parallax ocllusion mapping test  (engine core test) Animation Test. pose A to pose B snappy state switches.
-  Requires more clips between transitions for a better motion graph 
-
-  <img width="400" height="225" alt="test(1)" src="https://github.com/user-attachments/assets/5c524fdf-cb1b-45a9-83f5-67ebcc70f257" />
-  
-  <img width="400" height="225" alt="TEST2(1)(1)" src="https://github.com/user-attachments/assets/28ad909f-5cc3-4ea2-9459-52c3eacd22f7" />
-
-  (openGL test) Model Texture binding. disabled root motion  (Engine core) Tessellation tests using wireframe
-
-  <img width="400" height="225" alt="view(1)(1)" src="https://github.com/user-attachments/assets/2480229c-f7ab-48be-b4d7-9b092782d18d" /> 
-  
-<img width="400" height="225" alt="2026-11-05 18-01-19" src="https://github.com/user-attachments/assets/cce5bf46-af1a-4999-b3e1-098227f6b364" />
   
 (Engine core) Splat tests and POM ... and  Legacy tests
 
